@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "cache_write_tier": "5m",
+  "description": "Official per-1M-token rates for every model seen in Multica runtime usage. Rates come ONLY from vendor pricing pages; each carries its source URL and capture date. cache_write is the default (5-minute) cache-write rate; cache_write_1h is kept for reference. Edit this file (or point AISTAT_PRICING_OVERRIDES at a second JSON with the same shape) to add or override models without code changes. A model that has no official public rate must be listed with \"unpriced\": true and a note — never priced at 0.",
+  "assumptions": [
+    "Multica runtime usage reports four token counts per (runtime, model, day): input / output / cache_read / cache_write. input_tokens is the uncached remainder, so total cost = input*input + output*output + cache_read*cache_read + cache_write*cache_write, all per 1M tokens.",
+    "cache_write tokens are priced at the vendor's default 5-minute cache-write rate (Anthropic 1.25x input; OpenAI gpt-5.6 1.25x input). Agents use the default ephemeral (5m) cache, so the 5m rate is the correct default; the 1h rate is recorded for reference/override.",
+    "cache_read tokens are priced at the vendor cache-hit rate (Anthropic 0.1x input; OpenAI cached-input 0.1x input)."
+  ],
+  "models": {
+    "claude-opus-4-8": {
+      "vendor": "Anthropic",
+      "input": 5.0,
+      "output": 25.0,
+      "cache_read": 0.5,
+      "cache_write": 6.25,
+      "cache_write_1h": 10.0,
+      "currency": "USD",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "captured_at": "2026-07-15",
+      "notes": "Claude Opus 4.8. 5m cache write = 1.25x input; 1h = 2x; cache read (hit) = 0.1x input."
+    },
+    "claude-fable-5": {
+      "vendor": "Anthropic",
+      "input": 10.0,
+      "output": 50.0,
+      "cache_read": 1.0,
+      "cache_write": 12.5,
+      "cache_write_1h": 20.0,
+      "currency": "USD",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "captured_at": "2026-07-15",
+      "notes": "Claude Fable 5 (Anthropic's most capable widely released model). 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input."
+    },
+    "claude-haiku-4-5-20251001": {
+      "vendor": "Anthropic",
+      "input": 1.0,
+      "output": 5.0,
+      "cache_read": 0.1,
+      "cache_write": 1.25,
+      "cache_write_1h": 2.0,
+      "currency": "USD",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "captured_at": "2026-07-15",
+      "notes": "Claude Haiku 4.5 (API ID claude-haiku-4-5-20251001). 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input."
+    },
+    "gpt-5.6-sol": {
+      "vendor": "OpenAI",
+      "input": 5.0,
+      "output": 30.0,
+      "cache_read": 0.5,
+      "cache_write": 6.25,
+      "currency": "USD",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "captured_at": "2026-07-15",
+      "notes": "GPT-5.6 Sol. cached input (cache_read) = 10% of input; cache write = 1.25x input. Multica reports cache_write_tokens=0 for codex runtimes, so the cache-write rate does not affect current cost but is recorded for completeness."
+    },
+    "gpt-5.6-terra": {
+      "vendor": "OpenAI",
+      "input": 2.5,
+      "output": 15.0,
+      "cache_read": 0.25,
+      "cache_write": 3.125,
+      "currency": "USD",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "captured_at": "2026-07-15",
+      "notes": "GPT-5.6 Terra. cached input (cache_read) = 10% of input; cache write = 1.25x input. Multica reports cache_write_tokens=0 for codex runtimes."
+    }
+  }
+}

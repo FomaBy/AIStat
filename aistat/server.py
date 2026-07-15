@@ -27,6 +27,7 @@ def health():
     conn = connect(config.db_path)
     try:
         init_db(conn)
-        return snapshot(conn, db_path=str(config.db_path))
+        return snapshot(conn, db_path=str(config.db_path),
+                        credits_per_usd=config.credits_per_usd)
     finally:
         conn.close()

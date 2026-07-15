@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtimes (
@@ -92,6 +92,13 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
     synced_at           TEXT NOT NULL,
+    -- Cost is (re)computed from token counts x model_pricing (stage 2).
+    -- cost_usd/cost_credits are NULL when the model is unpriced (never 0),
+    -- and cost_priced flags whether an official rate was applied.
+    cost_usd            REAL,
+    cost_credits        REAL,
+    cost_priced         INTEGER NOT NULL DEFAULT 0,
+    cost_computed_at    TEXT,
     PRIMARY KEY (runtime_id, model, date)
 );
 
@@ -153,7 +160,46 @@ CREATE TABLE IF NOT EXISTS poll_cycles (
     sources_failed  INTEGER NOT NULL DEFAULT 0,
     notes           TEXT
 );
+
+-- Official per-1M-token rates, loaded from pricing.json (+ optional override).
+-- Rates are NULL for an unpriced model; source_url/captured_at record where
+-- and when each rate was taken from the vendor's official pricing page.
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model                TEXT PRIMARY KEY,
+    vendor               TEXT,
+    currency             TEXT,
+    input_rate           REAL,
+    output_rate          REAL,
+    cache_read_rate      REAL,
+    cache_write_rate     REAL,
+    cache_write_1h_rate  REAL,
+    unpriced             INTEGER NOT NULL DEFAULT 0,
+    source_url           TEXT,
+    captured_at          TEXT,
+    notes                TEXT,
+    loaded_at            TEXT NOT NULL
+);
 """
+
+# Columns added to pre-existing tables after their first release. init_db adds
+# any that are missing so an already-populated database upgrades in place
+# (CREATE TABLE IF NOT EXISTS never alters an existing table).
+_ADDED_COLUMNS = {
+    "daily_usage": [
+        ("cost_usd", "REAL"),
+        ("cost_credits", "REAL"),
+        ("cost_priced", "INTEGER NOT NULL DEFAULT 0"),
+        ("cost_computed_at", "TEXT"),
+    ],
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def utcnow_iso() -> str:
@@ -171,5 +217,6 @@ def connect(db_path: Union[str, Path]) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

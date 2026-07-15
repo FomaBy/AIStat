@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import normalize, store
+from . import normalize, pricing, store
 from .cli import CliError, run_cli
 from .config import Config
 from .db import connect, init_db, utcnow_iso
@@ -187,6 +187,38 @@ class Poller:
         rows = [normalize.normalize_run(item) for item in data]
         return store.upsert_runs(self.conn, rows)
 
+    def sync_pricing(self, result: CycleResult) -> None:
+        """Load pricing.json, mirror it into the DB and (re)compute daily costs.
+
+        Reported as its own 'pricing' source so a broken/missing pricing file
+        surfaces in health rather than silently leaving costs stale. Models
+        present in usage but absent from the table are recorded as unpriced —
+        that is a reported condition, not a source failure.
+        """
+        try:
+            rates = pricing.load_pricing(
+                self.config.pricing_path, self.config.pricing_overrides_path
+            )
+            pricing.upsert_model_pricing(self.conn, rates)
+            pricing.recompute_daily_costs(
+                self.conn, rates, self.config.credits_per_usd
+            )
+            unpriced = pricing.unpriced_models_in_usage(self.conn, rates)
+            self.conn.commit()
+        except pricing.PricingError as exc:
+            message = str(exc)
+            logger.error("source pricing failed: %s", message)
+            store.record_source_attempt(self.conn, "pricing", ok=False, error=message)
+            self.conn.commit()
+            result.sources_failed += 1
+            result.errors.append(f"pricing: {message}")
+            return
+        store.record_source_attempt(self.conn, "pricing", ok=True)
+        self.conn.commit()
+        result.sources_ok += 1
+        if unpriced:
+            logger.warning("unpriced models in usage: %s", ", ".join(unpriced))
+
     # -- the cycle ------------------------------------------------------------
 
     def run_cycle(self, detail_budget: Optional[int] = None) -> CycleResult:
@@ -202,6 +234,9 @@ class Poller:
                          functools.partial(self.sync_runtime_usage, rid))
             self._source(result, f"runtime_activity:{rid}",
                          functools.partial(self.sync_runtime_activity, rid))
+
+        # daily_usage is now fresh; price it and refresh the pricing table.
+        self.sync_pricing(result)
 
         for project in projects or []:
             pid = project["id"]

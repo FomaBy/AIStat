@@ -7,6 +7,7 @@ can be tuned without code changes. Defaults are chosen for this workspace.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -16,6 +17,20 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _env_path(name: str, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return Path(raw)
 
 
 @dataclass
@@ -42,6 +57,21 @@ class Config:
     cli_bin: str = field(default_factory=lambda: os.environ.get("AISTAT_CLI_BIN", "multica"))
     cli_timeout_seconds: int = field(
         default_factory=lambda: _env_int("AISTAT_CLI_TIMEOUT_SECONDS", 120)
+    )
+    # Versioned pricing table (model -> official per-1M-token rates + source).
+    pricing_path: Path = field(
+        default_factory=lambda: _env_path("AISTAT_PRICING_PATH", PROJECT_ROOT / "pricing.json")
+    )
+    # Optional second pricing file that overrides / extends the base one,
+    # letting an operator add or re-rate models without editing pricing.json.
+    pricing_overrides_path: Optional[Path] = field(
+        default_factory=lambda: _env_path("AISTAT_PRICING_OVERRIDES", None)
+    )
+    # Credits per USD of cost. Multica publishes no official public credit
+    # model, so this is a documented, configurable assumption (default 1.0 =>
+    # 1 credit == $1). Override with AISTAT_CREDITS_PER_USD.
+    credits_per_usd: float = field(
+        default_factory=lambda: _env_float("AISTAT_CREDITS_PER_USD", 1.0)
     )
 
     def ensure_db_dir(self) -> None:
