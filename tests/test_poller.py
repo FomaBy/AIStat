@@ -190,6 +190,49 @@ def test_detail_sync_failure_leaves_issue_pending(conn):
     assert "3 of 3" in row["last_error"]
 
 
+def test_live_beat_lands_before_slow_phase(conn):
+    """FAN-1147: SSE clients must be woken as soon as live data (daily usage,
+    pricing) is committed — before issue lists and the detail backfill."""
+    inner = make_runner()
+    seen = {}
+
+    def runner(args):
+        if args[:2] == ["issue", "list"] and "beat" not in seen:
+            row = conn.execute("SELECT seq, phase FROM sync_beats").fetchone()
+            seen["beat"] = (row["seq"], row["phase"]) if row else None
+        return inner(args)
+
+    poller = Poller(Config(), conn, runner=runner)
+    poller.run_cycle()
+
+    assert seen["beat"] == (1, "live")
+    final = conn.execute("SELECT seq, phase FROM sync_beats").fetchone()
+    assert (final["seq"], final["phase"]) == (2, "cycle")
+
+
+def test_detail_backfill_deferred_past_deadline_still_progresses(conn):
+    """FAN-1147: a large detail backlog must not stretch the tick — but every
+    cycle still syncs at least one issue, so the backlog always drains."""
+    poller = Poller(Config(), conn, runner=make_runner(), clock=lambda: 100.0)
+    result = poller.run_cycle(deadline=0.0)  # deadline already passed
+
+    assert result.detail_synced == 1
+    assert result.detail_deferred == 2
+    assert result.sources_failed == 0  # deferral is scheduling, not an error
+    assert len(poller.pending_detail_issues(budget=10)) == 2
+
+    poller.run_cycle(deadline=0.0)
+    poller.run_cycle(deadline=0.0)
+    assert poller.pending_detail_issues(budget=10) == []
+
+
+def test_detail_backfill_unclamped_without_deadline(conn):
+    poller = Poller(Config(), conn, runner=make_runner(), clock=lambda: 100.0)
+    result = poller.run_cycle()  # --once path: no deadline
+    assert result.detail_synced == 3
+    assert result.detail_deferred == 0
+
+
 def test_upsert_updates_changed_values(conn):
     poller = Poller(Config(), conn, runner=make_runner())
     poller.run_cycle()

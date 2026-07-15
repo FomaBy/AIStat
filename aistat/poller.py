@@ -1,16 +1,30 @@
 """Background poller: full incremental sync cycle over the multica CLI.
 
-One cycle:
+One cycle, in two phases:
+
+Live phase — everything the dashboard's live view is built from; a `live`
+beat (see store.record_beat) is committed right after it, so SSE clients
+refresh without waiting for the rest of the cycle:
   1. runtime list                          -> runtimes
   2. agent list                            -> agents
   3. project list                          -> projects
   4. runtime usage <id> --days N (each)    -> daily_usage
   5. runtime activity <id> (each)          -> runtime_activity
-  6. issue list --project <id> (paginated) -> issues (with story_points)
-  7. issue usage + issue runs, for up to `detail_budget` issues whose
+  6. pricing.json                          -> model_pricing, daily costs
+
+Slow phase — bulk data whose freshness matters less than live cadence:
+  7. issue list --project <id> (paginated) -> issues (with story_points)
+  8. agent tasks <id> (each)               -> runs
+  9. issue usage + issue runs, for up to `detail_budget` issues whose
      `updated_at` changed since their details were last fetched, most
      recently updated first                -> issue_usage, runs
-  8. agent tasks <id> (each)               -> runs
+     When a tick `deadline` is given, this backfill stops once the deadline
+     passes (always finishing at least one issue per cycle so the backlog
+     drains); deferred issues stay stale and are retried next cycle.
+
+The main loop schedules cycles start-to-start (a tick every
+poll_interval_seconds), not sleep-after-cycle, so the live cadence stays at
+the configured interval regardless of how long the detail backfill takes.
 
 Every source failure is logged, recorded in sync_state and reflected in
 health; it never aborts the remaining sources and is never replaced with
@@ -69,6 +83,7 @@ class CycleResult:
     errors: List[str] = field(default_factory=list)
     detail_synced: int = 0
     detail_failed: int = 0
+    detail_deferred: int = 0  # pending issues pushed past the tick deadline
 
     @property
     def ok(self) -> bool:
@@ -77,9 +92,11 @@ class CycleResult:
 
 class Poller:
     def __init__(self, config: Config, conn: sqlite3.Connection,
-                 runner: Optional[Runner] = None):
+                 runner: Optional[Runner] = None,
+                 clock: Callable[[], float] = time.monotonic):
         self.config = config
         self.conn = conn
+        self.clock = clock  # injectable for deadline tests
         self.runner: Runner = runner or functools.partial(
             run_cli, binary=config.cli_bin, timeout=config.cli_timeout_seconds
         )
@@ -169,17 +186,33 @@ class Poller:
         ).fetchall()
 
     def sync_issue_details(self, result: CycleResult,
-                           budget: Optional[int] = None) -> None:
+                           budget: Optional[int] = None,
+                           deadline: Optional[float] = None) -> None:
         """Fetch `issue usage` + `issue runs` for up to `budget` stale issues.
 
         Reported as a single 'issue_details' source so sync_state stays
         readable; per-issue failures are collected, do not stop the batch,
         and leave that issue marked stale for retry next cycle.
+
+        `deadline` (a self.clock() timestamp) bounds the backfill to the
+        current tick: once it passes, remaining issues are deferred to the
+        next cycle — except the first one, which is always synced so the
+        backlog keeps draining even when every tick overruns. Deferral is
+        normal scheduling, not a source failure.
         """
         budget = self.config.detail_budget if budget is None else budget
         pending = self.pending_detail_issues(budget)
         errors: List[str] = []
-        for issue in pending:
+        attempted = 0
+        for index, issue in enumerate(pending):
+            if deadline is not None and index > 0 and self.clock() >= deadline:
+                result.detail_deferred = len(pending) - index
+                logger.info(
+                    "tick deadline reached: deferring %d pending issue details "
+                    "to the next cycle", result.detail_deferred,
+                )
+                break
+            attempted += 1
             issue_id, detail_key = issue["id"], issue["detail_key"]
             try:
                 usage = self.runner(["issue", "usage", issue_id])
@@ -199,7 +232,7 @@ class Poller:
                 logger.error("issue details failed for %s: %s", issue_id, exc)
 
         if errors:
-            summary = f"{len(errors)} of {len(pending)} issues failed: " + "; ".join(errors[:3])
+            summary = f"{len(errors)} of {attempted} issues failed: " + "; ".join(errors[:3])
             store.record_source_attempt(self.conn, "issue_details", ok=False, error=summary)
             result.sources_failed += 1
             result.errors.append(f"issue_details: {summary}")
@@ -247,9 +280,11 @@ class Poller:
 
     # -- the cycle ------------------------------------------------------------
 
-    def run_cycle(self, detail_budget: Optional[int] = None) -> CycleResult:
+    def run_cycle(self, detail_budget: Optional[int] = None,
+                  deadline: Optional[float] = None) -> CycleResult:
         result = CycleResult(started_at=utcnow_iso())
 
+        # -- live phase: dimensions, daily usage, activity, pricing ---------
         _, runtimes = self._source(result, "runtimes", self.sync_runtimes)
         _, agents = self._source(result, "agents", self.sync_agents)
         _, projects = self._source(result, "projects", self.sync_projects)
@@ -264,17 +299,25 @@ class Poller:
         # daily_usage is now fresh; price it and refresh the pricing table.
         self.sync_pricing(result)
 
+        # Live data is committed — wake SSE clients before the slow phase.
+        store.record_beat(self.conn, "live")
+        self.conn.commit()
+
+        # -- slow phase: issues, runs, detail backfill ----------------------
         for project in projects or []:
             pid = project["id"]
             self._source(result, f"issues:{pid}",
                          functools.partial(self.sync_project_issues, pid))
 
-        self.sync_issue_details(result, budget=detail_budget)
-
+        # agent_tasks before issue_details: fresh runs can mark issues stale
+        # (and only issue_details is elastic, so it alone absorbs a deadline
+        # overrun — no other source can be starved by a large backlog).
         for agent in agents or []:
             aid = agent["id"]
             self._source(result, f"agent_tasks:{aid}",
                          functools.partial(self.sync_agent_tasks, aid))
+
+        self.sync_issue_details(result, budget=detail_budget, deadline=deadline)
 
         result.finished_at = utcnow_iso()
         self.conn.execute(
@@ -290,11 +333,12 @@ class Poller:
                 "; ".join(result.errors)[:2000] if result.errors else None,
             ),
         )
+        store.record_beat(self.conn, "cycle")
         self.conn.commit()
         logger.info(
-            "cycle done: %d ok, %d failed, details %d synced / %d failed",
+            "cycle done: %d ok, %d failed, details %d synced / %d failed / %d deferred",
             result.sources_ok, result.sources_failed,
-            result.detail_synced, result.detail_failed,
+            result.detail_synced, result.detail_failed, result.detail_deferred,
         )
         return result
 
@@ -329,11 +373,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     poller = Poller(config, conn)
 
     try:
+        # Fixed start-to-start cadence: each tick starts poll_interval_seconds
+        # after the previous tick started (immediately, if a cycle overran).
+        # The same deadline clamps the detail backfill inside the cycle, so a
+        # large backlog spreads over ticks instead of stretching every tick.
         while True:
-            result = poller.run_cycle(detail_budget=args.detail_budget)
+            deadline = time.monotonic() + config.poll_interval_seconds
+            result = poller.run_cycle(
+                detail_budget=args.detail_budget,
+                deadline=None if args.once else deadline,
+            )
             if args.once:
                 return 0 if result.ok else 1
-            time.sleep(config.poll_interval_seconds)
+            time.sleep(max(0.0, deadline - time.monotonic()))
     except KeyboardInterrupt:
         logger.info("stopped")
         return 0

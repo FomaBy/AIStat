@@ -78,6 +78,11 @@ def snapshot(conn: sqlite3.Connection, db_path: Optional[str] = None,
     ).fetchone()
     last_cycle = dict(last_cycle_row) if last_cycle_row else None
 
+    last_beat_row = conn.execute(
+        "SELECT seq, at, phase FROM sync_beats WHERE id = 1"
+    ).fetchone()
+    last_beat = dict(last_beat_row) if last_beat_row else None
+
     sources: List[Dict[str, Any]] = [
         dict(row)
         for row in conn.execute(
@@ -106,6 +111,7 @@ def snapshot(conn: sqlite3.Connection, db_path: Optional[str] = None,
         "status": "degraded" if failing else ("empty" if not last_cycle else "ok"),
         "row_counts": counts,
         "last_cycle": last_cycle,
+        "last_beat": last_beat,
         "daily_usage_span": {
             "first_date": usage_span[0],
             "last_date": usage_span[1],

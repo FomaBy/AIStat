@@ -8,12 +8,14 @@ Endpoints:
     GET /api/projects    — per-project cuts (tokens, est. cost, SP, statuses, efficiency)
     GET /api/efficiency  — per-issue tokens/SP, worst first (?project&limit)
     GET /api/health      — health snapshot (alias of /health)
-    GET /api/events      — SSE: an event after every completed poller cycle
+    GET /api/events      — SSE: `update` after every poller data batch
+                           (live phase or full cycle), `cycle` on full cycles
     GET /                — the dashboard (static, Chart.js vendored locally)
 
 The poller runs in a separate process; the SSE endpoint watches the
-poll_cycles table and notifies clients when a new cycle lands, so the
-frontend refreshes without reloading the page.
+sync_beats counter (bumped by the poller after its live phase and after
+every full cycle) plus the poll_cycles table, so the frontend refreshes as
+soon as live data lands — not only when a whole cycle finishes.
 
 Run: .venv/bin/uvicorn aistat.server:app --port 8787   (or ./run.sh)
 """
@@ -35,32 +37,44 @@ from .health import snapshot
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# SSE tuning: how often the cycle watcher polls the DB, and how often an
+# SSE tuning: how often the beat watcher polls the DB, and how often an
 # idle stream emits a keepalive comment so proxies don't drop it.
 SSE_CHECK_SECONDS = 2.0
 SSE_KEEPALIVE_SECONDS = 15.0
 
 
-async def cycle_event_stream(last_cycle_state, is_disconnected):
-    """SSE frames: `hello` with the current poll cycle, then `cycle` whenever
-    a new poller cycle lands, with keepalive comments in between.
+def _sync_marks(state) -> tuple:
+    """The change signature of a sync state: (beat seq, last cycle id)."""
+    beat = state.get("beat") or {}
+    cycle = state.get("cycle") or {}
+    return (beat.get("seq"), cycle.get("id"))
+
+
+async def update_event_stream(last_sync_state, is_disconnected):
+    """SSE frames: `hello` with the current sync state, then `update`
+    whenever the poller commits a fresh data batch (its live phase or a full
+    cycle) — plus a `cycle` event with the cycle row when a full cycle lands,
+    kept for external watchers — with keepalive comments in between.
 
     Takes callables instead of a request/connection so it can be tested
     directly — Starlette's TestClient buffers whole responses and would hang
     on an endless stream.
     """
-    state = last_cycle_state()
-    last_id = state["id"] if state else 0
-    yield "event: hello\ndata: " + json.dumps(state or {}) + "\n\n"
+    state = last_sync_state()
+    last = _sync_marks(state)
+    yield "event: hello\ndata: " + json.dumps(state) + "\n\n"
     idle = 0.0
     while not await is_disconnected():
         await asyncio.sleep(SSE_CHECK_SECONDS)
         idle += SSE_CHECK_SECONDS
-        state = last_cycle_state()
-        if state and state["id"] != last_id:
-            last_id = state["id"]
+        state = last_sync_state()
+        current = _sync_marks(state)
+        if current != last:
             idle = 0.0
-            yield "event: cycle\ndata: " + json.dumps(state) + "\n\n"
+            yield "event: update\ndata: " + json.dumps(state) + "\n\n"
+            if current[1] != last[1] and state.get("cycle"):
+                yield "event: cycle\ndata: " + json.dumps(state["cycle"]) + "\n\n"
+            last = current
         elif idle >= SSE_KEEPALIVE_SECONDS:
             idle = 0.0
             yield ": keepalive\n\n"
@@ -167,22 +181,28 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     def api_health():
         return health_payload()
 
-    def last_cycle_state() -> Optional[dict]:
+    def last_sync_state() -> dict:
         conn = db()
         try:
-            row = conn.execute(
+            beat = conn.execute(
+                "SELECT seq, at, phase FROM sync_beats WHERE id = 1"
+            ).fetchone()
+            cycle = conn.execute(
                 "SELECT id, started_at, finished_at, sources_ok, sources_failed "
                 "FROM poll_cycles ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            return dict(row) if row else None
+            return {
+                "beat": dict(beat) if beat else None,
+                "cycle": dict(cycle) if cycle else None,
+            }
         finally:
             conn.close()
 
     @app.get("/api/events")
     async def api_events(request: Request):
-        """SSE stream: `cycle` event whenever the poller finishes a cycle."""
+        """SSE stream: `update` whenever the poller lands fresh data."""
         return StreamingResponse(
-            cycle_event_stream(last_cycle_state, request.is_disconnected),
+            update_event_stream(last_sync_state, request.is_disconnected),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

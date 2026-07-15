@@ -109,24 +109,53 @@ def _collect_sse_frames(get_state, max_disconnect_checks):
 
     async def collect():
         frames = []
-        async for frame in server_module.cycle_event_stream(get_state, is_disconnected):
+        async for frame in server_module.update_event_stream(get_state, is_disconnected):
             frames.append(frame)
         return frames
 
     return asyncio.get_event_loop().run_until_complete(collect())
 
 
-def test_sse_stream_emits_cycle_event_on_new_poll_cycle(monkeypatch):
-    monkeypatch.setattr(server_module, "SSE_CHECK_SECONDS", 0.005)
-    states = iter([{"id": 1}, {"id": 1}, {"id": 2}])
+def _sync_state(beat_seq, cycle_id, phase="cycle"):
+    return {
+        "beat": {"seq": beat_seq, "at": "2026-01-01T00:00:00Z", "phase": phase},
+        "cycle": {"id": cycle_id} if cycle_id else None,
+    }
+
+
+def _stream_states(states):
+    """get_state stub: walk through `states`, then repeat the last one."""
+    remaining = iter(states)
     last = {"state": None}
 
     def get_state():
-        last["state"] = next(states, last["state"])
+        last["state"] = next(remaining, last["state"])
         return last["state"]
 
-    frames = _collect_sse_frames(get_state, max_disconnect_checks=5)
-    assert frames[0] == 'event: hello\ndata: {"id": 1}\n\n'
+    return get_state
+
+
+def test_sse_stream_emits_update_on_live_beat_without_cycle_event(monkeypatch):
+    """The mid-cycle live beat must wake clients on its own — that is the
+    live-latency fix — and must not fake a completed-cycle event."""
+    monkeypatch.setattr(server_module, "SSE_CHECK_SECONDS", 0.005)
+    states = [_sync_state(2, 1), _sync_state(2, 1), _sync_state(3, 1, phase="live")]
+    frames = _collect_sse_frames(_stream_states(states), max_disconnect_checks=5)
+
+    assert frames[0].startswith("event: hello\n")
+    updates = [f for f in frames if f.startswith("event: update")]
+    assert len(updates) == 1
+    assert '"phase": "live"' in updates[0]
+    assert not [f for f in frames if f.startswith("event: cycle")]
+
+
+def test_sse_stream_emits_update_and_cycle_on_new_poll_cycle(monkeypatch):
+    monkeypatch.setattr(server_module, "SSE_CHECK_SECONDS", 0.005)
+    states = [_sync_state(2, 1), _sync_state(2, 1), _sync_state(3, 2)]
+    frames = _collect_sse_frames(_stream_states(states), max_disconnect_checks=5)
+
+    updates = [f for f in frames if f.startswith("event: update")]
+    assert len(updates) == 1
     cycles = [f for f in frames if f.startswith("event: cycle")]
     assert cycles == ['event: cycle\ndata: {"id": 2}\n\n']
 
@@ -134,9 +163,9 @@ def test_sse_stream_emits_cycle_event_on_new_poll_cycle(monkeypatch):
 def test_sse_stream_sends_keepalive_when_idle(monkeypatch):
     monkeypatch.setattr(server_module, "SSE_CHECK_SECONDS", 0.005)
     monkeypatch.setattr(server_module, "SSE_KEEPALIVE_SECONDS", 0.005)
-    frames = _collect_sse_frames(lambda: {"id": 1}, max_disconnect_checks=3)
+    frames = _collect_sse_frames(lambda: _sync_state(1, 1), max_disconnect_checks=3)
     assert ": keepalive\n\n" in frames
-    assert not [f for f in frames if f.startswith("event: cycle")]
+    assert not [f for f in frames if f.startswith("event: update")]
 
 
 def test_sse_endpoint_is_registered(api):

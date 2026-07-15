@@ -118,6 +118,23 @@ def mark_issue_details_synced(conn: sqlite3.Connection, issue_id: str,
     )
 
 
+def record_beat(conn: sqlite3.Connection, phase: str,
+                at: Optional[str] = None) -> None:
+    """Bump the single-row counter that tells the SSE stream "data changed".
+
+    phase: 'live' after the live phase (daily usage, pricing, dimensions),
+    'cycle' after a full poll cycle.
+    """
+    conn.execute(
+        """
+        INSERT INTO sync_beats (id, seq, at, phase) VALUES (1, 1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            seq = sync_beats.seq + 1, at = excluded.at, phase = excluded.phase
+        """,
+        (at or utcnow_iso(), phase),
+    )
+
+
 def record_source_attempt(conn: sqlite3.Connection, source: str, ok: bool,
                           error: Optional[str] = None,
                           at: Optional[str] = None) -> None:

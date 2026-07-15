@@ -3,7 +3,8 @@
 Dimensions: runtimes, agents, projects, issues.
 Facts: daily_usage (runtime_id, model, date), issue_usage snapshots,
 runs (Multica tasks), runtime_activity (hour-of-day snapshot).
-Bookkeeping: sync_state (per-source health), poll_cycles.
+Bookkeeping: sync_state (per-source health), poll_cycles, sync_beats
+(single-row change counter driving SSE live updates).
 
 All writes are idempotent upserts keyed on natural primary keys, so the
 poller can run any number of times without producing duplicate rows.
@@ -14,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtimes (
@@ -152,6 +153,17 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_success_at  TEXT,
     last_error_at    TEXT,
     last_error       TEXT
+);
+
+-- Single-row change counter bumped whenever the poller commits a batch of
+-- fresh data (after the live phase and after a full cycle). The SSE stream
+-- watches `seq`, so clients refresh as soon as live data lands rather than
+-- waiting for the whole cycle.
+CREATE TABLE IF NOT EXISTS sync_beats (
+    id     INTEGER PRIMARY KEY CHECK (id = 1),
+    seq    INTEGER NOT NULL,
+    at     TEXT NOT NULL,
+    phase  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS poll_cycles (
