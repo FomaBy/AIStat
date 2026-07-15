@@ -35,6 +35,30 @@ logger = logging.getLogger("aistat.poller")
 # runner(args: List[str]) -> parsed JSON. Injectable for tests.
 Runner = Callable[[List[str]], Any]
 
+# Staleness of per-issue details (usage + runs). An issue's usage can change
+# without the issue record itself changing — e.g. a new run on the issue —
+# so the staleness key combines the issue's updated_at with the latest run
+# activity timestamp (both server-side timestamps: no local-clock skew).
+# Issues that currently have an active (non-terminal) run are refreshed on
+# every cycle so token accrual of in-flight work is visible live.
+# Shared with health so the pending-details counter uses the same definition.
+DETAIL_RUN_MARKS_CTE = """
+run_marks AS (
+    SELECT issue_id,
+           MAX(COALESCE(completed_at, started_at, created_at)) AS last_run_at,
+           SUM(CASE WHEN status IN ('pending', 'dispatched', 'running')
+                    THEN 1 ELSE 0 END) AS active_runs
+    FROM runs GROUP BY issue_id
+)"""
+DETAIL_KEY_EXPR = (
+    "CASE WHEN rm.last_run_at IS NULL THEN i.updated_at "
+    "ELSE i.updated_at || '|' || rm.last_run_at END"
+)
+DETAIL_STALE_WHERE = (
+    f"i.details_synced_for IS NULL OR i.details_synced_for != {DETAIL_KEY_EXPR} "
+    "OR COALESCE(rm.active_runs, 0) > 0"
+)
+
 
 @dataclass
 class CycleResult:
@@ -133,10 +157,12 @@ class Poller:
     def pending_detail_issues(self, budget: int) -> List[sqlite3.Row]:
         """Issues whose usage/runs details are missing or stale, newest first."""
         return self.conn.execute(
-            """
-            SELECT id, identifier, updated_at FROM issues
-            WHERE details_synced_for IS NULL OR details_synced_for != updated_at
-            ORDER BY updated_at DESC
+            f"""
+            WITH {DETAIL_RUN_MARKS_CTE}
+            SELECT i.id, i.identifier, {DETAIL_KEY_EXPR} AS detail_key
+            FROM issues i LEFT JOIN run_marks rm ON rm.issue_id = i.id
+            WHERE {DETAIL_STALE_WHERE}
+            ORDER BY i.updated_at DESC
             LIMIT ?
             """,
             (budget,),
@@ -154,7 +180,7 @@ class Poller:
         pending = self.pending_detail_issues(budget)
         errors: List[str] = []
         for issue in pending:
-            issue_id, updated_at = issue["id"], issue["updated_at"]
+            issue_id, detail_key = issue["id"], issue["detail_key"]
             try:
                 usage = self.runner(["issue", "usage", issue_id])
                 runs = self.runner(["issue", "runs", issue_id])
@@ -164,7 +190,7 @@ class Poller:
                 store.upsert_runs(
                     self.conn, [normalize.normalize_run(item) for item in runs]
                 )
-                store.mark_issue_details_synced(self.conn, issue_id, updated_at)
+                store.mark_issue_details_synced(self.conn, issue_id, detail_key)
                 self.conn.commit()
                 result.detail_synced += 1
             except (CliError, normalize.NormalizationError) as exc:

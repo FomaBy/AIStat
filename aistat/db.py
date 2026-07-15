@@ -72,9 +72,11 @@ CREATE TABLE IF NOT EXISTS issues (
     updated_at         TEXT,
     synced_at          TEXT NOT NULL,
     -- Details (issue usage + runs) are fetched separately with a per-cycle
-    -- budget. `details_synced_for` echoes the issue's `updated_at` at fetch
-    -- time; details are refetched when the two diverge. Comparing server
-    -- timestamps to server timestamps avoids local clock skew.
+    -- budget. `details_synced_for` stores the staleness key at fetch time:
+    -- the issue's `updated_at`, extended with the latest run activity
+    -- timestamp once the issue has runs (see poller.DETAIL_KEY_EXPR).
+    -- Details are refetched when the recomputed key diverges. Comparing
+    -- server timestamps to server timestamps avoids local clock skew.
     details_synced_at  TEXT,
     details_synced_for TEXT
 );

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import Config
 from .db import connect, utcnow_iso
+from .poller import DETAIL_RUN_MARKS_CTE, DETAIL_STALE_WHERE
 
 TABLES = [
     "runtimes",
@@ -91,8 +92,12 @@ def snapshot(conn: sqlite3.Connection, db_path: Optional[str] = None,
     ).fetchone()
 
     pending_details = conn.execute(
-        "SELECT COUNT(*) FROM issues "
-        "WHERE details_synced_for IS NULL OR details_synced_for != updated_at"
+        f"""
+        WITH {DETAIL_RUN_MARKS_CTE}
+        SELECT COUNT(*) FROM issues i
+        LEFT JOIN run_marks rm ON rm.issue_id = i.id
+        WHERE {DETAIL_STALE_WHERE}
+        """
     ).fetchone()[0]
 
     return {

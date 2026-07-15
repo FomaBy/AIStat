@@ -1,0 +1,130 @@
+:root {
+  --bg: #f4f6fb;
+  --panel: #ffffff;
+  --ink: #1e2430;
+  --muted: #67718a;
+  --line: #e4e8f2;
+  --accent: #4f6df5;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --bad: #dc2626;
+  --radius: 14px;
+  --shadow: 0 1px 2px rgba(30, 36, 48, 0.06), 0 4px 16px rgba(30, 36, 48, 0.05);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 18px 28px 10px;
+}
+
+.brand { display: flex; align-items: baseline; gap: 12px; }
+.brand h1 { margin: 0; font-size: 22px; letter-spacing: 0.2px; }
+.subtitle { color: var(--muted); font-size: 13px; }
+
+.status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.sep { opacity: 0.5; }
+
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.dot-on { background: var(--ok); box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18); }
+.dot-off { background: var(--bad); box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.15); }
+
+.badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.badge-ok { background: rgba(22, 163, 74, 0.12); color: var(--ok); }
+.badge-warn { background: rgba(217, 119, 6, 0.14); color: var(--warn); }
+
+.filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 6px 28px 4px;
+}
+.filters label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.filters select {
+  font: inherit;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.note { color: var(--muted); font-size: 12px; }
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  padding: 12px 28px;
+}
+.card {
+  background: var(--panel);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px 18px;
+}
+.card-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+.card-value { font-size: 26px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.card-sub { color: var(--muted); font-size: 12px; margin-top: 2px; min-height: 15px; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding: 2px 28px 20px;
+}
+.panel {
+  background: var(--panel);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px 14px;
+  min-width: 0;
+}
+.panel-wide { grid-column: 1 / -1; }
+.panel h2 { margin: 0 0 10px; font-size: 15px; font-weight: 650; }
+.est-mark { color: var(--muted); font-weight: 500; font-size: 12px; }
+
+.chart-box { position: relative; height: 320px; }
+.chart-box-small { height: 260px; }
+
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td.ellipsis { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: #f8faff; }
+
+.chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; margin-right: 4px; background: #eef1f8; color: var(--muted); }
+.chip-done { background: rgba(22, 163, 74, 0.12); color: var(--ok); }
+.chip-in_progress { background: rgba(79, 109, 245, 0.13); color: var(--accent); }
+.chip-in_review { background: rgba(217, 119, 6, 0.14); color: var(--warn); }
+.chip-blocked, .chip-cancelled { background: rgba(220, 38, 38, 0.11); color: var(--bad); }
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 28px 24px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.footer a { color: var(--accent); text-decoration: none; }
+
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+  .chart-box { height: 260px; }
+}

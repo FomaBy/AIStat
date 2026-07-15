@@ -108,11 +108,13 @@ def replace_runtime_activity(conn: sqlite3.Connection, runtime_id: str,
 
 
 def mark_issue_details_synced(conn: sqlite3.Connection, issue_id: str,
-                              issue_updated_at: str,
+                              detail_key: str,
                               synced_at: Optional[str] = None) -> None:
+    """Record the staleness key (issue updated_at [+ last run activity])
+    the details were fetched for; see poller.DETAIL_KEY_EXPR."""
     conn.execute(
         "UPDATE issues SET details_synced_at = ?, details_synced_for = ? WHERE id = ?",
-        (synced_at or utcnow_iso(), issue_updated_at, issue_id),
+        (synced_at or utcnow_iso(), detail_key, issue_id),
     )
 
 

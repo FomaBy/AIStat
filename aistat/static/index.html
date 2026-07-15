@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIStat — статистика токенов Multica</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>AIStat</h1>
+      <span class="subtitle">токены · стоимость · эффективность агентов Multica</span>
+    </div>
+    <div class="status">
+      <span id="live-dot" class="dot dot-off" title="Live-обновления"></span>
+      <span id="live-label">подключение…</span>
+      <span class="sep">·</span>
+      <span id="sync-label">синхронизация: —</span>
+      <span id="health-badge" class="badge badge-ok" hidden>ok</span>
+    </div>
+  </header>
+
+  <section class="filters">
+    <label>Проект
+      <select id="filter-project">
+        <option value="">Все проекты</option>
+      </select>
+    </label>
+    <label>Период
+      <select id="filter-period">
+        <option value="7">7 дней</option>
+        <option value="14">14 дней</option>
+        <option value="30" selected>30 дней</option>
+        <option value="90">90 дней</option>
+        <option value="">Всё время</option>
+      </select>
+    </label>
+    <label>Группировка графиков
+      <select id="filter-group">
+        <option value="model" selected>По моделям</option>
+        <option value="agent">По агентам</option>
+        <option value="project">По проектам</option>
+      </select>
+    </label>
+    <span id="estimate-note" class="note" hidden>≈ значения с фильтром по проекту / разбивкой по агентам — оценочные (атрибуция по запускам)</span>
+  </section>
+
+  <section class="cards" id="cards">
+    <div class="card"><div class="card-label">Всего токенов</div><div class="card-value" id="card-tokens">—</div><div class="card-sub" id="card-tokens-sub"></div></div>
+    <div class="card"><div class="card-label">Стоимость</div><div class="card-value" id="card-cost">—</div><div class="card-sub" id="card-cost-sub"></div></div>
+    <div class="card"><div class="card-label">Кредиты</div><div class="card-value" id="card-credits">—</div><div class="card-sub" id="card-credits-sub"></div></div>
+    <div class="card"><div class="card-label">Story Points</div><div class="card-value" id="card-sp">—</div><div class="card-sub" id="card-sp-sub"></div></div>
+    <div class="card"><div class="card-label">Эффективность</div><div class="card-value" id="card-eff">—</div><div class="card-sub">токенов на 1 SP · меньше — лучше</div></div>
+  </section>
+
+  <main class="grid">
+    <section class="panel panel-wide">
+      <h2>Токены по дням <span class="est-mark" id="daily-est" hidden>≈</span></h2>
+      <div class="chart-box"><canvas id="chart-daily-tokens"></canvas></div>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>Стоимость по дням, USD <span class="est-mark" id="cost-est" hidden>≈</span></h2>
+      <div class="chart-box"><canvas id="chart-daily-cost"></canvas></div>
+    </section>
+
+    <section class="panel">
+      <h2>Токены по агентам <span class="est-mark">за период</span></h2>
+      <div class="chart-box chart-box-small"><canvas id="chart-agents"></canvas></div>
+    </section>
+
+    <section class="panel">
+      <h2>Агенты <span class="est-mark">за период</span></h2>
+      <div class="table-wrap">
+        <table id="table-agents">
+          <thead><tr>
+            <th>Агент</th><th>Модель</th><th class="num">Токены</th>
+            <th class="num">Стоимость</th><th class="num">Кредиты</th><th class="num">Запуски</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note">≈ — оценка: агенты Codex Dev Sol и QA Codex Sol делят одну модель и runtime, их доли разнесены по длительности запусков за день.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Токены по проектам</h2>
+      <div class="chart-box chart-box-small"><canvas id="chart-projects"></canvas></div>
+    </section>
+
+    <section class="panel">
+      <h2>Проекты</h2>
+      <div class="table-wrap">
+        <table id="table-projects">
+          <thead><tr>
+            <th>Проект</th><th class="num">Задачи</th><th class="num">Токены</th>
+            <th class="num">Стоимость ≈</th><th class="num">Кредиты ≈</th>
+            <th class="num">SP</th><th class="num">Токены / SP</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note">Токены проектов — точные суммы по задачам (<code>multica issue usage</code>); стоимость ≈ оценена по моделям агентов, выполнявших задачи. Эффективность считается только по задачам со story points и загруженной статистикой.</p>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>Эффективность по задачам <span class="est-mark">токены ÷ SP · меньше — лучше</span></h2>
+      <div class="table-wrap">
+        <table id="table-efficiency">
+          <thead><tr>
+            <th>Задача</th><th>Название</th><th>Проект</th><th>Агенты</th><th>Статус</th>
+            <th class="num">SP</th><th class="num">Токены</th><th class="num">Токены / SP</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note">Задачи без story points исключены из метрики (не считаются как 0). Показаны топ-15 по расходу на 1 SP с учётом фильтра проекта.</p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span id="footer-span">—</span>
+    <span class="sep">·</span>
+    <span id="footer-credits">—</span>
+    <span class="sep">·</span>
+    <span id="footer-unpriced"></span>
+    <a href="/health" target="_blank" rel="noopener">health</a>
+  </footer>
+
+  <script src="vendor/chart.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

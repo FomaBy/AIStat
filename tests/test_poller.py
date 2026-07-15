@@ -4,7 +4,7 @@ import pytest
 
 from aistat.cli import CliError
 from aistat.config import Config
-from aistat.poller import Poller
+from aistat.poller import CycleResult, Poller
 from conftest import load_fixture
 
 
@@ -100,6 +100,53 @@ def test_detail_sync_skips_already_synced_issues(conn):
     conn.commit()
     pending = poller.pending_detail_issues(budget=10)
     assert [row["identifier"] for row in pending] == ["FAN-1139"]
+
+
+def test_new_run_activity_marks_issue_details_stale(conn):
+    """Usage can change without the issue record changing (a new run lands
+    on the issue) — the composed staleness key must catch that."""
+    poller = Poller(Config(), conn, runner=make_runner())
+    poller.run_cycle()
+    while poller.pending_detail_issues(budget=10):
+        poller.sync_issue_details(CycleResult())  # converge composed keys
+    conn.execute(
+        "INSERT INTO runs (id, issue_id, agent_id, runtime_id, status, "
+        "created_at, completed_at, synced_at) VALUES "
+        "('late-run', (SELECT id FROM issues WHERE identifier = 'FAN-1139'), "
+        "'agent-x', 'rt-x', 'completed', '2031-01-01T00:00:00Z', "
+        "'2031-01-01T00:10:00Z', '2031-01-01T00:10:00Z')"
+    )
+    conn.commit()
+    pending = poller.pending_detail_issues(budget=10)
+    assert [row["identifier"] for row in pending] == ["FAN-1139"]
+
+
+def test_issue_with_active_run_is_refreshed_every_cycle(conn):
+    poller = Poller(Config(), conn, runner=make_runner())
+    poller.run_cycle()
+    while poller.pending_detail_issues(budget=10):
+        poller.sync_issue_details(CycleResult())
+    conn.execute(
+        "INSERT INTO runs (id, issue_id, agent_id, runtime_id, status, "
+        "created_at, started_at, synced_at) VALUES "
+        "('live-run', (SELECT id FROM issues WHERE identifier = 'FAN-1139'), "
+        "'agent-x', 'rt-x', 'running', '2031-01-01T00:00:00Z', "
+        "'2031-01-01T00:00:01Z', '2031-01-01T00:00:01Z')"
+    )
+    conn.commit()
+    # While the run is active the issue stays pending on every cycle …
+    for _ in range(3):
+        pending = poller.pending_detail_issues(budget=10)
+        assert [row["identifier"] for row in pending] == ["FAN-1139"]
+        poller.sync_issue_details(CycleResult())
+    # … and settles once the run reaches a terminal state.
+    conn.execute(
+        "UPDATE runs SET status = 'completed', "
+        "completed_at = '2031-01-01T01:00:00Z' WHERE id = 'live-run'"
+    )
+    conn.commit()
+    poller.sync_issue_details(CycleResult())  # final refresh, stores new key
+    assert poller.pending_detail_issues(budget=10) == []
 
 
 def test_failed_source_recorded_without_breaking_cycle(conn):
