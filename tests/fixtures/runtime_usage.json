@@ -1,0 +1,102 @@
+[
+  {
+    "cache_read_tokens": 26546736,
+    "cache_write_tokens": 1439270,
+    "date": "2026-07-15",
+    "input_tokens": 126170,
+    "model": "claude-fable-5",
+    "output_tokens": 244331,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "date": "2026-07-15",
+    "input_tokens": 30990,
+    "model": "claude-haiku-4-5-20251001",
+    "output_tokens": 508,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 27555430,
+    "cache_write_tokens": 1177793,
+    "date": "2026-07-15",
+    "input_tokens": 26039,
+    "model": "claude-opus-4-8",
+    "output_tokens": 246538,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 7787821,
+    "cache_write_tokens": 254889,
+    "date": "2026-07-14",
+    "input_tokens": 12972,
+    "model": "claude-fable-5",
+    "output_tokens": 66940,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "date": "2026-07-14",
+    "input_tokens": 12790,
+    "model": "claude-haiku-4-5-20251001",
+    "output_tokens": 276,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 123269415,
+    "cache_write_tokens": 4902387,
+    "date": "2026-07-14",
+    "input_tokens": 102955,
+    "model": "claude-opus-4-8",
+    "output_tokens": 807511,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 3346674,
+    "cache_write_tokens": 231000,
+    "date": "2026-07-13",
+    "input_tokens": 9486,
+    "model": "claude-haiku-4-5-20251001",
+    "output_tokens": 31084,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 288469288,
+    "cache_write_tokens": 6738998,
+    "date": "2026-07-13",
+    "input_tokens": 144574,
+    "model": "claude-opus-4-8",
+    "output_tokens": 1823208,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 2039129,
+    "cache_write_tokens": 100064,
+    "date": "2026-07-12",
+    "input_tokens": 3747,
+    "model": "claude-haiku-4-5-20251001",
+    "output_tokens": 21308,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  },
+  {
+    "cache_read_tokens": 25249710,
+    "cache_write_tokens": 1093465,
+    "date": "2026-07-12",
+    "input_tokens": 24204,
+    "model": "claude-opus-4-8",
+    "output_tokens": 271932,
+    "provider": "claude",
+    "runtime_id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+  }
+]

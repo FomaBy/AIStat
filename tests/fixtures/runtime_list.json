@@ -1,0 +1,74 @@
+[
+  {
+    "created_at": "2026-07-11T18:31:51Z",
+    "custom_name": null,
+    "daemon_id": "019f5273-32fd-7f23-a3d9-bb5691ae99ee",
+    "device_info": "MacBook-Pro-Sergey.local · 2.1.172 (Claude Code)",
+    "id": "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188",
+    "last_seen_at": "2026-07-15T19:49:50Z",
+    "launch_header": "claude (stream-json)",
+    "metadata": {
+      "cli_version": "v0.4.2",
+      "launched_by": "desktop",
+      "version": "2.1.172 (Claude Code)"
+    },
+    "name": "Claude (MacBook-Pro-Sergey.local)",
+    "owner_id": "feb784a3-33e5-472b-8adf-68af58550446",
+    "profile_id": null,
+    "provider": "claude",
+    "runtime_mode": "local",
+    "status": "online",
+    "updated_at": "2026-07-15T15:30:29Z",
+    "visibility": "private",
+    "workspace_id": "afa7a066-e0cb-4b55-a07d-41b361a8bb84"
+  },
+  {
+    "created_at": "2026-07-12T18:47:19Z",
+    "custom_name": null,
+    "daemon_id": "019f5273-32fd-7f23-a3d9-bb5691ae99ee",
+    "device_info": "MacBook-Pro-Sergey.local",
+    "id": "f3f7cd53-f803-476a-afc7-ecab93684d48",
+    "last_seen_at": "2026-07-15T19:48:37Z",
+    "launch_header": "codex app-server",
+    "metadata": {
+      "cli_version": "v0.4.2",
+      "command_name": "codex-app-56",
+      "launched_by": "desktop",
+      "runtime_profile_failure_reason": "command not found on PATH: codex-app-56",
+      "runtime_profile_registration_error": true,
+      "version": ""
+    },
+    "name": "Codex 5.6 App Runtime (MacBook-Pro-Sergey.local)",
+    "owner_id": "feb784a3-33e5-472b-8adf-68af58550446",
+    "profile_id": "610a86db-18ed-4804-8e6b-0a1d0ed1c702",
+    "provider": "codex",
+    "runtime_mode": "local",
+    "status": "online",
+    "updated_at": "2026-07-15T15:30:29Z",
+    "visibility": "private",
+    "workspace_id": "afa7a066-e0cb-4b55-a07d-41b361a8bb84"
+  },
+  {
+    "created_at": "2026-07-14T10:16:25Z",
+    "custom_name": null,
+    "daemon_id": "019f5273-32fd-7f23-a3d9-bb5691ae99ee",
+    "device_info": "MacBook-Pro-Sergey.local · codex-cli 0.144.1",
+    "id": "51bfc654-f4a6-4e15-8acc-d2f7ce81f8f4",
+    "last_seen_at": "2026-07-15T19:49:50Z",
+    "launch_header": "codex app-server",
+    "metadata": {
+      "cli_version": "v0.4.2",
+      "launched_by": "desktop",
+      "version": "codex-cli 0.144.1"
+    },
+    "name": "Codex (MacBook-Pro-Sergey.local)",
+    "owner_id": "feb784a3-33e5-472b-8adf-68af58550446",
+    "profile_id": null,
+    "provider": "codex",
+    "runtime_mode": "local",
+    "status": "online",
+    "updated_at": "2026-07-15T15:30:29Z",
+    "visibility": "private",
+    "workspace_id": "afa7a066-e0cb-4b55-a07d-41b361a8bb84"
+  }
+]

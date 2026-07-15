@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local data (SQLite lives here)
+data/
+
+# Multica runtime artifacts (generated per agent run, not part of the app)
+CLAUDE.md
+.multica/
+.agent_context/
+.claude/
+
+# Editor / OS
+.DS_Store

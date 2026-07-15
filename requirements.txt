@@ -1,0 +1,5 @@
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+# test-only, kept here for a single simple install step
+pytest>=7.4,<9
+httpx>=0.27,<1
