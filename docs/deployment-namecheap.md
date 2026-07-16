@@ -196,11 +196,10 @@ cron запускает лёгкую проверку каждый час:
 - Month `*`;
 - Weekday `*`.
 
-Command (одной строкой, `$HOME` cPanel подставит сам; `\%` обязателен, потому
-что cron обрабатывает неэкранированный `%` как перенос строки):
+Command (одной строкой, `$HOME` cPanel подставит сам):
 
 ```bash
-[ "$(TZ=Europe/Vilnius date +\%H)" = "05" ] && /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" >> "$HOME/aistat-private/deploy.log" 2>&1
+LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" >> "$HOME/aistat-private/deploy.log" 2>&1
 ```
 
 Готово: каждый день в 05:00 по Вильнюсу сайт обновляется до последнего `main`,
