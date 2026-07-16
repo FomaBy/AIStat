@@ -55,8 +55,8 @@ from .tenant import canonical_tenant_id
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
-# One-time HttpOnly cookie binding an OAuth flow to the browser that started
-# it; only its hash is stored server-side with the state row.
+# Short-lived HttpOnly cookie binding OAuth states to the browser that started
+# them; only its hash is stored server-side with each state row.
 OAUTH_CLIENT_COOKIE = "aistat_oauth_client"
 
 
@@ -325,17 +325,15 @@ def create_app(config: Optional[Config] = None) -> Flask:
         ).format(email=shown)
         return body, 403
 
-    def drop_oauth_client_cookie(response):
-        response.delete_cookie(OAUTH_CLIENT_COOKIE, path="/auth")
-        return response
-
     @app.get("/auth/<provider>/start")
     def oauth_start(provider):
         provider_config = config.oauth_providers.get(provider)
         if provider_config is None:
             abort(404)
         next_url = safe_next_url(request.args.get("next"))
-        client_token = oauth.generate_client_token()
+        client_token = request.cookies.get(OAUTH_CLIENT_COOKIE)
+        if not oauth.is_valid_client_token(client_token):
+            client_token = oauth.generate_client_token()
         authorize_url = oauth.begin(
             security_store, provider_config, next_url, client_token
         )
@@ -368,7 +366,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 "Не удалось выполнить вход через провайдера. Попробуйте снова.",
                 400,
             )
-            return drop_oauth_client_cookie(app.make_response((body, status)))
+            return body, status
         session.clear()
         session["user_id"] = result["user_id"]
         session["email"] = result["email"]
@@ -378,12 +376,8 @@ def create_app(config: Optional[Config] = None) -> Flask:
         if not oauth.is_email_authorized(
             config.oauth_allowed_emails, result["email"]
         ):
-            return drop_oauth_client_cookie(
-                app.make_response(oauth_pending(result["email"]))
-            )
-        return drop_oauth_client_cookie(
-            redirect(safe_next_url(result["next_url"]), code=303)
-        )
+            return oauth_pending(result["email"])
+        return redirect(safe_next_url(result["next_url"]), code=303)
 
     @app.get("/healthz")
     def healthz():

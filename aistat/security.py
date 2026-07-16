@@ -223,6 +223,11 @@ class SecurityStore:
                 );
                 """
             )
+            # Serialize the inspect-and-alter migration across WSGI workers.
+            # Without the write lock, concurrent first starts can both observe
+            # the old schema and one loses the ALTER race with a duplicate
+            # column error.
+            conn.execute("BEGIN IMMEDIATE")
             columns = {
                 row[1]
                 for row in conn.execute("PRAGMA table_info(oauth_state)")

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import runpy
+import sqlite3
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.util import setup_testing_defaults
@@ -26,8 +27,7 @@ SESSION_SECRET = "legacy-session-" + "s" * 48
 INGEST_SECRET = "legacy-ingest-" + "i" * 48
 
 
-@pytest.fixture
-def legacy(tmp_path, monkeypatch):
+def configure_legacy_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AISTAT_DB_PATH", str(tmp_path / "public.db"))
     monkeypatch.setenv("AISTAT_SECURITY_DB_PATH", str(tmp_path / "security.db"))
     monkeypatch.setenv("AISTAT_TENANTS_DIR", str(tmp_path / "tenants"))
@@ -57,6 +57,10 @@ def legacy(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", "allowed@example.com")
 
+
+@pytest.fixture
+def legacy(tmp_path, monkeypatch):
+    configure_legacy_env(tmp_path, monkeypatch)
     import aistat.legacy_wsgi as module
 
     module = importlib.reload(module)
@@ -558,8 +562,8 @@ def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
     assert status == "303 See Other"
     assert header_values(headers, "Location") == ["/api/meta"]
     cookies = cookie_jar(headers, start_cookies)
-    # the one-time binding cookie is dropped once the callback completes
-    assert "aistat_oauth_client" not in cookies
+    # the short-lived browser binding remains for other overlapping flows
+    assert "aistat_oauth_client" in cookies
     status, _, body = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "200 OK"
     data = legacy.json.loads(body.decode("utf-8"))
@@ -652,7 +656,7 @@ def test_oauth_state_is_single_use(legacy, monkeypatch):
 
 
 def test_oauth_callback_rejects_cross_client_callback(legacy, monkeypatch):
-    # login CSRF: a client that did not run /start (no binding cookie) cannot
+    # login CSRF: a different browser with its own binding cookie cannot
     # complete the flow with a leaked-but-valid state; the provider is never
     # contacted and no session is created
     install_forbidden_http(monkeypatch)
@@ -661,8 +665,14 @@ def test_oauth_callback_rejects_cross_client_callback(legacy, monkeypatch):
     )
     state = state_from(headers)
     start_cookies = cookie_jar(headers)
+    _, other_headers, _ = request(
+        legacy.application, "/auth/google/start"
+    )
+    other_cookies = cookie_jar(other_headers)
     status, headers, _ = request(
-        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=other_cookies,
     )
     assert status == "400 Bad Request"
     assert not any(
@@ -679,6 +689,38 @@ def test_oauth_callback_rejects_cross_client_callback(legacy, monkeypatch):
     assert status == "400 Bad Request"
     status, _, _ = request(legacy.application, "/api/meta")
     assert status == "401 Unauthorized"
+
+
+def test_oauth_overlapping_starts_share_browser_binding(legacy, monkeypatch):
+    install_fake_http(
+        monkeypatch, {"sub": "g-tabs", "email": "allowed@example.com"}
+    )
+    _, first_headers, _ = request(
+        legacy.application, "/auth/google/start"
+    )
+    first_state = state_from(first_headers)
+    cookies = cookie_jar(first_headers)
+    _, second_headers, _ = request(
+        legacy.application, "/auth/google/start", cookie=cookies
+    )
+    second_state = state_from(second_headers)
+    second_cookies = cookie_jar(second_headers, cookies)
+    assert first_state != second_state
+    assert second_cookies == cookies
+
+    first = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=first" % first_state,
+        cookie=second_cookies,
+    )
+    cookies_after_first = cookie_jar(first[1], second_cookies)
+    second = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=second" % second_state,
+        cookie=cookies_after_first,
+    )
+    assert first[0] == "303 See Other"
+    assert second[0] == "303 See Other"
 
 
 def test_oauth_error_callback_burns_state(legacy, monkeypatch):
@@ -701,3 +743,45 @@ def test_oauth_error_callback_burns_state(legacy, monkeypatch):
     assert status == "400 Bad Request"
     status, _, _ = request(legacy.application, "/api/meta")
     assert status == "401 Unauthorized"
+
+
+def test_legacy_bootstrap_migrates_old_oauth_state_schema(
+    tmp_path, monkeypatch
+):
+    configure_legacy_env(tmp_path, monkeypatch)
+    path = tmp_path / "security.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE oauth_state ("
+            "state TEXT PRIMARY KEY, provider TEXT NOT NULL, "
+            "next_url TEXT, created_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO oauth_state "
+            "(state, provider, next_url, created_at) VALUES (?, ?, ?, ?)",
+            ("legacy-state", "google", "/", 100),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    import aistat.legacy_wsgi as module
+
+    module = importlib.reload(module)
+    conn = sqlite3.connect(str(path))
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(oauth_state)")
+        }
+        row = conn.execute(
+            "SELECT client_hash FROM oauth_state WHERE state = ?",
+            ("legacy-state",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert "client_hash" in columns
+    assert row == (None,)
+    assert module._LegacyOAuthStore().take_oauth_state(
+        "legacy-state", now=101
+    )["client_hash"] is None

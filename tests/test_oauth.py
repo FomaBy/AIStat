@@ -172,6 +172,15 @@ def test_generate_state_is_unique_and_urlsafe():
         assert value and all(c.isalnum() or c in "-_" for c in value)
 
 
+def test_generate_client_token_has_validated_cookie_shape():
+    values = {oauth.generate_client_token() for _ in range(64)}
+    assert len(values) == 64
+    assert all(oauth.is_valid_client_token(value) for value in values)
+    assert not oauth.is_valid_client_token(None)
+    assert not oauth.is_valid_client_token("")
+    assert not oauth.is_valid_client_token("invalid;cookie")
+
+
 def test_begin_persists_state_and_returns_authorize_url():
     store = FakeStore()
     url = oauth.begin(store, PROVIDER, "/api/meta", "browser-token")
@@ -292,7 +301,10 @@ def test_finish_provider_error_consumes_state(monkeypatch):
     assert captured == []
 
 
-def test_finish_rejects_callback_from_another_client(monkeypatch):
+@pytest.mark.parametrize("wrong_token", ["attacker-token", None, ""])
+def test_finish_rejects_callback_from_another_client(
+    monkeypatch, wrong_token
+):
     # a valid state presented by a browser that did not start the flow is
     # rejected before any token exchange, and the state is consumed
     captured = []
@@ -300,10 +312,14 @@ def test_finish_rejects_callback_from_another_client(monkeypatch):
     store = FakeStore()
     url = oauth.begin(store, PROVIDER, "/", "victim-token")
     state = parse_qs(urlsplit(url).query)["state"][0]
-    for wrong in ("attacker-token", None, ""):
-        with pytest.raises(oauth.OAuthError):
-            oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, wrong)
-        assert state not in store.states
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(
+            store,
+            PROVIDER,
+            {"state": state, "code": "c"},
+            wrong_token,
+        )
+    assert state not in store.states
     assert captured == []
 
 

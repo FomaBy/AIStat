@@ -1,5 +1,8 @@
 """Unit tests for the multi-user account model in SecurityStore."""
 
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+
 from aistat.security import OAUTH_STATE_TTL_SECONDS, SecurityStore
 
 
@@ -45,10 +48,78 @@ def test_oauth_state_unknown_is_rejected(tmp_path):
 
 
 def test_oauth_state_expires(tmp_path):
-    store = SecurityStore(tmp_path / "security.db")
+    path = tmp_path / "security.db"
+    store = SecurityStore(path)
     store.put_oauth_state("state-x", "google", next_url="/", now=100)
     expired_at = 100 + OAUTH_STATE_TTL_SECONDS + 1
     assert store.take_oauth_state("state-x", now=expired_at) is None
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM oauth_state WHERE state = 'state-x'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_old_oauth_state_schema_is_migrated_fail_closed(tmp_path):
+    path = tmp_path / "security.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE oauth_state ("
+            "state TEXT PRIMARY KEY, provider TEXT NOT NULL, "
+            "next_url TEXT, created_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO oauth_state "
+            "(state, provider, next_url, created_at) VALUES (?, ?, ?, ?)",
+            ("legacy-state", "google", "/", 100),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = SecurityStore(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(oauth_state)")
+        }
+        assert "client_hash" in columns
+    finally:
+        conn.close()
+    assert store.take_oauth_state("legacy-state", now=101) == {
+        "provider": "google",
+        "next_url": "/",
+        "client_hash": None,
+    }
+
+
+def test_old_schema_migration_is_safe_under_concurrent_startup(tmp_path):
+    path = tmp_path / "security.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE oauth_state ("
+            "state TEXT PRIMARY KEY, provider TEXT NOT NULL, "
+            "next_url TEXT, created_at INTEGER NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda _index: SecurityStore(path), range(32)))
+
+    conn = sqlite3.connect(str(path))
+    try:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(oauth_state)")
+        ]
+        assert columns.count("client_hash") == 1
+    finally:
+        conn.close()
 
 
 def test_account_model_does_not_disturb_throttle_or_ingest(tmp_path):

@@ -20,11 +20,13 @@ Security notes:
   match the callback path, so a state minted for one provider cannot be
   replayed against another.
 * every ``state`` is bound to the browser that started the flow: ``begin``
-  records the SHA-256 hash of a per-flow client token (the caller stores the
-  token itself in an HttpOnly cookie), and ``finish`` rejects a callback whose
-  presented token does not hash to the stored value *before* any token
-  exchange. A valid state alone therefore cannot log a different browser in
-  (login CSRF), and no OAuth secret ever leaves the server.
+  records the SHA-256 hash of a short-lived browser-context token (the caller
+  stores the token itself in an HttpOnly cookie), and ``finish`` rejects a
+  callback whose presented token does not hash to the stored value *before*
+  any token exchange. The same browser token may bind simultaneous states, so
+  overlapping login tabs do not invalidate each other. A valid state alone
+  therefore cannot log a different browser in (login CSRF), and no OAuth
+  secret ever leaves the server.
 * any terminal callback — success, provider error, missing code, provider or
   client mismatch — consumes the state, so it can never be replayed.
 * token and userinfo endpoints must be HTTPS; requests are bounded by a
@@ -46,6 +48,7 @@ __all__ = [
     "OAuthError",
     "generate_state",
     "generate_client_token",
+    "is_valid_client_token",
     "client_token_hash",
     "build_authorize_url",
     "exchange_code",
@@ -62,6 +65,7 @@ __all__ = [
 HTTP_TIMEOUT_SECONDS = 10
 MAX_RESPONSE_BYTES = 256 * 1024
 USER_AGENT = "AIStat-OAuth/1.0"
+_CLIENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 class OAuthError(Exception):
@@ -125,12 +129,20 @@ def generate_state() -> str:
 
 
 def generate_client_token() -> str:
-    """Return a fresh per-flow token identifying the initiating browser.
+    """Return a fresh short-lived token identifying the initiating browser.
 
     The caller hands the token to the browser in an HttpOnly cookie and passes
-    it back into :func:`finish`; only its hash is persisted server-side.
+    it back into :func:`finish`; only its hash is persisted server-side. A
+    caller may reuse the same token for simultaneous states in one browser.
     """
     return secrets.token_urlsafe(32)
+
+
+def is_valid_client_token(client_token) -> bool:
+    """Return whether a cookie value has the generated client-token shape."""
+    return isinstance(client_token, str) and bool(
+        _CLIENT_TOKEN_RE.fullmatch(client_token)
+    )
 
 
 def client_token_hash(client_token: str) -> str:
@@ -276,9 +288,9 @@ def begin(store, provider: "OAuthProvider", next_url, client_token, now=None) ->
 
     ``next_url`` must already be a safe, same-site path (each caller sanitises
     it with its own ``safe_next_url`` helper before calling). ``client_token``
-    is the per-flow browser token from :func:`generate_client_token`; the
-    caller must deliver it to the browser in an HttpOnly cookie, and only its
-    hash is stored with the state.
+    is the short-lived browser-context token from
+    :func:`generate_client_token`; the caller must deliver it to the browser
+    in an HttpOnly cookie, and only its hash is stored with the state.
     """
     if not client_token:
         raise OAuthError("client token is required")

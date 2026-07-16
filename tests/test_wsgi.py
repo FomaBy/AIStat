@@ -2,6 +2,7 @@
 
 import json
 import re
+import sqlite3
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -557,16 +558,18 @@ def test_oauth_start_sets_browser_binding_cookie(public_app):
 
 
 def test_oauth_callback_rejects_cross_client_callback(public_app, monkeypatch):
-    # login CSRF: a browser that did not run /start cannot complete the flow
-    # with a leaked-but-valid state, and no token exchange is attempted
+    # login CSRF: a different browser with its own binding cookie cannot
+    # complete the flow with a leaked-but-valid state, and no token exchange
+    # is attempted
     app, _ = public_app
     install_forbidden_http(monkeypatch)
-    victim = app.test_client()
-    attacker_start = victim.get(
+    initiator = app.test_client()
+    initiator_start = initiator.get(
         "/auth/google/start?next=/api/meta", base_url="https://localhost"
     )
-    state = state_from(attacker_start.headers["Location"])
+    state = state_from(initiator_start.headers["Location"])
     other_browser = app.test_client()
+    other_browser.get("/auth/google/start", base_url="https://localhost")
     callback = other_browser.get(
         "/auth/google/callback?state=%s&code=abc" % state,
         base_url="https://localhost",
@@ -577,16 +580,45 @@ def test_oauth_callback_rejects_cross_client_callback(public_app, monkeypatch):
         == 401
     )
     # the hijack attempt consumed the state, so it cannot be retried anywhere
-    replay = victim.get(
+    replay = initiator.get(
         "/auth/google/callback?state=%s&code=abc" % state,
         base_url="https://localhost",
     )
     assert replay.status_code == 400
 
 
+def test_oauth_overlapping_starts_share_browser_binding(public_app, monkeypatch):
+    app, _ = public_app
+    install_fake_http(
+        monkeypatch, {"sub": "g-tabs", "email": "allowed@example.com"}
+    )
+    client = app.test_client()
+    first = client.get("/auth/google/start", base_url="https://localhost")
+    first_state = state_from(first.headers["Location"])
+    first_cookie = client.get_cookie("aistat_oauth_client", path="/auth")
+    second = client.get("/auth/google/start", base_url="https://localhost")
+    second_state = state_from(second.headers["Location"])
+    second_cookie = client.get_cookie("aistat_oauth_client", path="/auth")
+    assert first_state != second_state
+    assert first_cookie is not None
+    assert second_cookie is not None
+    assert first_cookie.value == second_cookie.value
+
+    first_callback = client.get(
+        "/auth/google/callback?state=%s&code=first" % first_state,
+        base_url="https://localhost",
+    )
+    second_callback = client.get(
+        "/auth/google/callback?state=%s&code=second" % second_state,
+        base_url="https://localhost",
+    )
+    assert first_callback.status_code == 303
+    assert second_callback.status_code == 303
+
+
 def test_oauth_error_callback_burns_state(public_app, monkeypatch):
     # a provider error is terminal: the same state must not work with a code
-    app, _ = public_app
+    app, config = public_app
     install_forbidden_http(monkeypatch)
     client = app.test_client()
     start = client.get("/auth/google/start", base_url="https://localhost")
@@ -596,6 +628,16 @@ def test_oauth_error_callback_burns_state(public_app, monkeypatch):
         base_url="https://localhost",
     )
     assert errored.status_code == 400
+    # The browser binding remains available for other pending flows, so the
+    # replay below proves state consumption rather than merely a missing cookie.
+    assert client.get_cookie("aistat_oauth_client", path="/auth") is not None
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM oauth_state WHERE state = ?", (state,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
     retry = client.get(
         "/auth/google/callback?state=%s&code=abc" % state,
         base_url="https://localhost",

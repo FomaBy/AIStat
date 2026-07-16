@@ -188,6 +188,8 @@ def _bootstrap():
             );
             """
         )
+        # Serialize the inspect-and-alter migration across WSGI workers.
+        conn.execute("BEGIN IMMEDIATE")
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(oauth_state)")
         }
@@ -868,7 +870,9 @@ def _oauth(environ, start_response, path):
     query = _query(environ)
     if parts[2] == "start":
         next_url = _safe_next(_first(query, "next", "/"))
-        client_token = oauth.generate_client_token()
+        client_token = _cookies(environ).get("aistat_oauth_client")
+        if not oauth.is_valid_client_token(client_token):
+            client_token = oauth.generate_client_token()
         authorize_url = oauth.begin(store, provider, next_url, client_token)
         return _respond(
             environ,
@@ -888,11 +892,6 @@ def _oauth(environ, start_response, path):
             ],
         )
     client_token = _cookies(environ).get("aistat_oauth_client")
-    # The binding cookie is one-time: dropped on every callback outcome.
-    clear_client_cookie = (
-        "Set-Cookie",
-        _cookie_header("aistat_oauth_client", "", 0, path="/auth"),
-    )
     params = {
         "state": _first(query, "state"),
         "code": _first(query, "code"),
@@ -903,8 +902,7 @@ def _oauth(environ, start_response, path):
     except oauth.OAuthError:
         csrf = _make_login_csrf()
         headers = [
-            ("Set-Cookie", _cookie_header("aistat_login_csrf", csrf, 600)),
-            clear_client_cookie,
+            ("Set-Cookie", _cookie_header("aistat_login_csrf", csrf, 600))
         ]
         return _respond(
             environ,
@@ -932,14 +930,14 @@ def _oauth(environ, start_response, path):
             "403 Forbidden",
             _render_oauth_pending(result["email"]),
             "text/html; charset=utf-8",
-            [set_cookie, clear_client_cookie],
+            [set_cookie],
         )
     next_url = _safe_next(result["next_url"])
     return _respond(
         environ,
         start_response,
         "303 See Other",
-        headers=[("Location", next_url), set_cookie, clear_client_cookie],
+        headers=[("Location", next_url), set_cookie],
     )
 
 
