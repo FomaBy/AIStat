@@ -265,6 +265,7 @@ function renderEfficiency(issues) {
   const tbody = $("table-efficiency").querySelector("tbody");
   tbody.innerHTML = "";
   for (const it of issues) {
+    const est = it.estimated ? "≈ " : "";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${esc(it.identifier || it.issue_id)}</td>
@@ -272,9 +273,9 @@ function renderEfficiency(issues) {
       <td>${esc(it.project || "—")}</td>
       <td>${esc((it.agents || []).join(", ") || "—")}</td>
       <td><span class="chip chip-${esc(it.status)}">${esc(it.status)}</span></td>
-      <td class="num">${fmtNum(it.story_points)}</td>
-      <td class="num">${fmtTokens(it.total_tokens)}</td>
-      <td class="num">${fmtTokens(it.tokens_per_sp)}</td>`;
+      <td class="num">${est}${fmtNum(it.story_points)}</td>
+      <td class="num">${est}${fmtTokens(it.total_tokens)}</td>
+      <td class="num">${est}${fmtTokens(it.tokens_per_sp)}</td>`;
     tbody.appendChild(tr);
   }
 }
@@ -372,9 +373,13 @@ function renderSummary(s) {
   $("card-cost").textContent = est + fmtUSD(s.cost_usd);
   $("card-cost-sub").textContent = s.has_unpriced ? "есть неоценённые модели!" : "по официальным тарифам";
   $("card-credits").textContent = est + fmtCredits(s.cost_credits);
-  $("card-sp").textContent = fmtNum(s.story_points);
+  // SP and token efficiency are run-share attributions under agent/model/
+  // period filters; their flags are separate from the token-card `estimated`.
+  const spEst = s.sp_estimated ? "≈ " : "";
+  $("card-sp").textContent = spEst + fmtNum(s.story_points);
   $("card-sp-sub").textContent = `задач: ${s.issues} · с SP: ${s.issues_with_sp}`;
-  $("card-eff").textContent = s.tokens_per_sp == null ? "—" : fmtTokens(s.tokens_per_sp);
+  const effEst = s.efficiency_estimated ? "≈ " : "";
+  $("card-eff").textContent = s.tokens_per_sp == null ? "—" : effEst + fmtTokens(s.tokens_per_sp);
   // Cost/weighted efficiency lean on model attribution + pricing, so they are
   // always estimates (≈); a trailing * marks unpriced tokens in the mix.
   const effStar = s.efficiency_has_unpriced ? " *" : "";
@@ -400,7 +405,8 @@ function esc(text) {
 
 async function refreshAll() {
   $("estimate-note").hidden = !(
-    state.projects.length || state.agents.length || state.group !== "model" || state.from || state.to
+    state.projects.length || state.agents.length || state.models.length ||
+    state.group !== "model" || state.from || state.to
   );
   const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health] = await Promise.all([
     fetchJSON("/api/summary" + query()),

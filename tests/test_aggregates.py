@@ -316,6 +316,48 @@ def test_summary_period_filter(agg_conn):
     assert s["has_unpriced"] is False
 
 
+def test_summary_estimation_metadata_per_field(agg_conn):
+    # Unfiltered: everything is exact — no false ≈ on task-level values.
+    s = ag.summary(agg_conn)
+    assert s["estimated"] is False
+    assert s["sp_estimated"] is False
+    assert s["efficiency_estimated"] is False
+
+    # Model-only (FAN-1241 repro): whole-day model tokens stay exact, but SP
+    # and tokens/SP are run-duration attributions and carry their own flags.
+    m = ag.summary(agg_conn, filters=ag.make_filters(models=["m-shared"]))
+    assert m["estimated"] is False
+    assert m["sp_estimated"] is True
+    assert m["efficiency_estimated"] is True
+    assert m["total_tokens"] == 3_000_000
+    assert m["story_points"] == pytest.approx(2.5)  # I1: 5 SP × 1h/2h shared
+    assert m["tokens_per_sp"] == pytest.approx(300.0)
+
+    # Agent-only and (whole-day) period-only allocate SP the same way.
+    a = ag.summary(agg_conn, filters=ag.make_filters(agent_ids=["A2"]))
+    assert a["sp_estimated"] is True and a["efficiency_estimated"] is True
+    p = ag.summary(agg_conn, date_from="2026-01-01", date_to="2026-01-01")
+    assert p["estimated"] is False
+    assert p["sp_estimated"] is True and p["efficiency_estimated"] is True
+
+    # Project-only: SP belong to issues directly — exact even though the
+    # token attribution is estimated.
+    pr = ag.summary(agg_conn, project_id="P1")
+    assert pr["estimated"] is True
+    assert pr["sp_estimated"] is False
+    assert pr["efficiency_estimated"] is False
+
+
+def test_issue_efficiency_model_filter_marks_estimated(agg_conn):
+    rows = ag.issue_efficiency(agg_conn, filters=ag.make_filters(models=["m-shared"]))
+    assert [r["identifier"] for r in rows] == ["T-1"]
+    assert rows[0]["estimated"] is True
+    assert rows[0]["story_points"] == pytest.approx(2.5)
+    assert rows[0]["tokens_per_sp"] == pytest.approx(300.0)
+    # Unfiltered rows are exact task-level facts — never marked estimated.
+    assert all(r["estimated"] is False for r in ag.issue_efficiency(agg_conn))
+
+
 # -- efficiency breakdown (tokens / cost / weighted) -----------------------------
 
 

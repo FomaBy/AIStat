@@ -271,6 +271,26 @@ def test_efficiency_breakdown_endpoint(legacy):
     assert data["time"]["rows"][0]["total_tokens"] == 375
 
 
+def test_summary_estimation_flags(legacy):
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/summary?model=m-shared", cookie=cookies
+    )
+    assert status == "200 OK"
+    data = legacy.json.loads(body.decode("utf-8"))
+    # FAN-1241: exact model tokens, run-share attributed SP and tokens/SP.
+    assert data["estimated"] is False
+    assert data["sp_estimated"] is True
+    assert data["efficiency_estimated"] is True
+    assert abs(data["story_points"] - 2.5) < 1e-9
+    assert abs(data["tokens_per_sp"] - 300.0) < 1e-9
+    status, _, body = request(legacy.application, "/api/summary", cookie=cookies)
+    assert status == "200 OK"
+    exact = legacy.json.loads(body.decode("utf-8"))
+    assert exact["sp_estimated"] is False
+    assert exact["efficiency_estimated"] is False
+
+
 def test_legacy_hour_filters_accept_repeated_dimensions(legacy):
     cookies = login(legacy)
     status, _, body = request(

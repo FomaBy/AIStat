@@ -289,6 +289,24 @@ def test_efficiency_breakdown_endpoint_behind_auth(public_app):
     assert data["time"]["rows"][0]["total_tokens"] == 375
 
 
+def test_summary_estimation_flags_behind_auth(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    login(client)
+    data = client.get(
+        "/api/summary?model=m-shared", base_url="https://localhost"
+    ).get_json()
+    # FAN-1241: exact model tokens, run-share attributed SP and tokens/SP.
+    assert data["estimated"] is False
+    assert data["sp_estimated"] is True
+    assert data["efficiency_estimated"] is True
+    assert data["story_points"] == pytest.approx(2.5)
+    assert data["tokens_per_sp"] == pytest.approx(300.0)
+    exact = client.get("/api/summary", base_url="https://localhost").get_json()
+    assert exact["sp_estimated"] is False
+    assert exact["efficiency_estimated"] is False
+
+
 def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
     app, config = public_app
     client = app.test_client()

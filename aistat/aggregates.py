@@ -1222,6 +1222,13 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
     Whole-day model totals remain exact. Agent/project and partial-day ranges
     are duration-weighted estimates over the dated task runs; the same run
     share is applied to task SP and efficiency inputs.
+
+    ``estimated`` covers only the token/cost cards; a model-only or date-only
+    selection keeps them exact. Task-level facts have their own precision:
+    any agent/model/date selection allocates SP and efficiency inputs by run
+    duration shares, reported as ``sp_estimated`` / ``efficiency_estimated``.
+    A project-only selection keeps them exact (issues belong to projects
+    directly) even though the token attribution above is estimated.
     """
     filters = _coerce_filters(date_from, date_to, project_id, filters)
     date_from, date_to = _filter_dates(filters)
@@ -1322,6 +1329,8 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "cost_credits": cost_credits,
         "has_unpriced": has_unpriced,
         "estimated": estimated,
+        "sp_estimated": needs_run_filter,
+        "efficiency_estimated": needs_run_filter,
         "story_points": sp_sum,
         "issues": issue_count,
         "issues_with_sp": with_sp,

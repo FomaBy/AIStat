@@ -1,6 +1,7 @@
 """API endpoint tests: FastAPI app over a seeded temporary database."""
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -136,6 +137,29 @@ def test_summary_endpoint_has_cost_efficiency(api):
     assert s["weighted_efficiency"] == pytest.approx(0.00025)
 
 
+def test_summary_model_filter_flags_estimated_task_values(api):
+    client, _ = api
+    s = client.get("/api/summary", params={"model": "m-shared"}).json()
+    assert s["estimated"] is False               # whole-day model tokens are exact
+    assert s["sp_estimated"] is True             # run-share attribution (FAN-1241)
+    assert s["efficiency_estimated"] is True
+    assert s["story_points"] == pytest.approx(2.5)
+    assert s["tokens_per_sp"] == pytest.approx(300.0)
+
+    base = client.get("/api/summary").json()
+    assert base["sp_estimated"] is False
+    assert base["efficiency_estimated"] is False
+
+
+def test_efficiency_rows_carry_estimated_flag(api):
+    client, _ = api
+    rows = client.get("/api/efficiency", params={"model": "m-shared"}).json()["issues"]
+    assert rows[0]["estimated"] is True
+    assert rows[0]["story_points"] == pytest.approx(2.5)
+    exact = client.get("/api/efficiency").json()["issues"]
+    assert all(r["estimated"] is False for r in exact)
+
+
 def test_health_endpoints(api):
     client, _ = api
     for path in ("/health", "/api/health"):
@@ -151,6 +175,28 @@ def test_dashboard_static_files(api):
     assert "AIStat" in index.text
     assert client.get("/app.js").status_code == 200
     assert client.get("/vendor/chart.umd.min.js").status_code == 200
+
+
+def _js_function(source, name):
+    """The body of one top-level ``function name(...)`` in app.js."""
+    start = source.index(f"function {name}(")
+    end = source.find("\nfunction ", start)
+    return source[start:end if end != -1 else len(source)]
+
+
+def test_dashboard_renderers_mark_estimated_values():
+    """Static contract (FAN-1241): the renderers must consume the estimation
+    flags — summary cards via sp_estimated/efficiency_estimated, the task
+    table via each row's estimated — and mark those values with ≈."""
+    app_js = (Path(server_module.__file__).parent / "static" / "app.js"
+              ).read_text(encoding="utf-8")
+    render_summary = _js_function(app_js, "renderSummary")
+    assert "sp_estimated" in render_summary
+    assert "efficiency_estimated" in render_summary
+    assert "≈" in render_summary
+    render_efficiency = _js_function(app_js, "renderEfficiency")
+    assert ".estimated" in render_efficiency
+    assert "≈" in render_efficiency
 
 
 # The SSE generator is tested directly: Starlette's TestClient buffers whole
