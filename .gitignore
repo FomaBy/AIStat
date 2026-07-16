@@ -18,5 +18,8 @@ CLAUDE.md
 .agent_context/
 .claude/
 
+# Operator-local notes (admin panel URL / credentials — never publish)
+adminpanel.txt
+
 # Editor / OS
 .DS_Store
