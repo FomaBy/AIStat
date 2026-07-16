@@ -271,36 +271,54 @@ cmd_release() {
   local mdir; mdir="$(deploy_dir main)"
   [ -d "$mdir/.git" ] || die "main deployment not installed; run: local_deploy.sh install"
 
+  # The main deployment clone is the git base for the whole release: it carries
+  # origin (push credentials are host-scoped, so it can push) and, after a
+  # fetch, every branch a release might promote from.
+  git -C "$mdir" fetch --quiet origin || die "fetch origin failed"
+
+  # 1. Resolve the release candidate to an immutable SHA.
+  local candidate sha
+  if [ "$promote" = 1 ]; then candidate="$from"; else candidate="origin/main"; fi
+  sha="$(git -C "$mdir" rev-parse --verify "${candidate}^{commit}" 2>/dev/null)" \
+    || die "cannot resolve release candidate '$candidate'"
+  if [ "$promote" = 1 ] && [ "$force" != 1 ] \
+     && git -C "$mdir" rev-parse --verify --quiet origin/main >/dev/null; then
+    git -C "$mdir" merge-base --is-ancestor origin/main "$sha" \
+      || die "origin/main is not an ancestor of '$from' — refusing non-fast-forward release (use --force)"
+  fi
+
+  # 2. Build + validate the candidate in a THROWAWAY staging tree, before any
+  #    publish and before touching the live main deployment. If staging fails,
+  #    origin/main and the running main dashboard are left completely untouched
+  #    (this is the whole point of the release safety guarantee).
+  local stage; stage="$LOCAL_ROOT/.release-stage.$$"
+  rm -rf "$stage"; mkdir -p "$stage"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" EXIT
+  log "staging + validating candidate $(git -C "$mdir" rev-parse --short "$sha")"
+  git -C "$mdir" archive "$sha" | tar -x -C "$stage" \
+    || die "could not export candidate — nothing published, main untouched"
+  ( cd "$stage" && AISTAT_SKIP_ZIP=1 bash scripts/build_cpanel_package.sh >/dev/null ) \
+    || die "package build failed for candidate — origin/main and main deployment left untouched"
+  python3 -m compileall -q -f "$stage/dist/aistat-cpanel/aistat" \
+    || die "candidate failed py_compile — origin/main and main deployment left untouched"
+  rm -rf "$stage"; trap - EXIT
+  log "candidate validated"
+
+  # 3. Only now publish: push the validated SHA to origin/main (if promoting).
   if [ "$promote" = 1 ]; then
-    git -C "$SOURCE_ROOT" fetch --quiet origin || die "fetch origin failed"
-    local sha
-    sha="$(git -C "$SOURCE_ROOT" rev-parse --verify "${from}^{commit}" 2>/dev/null)" \
-      || die "cannot resolve --from '$from'"
-    if [ "$force" != 1 ] && git -C "$SOURCE_ROOT" rev-parse --verify --quiet origin/main >/dev/null; then
-      git -C "$SOURCE_ROOT" merge-base --is-ancestor origin/main "$sha" \
-        || die "origin/main is not an ancestor of '$from' — refusing non-fast-forward release (use --force)"
-    fi
-    log "promoting $from ($(git -C "$SOURCE_ROOT" rev-parse --short "$sha")) -> origin/main"
+    log "promoting $from ($(git -C "$mdir" rev-parse --short "$sha")) -> origin/main"
     if [ "$force" = 1 ]; then
-      git -C "$SOURCE_ROOT" push --force-with-lease origin "$sha:refs/heads/main" || die "push to origin/main failed"
+      git -C "$mdir" push --force-with-lease origin "$sha:refs/heads/main" || die "push to origin/main failed"
     else
-      git -C "$SOURCE_ROOT" push origin "$sha:refs/heads/main" || die "push to origin/main failed"
+      git -C "$mdir" push origin "$sha:refs/heads/main" || die "push to origin/main failed"
     fi
   fi
 
-  # Bring the local main deployment to the released commit, but validate the
-  # build BEFORE restarting so a broken release never replaces a working one
-  # (same safety ordering as deploy/cpanel_deploy.sh).
-  log "syncing main deployment to origin/main"
-  git -C "$mdir" fetch --quiet origin main || die "fetch origin/main failed"
-  git -C "$mdir" reset --hard --quiet origin/main
+  # 4. Move the live main deployment to the validated commit and restart it.
+  log "updating main deployment to $(git -C "$mdir" rev-parse --short "$sha")"
+  git -C "$mdir" reset --hard --quiet "$sha"
   ensure_deps "$mdir"
-  log "building deployable package"
-  ( cd "$mdir" && AISTAT_SKIP_ZIP=1 bash scripts/build_cpanel_package.sh >/dev/null ) \
-    || die "package build failed — main deployment left running the previous release"
-  python3 -m compileall -q -f "$mdir/dist/aistat-cpanel/aistat" \
-    || die "package failed py_compile — main deployment left running the previous release"
-  log "restarting main deployment"
   restart_agent main
   log "release complete: origin/main at $(git -C "$mdir" rev-parse --short HEAD); dashboard http://127.0.0.1:$MAIN_PORT"
 }
@@ -356,4 +374,8 @@ main() {
   esac
 }
 
-main "$@"
+# Run only when executed directly; sourcing (e.g. from tests) loads the
+# functions without dispatching a command.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
