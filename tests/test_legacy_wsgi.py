@@ -13,7 +13,7 @@ from wsgiref.util import setup_testing_defaults
 import pytest
 from werkzeug.security import generate_password_hash
 
-from aistat.db import connect
+from aistat.db import SCHEMA_VERSION, connect
 from aistat.snapshot import create_compressed_snapshot
 from conftest import seed_aggregate_fixture
 
@@ -254,7 +254,10 @@ def test_signed_snapshot_ingest(legacy, tmp_path):
         },
     )
     assert status == "200 OK"
-    assert legacy.json.loads(body.decode("utf-8"))["schema_version"] == 3
+    assert (
+        legacy.json.loads(body.decode("utf-8"))["schema_version"]
+        == SCHEMA_VERSION
+    )
     cookies = login(legacy)
     status, _, body = request(
         legacy.application, "/api/summary", cookie=cookies

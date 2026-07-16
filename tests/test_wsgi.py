@@ -7,7 +7,7 @@ import pytest
 from werkzeug.security import generate_password_hash
 
 from aistat.config import Config
-from aistat.db import connect, init_db
+from aistat.db import SCHEMA_VERSION, connect, init_db
 from aistat.security import snapshot_signature
 from aistat.snapshot import create_compressed_snapshot
 from aistat.wsgi import create_app
@@ -169,7 +169,7 @@ def test_signed_snapshot_install_and_replay_rejection(public_app, tmp_path):
         },
     )
     assert response.status_code == 200
-    assert response.get_json()["schema_version"] == 3
+    assert response.get_json()["schema_version"] == SCHEMA_VERSION
     assert config.db_path.with_name("public.db.previous").exists()
 
     replay = client.post(
