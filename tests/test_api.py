@@ -1,6 +1,7 @@
 """API endpoint tests: FastAPI app over a seeded temporary database."""
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,20 @@ def test_efficiency_breakdown_endpoint(api):
     ).status_code == 422
 
 
+def test_efficiency_breakdown_empty_selection_returns_empty_cuts(api):
+    """The QA scenario behind FAN-1242: a filter matching nothing comes back
+    as empty cuts, which the dashboard must render as explicit no-data."""
+    client, _ = api
+    data = client.get(
+        "/api/efficiency-breakdown",
+        params=[("from", "2026-01-02T00:00Z"), ("to", "2026-01-02T01:00Z"),
+                ("agent", "missing"), ("model", "missing")],
+    ).json()
+    assert data["agents"] == []
+    assert data["models"] == []
+    assert data["time"] == {"granularity": "hour", "rows": []}
+
+
 def test_summary_endpoint_has_cost_efficiency(api):
     client, _ = api
     s = client.get("/api/summary").json()
@@ -273,6 +288,41 @@ def test_dashboard_renderers_mark_estimated_values():
     render_efficiency = _js_function(app_js, "renderEfficiency")
     assert ".estimated" in render_efficiency
     assert "≈" in render_efficiency
+
+
+def test_dashboard_efficiency_charts_have_accessible_alternatives():
+    """Static contract (FAN-1242): each efficiency chart canvas carries an
+    accessible name, a hidden no-data message and a table alternative, and
+    the stylesheet keeps the message hidden while its hidden attribute is
+    set (display:flex would beat the UA [hidden] rule otherwise)."""
+    static = Path(server_module.__file__).parent / "static"
+    index_html = (static / "index.html").read_text(encoding="utf-8")
+    for chart in ("efficiency-agents", "efficiency-models", "efficiency-time"):
+        canvas = re.search(rf'<canvas id="chart-{chart}"[^>]*>', index_html)
+        assert canvas is not None, chart
+        assert 'role="img"' in canvas.group(0)
+        assert "aria-label=" in canvas.group(0)
+        assert f'id="empty-{chart}" hidden' in index_html
+        assert f'id="table-{chart}-data"' in index_html
+    style_css = (static / "style.css").read_text(encoding="utf-8")
+    assert ".chart-empty[hidden]" in style_css
+
+
+def test_dashboard_breakdown_renderer_handles_empty_and_partial_data():
+    """Static contract (FAN-1242): renderEfficiencyBreakdown must toggle the
+    no-data messages, fill the table alternatives, and keep empty buckets as
+    gaps — a null tokens/SP is never coerced to 0 and spanGaps stays off."""
+    app_js = (Path(server_module.__file__).parent / "static" / "app.js"
+              ).read_text(encoding="utf-8")
+    render = _js_function(app_js, "renderEfficiencyBreakdown")
+    for chart in ("efficiency-agents", "efficiency-models", "efficiency-time"):
+        assert f"empty-{chart}" in render
+        assert f"table-{chart}-data" in render
+    assert "spanGaps: false" in render
+    assert "|| 0" not in render
+    table = _js_function(app_js, "renderBreakdownTable")
+    assert "—" in table           # a gap is an explicit dash, not a fake 0
+    assert "Нет данных" in table  # an empty selection is spelled out
 
 
 # The SSE generator is tested directly: Starlette's TestClient buffers whole

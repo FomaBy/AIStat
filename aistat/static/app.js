@@ -328,6 +328,26 @@ function efficiencyBarConfig(rows) {
   };
 }
 
+// The keyboard/screen-reader alternative for one efficiency chart: the same
+// label → tokens/SP pairs the chart draws, with a gap shown as an explicit —.
+function renderBreakdownTable(id, rows) {
+  const tbody = $(id).querySelector("tbody");
+  tbody.innerHTML = "";
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="2" class="note">Нет данных за выбранный период и фильтры.</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="wrap">${esc(r.label)}</td>
+      <td class="num">${r.tokens_per_sp == null ? "—" : fmtTokens(r.tokens_per_sp)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
 function renderEfficiencyBreakdown(data) {
   const agents = (data && data.agents) || [];
   const models = (data && data.models) || [];
@@ -336,6 +356,17 @@ function renderEfficiencyBreakdown(data) {
   const granularity = time.granularity === "hour" ? "часам UTC" : "дням UTC";
   $("efficiency-time-title").innerHTML =
     `Эффективность во времени <span class="est-mark">≈ по ${granularity} · токены / SP · меньше — лучше</span>`;
+  $("efficiency-time-data-label").textContent =
+    time.granularity === "hour" ? "Час (UTC)" : "День (UTC)";
+  // A chart with nothing drawable is an unexplained blank canvas — cover it
+  // with the no-data message instead (FAN-1242).
+  const hasData = (rs) => rs.some((r) => r.tokens_per_sp != null);
+  $("empty-efficiency-agents").hidden = hasData(agents);
+  $("empty-efficiency-models").hidden = hasData(models);
+  $("empty-efficiency-time").hidden = hasData(rows);
+  renderBreakdownTable("table-efficiency-agents-data", agents);
+  renderBreakdownTable("table-efficiency-models-data", models);
+  renderBreakdownTable("table-efficiency-time-data", rows);
   upsertChart("chart-efficiency-agents", efficiencyBarConfig(agents));
   upsertChart("chart-efficiency-models", efficiencyBarConfig(models));
   upsertChart("chart-efficiency-time", {
@@ -344,7 +375,9 @@ function renderEfficiencyBreakdown(data) {
       labels: rows.map((r) => r.label),
       datasets: [{
         label: "Токены / SP",
-        data: rows.map((r) => r.tokens_per_sp),
+        // A bucket without attributable SP stays null so the line breaks at
+        // the gap (spanGaps: false) instead of inventing a zero.
+        data: rows.map((r) => (r.tokens_per_sp == null ? null : r.tokens_per_sp)),
         borderColor: colorFor(0),
         backgroundColor: colorFor(0),
         pointRadius: 3,

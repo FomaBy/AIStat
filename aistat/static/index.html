@@ -126,18 +126,54 @@
 
     <section class="panel">
       <h2>Эффективность по агентам <span class="est-mark">≈ токены / SP · меньше — лучше</span></h2>
-      <div class="chart-box chart-box-small"><canvas id="chart-efficiency-agents"></canvas></div>
+      <div class="chart-box chart-box-small">
+        <canvas id="chart-efficiency-agents" role="img" aria-label="График: эффективность по агентам, токены на 1 story point">Значения графика — в таблице «Данные таблицей» ниже.</canvas>
+        <p class="chart-empty" id="empty-efficiency-agents" hidden>Нет данных за выбранный период и фильтры.</p>
+      </div>
+      <details class="chart-data">
+        <summary>Данные таблицей</summary>
+        <div class="table-wrap">
+          <table id="table-efficiency-agents-data" aria-label="Эффективность по агентам: токены на 1 story point">
+            <thead><tr><th>Агент</th><th class="num">Токены / SP</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     <section class="panel">
       <h2>Эффективность по моделям <span class="est-mark">≈ токены / SP · меньше — лучше</span></h2>
-      <div class="chart-box chart-box-small"><canvas id="chart-efficiency-models"></canvas></div>
+      <div class="chart-box chart-box-small">
+        <canvas id="chart-efficiency-models" role="img" aria-label="График: эффективность по моделям, токены на 1 story point">Значения графика — в таблице «Данные таблицей» ниже.</canvas>
+        <p class="chart-empty" id="empty-efficiency-models" hidden>Нет данных за выбранный период и фильтры.</p>
+      </div>
+      <details class="chart-data">
+        <summary>Данные таблицей</summary>
+        <div class="table-wrap">
+          <table id="table-efficiency-models-data" aria-label="Эффективность по моделям: токены на 1 story point">
+            <thead><tr><th>Модель</th><th class="num">Токены / SP</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     <section class="panel panel-wide">
       <h2 id="efficiency-time-title">Эффективность во времени <span class="est-mark">≈ токены / SP · меньше — лучше</span></h2>
-      <div class="chart-box"><canvas id="chart-efficiency-time"></canvas></div>
-      <p class="note">Токены и SP каждой задачи распределяются по длительности подтверждённых запусков. В явно заданном интервале до 48 часов график строится по часам UTC; иначе — по дням UTC. Задачи без датированных запусков не получают выдуманную атрибуцию и не попадают в эти графики.</p>
+      <div class="chart-box">
+        <canvas id="chart-efficiency-time" role="img" aria-label="График: эффективность во времени, токены на 1 story point">Значения графика — в таблице «Данные таблицей» ниже.</canvas>
+        <p class="chart-empty" id="empty-efficiency-time" hidden>Нет данных за выбранный период и фильтры.</p>
+      </div>
+      <details class="chart-data">
+        <summary>Данные таблицей</summary>
+        <div class="table-wrap">
+          <table id="table-efficiency-time-data" aria-label="Эффективность во времени: токены на 1 story point">
+            <thead><tr><th id="efficiency-time-data-label">День (UTC)</th><th class="num">Токены / SP</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+      <p class="note">Токены и SP каждой задачи распределяются по длительности подтверждённых запусков. В явно заданном интервале до 48 часов график строится по часам UTC; иначе — по дням UTC. Задачи без датированных запусков не получают выдуманную атрибуцию и не попадают в эти графики. Интервалы без данных остаются разрывами: «—» в таблице, пропуск на графике.</p>
     </section>
 
     <section class="panel panel-wide">

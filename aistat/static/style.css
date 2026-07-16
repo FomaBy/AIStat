@@ -111,6 +111,30 @@ body {
 .chart-box { position: relative; height: 320px; }
 .chart-box-small { height: 260px; }
 
+/* No-data message covering an otherwise unexplained blank canvas. The
+   explicit [hidden] rule is required: display:flex would beat the UA's
+   [hidden] { display:none } otherwise. */
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  background: var(--panel);
+}
+.chart-empty[hidden] { display: none; }
+
+/* Keyboard/screen-reader alternative: the chart's values as a table. */
+.chart-data { margin-top: 8px; }
+.chart-data summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.chart-data summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+td.wrap { white-space: normal; word-break: break-word; }
+
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
