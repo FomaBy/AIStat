@@ -19,11 +19,21 @@ Security notes:
   consumed exactly once on callback; the provider recorded with the state must
   match the callback path, so a state minted for one provider cannot be
   replayed against another.
+* every ``state`` is bound to the browser that started the flow: ``begin``
+  records the SHA-256 hash of a per-flow client token (the caller stores the
+  token itself in an HttpOnly cookie), and ``finish`` rejects a callback whose
+  presented token does not hash to the stored value *before* any token
+  exchange. A valid state alone therefore cannot log a different browser in
+  (login CSRF), and no OAuth secret ever leaves the server.
+* any terminal callback — success, provider error, missing code, provider or
+  client mismatch — consumes the state, so it can never be replayed.
 * token and userinfo endpoints must be HTTPS; requests are bounded by a
   timeout and a maximum response size.
 * secrets (client secret, code, tokens) are never logged.
 """
 
+import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -35,6 +45,8 @@ __all__ = [
     "OAuthProvider",
     "OAuthError",
     "generate_state",
+    "generate_client_token",
+    "client_token_hash",
     "build_authorize_url",
     "exchange_code",
     "fetch_identity",
@@ -110,6 +122,20 @@ class OAuthProvider(object):
 def generate_state() -> str:
     """Return a fresh, unguessable ``state`` value (URL-safe, 256-bit)."""
     return secrets.token_urlsafe(32)
+
+
+def generate_client_token() -> str:
+    """Return a fresh per-flow token identifying the initiating browser.
+
+    The caller hands the token to the browser in an HttpOnly cookie and passes
+    it back into :func:`finish`; only its hash is persisted server-side.
+    """
+    return secrets.token_urlsafe(32)
+
+
+def client_token_hash(client_token: str) -> str:
+    """Hash a client token for storage alongside the state row."""
+    return hashlib.sha256(client_token.encode("utf-8")).hexdigest()
 
 
 def _require_https(url: str, what: str) -> None:
@@ -245,44 +271,72 @@ def fetch_identity(
     return str(subject), email, display_name
 
 
-def begin(store, provider: "OAuthProvider", next_url, now=None) -> str:
+def begin(store, provider: "OAuthProvider", next_url, client_token, now=None) -> str:
     """Start a login: mint a one-time ``state``, persist it, return the URL.
 
     ``next_url`` must already be a safe, same-site path (each caller sanitises
-    it with its own ``safe_next_url`` helper before calling).
+    it with its own ``safe_next_url`` helper before calling). ``client_token``
+    is the per-flow browser token from :func:`generate_client_token`; the
+    caller must deliver it to the browser in an HttpOnly cookie, and only its
+    hash is stored with the state.
     """
+    if not client_token:
+        raise OAuthError("client token is required")
     state = generate_state()
-    store.put_oauth_state(state, provider.name, next_url=next_url, now=now)
+    store.put_oauth_state(
+        state,
+        provider.name,
+        next_url=next_url,
+        client_hash=client_token_hash(client_token),
+        now=now,
+    )
     return build_authorize_url(provider, state)
 
 
-def finish(store, provider: "OAuthProvider", params, now=None) -> dict:
+def finish(store, provider: "OAuthProvider", params, client_token, now=None) -> dict:
     """Validate an OAuth callback and resolve the account.
 
-    ``params`` is the callback query mapping (supports ``.get``). Steps:
+    ``params`` is the callback query mapping (supports ``.get``);
+    ``client_token`` is the browser-binding cookie value presented with the
+    callback (``None`` when absent). Steps:
 
-    1. reject an explicit provider ``error``;
-    2. require both ``state`` and ``code``;
-    3. consume ``state`` exactly once and verify it was minted for *this*
-       provider (an unknown, already-used, expired or mismatched state is
-       rejected);
-    4. exchange the code and resolve the identity;
-    5. map the identity to a stable AIStat user id.
+    1. consume ``state`` exactly once — every terminal callback, including a
+       provider ``error``, invalidates it so it can never be replayed;
+    2. reject an explicit provider ``error``;
+    3. require both ``state`` and ``code``;
+    4. verify the state was minted for *this* provider (an unknown,
+       already-used, expired or mismatched state is rejected);
+    5. verify the presented client token hashes to the value recorded when the
+       flow started, so only the initiating browser can complete it — all
+       before any token exchange;
+    6. exchange the code and resolve the identity;
+    7. map the identity to a stable AIStat user id.
 
     Returns ``{"user_id", "email", "display_name", "next_url"}``. Raises
     :class:`OAuthError` on any failure. Establishing a session and deciding
     whether the account is *authorised* to see data are the caller's job.
     """
-    error = params.get("error")
-    if error:
-        raise OAuthError("provider reported an error")
     state = params.get("state")
     code = params.get("code")
+    error = params.get("error")
+    # Consume the state first: a callback is terminal for its state whatever
+    # the outcome, so an error or mismatch cannot leave it usable later.
+    record = store.take_oauth_state(state, now=now) if state else None
+    if error:
+        raise OAuthError("provider reported an error")
     if not state or not code:
         raise OAuthError("missing state or code")
-    record = store.take_oauth_state(state, now=now)
     if not record or record.get("provider") != provider.name:
         raise OAuthError("invalid, expired or mismatched state")
+    expected_hash = record.get("client_hash")
+    if (
+        not client_token
+        or not expected_hash
+        or not hmac.compare_digest(
+            expected_hash, client_token_hash(client_token)
+        )
+    ):
+        raise OAuthError("callback is not bound to the initiating browser")
     access_token = exchange_code(provider, code)
     subject, email, display_name = fetch_identity(provider, access_token)
     user_id = store.find_or_create_user_by_identity(

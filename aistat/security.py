@@ -193,10 +193,19 @@ class SecurityStore:
                     state           TEXT PRIMARY KEY,
                     provider        TEXT NOT NULL,
                     next_url        TEXT,
-                    created_at      INTEGER NOT NULL
+                    created_at      INTEGER NOT NULL,
+                    client_hash     TEXT
                 );
                 """
             )
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(oauth_state)")
+            }
+            if "client_hash" not in columns:
+                conn.execute(
+                    "ALTER TABLE oauth_state ADD COLUMN client_hash TEXT"
+                )
             conn.commit()
         finally:
             conn.close()
@@ -354,9 +363,14 @@ class SecurityStore:
         state: str,
         provider: str,
         next_url: Optional[str] = None,
+        client_hash: Optional[str] = None,
         now: Optional[int] = None,
     ) -> None:
-        """Persist a one-time OAuth ``state`` value with a bounded lifetime."""
+        """Persist a one-time OAuth ``state`` value with a bounded lifetime.
+
+        ``client_hash`` is the hash of the browser-binding token minted when
+        the flow started; the callback must present the matching token.
+        """
         now = int(time.time()) if now is None else int(now)
         conn = self._connect()
         try:
@@ -366,9 +380,10 @@ class SecurityStore:
                 (OAUTH_STATE_TTL_SECONDS, now),
             )
             conn.execute(
-                "INSERT INTO oauth_state (state, provider, next_url, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (state, provider, next_url, now),
+                "INSERT INTO oauth_state "
+                "(state, provider, next_url, created_at, client_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (state, provider, next_url, now, client_hash),
             )
             conn.commit()
         finally:
@@ -379,16 +394,16 @@ class SecurityStore:
     ) -> Optional[dict]:
         """Consume a stored OAuth ``state`` exactly once.
 
-        Returns ``{"provider", "next_url"}`` for a fresh, known state and
-        ``None`` for an unknown, already-consumed or expired one. The row is
-        deleted on any match so a state can never be replayed.
+        Returns ``{"provider", "next_url", "client_hash"}`` for a fresh, known
+        state and ``None`` for an unknown, already-consumed or expired one.
+        The row is deleted on any match so a state can never be replayed.
         """
         now = int(time.time()) if now is None else int(now)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT provider, next_url, created_at "
+                "SELECT provider, next_url, created_at, client_hash "
                 "FROM oauth_state WHERE state = ?",
                 (state,),
             ).fetchone()
@@ -399,7 +414,11 @@ class SecurityStore:
             conn.commit()
             if row["created_at"] + OAUTH_STATE_TTL_SECONDS <= now:
                 return None
-            return {"provider": row["provider"], "next_url": row["next_url"]}
+            return {
+                "provider": row["provider"],
+                "next_url": row["next_url"],
+                "client_hash": row["client_hash"],
+            }
         finally:
             conn.close()
 

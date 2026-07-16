@@ -40,6 +40,7 @@ from .config import Config
 from .db import connect, connect_readonly, init_db
 from .health import snapshot
 from .security import (
+    OAUTH_STATE_TTL_SECONDS,
     SecurityStore,
     client_key,
     csrf_token,
@@ -52,6 +53,10 @@ from .snapshot import SnapshotError, install_compressed_snapshot
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+# One-time HttpOnly cookie binding an OAuth flow to the browser that started
+# it; only its hash is stored server-side with the state row.
+OAUTH_CLIENT_COOKIE = "aistat_oauth_client"
 
 
 def create_app(config: Optional[Config] = None) -> Flask:
@@ -292,28 +297,50 @@ def create_app(config: Optional[Config] = None) -> Flask:
         ).format(email=shown)
         return body, 403
 
+    def drop_oauth_client_cookie(response):
+        response.delete_cookie(OAUTH_CLIENT_COOKIE, path="/auth")
+        return response
+
     @app.get("/auth/<provider>/start")
     def oauth_start(provider):
         provider_config = config.oauth_providers.get(provider)
         if provider_config is None:
             abort(404)
         next_url = safe_next_url(request.args.get("next"))
-        authorize_url = oauth.begin(security_store, provider_config, next_url)
-        return redirect(authorize_url, code=303)
+        client_token = oauth.generate_client_token()
+        authorize_url = oauth.begin(
+            security_store, provider_config, next_url, client_token
+        )
+        response = redirect(authorize_url, code=303)
+        # SameSite=Lax survives the top-level redirect back from the provider
+        # while staying invisible to scripts and other sites.
+        response.set_cookie(
+            OAUTH_CLIENT_COOKIE,
+            client_token,
+            max_age=OAUTH_STATE_TTL_SECONDS,
+            path="/auth",
+            secure=config.session_cookie_secure,
+            httponly=True,
+            samesite="Lax",
+        )
+        return response
 
     @app.get("/auth/<provider>/callback")
     def oauth_callback(provider):
         provider_config = config.oauth_providers.get(provider)
         if provider_config is None:
             abort(404)
+        client_token = request.cookies.get(OAUTH_CLIENT_COOKIE)
         try:
-            result = oauth.finish(security_store, provider_config, request.args)
+            result = oauth.finish(
+                security_store, provider_config, request.args, client_token
+            )
         except oauth.OAuthError:
-            response, status = render_login(
+            body, status = render_login(
                 "Не удалось выполнить вход через провайдера. Попробуйте снова.",
                 400,
             )
-            return response, status
+            return drop_oauth_client_cookie(app.make_response((body, status)))
         session.clear()
         session["user_id"] = result["user_id"]
         session["email"] = result["email"]
@@ -323,8 +350,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
         if not oauth.is_email_authorized(
             config.oauth_allowed_emails, result["email"]
         ):
-            return oauth_pending(result["email"])
-        return redirect(safe_next_url(result["next_url"]), code=303)
+            return drop_oauth_client_cookie(
+                app.make_response(oauth_pending(result["email"]))
+            )
+        return drop_oauth_client_cookie(
+            redirect(safe_next_url(result["next_url"]), code=303)
+        )
 
     @app.get("/healthz")
     def healthz():

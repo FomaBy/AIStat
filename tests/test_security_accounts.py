@@ -26,9 +26,15 @@ def test_distinct_identities_map_to_distinct_users(tmp_path):
 
 def test_oauth_state_is_single_use(tmp_path):
     store = SecurityStore(tmp_path / "security.db")
-    store.put_oauth_state("state-1", "google", next_url="/api/meta", now=100)
+    store.put_oauth_state(
+        "state-1", "google", next_url="/api/meta", client_hash="hash-1", now=100
+    )
     taken = store.take_oauth_state("state-1", now=110)
-    assert taken == {"provider": "google", "next_url": "/api/meta"}
+    assert taken == {
+        "provider": "google",
+        "next_url": "/api/meta",
+        "client_hash": "hash-1",
+    }
     # a second consumption of the same state is rejected
     assert store.take_oauth_state("state-1", now=111) is None
 

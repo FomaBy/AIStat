@@ -344,6 +344,15 @@ def test_oauth_unknown_provider_is_404(legacy):
     assert status == "404 Not Found"
 
 
+def install_forbidden_http(monkeypatch):
+    def forbidden_urlopen(request, timeout=None):
+        raise AssertionError(
+            "provider must not be contacted: " + request.full_url
+        )
+
+    monkeypatch.setattr("aistat.oauth.urlopen", forbidden_urlopen)
+
+
 def test_oauth_start_redirects_to_provider_with_state(legacy):
     status, headers, _ = request(
         legacy.application, "/auth/google/start?next=/api/meta"
@@ -352,6 +361,15 @@ def test_oauth_start_redirects_to_provider_with_state(legacy):
     location = header_values(headers, "Location")[0]
     assert location.startswith("https://accounts.example/authorize")
     assert "state=" in location
+    binding = next(
+        value
+        for value in header_values(headers, "Set-Cookie")
+        if value.startswith("aistat_oauth_client=")
+    )
+    assert "HttpOnly" in binding
+    assert "Secure" in binding
+    assert "SameSite=Lax" in binding
+    assert "Path=/auth" in binding
 
 
 def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
@@ -362,12 +380,17 @@ def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
         legacy.application, "/auth/google/start?next=/api/meta"
     )
     state = state_from(headers)
+    start_cookies = cookie_jar(headers)
     status, headers, _ = request(
-        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
     )
     assert status == "303 See Other"
     assert header_values(headers, "Location") == ["/api/meta"]
-    cookies = cookie_jar(headers)
+    cookies = cookie_jar(headers, start_cookies)
+    # the one-time binding cookie is dropped once the callback completes
+    assert "aistat_oauth_client" not in cookies
     status, _, body = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "200 OK"
     data = legacy.json.loads(body.decode("utf-8"))
@@ -380,11 +403,14 @@ def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
     )
     status, headers, _ = request(legacy.application, "/auth/google/start")
     state = state_from(headers)
+    start_cookies = cookie_jar(headers)
     status, headers, _ = request(
-        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
     )
     assert status == "403 Forbidden"
-    cookies = cookie_jar(headers)
+    cookies = cookie_jar(headers, start_cookies)
     status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "401 Unauthorized"
 
@@ -404,12 +430,69 @@ def test_oauth_state_is_single_use(legacy, monkeypatch):
     )
     status, headers, _ = request(legacy.application, "/auth/google/start")
     state = state_from(headers)
+    start_cookies = cookie_jar(headers)
     first = request(
-        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
     )
     assert first[0] == "303 See Other"
     # replaying the now-consumed state is rejected
     second = request(
-        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
     )
     assert second[0] == "400 Bad Request"
+
+
+def test_oauth_callback_rejects_cross_client_callback(legacy, monkeypatch):
+    # login CSRF: a client that did not run /start (no binding cookie) cannot
+    # complete the flow with a leaked-but-valid state; the provider is never
+    # contacted and no session is created
+    install_forbidden_http(monkeypatch)
+    status, headers, _ = request(
+        legacy.application, "/auth/google/start?next=/api/meta"
+    )
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, headers, _ = request(
+        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+    )
+    assert status == "400 Bad Request"
+    assert not any(
+        value.startswith("aistat_session=")
+        for value in header_values(headers, "Set-Cookie")
+    )
+    # the hijack attempt consumed the state: the initiating client's retry
+    # is rejected too
+    status, _, _ = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
+    status, _, _ = request(legacy.application, "/api/meta")
+    assert status == "401 Unauthorized"
+
+
+def test_oauth_error_callback_burns_state(legacy, monkeypatch):
+    # a provider error is terminal: the same state must not work with a code
+    install_forbidden_http(monkeypatch)
+    status, headers, _ = request(legacy.application, "/auth/google/start")
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, _, _ = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&error=access_denied" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
+    status, _, _ = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
+    status, _, _ = request(legacy.application, "/api/meta")
+    assert status == "401 Unauthorized"

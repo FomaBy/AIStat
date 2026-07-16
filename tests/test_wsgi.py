@@ -331,6 +331,80 @@ def test_oauth_callback_rejects_forged_state(public_app):
     assert client.get("/api/meta", base_url="https://localhost").status_code == 401
 
 
+def install_forbidden_http(monkeypatch):
+    def forbidden_urlopen(request, timeout=None):
+        raise AssertionError(
+            "provider must not be contacted: " + request.full_url
+        )
+
+    monkeypatch.setattr("aistat.oauth.urlopen", forbidden_urlopen)
+
+
+def test_oauth_start_sets_browser_binding_cookie(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    response = client.get(
+        "/auth/google/start?next=/api/meta", base_url="https://localhost"
+    )
+    cookie = next(
+        header
+        for header in response.headers.getlist("Set-Cookie")
+        if header.startswith("aistat_oauth_client=")
+    )
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+    assert "SameSite=Lax" in cookie
+    assert "Path=/auth" in cookie
+
+
+def test_oauth_callback_rejects_cross_client_callback(public_app, monkeypatch):
+    # login CSRF: a browser that did not run /start cannot complete the flow
+    # with a leaked-but-valid state, and no token exchange is attempted
+    app, _ = public_app
+    install_forbidden_http(monkeypatch)
+    victim = app.test_client()
+    attacker_start = victim.get(
+        "/auth/google/start?next=/api/meta", base_url="https://localhost"
+    )
+    state = state_from(attacker_start.headers["Location"])
+    other_browser = app.test_client()
+    callback = other_browser.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 400
+    assert (
+        other_browser.get("/api/meta", base_url="https://localhost").status_code
+        == 401
+    )
+    # the hijack attempt consumed the state, so it cannot be retried anywhere
+    replay = victim.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert replay.status_code == 400
+
+
+def test_oauth_error_callback_burns_state(public_app, monkeypatch):
+    # a provider error is terminal: the same state must not work with a code
+    app, _ = public_app
+    install_forbidden_http(monkeypatch)
+    client = app.test_client()
+    start = client.get("/auth/google/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    errored = client.get(
+        "/auth/google/callback?state=%s&error=access_denied" % state,
+        base_url="https://localhost",
+    )
+    assert errored.status_code == 400
+    retry = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert retry.status_code == 400
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+
 def test_password_login_unaffected_by_oauth(public_app):
     app, _ = public_app
     client = app.test_client()

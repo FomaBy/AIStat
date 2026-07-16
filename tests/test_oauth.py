@@ -49,8 +49,14 @@ class FakeStore:
         self.identities = {}
         self._next_id = 0
 
-    def put_oauth_state(self, state, provider, next_url=None, now=None):
-        self.states[state] = {"provider": provider, "next_url": next_url}
+    def put_oauth_state(
+        self, state, provider, next_url=None, client_hash=None, now=None
+    ):
+        self.states[state] = {
+            "provider": provider,
+            "next_url": next_url,
+            "client_hash": client_hash,
+        }
 
     def take_oauth_state(self, state, now=None):
         return self.states.pop(state, None)
@@ -168,9 +174,22 @@ def test_generate_state_is_unique_and_urlsafe():
 
 def test_begin_persists_state_and_returns_authorize_url():
     store = FakeStore()
-    url = oauth.begin(store, PROVIDER, "/api/meta")
+    url = oauth.begin(store, PROVIDER, "/api/meta", "browser-token")
     state = parse_qs(urlsplit(url).query)["state"][0]
-    assert store.states[state] == {"provider": "google", "next_url": "/api/meta"}
+    assert store.states[state] == {
+        "provider": "google",
+        "next_url": "/api/meta",
+        "client_hash": oauth.client_token_hash("browser-token"),
+    }
+    # only the hash of the browser token is persisted, never the token itself
+    assert "browser-token" not in str(store.states[state])
+
+
+def test_begin_requires_client_token():
+    store = FakeStore()
+    with pytest.raises(oauth.OAuthError):
+        oauth.begin(store, PROVIDER, "/", "")
+    assert store.states == {}
 
 
 def test_finish_happy_path_and_single_use(monkeypatch):
@@ -180,38 +199,52 @@ def test_finish_happy_path_and_single_use(monkeypatch):
         identity={"sub": "abc", "email": "u@example.com", "name": "U"},
     )
     store = FakeStore()
-    url = oauth.begin(store, PROVIDER, "/api/summary")
+    url = oauth.begin(store, PROVIDER, "/api/summary", "tok-a")
     state = parse_qs(urlsplit(url).query)["state"][0]
 
-    result = oauth.finish(store, PROVIDER, {"state": state, "code": "c"})
+    result = oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, "tok-a")
     assert result["email"] == "u@example.com"
     assert result["next_url"] == "/api/summary"
     assert isinstance(result["user_id"], int)
 
     # the same external identity maps back to the same user id
-    url2 = oauth.begin(store, PROVIDER, "/")
+    url2 = oauth.begin(store, PROVIDER, "/", "tok-b")
     state2 = parse_qs(urlsplit(url2).query)["state"][0]
-    again = oauth.finish(store, PROVIDER, {"state": state2, "code": "c"})
+    again = oauth.finish(store, PROVIDER, {"state": state2, "code": "c"}, "tok-b")
     assert again["user_id"] == result["user_id"]
 
     # replaying the first, already-consumed state is rejected
     with pytest.raises(oauth.OAuthError):
-        oauth.finish(store, PROVIDER, {"state": state, "code": "c"})
+        oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, "tok-a")
 
 
 def test_finish_rejects_missing_state_or_code():
     store = FakeStore()
     with pytest.raises(oauth.OAuthError):
-        oauth.finish(store, PROVIDER, {"code": "c"})
+        oauth.finish(store, PROVIDER, {"code": "c"}, "tok")
     with pytest.raises(oauth.OAuthError):
-        oauth.finish(store, PROVIDER, {"state": "s"})
+        oauth.finish(store, PROVIDER, {"state": "s"}, "tok")
+
+
+def test_finish_missing_code_still_consumes_state(monkeypatch):
+    # a callback that arrives without a code is terminal for its state
+    captured = []
+    fake_http(monkeypatch, captured=captured)
+    store = FakeStore()
+    url = oauth.begin(store, PROVIDER, "/", "tok")
+    state = parse_qs(urlsplit(url).query)["state"][0]
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(store, PROVIDER, {"state": state}, "tok")
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, "tok")
+    assert captured == []
 
 
 def test_finish_rejects_unknown_or_expired_state():
     # an unknown state, and an expired one, both surface from the store as None
     store = FakeStore()
     with pytest.raises(oauth.OAuthError):
-        oauth.finish(store, PROVIDER, {"state": "forged", "code": "c"})
+        oauth.finish(store, PROVIDER, {"state": "forged", "code": "c"}, "tok")
 
 
 def test_finish_rejects_state_minted_for_another_provider(monkeypatch):
@@ -221,19 +254,74 @@ def test_finish_rejects_state_minted_for_another_provider(monkeypatch):
         "yandex", PROVIDER.authorize_url, PROVIDER.token_url,
         PROVIDER.userinfo_url, ("email",), "c", "s", "https://app/cb"
     )
-    url = oauth.begin(store, other, "/")
+    url = oauth.begin(store, other, "/", "tok")
     state = parse_qs(urlsplit(url).query)["state"][0]
     # state was issued for yandex; replaying it against google must fail
     with pytest.raises(oauth.OAuthError):
-        oauth.finish(store, PROVIDER, {"state": state, "code": "c"})
+        oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, "tok")
+    # the mismatch consumed the state, so it is dead for yandex too
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(store, other, {"state": state, "code": "c"}, "tok")
 
 
 def test_finish_rejects_provider_error():
     store = FakeStore()
     with pytest.raises(oauth.OAuthError):
         oauth.finish(
-            store, PROVIDER, {"error": "access_denied", "state": "x", "code": "y"}
+            store,
+            PROVIDER,
+            {"error": "access_denied", "state": "x", "code": "y"},
+            "tok",
         )
+
+
+def test_finish_provider_error_consumes_state(monkeypatch):
+    # error-then-code reuse: the errored callback must burn the state
+    captured = []
+    fake_http(monkeypatch, captured=captured)
+    store = FakeStore()
+    url = oauth.begin(store, PROVIDER, "/", "tok")
+    state = parse_qs(urlsplit(url).query)["state"][0]
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(
+            store, PROVIDER, {"error": "access_denied", "state": state}, "tok"
+        )
+    assert state not in store.states
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, "tok")
+    assert captured == []
+
+
+def test_finish_rejects_callback_from_another_client(monkeypatch):
+    # a valid state presented by a browser that did not start the flow is
+    # rejected before any token exchange, and the state is consumed
+    captured = []
+    fake_http(monkeypatch, captured=captured)
+    store = FakeStore()
+    url = oauth.begin(store, PROVIDER, "/", "victim-token")
+    state = parse_qs(urlsplit(url).query)["state"][0]
+    for wrong in ("attacker-token", None, ""):
+        with pytest.raises(oauth.OAuthError):
+            oauth.finish(store, PROVIDER, {"state": state, "code": "c"}, wrong)
+        assert state not in store.states
+    assert captured == []
+
+
+def test_finish_rejects_state_without_client_binding(monkeypatch):
+    # a pre-migration row with no stored client hash is rejected fail-closed
+    captured = []
+    fake_http(monkeypatch, captured=captured)
+    store = FakeStore()
+    store.states["legacy-state"] = {
+        "provider": "google",
+        "next_url": "/",
+        "client_hash": None,
+    }
+    with pytest.raises(oauth.OAuthError):
+        oauth.finish(
+            store, PROVIDER, {"state": "legacy-state", "code": "c"}, "tok"
+        )
+    assert captured == []
 
 
 def test_providers_from_env_builds_generic_provider():

@@ -165,10 +165,16 @@ def _bootstrap():
                 state           TEXT PRIMARY KEY,
                 provider        TEXT NOT NULL,
                 next_url        TEXT,
-                created_at      INTEGER NOT NULL
+                created_at      INTEGER NOT NULL,
+                client_hash     TEXT
             );
             """
         )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(oauth_state)")
+        }
+        if "client_hash" not in columns:
+            conn.execute("ALTER TABLE oauth_state ADD COLUMN client_hash TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -194,10 +200,10 @@ def _sign(data, secret):
     ).hexdigest()
 
 
-def _cookie_header(name, value, max_age):
+def _cookie_header(name, value, max_age, path="/"):
     parts = [
         "{}={}".format(name, value),
-        "Path=/",
+        "Path={}".format(path),
         "Max-Age={}".format(max_age),
         "HttpOnly",
         "SameSite=Lax",
@@ -434,7 +440,9 @@ class _LegacyOAuthStore(object):
     ``dataclasses``-based config import and remains Python 3.6-clean.
     """
 
-    def put_oauth_state(self, state, provider, next_url=None, now=None):
+    def put_oauth_state(
+        self, state, provider, next_url=None, client_hash=None, now=None
+    ):
         now = int(time.time()) if now is None else int(now)
         conn = _security_connection()
         try:
@@ -444,9 +452,10 @@ class _LegacyOAuthStore(object):
                 (OAUTH_STATE_TTL_SECONDS, now),
             )
             conn.execute(
-                "INSERT INTO oauth_state (state, provider, next_url, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (state, provider, next_url, now),
+                "INSERT INTO oauth_state "
+                "(state, provider, next_url, created_at, client_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (state, provider, next_url, now, client_hash),
             )
             conn.commit()
         finally:
@@ -458,7 +467,7 @@ class _LegacyOAuthStore(object):
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT provider, next_url, created_at "
+                "SELECT provider, next_url, created_at, client_hash "
                 "FROM oauth_state WHERE state = ?",
                 (state,),
             ).fetchone()
@@ -469,7 +478,11 @@ class _LegacyOAuthStore(object):
             conn.commit()
             if row["created_at"] + OAUTH_STATE_TTL_SECONDS <= now:
                 return None
-            return {"provider": row["provider"], "next_url": row["next_url"]}
+            return {
+                "provider": row["provider"],
+                "next_url": row["next_url"],
+                "client_hash": row["client_hash"],
+            }
         finally:
             conn.close()
 
@@ -743,23 +756,44 @@ def _oauth(environ, start_response, path):
     query = _query(environ)
     if parts[2] == "start":
         next_url = _safe_next(_first(query, "next", "/"))
-        authorize_url = oauth.begin(store, provider, next_url)
+        client_token = oauth.generate_client_token()
+        authorize_url = oauth.begin(store, provider, next_url, client_token)
         return _respond(
             environ,
             start_response,
             "303 See Other",
-            headers=[("Location", authorize_url)],
+            headers=[
+                ("Location", authorize_url),
+                (
+                    "Set-Cookie",
+                    _cookie_header(
+                        "aistat_oauth_client",
+                        client_token,
+                        OAUTH_STATE_TTL_SECONDS,
+                        path="/auth",
+                    ),
+                ),
+            ],
         )
+    client_token = _cookies(environ).get("aistat_oauth_client")
+    # The binding cookie is one-time: dropped on every callback outcome.
+    clear_client_cookie = (
+        "Set-Cookie",
+        _cookie_header("aistat_oauth_client", "", 0, path="/auth"),
+    )
     params = {
         "state": _first(query, "state"),
         "code": _first(query, "code"),
         "error": _first(query, "error"),
     }
     try:
-        result = oauth.finish(store, provider, params)
+        result = oauth.finish(store, provider, params, client_token)
     except oauth.OAuthError:
         csrf = _make_login_csrf()
-        headers = [("Set-Cookie", _cookie_header("aistat_login_csrf", csrf, 600))]
+        headers = [
+            ("Set-Cookie", _cookie_header("aistat_login_csrf", csrf, 600)),
+            clear_client_cookie,
+        ]
         return _respond(
             environ,
             start_response,
@@ -786,14 +820,14 @@ def _oauth(environ, start_response, path):
             "403 Forbidden",
             _render_oauth_pending(result["email"]),
             "text/html; charset=utf-8",
-            [set_cookie],
+            [set_cookie, clear_client_cookie],
         )
     next_url = _safe_next(result["next_url"])
     return _respond(
         environ,
         start_response,
         "303 See Other",
-        headers=[("Location", next_url), set_cookie],
+        headers=[("Location", next_url), set_cookie, clear_client_cookie],
     )
 
 
