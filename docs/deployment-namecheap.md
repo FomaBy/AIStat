@@ -185,16 +185,26 @@ CI / Mac / агента не появляется. Данные (`~/aistat-priva
 
 ### Шаг 2. Добавить cron-задачу (cPanel → Cron Jobs)
 
-`cPanel → Advanced → Cron Jobs → Add New Cron Job`. Расписание — ежедневно в
-05:00: Minute `0`, Hour `5`, Day `*`, Month `*`, Weekday `*`.
+`cPanel → Advanced → Cron Jobs → Add New Cron Job`. Часовой пояс сервера
+Namecheap может отличаться от часового пояса владельца. Чтобы обновление всегда
+проходило в **05:00 Europe/Vilnius**, включая переходы на летнее и зимнее время,
+cron запускает лёгкую проверку каждый час:
 
-Command (одной строкой, `$HOME` cPanel подставит сам):
+- Minute `0`;
+- Hour `*`;
+- Day `*`;
+- Month `*`;
+- Weekday `*`.
+
+Command (одной строкой, `$HOME` cPanel подставит сам; `\%` обязателен, потому
+что cron обрабатывает неэкранированный `%` как перенос строки):
 
 ```bash
-/bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" >> "$HOME/aistat-private/deploy.log" 2>&1
+[ "$(TZ=Europe/Vilnius date +\%H)" = "05" ] && /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" >> "$HOME/aistat-private/deploy.log" 2>&1
 ```
 
-Готово: каждый день в 05:00 сайт обновляется до последнего `main`.
+Готово: каждый день в 05:00 по Вильнюсу сайт обновляется до последнего `main`,
+независимо от часового пояса cPanel-сервера.
 
 ### Что делает `deploy/cpanel_deploy.sh`
 
