@@ -223,18 +223,39 @@ def _copy_database(source_path, temp_path):
         source.close()
 
 
-def _archive_legacy_source(source_path, target_path):
-    archive = source_path + ".migrated"
-    target_info = _validate_database(target_path)
-    if os.path.exists(archive):
-        if _validate_database(archive)["sha256"] != target_info["sha256"]:
-            raise MigrationError("existing legacy migration archive differs")
-    else:
-        shutil.copy2(target_path, archive)
+def _install_archive(copy_path, archive_path, expected_sha256):
+    """Write the rollback archive via a validated sibling temp file.
+
+    The archive only appears under its final name after a complete,
+    validated copy, so a write failure can never leave a partial
+    ``.migrated`` behind to block a retry.
+    """
+    if os.path.exists(archive_path):
+        return
+    handle, temp_archive = tempfile.mkstemp(
+        prefix=".aistat-owner-archive-",
+        suffix=".db",
+        dir=os.path.dirname(archive_path),
+    )
+    os.close(handle)
+    try:
+        shutil.copy2(copy_path, temp_archive)
         try:
-            os.chmod(archive, 0o600)
+            os.chmod(temp_archive, 0o600)
         except OSError:
             pass
+        if _validate_database(temp_archive)["sha256"] != expected_sha256:
+            raise MigrationError(
+                "archive copy does not match the migrated data"
+            )
+        os.replace(temp_archive, archive_path)
+        temp_archive = None
+    finally:
+        if temp_archive and os.path.exists(temp_archive):
+            os.unlink(temp_archive)
+
+
+def _remove_legacy_source(source_path):
     for path in (source_path, source_path + "-wal", source_path + "-shm"):
         try:
             os.unlink(path)
@@ -322,11 +343,21 @@ def migrate_owner_database(config=None, now=None):
                                 raise MigrationError(
                                     "owner tenant already contains different data"
                                 )
+                            _install_archive(
+                                temp_path, archive_path, candidate["sha256"]
+                            )
                         else:
                             if os.path.islink(target_path):
                                 raise MigrationError(
                                     "tenant database must not be a symlink"
                                 )
+                            # The rollback archive must be in place before
+                            # the tenant DB: an archive failure would
+                            # otherwise strand a new target that the
+                            # rolled-back security DB never registered.
+                            _install_archive(
+                                temp_path, archive_path, candidate["sha256"]
+                            )
                             os.replace(temp_path, target_path)
                             temp_path = None
                             try:
@@ -337,7 +368,7 @@ def migrate_owner_database(config=None, now=None):
                     finally:
                         if temp_path and os.path.exists(temp_path):
                             os.unlink(temp_path)
-                    _archive_legacy_source(db_path, target_path)
+                    _remove_legacy_source(db_path)
 
                 if os.path.exists(target_path):
                     info = _validate_database(target_path)

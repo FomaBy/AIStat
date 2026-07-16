@@ -1,5 +1,6 @@
 """Tenant path safety, owner resolution and legacy data migration."""
 
+import os
 import sqlite3
 
 import pytest
@@ -7,7 +8,11 @@ import pytest
 from aistat.config import Config
 from aistat.db import connect, init_db
 from aistat import migrate
-from aistat.migrate import REQUIRED_TABLES, migrate_owner_database
+from aistat.migrate import (
+    MigrationError,
+    REQUIRED_TABLES,
+    migrate_owner_database,
+)
 from aistat.security import SecurityConfigError, SecurityStore
 from conftest import seed_aggregate_fixture
 
@@ -205,3 +210,86 @@ def test_owner_migration_fallback_failure_preserves_source(
     conn = sqlite3.connect("file:{}?mode=ro".format(target), uri=True)
     assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     conn.close()
+
+
+@pytest.mark.parametrize(
+    "failure_mode, expected_error",
+    [
+        ("no_write", OSError),
+        ("partial_write", OSError),
+        ("silent_corruption", MigrationError),
+    ],
+)
+def test_owner_migration_archive_failure_rolls_back(
+    tmp_path, monkeypatch, failure_mode, expected_error
+):
+    config = tenant_config(tmp_path)
+    source = connect(config.db_path)
+    init_db(source)
+    seed_aggregate_fixture(source)
+    source.commit()
+    expected_counts = _table_counts(source)
+
+    monkeypatch.setattr(migrate, "sqlite3", _NoBackupSqlite())
+    real_copy2 = migrate.shutil.copy2
+
+    def archive_copy(src, dst):
+        if not os.path.basename(dst).startswith(".aistat-owner-archive-"):
+            return real_copy2(src, dst)
+        if failure_mode == "no_write":
+            raise OSError("archive write failed")
+        with open(dst, "wb") as fh:
+            fh.write(b"partial archive bytes")
+        if failure_mode == "partial_write":
+            raise OSError("disk full while writing archive")
+        return dst
+
+    monkeypatch.setattr(migrate.shutil, "copy2", archive_copy)
+    with pytest.raises(expected_error):
+        migrate_owner_database(config, now=1000)
+
+    # The source database, its WAL sidecars and the data are untouched.
+    assert config.db_path.is_file()
+    assert config.db_path.with_name("aistat.db-wal").is_file()
+    conn = sqlite3.connect(str(config.db_path))
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert _table_counts(conn) == expected_counts
+    conn.close()
+
+    # No tenant DB was installed and no final, partial or temp archive
+    # is left behind.
+    assert list(config.tenants_dir.iterdir()) == []
+    assert not config.db_path.with_name("aistat.db.migrated").exists()
+    assert [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(".aistat-owner-")
+    ] == []
+
+    # The security transaction rolled back: no registered tenant.
+    sec = sqlite3.connect(str(config.security_db_path))
+    has_tenants_table = sec.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'tenants'"
+    ).fetchone()[0]
+    if has_tenants_table:
+        assert sec.execute(
+            "SELECT COUNT(*) FROM tenants"
+        ).fetchone()[0] == 0
+    sec.close()
+
+    # Retry after the failure is fixed migrates the same data.
+    monkeypatch.setattr(migrate.shutil, "copy2", real_copy2)
+    result = migrate_owner_database(config, now=2000)
+    source.close()
+    assert result["migrated"] is True
+    target = config.tenant_db_path(result["owner_user_id"])
+    assert config.db_path.with_name("aistat.db.migrated").is_file()
+    assert not config.db_path.exists()
+    conn = sqlite3.connect("file:{}?mode=ro".format(target), uri=True)
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert _table_counts(conn) == expected_counts
+    conn.close()
+    tenant = SecurityStore(config.security_db_path).get_tenant(
+        result["owner_user_id"]
+    )
+    assert tenant["last_snapshot_sha256"] == result["sha256"]
