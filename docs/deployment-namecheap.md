@@ -151,12 +151,16 @@ AISTAT_INGEST_SECRET="$(security find-generic-password \
   .venv/bin/python -m aistat.publish
 ```
 
-Для автозапуска скопировать `deploy/com.aistat.sync.plist.example` в
-`~/Library/LaunchAgents/com.aistat.sync.plist`, затем:
+Для автозапуска установить отдельную runtime-копию вне защищённого macOS
+каталога `Documents`:
 
 ```bash
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.aistat.sync.plist
+./scripts/install_launchd_sync.sh
 ```
+
+Скрипт копирует только исполняемый код в
+`~/Library/Application Support/AIStat`, сохраняет базу там же и регистрирует
+`com.aistat.sync`. Секрет остаётся в login Keychain.
 
 ## Защита данных
 

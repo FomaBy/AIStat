@@ -7,10 +7,10 @@
   <string>com.aistat.sync</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/sergeyfomin/Documents/AIStat/sync_to_host.sh</string>
+    <string>/Users/sergeyfomin/Library/Application Support/AIStat/sync_to_host.sh</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/sergeyfomin/Documents/AIStat</string>
+  <string>/Users/sergeyfomin/Library/Application Support/AIStat</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
@@ -21,8 +21,8 @@
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/sergeyfomin/Documents/AIStat/data/sync.stdout.log</string>
+  <string>/Users/sergeyfomin/Library/Application Support/AIStat/data/sync.stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/sergeyfomin/Documents/AIStat/data/sync.stderr.log</string>
+  <string>/Users/sergeyfomin/Library/Application Support/AIStat/data/sync.stderr.log</string>
 </dict>
 </plist>
