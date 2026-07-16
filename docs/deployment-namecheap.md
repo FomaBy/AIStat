@@ -164,6 +164,71 @@ AISTAT_INGEST_SECRET="$(security find-generic-password \
 незакоммиченные изменения не попадают в работающий сервис. Секрет остаётся в
 login Keychain.
 
+## 6. Автообновление сайта через cPanel Git + cron (ежедневно в 05:00)
+
+Прод обновляется раз в сутки без передачи каких-либо доступов: хостинг сам
+забирает код из **публичного** репозитория `FomaBy/AIStat`, а cron в 05:00
+собирает пакет и атомарно публикует его. Ни одного секрета на стороне
+CI / Mac / агента не появляется. Данные (`~/aistat-private`) и 5-минутный цикл
+публикации (`com.aistat.sync` на Mac) этот механизм не трогает.
+
+### Шаг 1. Клонировать репозиторий (cPanel → Git Version Control)
+
+`cPanel → Files → Git™ Version Control → Create`:
+
+- **Clone URL**: `https://github.com/FomaBy/AIStat.git`
+- **Repository Path**: `repositories/AIStat`
+  (полный путь получится `/home/CPANEL_USER/repositories/AIStat`)
+- **Repository Name**: `AIStat`
+
+Нажать **Create** — cPanel сделает начальный clone ветки `main`.
+
+### Шаг 2. Добавить cron-задачу (cPanel → Cron Jobs)
+
+`cPanel → Advanced → Cron Jobs → Add New Cron Job`. Расписание — ежедневно в
+05:00: Minute `0`, Hour `5`, Day `*`, Month `*`, Weekday `*`.
+
+Command (одной строкой, `$HOME` cPanel подставит сам):
+
+```bash
+/bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" >> "$HOME/aistat-private/deploy.log" 2>&1
+```
+
+Готово: каждый день в 05:00 сайт обновляется до последнего `main`.
+
+### Что делает `deploy/cpanel_deploy.sh`
+
+1. `git fetch` + `git reset --hard origin/main` в клоне;
+2. собирает dependency-free пакет (`scripts/build_cpanel_package.sh`, без `zip`);
+3. проверяет пакет через `python3 -m compileall` — при ошибке деплой **не
+   выполняется**;
+4. кладёт новую версию в `~/aistat_releases/<дата>-<sha>` и атомарно
+   переключает симлинк `~/aistat_app` на неё (`ln -sfn`);
+5. хранит последние релизы (по умолчанию 5) для отката.
+
+Любой сбой на шагах 1–3 прекращает деплой **до** переключения симлинка — прод
+продолжает работать на прежнем релизе. CGI-вход перечитывает код на каждом
+запросе, поэтому перезапуск не нужен (для Passenger — Restart в Setup Python App).
+
+### Как убедиться, что деплой прошёл
+
+```bash
+tail -n 20 ~/aistat-private/deploy.log   # строки "PUBLISHED ... -> <релиз>" и "deploy complete: <sha>"
+ls -l ~/aistat_app                        # симлинк на ~/aistat_releases/<дата>-<sha>
+ls -1t ~/aistat_releases                  # список релизов, новейший сверху
+curl -I https://aistat.app/               # сайт отвечает (редирект на /login)
+```
+
+### Откат на предыдущую версию
+
+```bash
+ls -1t ~/aistat_releases                  # выбрать предыдущий релиз
+ln -sfn ~/aistat_releases/<предыдущий> ~/aistat_app
+```
+
+При первом запуске существующий каталог `~/aistat_app` из ручной установки
+сохраняется как релиз `manual-<дата>` — на него тоже можно откатиться.
+
 ## Защита данных
 
 - все страницы, API и статические dashboard-assets требуют входа;
