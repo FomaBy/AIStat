@@ -73,6 +73,51 @@ def test_story_points_absent():
     assert normalize.extract_story_points(issue) is None
 
 
+def test_normalize_issue_detects_jira_origin():
+    issue = {
+        "id": "j1",
+        "updated_at": "2026-07-15T00:00:00Z",
+        "metadata": {
+            "jira_key": "SCRUM-1078",
+            "jira_url": "https://fantasydisk.atlassian.net/browse/SCRUM-1078",
+            "historical_import": "true",
+            "story_points": 5,
+        },
+    }
+    row = normalize.normalize_issue(issue)
+    assert row["is_jira"] == 1
+    assert row["jira_key"] == "SCRUM-1078"
+
+
+def test_normalize_issue_native_multica_task_not_jira():
+    # A native task, even one that lives in the Jira Archive project, has no
+    # jira_* / historical_import markers and must NOT be flagged.
+    issue = {
+        "id": "n1",
+        "updated_at": "2026-07-15T00:00:00Z",
+        "metadata": {"story_points": 3, "estimation_model": "CUE"},
+    }
+    row = normalize.normalize_issue(issue)
+    assert row["is_jira"] == 0
+    assert row["jira_key"] is None
+
+
+def test_is_jira_issue_markers():
+    assert normalize.is_jira_issue({"metadata": {"jira_key": "SCRUM-1"}})
+    assert normalize.is_jira_issue({"metadata": {"jira_url": "https://x/browse/SCRUM-1"}})
+    assert normalize.is_jira_issue({"metadata": {"historical_import": "true"}})
+    assert not normalize.is_jira_issue({"metadata": {"historical_import": "false"}})
+    assert not normalize.is_jira_issue({"metadata": {"story_points": 5}})
+    assert not normalize.is_jira_issue({})
+
+
+def test_normalize_issues_fixture_are_native():
+    page = load_fixture("issue_list_page.json")
+    rows = [normalize.normalize_issue(i) for i in page["issues"]]
+    assert all(r["is_jira"] == 0 for r in rows)
+    assert all(r["jira_key"] is None for r in rows)
+
+
 def test_normalize_issue_usage_fixture():
     row = normalize.normalize_issue_usage("parent-id", load_fixture("issue_usage.json"))
     assert row["issue_id"] == "parent-id"

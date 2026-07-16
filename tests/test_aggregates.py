@@ -191,3 +191,48 @@ def test_summary_period_filter(agg_conn):
     s = ag.summary(agg_conn, date_from="2026-01-01", date_to="2026-01-01")
     assert s["total_tokens"] == 4_000_000
     assert s["has_unpriced"] is False
+
+
+# -- Jira exclusion --------------------------------------------------------------
+
+
+def _insert_jira_issue(conn):
+    """A legacy Jira-imported issue in project Alpha: SP=8 and a usage row.
+    If it were counted it would dominate every issue-based statistic."""
+    now = "2026-01-02T00:00:00Z"
+    conn.executescript(f"""
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        is_jira, jira_key, updated_at, synced_at) VALUES
+      ('J1', 'FAN-999', 'legacy jira', 'done', 'P1', 8, 1, 'SCRUM-1078', '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('J1', 5, 999999, 0, 0, 0, '{now}');
+    """)
+    conn.commit()
+
+
+def test_summary_excludes_jira_issues(agg_conn):
+    before = ag.summary(agg_conn)
+    _insert_jira_issue(agg_conn)
+    after = ag.summary(agg_conn)
+    # The Jira issue's SP=8 and 999999 tokens must not move any headline.
+    assert after["issues"] == before["issues"]
+    assert after["story_points"] == before["story_points"]
+    assert after["issues_with_sp"] == before["issues_with_sp"]
+    assert after["tokens_per_sp"] == before["tokens_per_sp"]
+
+
+def test_projects_overview_excludes_jira_issues(agg_conn):
+    _insert_jira_issue(agg_conn)
+    alpha = {p["title"]: p for p in ag.projects_overview(agg_conn)}["Alpha"]
+    assert alpha["issues"] == 2            # I1, I2 only — J1 excluded
+    assert alpha["story_points"] == 5      # J1's 8 SP not added
+    assert alpha["total_tokens"] == 3500   # J1's usage not added
+
+
+def test_issue_efficiency_excludes_jira_issues(agg_conn):
+    _insert_jira_issue(agg_conn)
+    # Despite J1 having both SP and (huge) usage, it stays out of the metric.
+    issues = ag.issue_efficiency(agg_conn)
+    assert [i["identifier"] for i in issues] == ["T-1"]

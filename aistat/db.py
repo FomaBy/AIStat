@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtimes (
@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS issues (
     assignee_type      TEXT,
     story_points       REAL,
     estimation_model   TEXT,
+    -- Jira provenance: issues imported from the legacy Jira archive carry
+    -- jira_* / historical_import markers in their Multica metadata. They were
+    -- never executed in Multica (no runs, no usage), so they are excluded from
+    -- token/story-point/efficiency statistics. is_jira flags such an issue;
+    -- jira_key keeps the original Jira key (e.g. SCRUM-1078) for reference.
+    is_jira            INTEGER NOT NULL DEFAULT 0,
+    jira_key           TEXT,
     created_at         TEXT,
     updated_at         TEXT,
     synced_at          TEXT NOT NULL,
@@ -204,6 +211,10 @@ _ADDED_COLUMNS = {
         ("cost_credits", "REAL"),
         ("cost_priced", "INTEGER NOT NULL DEFAULT 0"),
         ("cost_computed_at", "TEXT"),
+    ],
+    "issues": [
+        ("is_jira", "INTEGER NOT NULL DEFAULT 0"),
+        ("jira_key", "TEXT"),
     ],
 }
 

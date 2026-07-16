@@ -419,6 +419,7 @@ def projects_overview(conn: sqlite3.Connection,
                u.total_cache_read_tokens, u.total_cache_write_tokens,
                (u.issue_id IS NOT NULL) AS has_usage
         FROM issues i LEFT JOIN issue_usage u ON u.issue_id = i.id
+        WHERE i.is_jira = 0
         """
     ).fetchall()
 
@@ -496,7 +497,7 @@ def issue_efficiency(conn: sqlite3.Connection, project_id: Optional[str] = None,
     issues without story points are excluded from the metric (never SP=0).
     """
     params: List[Any] = []
-    where = "i.story_points IS NOT NULL AND i.story_points > 0"
+    where = "i.is_jira = 0 AND i.story_points IS NOT NULL AND i.story_points > 0"
     if project_id is not None:
         where += " AND i.project_id = ?"
         params.append(project_id)
@@ -581,9 +582,12 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
             has_unpriced = False
         estimated = True
 
-    sp_where, sp_params = "1=1", []
+    # Jira-imported issues never ran in Multica; exclude them from the
+    # story-point and efficiency facts (tokens already exclude them, as Jira
+    # issues have no runs/usage).
+    sp_where, sp_params = "i.is_jira = 0", []
     if project_id is not None:
-        sp_where, sp_params = "i.project_id = ?", [project_id]
+        sp_where, sp_params = "i.is_jira = 0 AND i.project_id = ?", [project_id]
     sp_row = conn.execute(
         f"""
         SELECT SUM(i.story_points) AS sp_sum,

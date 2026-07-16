@@ -8,7 +8,7 @@ import time
 import pytest
 
 from aistat.config import Config
-from aistat.db import connect, init_db
+from aistat.db import SCHEMA_VERSION, connect, init_db
 from aistat.publish import PublishError, publish_once
 from aistat.security import (
     SecurityStore,
@@ -78,7 +78,7 @@ def test_snapshot_round_trip_and_size_limit(tmp_path):
     seeded_db(source)
     payload = create_compressed_snapshot(source)
     info = install_compressed_snapshot(payload, target, 64 * 1024 * 1024)
-    assert info.schema_version == 3
+    assert info.schema_version == SCHEMA_VERSION
     assert info.size_bytes == target.stat().st_size
 
     with pytest.raises(SnapshotError):

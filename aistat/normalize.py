@@ -84,6 +84,30 @@ def extract_story_points(obj: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def extract_jira_key(obj: Dict[str, Any]) -> Optional[str]:
+    """The original Jira key (e.g. SCRUM-1078) if the issue was imported from
+    the legacy Jira archive, else None."""
+    metadata = obj.get("metadata") or {}
+    key = metadata.get("jira_key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    return None
+
+
+def is_jira_issue(obj: Dict[str, Any]) -> bool:
+    """Whether the issue originates from the legacy Jira archive rather than
+    Multica. Jira-imported issues carry jira_* / historical_import markers in
+    their Multica metadata; native Multica tasks (even those living in the
+    Jira Archive project) do not. Such issues were never executed in Multica,
+    so they are excluded from statistics."""
+    metadata = obj.get("metadata") or {}
+    if extract_jira_key(obj):
+        return True
+    if metadata.get("jira_url"):
+        return True
+    return str(metadata.get("historical_import", "")).strip().lower() == "true"
+
+
 def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
     metadata = obj.get("metadata") or {}
     return {
@@ -100,6 +124,8 @@ def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
         "assignee_type": obj.get("assignee_type"),
         "story_points": extract_story_points(obj),
         "estimation_model": metadata.get("estimation_model"),
+        "is_jira": 1 if is_jira_issue(obj) else 0,
+        "jira_key": extract_jira_key(obj),
         "created_at": obj.get("created_at"),
         "updated_at": _require(obj, "updated_at", "issue"),
     }
