@@ -160,7 +160,9 @@ AISTAT_INGEST_SECRET="$(security find-generic-password \
 
 Скрипт копирует только исполняемый код в
 `~/Library/Application Support/AIStat`, сохраняет базу там же и регистрирует
-`com.aistat.sync`. Секрет остаётся в login Keychain.
+`com.aistat.sync`. Runtime собирается из текущего Git-коммита, поэтому случайные
+незакоммиченные изменения не попадают в работающий сервис. Секрет остаётся в
+login Keychain.
 
 ## Защита данных
 
