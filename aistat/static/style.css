@@ -44,6 +44,16 @@ body {
 .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
 .badge-ok { background: rgba(22, 163, 74, 0.12); color: var(--ok); }
 .badge-warn { background: rgba(217, 119, 6, 0.14); color: var(--warn); }
+.logout-button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 9px;
+  color: var(--muted);
+  background: var(--panel);
+  font: inherit;
+  cursor: pointer;
+}
+.logout-button:hover { color: var(--ink); border-color: #cbd3e3; }
 
 .filters {
   display: flex;
@@ -112,6 +122,7 @@ tbody tr:hover { background: #f8faff; }
 .chip-in_progress { background: rgba(79, 109, 245, 0.13); color: var(--accent); }
 .chip-in_review { background: rgba(217, 119, 6, 0.14); color: var(--warn); }
 .chip-blocked, .chip-cancelled { background: rgba(220, 38, 38, 0.11); color: var(--bad); }
+.status-chips { white-space: normal; }
 
 .footer {
   display: flex;

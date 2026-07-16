@@ -1,0 +1,4 @@
+-r requirements.txt
+Flask>=3.0,<4
+pytest>=7.4,<9
+httpx>=0.27,<1

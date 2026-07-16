@@ -207,6 +207,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/api/sync")
+    def api_sync():
+        return last_sync_state()
+
     # Mounted last so /api and /health win over static paths.
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 

@@ -6,6 +6,11 @@ __pycache__/
 
 # Local data (SQLite lives here)
 data/
+.env
+.env.*
+!.env.example
+dist/
+*.zip
 
 # Multica runtime artifacts (generated per agent run, not part of the app)
 CLAUDE.md

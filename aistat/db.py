@@ -229,6 +229,15 @@ def connect(db_path: Union[str, Path]) -> sqlite3.Connection:
     return conn
 
 
+def connect_readonly(db_path: Union[str, Path]) -> sqlite3.Connection:
+    """Open a query-only connection suitable for the hosted snapshot."""
+    path = Path(db_path).resolve()
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _add_missing_columns(conn)
