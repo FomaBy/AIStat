@@ -17,9 +17,14 @@ CLAUDE.md
 .multica/
 .agent_context/
 .claude/
+# Agent scratch files for issue/comment bodies (see AGENTS.md / CLAUDE.md)
+description.md
+reply.md
 
 # Operator-local notes (admin panel URL / credentials — never publish)
 adminpanel.txt
+# Deploy-host SSL certificate bundle (host-specific, never publish)
+aistat_app/
 
 # Editor / OS
 .DS_Store
