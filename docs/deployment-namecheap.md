@@ -17,7 +17,10 @@ Multica CLI и его токен **не устанавливаются на пу
 доверенный Mac продолжает собирать данные через `multica`, создаёт согласованный
 SQLite snapshot и отправляет его на сайт по HTTPS. Запрос подписан отдельным
 HMAC-секретом; сервер проверяет подпись, срок запроса, защиту от повтора,
-целостность SQLite и версию схемы, затем атомарно заменяет только файл данных.
+целостность SQLite и версию схемы, затем атомарно заменяет только файл
+конкретного пользователя `tenants/<user_id>.db`. Tenant ID входит в HMAC
+подпись `v2`; replay watermark и сведения о последнем snapshot хранятся
+отдельно для каждого пользователя в `security.db`.
 
 Полезные официальные инструкции Namecheap:
 
@@ -92,7 +95,9 @@ Passenger-привязку и использовать CGI-вариант выш
 
 ```bash
 mkdir -p "$HOME/aistat-private"
+mkdir -p "$HOME/aistat-private/tenants"
 chmod 700 "$HOME/aistat-private"
+chmod 700 "$HOME/aistat-private/tenants"
 ```
 
 Для Passenger задать Environment Variables приложения. Для CGI сохранить те же
@@ -101,17 +106,46 @@ chmod 700 "$HOME/aistat-private"
 ```text
 AISTAT_DB_PATH=/home/CPANEL_USER/aistat-private/aistat.db
 AISTAT_SECURITY_DB_PATH=/home/CPANEL_USER/aistat-private/security.db
+AISTAT_TENANTS_DIR=/home/CPANEL_USER/aistat-private/tenants
 AISTAT_ALLOWED_HOSTS=aistat.app,www.aistat.app
 AISTAT_FORCE_HTTPS=1
 AISTAT_SESSION_COOKIE_SECURE=1
 AISTAT_ADMIN_USERNAME=<логин>
+AISTAT_ADMIN_EMAIL=<email владельца, рекомендуется>
 AISTAT_PASSWORD_HASH=<результат hash-password>
 AISTAT_SESSION_SECRET=<первый секрет>
 AISTAT_INGEST_SECRET=<второй секрет>
 ```
 
-Перезапустить Python App. `https://aistat.app/healthz` должен вернуть только
-минимальный статус; сам дашборд должен перенаправить на `/login`.
+### Одноразово перенести текущие данные владельца
+
+После загрузки нового кода, но до запуска publisher выполнить на хостинге:
+
+```bash
+cd "$HOME/aistat_app"
+set -a
+. "$HOME/aistat-private/aistat.env"
+set +a
+python3 -m aistat.migrate
+```
+
+Команда совместима с Python 3.6, повторный запуск безопасен. Она:
+
+- находит единственного `users.is_admin=1`, либо назначает пользователя с
+  `AISTAT_ADMIN_EMAIL`, либо создаёт владельца из `AISTAT_ADMIN_USERNAME`;
+- создаёт согласованную копию старой `AISTAT_DB_PATH` в
+  `AISTAT_TENANTS_DIR/<owner_user_id>.db`;
+- сохраняет rollback-копию `<AISTAT_DB_PATH>.migrated`;
+- переносит старый replay watermark в запись владельца и печатает JSON с
+  `owner_user_id`.
+
+Если команда сообщает неоднозначность владельца или отличающийся существующий
+tenant-файл, она ничего не перезаписывает: сначала нужно исправить данные
+`security.db`, а не выбирать пользователя по первой строке.
+
+После миграции перезапустить Python App. `https://aistat.app/healthz` должен
+вернуть только минимальный статус; дашборд должен перенаправить на `/login`, а
+после входа владельца показать прежнюю статистику.
 
 ## 5. Включить безопасную синхронизацию Multica
 
@@ -139,6 +173,7 @@ cd /Users/sergeyfomin/Documents/AIStat
 
 ```text
 AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot
+AISTAT_TENANT_ID=<owner_user_id из aistat.migrate>
 AISTAT_PUBLISH_INTERVAL_SECONDS=300
 ```
 
@@ -148,6 +183,7 @@ AISTAT_PUBLISH_INTERVAL_SECONDS=300
 AISTAT_INGEST_SECRET="$(security find-generic-password \
   -a "$USER" -s 'aistat.app ingest' -w)" \
   AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot \
+  AISTAT_TENANT_ID=<owner_user_id> \
   .venv/bin/python -m aistat.publish
 ```
 
@@ -246,9 +282,10 @@ ln -sfn ~/aistat_releases/<предыдущий> ~/aistat_app
 - после пяти неудачных входов IP-hash блокируется на 15 минут;
 - CSP, HSTS, `frame-ancestors 'none'`, `nosniff`, no-referrer и no-store;
 - разрешены только заданные Host headers;
-- SQLite и security DB имеют права `600` и находятся вне web root;
+- tenant SQLite и security DB имеют права `600`, каталог tenants — `700`;
 - Multica credential остаётся только на локальном Mac;
-- ingest secret отделён от session secret, подпись сравнивается constant-time;
+- ingest secret отделён от session secret; tenant ID входит в HMAC, подпись
+  сравнивается constant-time, replay-защита ведётся per tenant;
 - snapshot проверяется на размер, gzip bomb, SQLite integrity, обязательные
   таблицы и совместимую версию схемы;
-- предыдущий snapshot сохраняется как `aistat.db.previous` для отката.
+- предыдущий snapshot сохраняется как `<user_id>.db.previous` для отката.

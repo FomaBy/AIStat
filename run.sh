@@ -8,6 +8,11 @@ cd "$(dirname "$0")"
 PORT="${AISTAT_PORT:-8787}"
 VENV=".venv"
 
+if [ -n "${AISTAT_PUBLISH_URL:-}" ] && [ -z "${AISTAT_TENANT_ID:-}" ]; then
+  echo "AISTAT_TENANT_ID is required when snapshot publishing is enabled" >&2
+  exit 1
+fi
+
 if [ ! -x "$VENV/bin/python" ]; then
   echo "==> первый запуск: создаю venv и ставлю зависимости"
   python3 -m venv "$VENV"

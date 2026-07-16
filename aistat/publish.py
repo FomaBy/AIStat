@@ -41,6 +41,8 @@ def _validate_publish_config(config: Config) -> None:
         )
     if not config.ingest_secret or len(config.ingest_secret.encode("utf-8")) < 32:
         raise PublishError("AISTAT_INGEST_SECRET must contain at least 32 bytes")
+    if config.publish_tenant_id is None:
+        raise PublishError("AISTAT_TENANT_ID is not configured")
     if config.publish_interval_seconds < 60:
         raise PublishError("AISTAT_PUBLISH_INTERVAL_SECONDS must be at least 60")
 
@@ -86,13 +88,16 @@ def publish_once(
         raise PublishError("decompressed snapshot exceeds the configured limit")
 
     timestamp = int(time.time()) if now is None else int(now)
-    signature = snapshot_signature(config.ingest_secret, timestamp, payload)
+    signature = snapshot_signature(
+        config.ingest_secret, config.publish_tenant_id, timestamp, payload
+    )
     request = urllib.request.Request(
         config.publish_url,
         data=payload,
         method="POST",
         headers={
             "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
             "X-AIStat-Timestamp": str(timestamp),
             "X-AIStat-Signature": signature,
             "User-Agent": "AIStat-Publisher/1",
@@ -115,7 +120,8 @@ def publish_once(
     if result.get("status") != "ok":
         raise PublishError("host did not confirm snapshot installation")
     if (
-        result.get("sha256") != expected_sha256
+        result.get("tenant_id") != config.publish_tenant_id
+        or result.get("sha256") != expected_sha256
         or result.get("size_bytes") != expected_size
     ):
         raise PublishError("host confirmation does not match the sent snapshot")

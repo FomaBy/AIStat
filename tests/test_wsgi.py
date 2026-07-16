@@ -11,7 +11,8 @@ from werkzeug.security import generate_password_hash
 from aistat import oauth
 from aistat.config import Config
 from aistat.db import SCHEMA_VERSION, connect, init_db
-from aistat.security import snapshot_signature
+from aistat.migrate import migrate_owner_database
+from aistat.security import SecurityStore, snapshot_signature
 from aistat.snapshot import create_compressed_snapshot
 from aistat.wsgi import create_app
 from conftest import seed_aggregate_fixture
@@ -65,6 +66,7 @@ def public_app(tmp_path):
     config = Config()
     config.db_path = tmp_path / "public.db"
     config.security_db_path = tmp_path / "security.db"
+    config.tenants_dir = tmp_path / "tenants"
     config.credits_per_usd = 2.0
     config.auth_username = "sergey"
     config.auth_password_hash = generate_password_hash(
@@ -83,6 +85,8 @@ def public_app(tmp_path):
     seed_aggregate_fixture(conn)
     conn.close()
 
+    migration = migrate_owner_database(config, now=1000)
+    config.publish_tenant_id = migration["owner_user_id"]
     app = create_app(config)
     app.config.update(TESTING=True)
     return app, config
@@ -201,7 +205,9 @@ def test_signed_snapshot_install_and_replay_rejection(public_app, tmp_path):
     payload = create_compressed_snapshot(source_path)
 
     timestamp = int(time.time())
-    signature = snapshot_signature(INGEST_SECRET, timestamp, payload)
+    signature = snapshot_signature(
+        INGEST_SECRET, config.publish_tenant_id, timestamp, payload
+    )
     client = app.test_client()
     response = client.post(
         "/api/ingest/snapshot",
@@ -209,12 +215,14 @@ def test_signed_snapshot_install_and_replay_rejection(public_app, tmp_path):
         content_type="application/vnd.aistat.snapshot+gzip",
         headers={
             "X-AIStat-Timestamp": str(timestamp),
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
             "X-AIStat-Signature": signature,
         },
     )
     assert response.status_code == 200
     assert response.get_json()["schema_version"] == SCHEMA_VERSION
-    assert config.db_path.with_name("public.db.previous").exists()
+    owner_path = config.tenant_db_path(config.publish_tenant_id)
+    assert owner_path.with_name(owner_path.name + ".previous").exists()
 
     replay = client.post(
         "/api/ingest/snapshot",
@@ -222,6 +230,7 @@ def test_signed_snapshot_install_and_replay_rejection(public_app, tmp_path):
         content_type="application/vnd.aistat.snapshot+gzip",
         headers={
             "X-AIStat-Timestamp": str(timestamp),
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
             "X-AIStat-Signature": signature,
         },
     )
@@ -247,7 +256,7 @@ def test_model_efficiency_endpoint_behind_auth(public_app):
 
 
 def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
-    app, _ = public_app
+    app, config = public_app
     client = app.test_client()
     timestamp = int(time.time())
     payload = b"not a gzip snapshot"
@@ -261,17 +270,137 @@ def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
         },
     ).status_code == 401
 
-    signature = snapshot_signature(INGEST_SECRET, timestamp + 1, payload)
+    signature = snapshot_signature(
+        INGEST_SECRET, config.publish_tenant_id, timestamp + 1, payload
+    )
     invalid = client.post(
         "/api/ingest/snapshot",
         data=payload,
         content_type="application/vnd.aistat.snapshot+gzip",
         headers={
             "X-AIStat-Timestamp": str(timestamp + 1),
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
             "X-AIStat-Signature": signature,
         },
     )
     assert invalid.status_code == 422
+
+    valid_source = config.tenants_dir.parent / "valid-after-invalid.db"
+    conn = connect(valid_source)
+    init_db(conn)
+    conn.close()
+    valid_payload = create_compressed_snapshot(valid_source)
+    accepted = client.post(
+        "/api/ingest/snapshot",
+        data=valid_payload,
+        content_type="application/vnd.aistat.snapshot+gzip",
+        headers={
+            "X-AIStat-Timestamp": str(timestamp + 1),
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Signature": snapshot_signature(
+                INGEST_SECRET,
+                config.publish_tenant_id,
+                timestamp + 1,
+                valid_payload,
+            ),
+        },
+    )
+    assert accepted.status_code == 200
+
+
+def test_ingest_isolated_between_tenants_and_rejects_unknown(
+    public_app, tmp_path
+):
+    app, config = public_app
+    store = SecurityStore(config.security_db_path)
+    bob_id = store.find_or_create_user_by_identity(
+        "google", "bob", email="bob@example.com", now=100
+    )
+    store.ensure_tenant(bob_id, now=100)
+
+    source = tmp_path / "tenant-source.db"
+    conn = connect(source)
+    init_db(conn)
+    seed_aggregate_fixture(conn)
+    conn.execute(
+        "UPDATE daily_usage SET input_tokens = input_tokens + 222 "
+        "WHERE runtime_id = 'R1'"
+    )
+    conn.commit()
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    timestamp = int(time.time())
+    client = app.test_client()
+
+    def upload(tenant_id, signed_tenant_id=None, at=timestamp):
+        signed_tenant_id = (
+            tenant_id if signed_tenant_id is None else signed_tenant_id
+        )
+        return client.post(
+            "/api/ingest/snapshot",
+            data=payload,
+            content_type="application/vnd.aistat.snapshot+gzip",
+            headers={
+                "X-AIStat-Tenant": str(tenant_id),
+                "X-AIStat-Timestamp": str(at),
+                "X-AIStat-Signature": snapshot_signature(
+                    INGEST_SECRET, signed_tenant_id, at, payload
+                ),
+            },
+        )
+
+    assert upload(config.publish_tenant_id).status_code == 200
+    assert upload(bob_id).status_code == 200
+    bob_path = config.tenant_db_path(bob_id)
+    bob_bytes = bob_path.read_bytes()
+    assert upload(config.publish_tenant_id).status_code == 409
+    assert upload(bob_id, signed_tenant_id=config.publish_tenant_id).status_code == 401
+    assert bob_path.read_bytes() == bob_bytes
+
+    unknown_id = bob_id + 1000
+    assert upload(unknown_id).status_code == 401
+    assert not config.tenant_db_path(unknown_id).exists()
+
+    assert upload(config.publish_tenant_id, at=timestamp + 1).status_code == 200
+    assert bob_path.read_bytes() == bob_bytes
+
+
+def test_ingest_age_and_size_limits(public_app, tmp_path):
+    app, config = public_app
+    source = tmp_path / "limits.db"
+    conn = connect(source)
+    init_db(conn)
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    stale_at = int(time.time()) - config.ingest_max_age_seconds - 1
+    stale = app.test_client().post(
+        "/api/ingest/snapshot",
+        data=payload,
+        content_type="application/vnd.aistat.snapshot+gzip",
+        headers={
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Timestamp": str(stale_at),
+            "X-AIStat-Signature": snapshot_signature(
+                INGEST_SECRET, config.publish_tenant_id, stale_at, payload
+            ),
+        },
+    )
+    assert stale.status_code == 401
+
+    config.max_snapshot_bytes = len(payload) - 1
+    limited = create_app(config)
+    limited.config.update(TESTING=True)
+    oversized = limited.test_client().post(
+        "/api/ingest/snapshot",
+        data=payload,
+        content_type="application/vnd.aistat.snapshot+gzip",
+        headers={
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Timestamp": str(int(time.time())),
+            "X-AIStat-Signature": "unused",
+        },
+    )
+    assert oversized.status_code == 413
 
 
 def test_oauth_unknown_provider_is_404(public_app):
@@ -312,7 +441,9 @@ def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
     assert callback.status_code == 303
     assert callback.headers["Location"] == "/api/meta"
     # the allow-listed OAuth session now reaches private data
-    assert client.get("/api/meta", base_url="https://localhost").status_code == 200
+    response = client.get("/api/meta", base_url="https://localhost")
+    assert response.status_code == 200
+    assert response.get_json()["projects"] == []
 
 
 @pytest.mark.parametrize(

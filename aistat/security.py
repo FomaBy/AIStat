@@ -6,8 +6,9 @@ The public host never receives a Multica API token. It has only:
 * an independent Flask session-signing secret;
 * an independent HMAC key for signed SQLite snapshot uploads.
 
-Failed-login counters and the last accepted ingest timestamp are stored in a
-small database separate from the replaceable Multica data snapshot.
+Failed-login counters, user accounts, the tenant registry and per-tenant
+snapshot/replay state are stored in a small database separate from replaceable
+Multica data snapshots.
 """
 
 import argparse
@@ -23,11 +24,14 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from .config import Config
+from .tenant import (
+    canonical_tenant_id,
+    snapshot_signature as tenant_snapshot_signature,
+)
 
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCK_SECONDS = 15 * 60
 LOGIN_MAX_FAILURES = 5
-INGEST_SIGNATURE_PREFIX = "v1="
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 
 
@@ -63,6 +67,12 @@ def validate_public_config(config: Config) -> None:
     if config.db_path.resolve() == config.security_db_path.resolve():
         raise SecurityConfigError(
             "AISTAT_DB_PATH and AISTAT_SECURITY_DB_PATH must be different"
+        )
+    tenants_dir = config.tenants_dir.resolve()
+    security_db_path = config.security_db_path.resolve()
+    if security_db_path == tenants_dir or security_db_path.parent == tenants_dir:
+        raise SecurityConfigError(
+            "AISTAT_TENANTS_DIR must be a directory separate from security.db"
         )
     if config.session_hours < 1 or config.session_hours > 168:
         raise SecurityConfigError("AISTAT_SESSION_HOURS must be between 1 and 168")
@@ -117,17 +127,15 @@ def client_key(session_secret: str, remote_addr: Optional[str]) -> str:
     ).hexdigest()
 
 
-def snapshot_signature(secret: str, timestamp: int, body: bytes) -> str:
-    body_digest = hashlib.sha256(body).hexdigest()
-    canonical = f"{timestamp}\n{body_digest}".encode("ascii")
-    digest = hmac.new(
-        secret.encode("utf-8"), canonical, hashlib.sha256
-    ).hexdigest()
-    return INGEST_SIGNATURE_PREFIX + digest
+def snapshot_signature(
+    secret: str, tenant_id: int, timestamp: int, body: bytes
+) -> str:
+    return tenant_snapshot_signature(secret, tenant_id, timestamp, body)
 
 
 def verify_snapshot_signature(
     secret: str,
+    tenant_id: int,
     timestamp_header: Optional[str],
     signature_header: Optional[str],
     body: bytes,
@@ -141,7 +149,7 @@ def verify_snapshot_signature(
     now = int(time.time()) if now is None else int(now)
     if abs(now - timestamp) > max_age_seconds:
         raise ValueError("stale ingest timestamp")
-    expected = snapshot_signature(secret, timestamp, body)
+    expected = snapshot_signature(secret, tenant_id, timestamp, body)
     if not signature_header or not hmac.compare_digest(
         expected, signature_header
     ):
@@ -205,6 +213,13 @@ class SecurityStore:
                     next_url        TEXT,
                     created_at      INTEGER NOT NULL,
                     client_hash     TEXT
+                );
+                CREATE TABLE IF NOT EXISTS tenants (
+                    user_id                INTEGER PRIMARY KEY,
+                    created_at             INTEGER NOT NULL,
+                    last_ingest_timestamp  INTEGER NOT NULL DEFAULT 0,
+                    last_snapshot_at       INTEGER,
+                    last_snapshot_sha256   TEXT
                 );
                 """
             )
@@ -295,31 +310,167 @@ class SecurityStore:
         finally:
             conn.close()
 
-    def last_ingest_timestamp(self) -> int:
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT last_timestamp FROM ingest_state WHERE id = 1"
-            ).fetchone()
-            return int(row["last_timestamp"])
-        finally:
-            conn.close()
-
-    def record_ingest_timestamp(self, timestamp: int) -> bool:
+    def ensure_owner_user(
+        self,
+        username: str,
+        email: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> int:
+        """Return the one password-admin user, creating it when absent."""
+        now = int(time.time()) if now is None else int(now)
+        normalized_email = email.strip().lower() if email else None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            current = int(
-                conn.execute(
-                    "SELECT last_timestamp FROM ingest_state WHERE id = 1"
-                ).fetchone()["last_timestamp"]
+            admins = conn.execute(
+                "SELECT id FROM users WHERE is_admin = 1 ORDER BY id"
+            ).fetchall()
+            if len(admins) > 1:
+                conn.rollback()
+                raise SecurityConfigError(
+                    "security.db contains multiple admin users"
+                )
+            if admins:
+                conn.commit()
+                return int(admins[0]["id"])
+
+            if normalized_email:
+                matches = conn.execute(
+                    "SELECT id FROM users "
+                    "WHERE email IS NOT NULL AND lower(email) = ? ORDER BY id",
+                    (normalized_email,),
+                ).fetchall()
+                if len(matches) > 1:
+                    conn.rollback()
+                    raise SecurityConfigError(
+                        "AISTAT_ADMIN_EMAIL matches multiple users"
+                    )
+                if matches:
+                    user_id = int(matches[0]["id"])
+                    conn.execute(
+                        "UPDATE users SET is_admin = 1 WHERE id = ?",
+                        (user_id,),
+                    )
+                    conn.commit()
+                    return user_id
+
+            cursor = conn.execute(
+                "INSERT INTO users "
+                "(created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 1)",
+                (now, username, normalized_email),
             )
+            user_id = int(cursor.lastrowid)
+            conn.commit()
+            return user_id
+        finally:
+            conn.close()
+
+    def owner_user_id(self) -> Optional[int]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM users WHERE is_admin = 1 ORDER BY id"
+            ).fetchall()
+            if len(rows) > 1:
+                raise SecurityConfigError(
+                    "security.db contains multiple admin users"
+                )
+            return int(rows[0]["id"]) if rows else None
+        finally:
+            conn.close()
+
+    def ensure_tenant(
+        self,
+        user_id: int,
+        now: Optional[int] = None,
+        initial_ingest_timestamp: int = 0,
+    ) -> dict:
+        user_id = canonical_tenant_id(user_id)
+        now = int(time.time()) if now is None else int(now)
+        initial_ingest_timestamp = int(initial_ingest_timestamp)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM users WHERE id = ?", (user_id,)
+            ).fetchone() is None:
+                conn.rollback()
+                raise ValueError("tenant user does not exist")
+            conn.execute(
+                "INSERT OR IGNORE INTO tenants "
+                "(user_id, created_at, last_ingest_timestamp) "
+                "VALUES (?, ?, ?)",
+                (user_id, now, initial_ingest_timestamp),
+            )
+            if initial_ingest_timestamp:
+                conn.execute(
+                    "UPDATE tenants SET last_ingest_timestamp = "
+                    "MAX(last_ingest_timestamp, ?) WHERE user_id = ?",
+                    (initial_ingest_timestamp, user_id),
+                )
+            row = conn.execute(
+                "SELECT user_id, created_at, last_ingest_timestamp, "
+                "last_snapshot_at, last_snapshot_sha256 "
+                "FROM tenants WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            conn.commit()
+            return dict(row)
+        finally:
+            conn.close()
+
+    def get_tenant(self, user_id: int) -> Optional[dict]:
+        user_id = canonical_tenant_id(user_id)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT user_id, created_at, last_ingest_timestamp, "
+                "last_snapshot_at, last_snapshot_sha256 "
+                "FROM tenants WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def ingest_timestamp_is_fresh(
+        self, user_id: int, timestamp: int
+    ) -> bool:
+        tenant = self.get_tenant(user_id)
+        return bool(
+            tenant and int(timestamp) > int(tenant["last_ingest_timestamp"])
+        )
+
+    def record_tenant_snapshot(
+        self,
+        user_id: int,
+        timestamp: int,
+        sha256: str,
+        snapshot_at: Optional[int] = None,
+    ) -> bool:
+        user_id = canonical_tenant_id(user_id)
+        timestamp = int(timestamp)
+        snapshot_at = timestamp if snapshot_at is None else int(snapshot_at)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT last_ingest_timestamp FROM tenants WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            current = int(row["last_ingest_timestamp"])
             if timestamp <= current:
                 conn.rollback()
                 return False
             conn.execute(
-                "UPDATE ingest_state SET last_timestamp = ? WHERE id = 1",
-                (timestamp,),
+                "UPDATE tenants SET last_ingest_timestamp = ?, "
+                "last_snapshot_at = ?, last_snapshot_sha256 = ? "
+                "WHERE user_id = ?",
+                (timestamp, snapshot_at, sha256, user_id),
             )
             conn.commit()
             return True

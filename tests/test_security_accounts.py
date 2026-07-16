@@ -53,10 +53,11 @@ def test_oauth_state_expires(tmp_path):
 
 def test_account_model_does_not_disturb_throttle_or_ingest(tmp_path):
     store = SecurityStore(tmp_path / "security.db")
-    store.find_or_create_user_by_identity("google", "sub", now=100)
+    user_id = store.find_or_create_user_by_identity("google", "sub", now=100)
+    store.ensure_tenant(user_id, now=100)
     store.put_oauth_state("s", "google", now=100)
     # pre-existing throttle and ingest replay state keep working
     assert store.record_login_failure("client", now=100) == 0
     assert store.login_retry_after("client", now=100) == 0
-    assert store.record_ingest_timestamp(500) is True
-    assert store.record_ingest_timestamp(500) is False
+    assert store.record_tenant_snapshot(user_id, 500, "a" * 64) is True
+    assert store.record_tenant_snapshot(user_id, 500, "a" * 64) is False

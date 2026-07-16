@@ -14,7 +14,10 @@ from wsgiref.util import setup_testing_defaults
 import pytest
 from werkzeug.security import generate_password_hash
 
-from aistat.db import SCHEMA_VERSION, connect
+from aistat.db import SCHEMA_VERSION, connect, init_db
+from aistat.config import Config
+from aistat.migrate import migrate_owner_database
+from aistat.security import SecurityStore
 from aistat.snapshot import create_compressed_snapshot
 from conftest import seed_aggregate_fixture
 
@@ -27,6 +30,7 @@ INGEST_SECRET = "legacy-ingest-" + "i" * 48
 def legacy(tmp_path, monkeypatch):
     monkeypatch.setenv("AISTAT_DB_PATH", str(tmp_path / "public.db"))
     monkeypatch.setenv("AISTAT_SECURITY_DB_PATH", str(tmp_path / "security.db"))
+    monkeypatch.setenv("AISTAT_TENANTS_DIR", str(tmp_path / "tenants"))
     monkeypatch.setenv("AISTAT_ALLOWED_HOSTS", "localhost,aistat.app")
     monkeypatch.setenv("AISTAT_FORCE_HTTPS", "0")
     monkeypatch.setenv("AISTAT_SESSION_COOKIE_SECURE", "1")
@@ -57,8 +61,10 @@ def legacy(tmp_path, monkeypatch):
 
     module = importlib.reload(module)
     conn = connect(module.DB_PATH)
+    init_db(conn)
     seed_aggregate_fixture(conn)
     conn.close()
+    migrate_owner_database(Config(), now=1000)
     return module
 
 
@@ -150,7 +156,13 @@ def login(module):
 def test_source_parses_as_python_36():
     # legacy_wsgi imports oauth at runtime on cPanel's Python 3.6, so the
     # shared core must parse as 3.6 too.
-    for path in ("aistat/legacy_wsgi.py", "aistat/oauth.py", "aistat.cgi"):
+    for path in (
+        "aistat/legacy_wsgi.py",
+        "aistat/migrate.py",
+        "aistat/oauth.py",
+        "aistat/tenant.py",
+        "aistat.cgi",
+    ):
         source = open(path, encoding="utf-8").read()
         ast.parse(source, filename=path, feature_version=(3, 6))
 
@@ -288,8 +300,6 @@ def test_logout_accepts_form_csrf_for_shared_host_waf(legacy):
 def test_signed_snapshot_ingest(legacy, tmp_path):
     source = tmp_path / "source.db"
     conn = connect(source)
-    from aistat.db import init_db
-
     init_db(conn)
     seed_aggregate_fixture(conn)
     conn.execute(
@@ -300,7 +310,9 @@ def test_signed_snapshot_ingest(legacy, tmp_path):
     conn.close()
     payload = create_compressed_snapshot(source)
     timestamp = int(legacy.time.time())
-    signature = legacy._snapshot_signature(timestamp, payload)
+    signature = legacy._snapshot_signature(
+        legacy.OWNER_USER_ID, timestamp, payload
+    )
     status, _, body = request(
         legacy.application,
         "/api/ingest/snapshot",
@@ -308,6 +320,7 @@ def test_signed_snapshot_ingest(legacy, tmp_path):
         body=payload,
         headers={
             "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(legacy.OWNER_USER_ID),
             "X-AIStat-Timestamp": str(timestamp),
             "X-AIStat-Signature": signature,
         },
@@ -323,6 +336,137 @@ def test_signed_snapshot_ingest(legacy, tmp_path):
     )
     assert status == "200 OK"
     assert legacy.json.loads(body.decode("utf-8"))["total_tokens"] == 5_700_000
+
+
+def test_snapshot_replay_is_per_tenant_and_unknown_fails_closed(
+    legacy, tmp_path
+):
+    store = SecurityStore(legacy.SECURITY_DB_PATH)
+    bob_id = store.find_or_create_user_by_identity(
+        "google", "bob", email="bob@example.com", now=100
+    )
+    store.ensure_tenant(bob_id, now=100)
+    source = tmp_path / "multi-tenant.db"
+    conn = connect(source)
+    init_db(conn)
+    seed_aggregate_fixture(conn)
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    timestamp = int(legacy.time.time())
+
+    def upload(tenant_id, signed_tenant_id=None, at=timestamp):
+        signed_tenant_id = (
+            tenant_id if signed_tenant_id is None else signed_tenant_id
+        )
+        return request(
+            legacy.application,
+            "/api/ingest/snapshot",
+            method="POST",
+            body=payload,
+            headers={
+                "Content-Type": "application/vnd.aistat.snapshot+gzip",
+                "X-AIStat-Tenant": str(tenant_id),
+                "X-AIStat-Timestamp": str(at),
+                "X-AIStat-Signature": legacy._snapshot_signature(
+                    signed_tenant_id, at, payload
+                ),
+            },
+        )
+
+    assert upload(legacy.OWNER_USER_ID)[0] == "200 OK"
+    assert upload(bob_id)[0] == "200 OK"
+    bob_path = legacy.tenant_db_path(legacy.TENANTS_DIR, bob_id)
+    with open(bob_path, "rb") as source_file:
+        bob_bytes = source_file.read()
+    assert upload(legacy.OWNER_USER_ID)[0] == "409 Conflict"
+    assert upload(
+        bob_id, signed_tenant_id=legacy.OWNER_USER_ID
+    )[0] == "401 Unauthorized"
+    with open(bob_path, "rb") as source_file:
+        assert source_file.read() == bob_bytes
+
+    unknown_id = bob_id + 1000
+    assert upload(unknown_id)[0] == "401 Unauthorized"
+    assert not os.path.exists(
+        legacy.tenant_db_path(legacy.TENANTS_DIR, unknown_id)
+    )
+    assert upload(legacy.OWNER_USER_ID, at=timestamp + 1)[0] == "200 OK"
+    with open(bob_path, "rb") as source_file:
+        assert source_file.read() == bob_bytes
+
+
+def test_snapshot_age_and_size_limits_are_enforced_per_request(
+    legacy, tmp_path
+):
+    source = tmp_path / "limits.db"
+    conn = connect(source)
+    init_db(conn)
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    stale_at = int(legacy.time.time()) - legacy.INGEST_MAX_AGE - 1
+    status, _, _ = request(
+        legacy.application,
+        "/api/ingest/snapshot",
+        method="POST",
+        body=payload,
+        headers={
+            "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(legacy.OWNER_USER_ID),
+            "X-AIStat-Timestamp": str(stale_at),
+            "X-AIStat-Signature": legacy._snapshot_signature(
+                legacy.OWNER_USER_ID, stale_at, payload
+            ),
+        },
+    )
+    assert status == "401 Unauthorized"
+
+    invalid_at = int(legacy.time.time())
+    invalid_payload = b"not gzip"
+    status, _, _ = request(
+        legacy.application,
+        "/api/ingest/snapshot",
+        method="POST",
+        body=invalid_payload,
+        headers={
+            "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(legacy.OWNER_USER_ID),
+            "X-AIStat-Timestamp": str(invalid_at),
+            "X-AIStat-Signature": legacy._snapshot_signature(
+                legacy.OWNER_USER_ID, invalid_at, invalid_payload
+            ),
+        },
+    )
+    assert status == "422 Unprocessable Entity"
+    status, _, _ = request(
+        legacy.application,
+        "/api/ingest/snapshot",
+        method="POST",
+        body=payload,
+        headers={
+            "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(legacy.OWNER_USER_ID),
+            "X-AIStat-Timestamp": str(invalid_at),
+            "X-AIStat-Signature": legacy._snapshot_signature(
+                legacy.OWNER_USER_ID, invalid_at, payload
+            ),
+        },
+    )
+    assert status == "200 OK"
+
+    legacy.MAX_SNAPSHOT_BYTES = len(payload) - 1
+    status, _, _ = request(
+        legacy.application,
+        "/api/ingest/snapshot",
+        method="POST",
+        body=payload,
+        headers={
+            "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(legacy.OWNER_USER_ID),
+            "X-AIStat-Timestamp": str(int(legacy.time.time())),
+            "X-AIStat-Signature": "unused",
+        },
+    )
+    assert status == "413 Payload Too Large"
 
 
 def test_host_allowlist(legacy):
@@ -407,7 +551,7 @@ def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
     status, _, body = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "200 OK"
     data = legacy.json.loads(body.decode("utf-8"))
-    assert [p["title"] for p in data["projects"]] == ["Alpha", "Beta"]
+    assert data["projects"] == []
 
 
 @pytest.mark.parametrize(

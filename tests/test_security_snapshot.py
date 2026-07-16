@@ -24,6 +24,7 @@ from aistat.snapshot import (
 from conftest import seed_aggregate_fixture
 
 SECRET = "publisher-" + "p" * 48
+TENANT_ID = 7
 
 
 def seeded_db(path):
@@ -46,17 +47,27 @@ def test_safe_next_url_rejects_browser_normalized_external_redirects():
 def test_snapshot_signature_age_and_body_binding():
     now = int(time.time())
     body = b"payload"
-    signature = snapshot_signature(SECRET, now, body)
+    signature = snapshot_signature(SECRET, TENANT_ID, now, body)
     assert verify_snapshot_signature(
-        SECRET, str(now), signature, body, 300, now=now
+        SECRET, TENANT_ID, str(now), signature, body, 300, now=now
     ) == now
     with pytest.raises(ValueError):
         verify_snapshot_signature(
-            SECRET, str(now), signature, b"changed", 300, now=now
+            SECRET, TENANT_ID, str(now), signature, b"changed", 300, now=now
         )
     with pytest.raises(ValueError):
         verify_snapshot_signature(
-            SECRET, str(now - 301), signature, body, 300, now=now
+            SECRET,
+            TENANT_ID,
+            str(now - 301),
+            signature,
+            body,
+            300,
+            now=now,
+        )
+    with pytest.raises(ValueError):
+        verify_snapshot_signature(
+            SECRET, TENANT_ID + 1, str(now), signature, body, 300, now=now
         )
 
 
@@ -69,10 +80,17 @@ def test_security_store_persists_throttle_and_replay_state(tmp_path):
     store.clear_login_failures("client")
     assert store.login_retry_after("client", now=105) == 0
 
-    assert store.record_ingest_timestamp(1000) is True
-    assert store.record_ingest_timestamp(1000) is False
-    assert store.record_ingest_timestamp(999) is False
-    assert store.record_ingest_timestamp(1001) is True
+    alice = store.find_or_create_user_by_identity("google", "alice", now=100)
+    bob = store.find_or_create_user_by_identity("google", "bob", now=100)
+    store.ensure_tenant(alice, now=100)
+    store.ensure_tenant(bob, now=100)
+    assert store.ingest_timestamp_is_fresh(alice, 1000) is True
+    assert store.record_tenant_snapshot(alice, 1000, "a" * 64) is True
+    assert store.ingest_timestamp_is_fresh(alice, 1000) is False
+    assert store.ingest_timestamp_is_fresh(alice, 999) is False
+    assert store.ingest_timestamp_is_fresh(bob, 999) is True
+    assert store.record_tenant_snapshot(bob, 999, "b" * 64) is True
+    assert store.record_tenant_snapshot(alice, 1001, "c" * 64) is True
 
 
 def test_snapshot_round_trip_and_size_limit(tmp_path):
@@ -115,6 +133,7 @@ def test_publisher_builds_valid_signed_request(tmp_path):
     config.allow_insecure_publish = True
     config.publish_interval_seconds = 300
     config.ingest_secret = SECRET
+    config.publish_tenant_id = TENANT_ID
 
     captured = {}
 
@@ -123,8 +142,10 @@ def test_publisher_builds_valid_signed_request(tmp_path):
         captured["body"] = request.data
         timestamp = request.headers["X-aistat-timestamp"]
         signature = request.headers["X-aistat-signature"]
+        assert request.headers["X-aistat-tenant"] == str(TENANT_ID)
         verify_snapshot_signature(
             SECRET,
+            TENANT_ID,
             timestamp,
             signature,
             request.data,
@@ -136,6 +157,7 @@ def test_publisher_builds_valid_signed_request(tmp_path):
             json.dumps(
                 {
                     "status": "ok",
+                    "tenant_id": TENANT_ID,
                     "schema_version": 3,
                     "size_bytes": len(data),
                     "sha256": hashlib.sha256(data).hexdigest(),
@@ -156,6 +178,7 @@ def test_publisher_requires_https_by_default(tmp_path):
     config.db_path = db_path
     config.publish_url = "http://example.test/upload"
     config.ingest_secret = SECRET
+    config.publish_tenant_id = TENANT_ID
     with pytest.raises(PublishError):
         publish_once(config)
 
@@ -169,6 +192,7 @@ def test_publisher_rejects_mismatched_host_confirmation(tmp_path):
     config.allow_insecure_publish = True
     config.publish_interval_seconds = 300
     config.ingest_secret = SECRET
+    config.publish_tenant_id = TENANT_ID
 
     def opener(_request, timeout):
         assert timeout == config.publish_timeout_seconds
@@ -176,6 +200,7 @@ def test_publisher_rejects_mismatched_host_confirmation(tmp_path):
             json.dumps(
                 {
                     "status": "ok",
+                    "tenant_id": TENANT_ID + 1,
                     "schema_version": 3,
                     "size_bytes": 1,
                     "sha256": "wrong",

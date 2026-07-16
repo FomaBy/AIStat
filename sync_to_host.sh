@@ -13,6 +13,10 @@ fi
 
 export AISTAT_PUBLISH_URL="${AISTAT_PUBLISH_URL:-https://aistat.app/api/ingest/snapshot}"
 export AISTAT_PUBLISH_INTERVAL_SECONDS="${AISTAT_PUBLISH_INTERVAL_SECONDS:-300}"
+if [ -z "${AISTAT_TENANT_ID:-}" ]; then
+  echo "AISTAT_TENANT_ID must be set to the owner_user_id from aistat.migrate" >&2
+  exit 1
+fi
 
 if [ -z "${AISTAT_INGEST_SECRET:-}" ]; then
   KEYCHAIN_ACCOUNT="${AISTAT_KEYCHAIN_ACCOUNT:-$USER}"

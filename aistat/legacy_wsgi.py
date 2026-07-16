@@ -31,7 +31,12 @@ from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlsplit
 
 from . import __version__, aggregates, oauth
-from .db import SCHEMA_VERSION, connect, init_db
+from .db import SCHEMA_VERSION, init_db
+from .tenant import (
+    canonical_tenant_id,
+    snapshot_signature as tenant_snapshot_signature,
+    tenant_db_path,
+)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 OAUTH_STATE_TTL_SECONDS = 10 * 60
@@ -69,6 +74,10 @@ SECURITY_DB_PATH = os.environ.get(
     "AISTAT_SECURITY_DB_PATH",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "security.db")),
 )
+TENANTS_DIR = os.environ.get(
+    "AISTAT_TENANTS_DIR",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "tenants")),
+)
 ALLOWED_HOSTS = {
     value.strip().lower()
     for value in os.environ.get(
@@ -79,6 +88,7 @@ ALLOWED_HOSTS = {
 FORCE_HTTPS = _env_bool("AISTAT_FORCE_HTTPS", False)
 COOKIE_SECURE = _env_bool("AISTAT_SESSION_COOKIE_SECURE", FORCE_HTTPS)
 ADMIN_USERNAME = os.environ.get("AISTAT_ADMIN_USERNAME", "admin")
+ADMIN_EMAIL = os.environ.get("AISTAT_ADMIN_EMAIL") or None
 PASSWORD_HASH = os.environ.get("AISTAT_PASSWORD_HASH", "")
 SESSION_SECRET = os.environ.get("AISTAT_SESSION_SECRET", "")
 INGEST_SECRET = os.environ.get("AISTAT_INGEST_SECRET", "")
@@ -107,6 +117,13 @@ def _validate_config():
         raise RuntimeError("dashboard credentials are not configured")
     if os.path.abspath(DB_PATH) == os.path.abspath(SECURITY_DB_PATH):
         raise RuntimeError("data and security databases must be different")
+    tenants_dir = os.path.realpath(TENANTS_DIR)
+    security_db_path = os.path.realpath(SECURITY_DB_PATH)
+    if (
+        security_db_path == tenants_dir
+        or os.path.dirname(security_db_path) == tenants_dir
+    ):
+        raise RuntimeError("tenant directory and security database must be different")
     if not ALLOWED_HOSTS:
         raise RuntimeError("AISTAT_ALLOWED_HOSTS must not be empty")
 
@@ -119,18 +136,12 @@ def _chmod_private(path):
 
 
 def _bootstrap():
-    for path in (DB_PATH, SECURITY_DB_PATH):
+    for path in (SECURITY_DB_PATH, os.path.join(TENANTS_DIR, ".keep")):
         parent = os.path.dirname(path)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, 0o700)
-    if not os.path.exists(DB_PATH):
-        conn = connect(DB_PATH)
-        try:
-            init_db(conn)
-        finally:
-            conn.close()
-        _chmod_private(DB_PATH)
     conn = sqlite3.connect(SECURITY_DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
         conn.executescript(
             """
@@ -168,6 +179,13 @@ def _bootstrap():
                 created_at      INTEGER NOT NULL,
                 client_hash     TEXT
             );
+            CREATE TABLE IF NOT EXISTS tenants (
+                user_id                INTEGER PRIMARY KEY,
+                created_at             INTEGER NOT NULL,
+                last_ingest_timestamp  INTEGER NOT NULL DEFAULT 0,
+                last_snapshot_at       INTEGER,
+                last_snapshot_sha256   TEXT
+            );
             """
         )
         columns = {
@@ -175,14 +193,52 @@ def _bootstrap():
         }
         if "client_hash" not in columns:
             conn.execute("ALTER TABLE oauth_state ADD COLUMN client_hash TEXT")
+        admins = conn.execute(
+            "SELECT id FROM users WHERE is_admin = 1 ORDER BY id"
+        ).fetchall()
+        if len(admins) > 1:
+            raise RuntimeError("security.db contains multiple admin users")
+        if admins:
+            owner_user_id = int(admins[0]["id"])
+        else:
+            matches = []
+            if ADMIN_EMAIL:
+                matches = conn.execute(
+                    "SELECT id FROM users "
+                    "WHERE email IS NOT NULL AND lower(email) = ? ORDER BY id",
+                    (ADMIN_EMAIL.strip().lower(),),
+                ).fetchall()
+                if len(matches) > 1:
+                    raise RuntimeError(
+                        "AISTAT_ADMIN_EMAIL matches multiple users"
+                    )
+            if matches:
+                owner_user_id = int(matches[0]["id"])
+                conn.execute(
+                    "UPDATE users SET is_admin = 1 WHERE id = ?",
+                    (owner_user_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO users "
+                    "(created_at, display_name, email, is_admin) "
+                    "VALUES (?, ?, ?, 1)",
+                    (int(time.time()), ADMIN_USERNAME, ADMIN_EMAIL),
+                )
+                owner_user_id = int(cursor.lastrowid)
         conn.commit()
     finally:
         conn.close()
     _chmod_private(SECURITY_DB_PATH)
+    try:
+        os.chmod(TENANTS_DIR, 0o700)
+    except OSError:
+        pass
+    return owner_user_id
 
 
 _validate_config()
-_bootstrap()
+OWNER_USER_ID = _bootstrap()
 
 
 def _b64encode(data):
@@ -225,6 +281,7 @@ def _cookies(environ):
 def _make_session():
     payload = {
         "u": ADMIN_USERNAME,
+        "uid": OWNER_USER_ID,
         "exp": int(time.time()) + SESSION_SECONDS,
         "csrf": secrets.token_urlsafe(32),
     }
@@ -420,21 +477,49 @@ def _clear_login_failures(key):
         conn.close()
 
 
-def _record_ingest_timestamp(timestamp):
+def _tenant_record(user_id):
+    user_id = canonical_tenant_id(user_id)
+    conn = _security_connection()
+    try:
+        row = conn.execute(
+            "SELECT user_id, created_at, last_ingest_timestamp, "
+            "last_snapshot_at, last_snapshot_sha256 "
+            "FROM tenants WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _ingest_timestamp_is_fresh(user_id, timestamp):
+    tenant = _tenant_record(user_id)
+    return bool(
+        tenant and int(timestamp) > int(tenant["last_ingest_timestamp"])
+    )
+
+
+def _record_tenant_snapshot(user_id, timestamp, sha256):
+    user_id = canonical_tenant_id(user_id)
     conn = _security_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        current = int(
-            conn.execute(
-                "SELECT last_timestamp FROM ingest_state WHERE id = 1"
-            ).fetchone()["last_timestamp"]
-        )
+        row = conn.execute(
+            "SELECT last_ingest_timestamp FROM tenants WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        current = int(row["last_ingest_timestamp"])
         if timestamp <= current:
             conn.rollback()
             return False
         conn.execute(
-            "UPDATE ingest_state SET last_timestamp = ? WHERE id = 1",
-            (timestamp,),
+            "UPDATE tenants SET last_ingest_timestamp = ?, "
+            "last_snapshot_at = ?, last_snapshot_sha256 = ? "
+            "WHERE user_id = ?",
+            (timestamp, timestamp, sha256, user_id),
         )
         conn.commit()
         return True
@@ -615,8 +700,25 @@ def _read_form(environ):
     return parse_qs(body.decode("utf-8"), keep_blank_values=True)
 
 
-def _data_connection():
-    conn = sqlite3.connect(DB_PATH)
+def _empty_data_connection():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def _data_connection(session):
+    try:
+        user_id = canonical_tenant_id(session.get("uid"))
+    except (AttributeError, ValueError):
+        return _empty_data_connection()
+    if _tenant_record(user_id) is None:
+        return _empty_data_connection()
+    path = tenant_db_path(TENANTS_DIR, user_id)
+    if not os.path.isfile(path):
+        return _empty_data_connection()
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn
@@ -863,26 +965,27 @@ def _serve_static(environ, start_response, name):
     return _respond(environ, start_response, "200 OK", body, content_type)
 
 
-def _snapshot_signature(timestamp, body):
-    digest = hashlib.sha256(body).hexdigest()
-    canonical = "{}\n{}".format(timestamp, digest).encode("ascii")
-    return "v1=" + hmac.new(
-        INGEST_SECRET.encode("utf-8"), canonical, hashlib.sha256
-    ).hexdigest()
+def _snapshot_signature(tenant_id, timestamp, body):
+    return tenant_snapshot_signature(
+        INGEST_SECRET, tenant_id, timestamp, body
+    )
 
 
 def _verify_snapshot_request(environ, body):
     try:
+        tenant_id = canonical_tenant_id(
+            environ.get("HTTP_X_AISTAT_TENANT", "")
+        )
         timestamp = int(environ.get("HTTP_X_AISTAT_TIMESTAMP", ""))
     except ValueError:
-        raise ValueError("invalid timestamp")
+        raise ValueError("invalid snapshot authentication")
     if abs(int(time.time()) - timestamp) > INGEST_MAX_AGE:
         raise ValueError("stale timestamp")
     supplied = environ.get("HTTP_X_AISTAT_SIGNATURE", "")
-    expected = _snapshot_signature(timestamp, body)
+    expected = _snapshot_signature(tenant_id, timestamp, body)
     if not hmac.compare_digest(supplied, expected):
         raise ValueError("invalid signature")
-    return timestamp
+    return tenant_id, timestamp
 
 
 def _unlink_if_exists(path):
@@ -892,10 +995,15 @@ def _unlink_if_exists(path):
         pass
 
 
-def _install_snapshot(payload):
+def _install_snapshot(payload, target_path):
     if len(payload) > MAX_SNAPSHOT_BYTES:
         raise ValueError("snapshot too large")
-    parent = os.path.dirname(DB_PATH)
+    parent = os.path.dirname(target_path)
+    if os.path.islink(target_path):
+        raise ValueError("snapshot target is a symlink")
+    previous = target_path + ".previous"
+    if os.path.islink(previous):
+        raise ValueError("snapshot backup is a symlink")
     handle, temp_path = tempfile.mkstemp(
         prefix=".aistat-snapshot-", suffix=".db", dir=parent
     )
@@ -938,15 +1046,14 @@ def _install_snapshot(payload):
         finally:
             conn.close()
 
-        previous = DB_PATH + ".previous"
-        if os.path.exists(DB_PATH):
-            shutil.copy2(DB_PATH, previous)
+        if os.path.exists(target_path):
+            shutil.copy2(target_path, previous)
             _chmod_private(previous)
-        _unlink_if_exists(DB_PATH + "-wal")
-        _unlink_if_exists(DB_PATH + "-shm")
-        os.replace(temp_path, DB_PATH)
-        _chmod_private(DB_PATH)
-        with open(DB_PATH, "rb") as source:
+        _unlink_if_exists(target_path + "-wal")
+        _unlink_if_exists(target_path + "-shm")
+        os.replace(temp_path, target_path)
+        _chmod_private(target_path)
+        with open(target_path, "rb") as source:
             data = source.read()
         return {
             "sha256": hashlib.sha256(data).hexdigest(),
@@ -1069,29 +1176,45 @@ def _ingest(environ, start_response):
         )
     body = environ["wsgi.input"].read(length)
     try:
-        timestamp = _verify_snapshot_request(environ, body)
+        tenant_id, timestamp = _verify_snapshot_request(environ, body)
     except ValueError:
         return _json_response(
             environ, start_response, "401 Unauthorized", {"detail": "snapshot authentication failed"}
         )
+    tenant = _tenant_record(tenant_id)
+    if tenant is None:
+        return _json_response(
+            environ, start_response, "401 Unauthorized", {"detail": "snapshot authentication failed"}
+        )
+    # File paths use the canonical id read from security.db, not raw input.
+    tenant_id = int(tenant["user_id"])
     lock_path = os.path.join(os.path.dirname(SECURITY_DB_PATH), "ingest.lock")
     with open(lock_path, "a+b") as lock:
         _chmod_private(lock_path)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            if not _record_ingest_timestamp(timestamp):
+            if not _ingest_timestamp_is_fresh(tenant_id, timestamp):
                 return _json_response(
                     environ, start_response, "409 Conflict", {"detail": "snapshot replay rejected"}
                 )
             try:
-                info = _install_snapshot(body)
+                info = _install_snapshot(
+                    body, tenant_db_path(TENANTS_DIR, tenant_id)
+                )
             except ValueError:
                 return _json_response(
                     environ, start_response, "422 Unprocessable Entity", {"detail": "invalid snapshot"}
                 )
+            if not _record_tenant_snapshot(
+                tenant_id, timestamp, info["sha256"]
+            ):
+                return _json_response(
+                    environ, start_response, "409 Conflict", {"detail": "snapshot replay rejected"}
+                )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     info["status"] = "ok"
+    info["tenant_id"] = tenant_id
     return _json_response(environ, start_response, "200 OK", info)
 
 
@@ -1103,9 +1226,13 @@ def _api(environ, start_response, path):
             environ,
             start_response,
             "200 OK",
-            {"username": ADMIN_USERNAME, "csrf": session["csrf"]},
+            {
+                "username": ADMIN_USERNAME,
+                "user_id": session.get("uid"),
+                "csrf": session["csrf"],
+            },
         )
-    conn = _data_connection()
+    conn = _data_connection(session)
     try:
         if path == "/api/meta":
             data = aggregates.meta(conn)

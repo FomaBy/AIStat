@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, FrozenSet, Optional, Tuple
 
 from . import oauth
+from .tenant import canonical_tenant_id, tenant_db_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,6 +27,13 @@ def _env_float(name: str, default: float) -> float:
     if raw is None or raw == "":
         return default
     return float(raw)
+
+
+def _env_optional_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return canonical_tenant_id(raw)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -94,6 +102,9 @@ class Config:
     auth_username: str = field(
         default_factory=lambda: os.environ.get("AISTAT_ADMIN_USERNAME", "admin")
     )
+    admin_email: Optional[str] = field(
+        default_factory=lambda: os.environ.get("AISTAT_ADMIN_EMAIL") or None
+    )
     auth_password_hash: Optional[str] = field(
         default_factory=lambda: os.environ.get("AISTAT_PASSWORD_HASH") or None
     )
@@ -112,6 +123,11 @@ class Config:
     security_db_path: Path = field(
         default_factory=lambda: _env_path(
             "AISTAT_SECURITY_DB_PATH", PROJECT_ROOT / "data" / "security.db"
+        )
+    )
+    tenants_dir: Path = field(
+        default_factory=lambda: _env_path(
+            "AISTAT_TENANTS_DIR", PROJECT_ROOT / "data" / "tenants"
         )
     )
     allowed_hosts: Tuple[str, ...] = field(
@@ -156,6 +172,9 @@ class Config:
     publish_timeout_seconds: int = field(
         default_factory=lambda: _env_int("AISTAT_PUBLISH_TIMEOUT_SECONDS", 60)
     )
+    publish_tenant_id: Optional[int] = field(
+        default_factory=lambda: _env_optional_int("AISTAT_TENANT_ID")
+    )
     allow_insecure_publish: bool = field(
         default_factory=lambda: _env_bool("AISTAT_ALLOW_INSECURE_PUBLISH", False)
     )
@@ -165,3 +184,16 @@ class Config:
 
     def ensure_security_db_dir(self) -> None:
         self.security_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def ensure_tenants_dir(self) -> None:
+        self.tenants_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.tenants_dir.chmod(0o700)
+        except OSError:
+            pass
+
+    def tenant_db_path(self, user_id: int) -> Path:
+        """Resolve a tenant path only from a trusted internal numeric user id."""
+        if not isinstance(user_id, int) or isinstance(user_id, bool):
+            raise ValueError("tenant path requires an internal integer user id")
+        return Path(tenant_db_path(self.tenants_dir, user_id))

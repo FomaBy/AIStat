@@ -37,7 +37,7 @@ from markupsafe import escape
 
 from . import __version__, aggregates, oauth
 from .config import Config
-from .db import connect, connect_readonly, init_db
+from .db import connect_readonly, init_db
 from .health import snapshot
 from .security import (
     OAUTH_STATE_TTL_SECONDS,
@@ -50,6 +50,7 @@ from .security import (
     verify_snapshot_signature,
 )
 from .snapshot import SnapshotError, install_compressed_snapshot
+from .tenant import canonical_tenant_id
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -62,16 +63,8 @@ OAUTH_CLIENT_COOKIE = "aistat_oauth_client"
 def create_app(config: Optional[Config] = None) -> Flask:
     config = config or Config()
     validate_public_config(config)
-    config.ensure_db_dir()
     config.ensure_security_db_dir()
-
-    # Let the app boot before its first signed snapshot arrives.
-    if not config.db_path.exists():
-        bootstrap = connect(config.db_path)
-        try:
-            init_db(bootstrap)
-        finally:
-            bootstrap.close()
+    config.ensure_tenants_dir()
 
     app = Flask(
         __name__,
@@ -91,6 +84,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
         SESSION_COOKIE_SAMESITE="Lax",
     )
     security_store = SecurityStore(config.security_db_path)
+    owner_user_id = security_store.ensure_owner_user(
+        config.auth_username, config.admin_email
+    )
     ingest_lock_path = config.security_db_path.with_name("ingest.lock")
 
     public_endpoints = {
@@ -178,8 +174,32 @@ def create_app(config: Optional[Config] = None) -> Flask:
             )
         return response
 
+    def empty_data_connection() -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
+    def current_user_id() -> Optional[int]:
+        raw = session.get("user_id")
+        if raw is not None:
+            try:
+                return canonical_tenant_id(raw)
+            except ValueError:
+                return None
+        if session.get("user") == config.auth_username:
+            return owner_user_id
+        return None
+
     def data_connection() -> sqlite3.Connection:
-        return connect_readonly(config.db_path)
+        user_id = current_user_id()
+        if user_id is None or security_store.get_tenant(user_id) is None:
+            return empty_data_connection()
+        path = config.tenant_db_path(user_id)
+        if not path.is_file():
+            return empty_data_connection()
+        return connect_readonly(path)
 
     @contextmanager
     def ingest_lock():
@@ -265,6 +285,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
         next_url = safe_next_url(request.form.get("next"))
         session.clear()
         session["user"] = config.auth_username
+        session["user_id"] = owner_user_id
         session.permanent = True
         csrf_token(session)
         return redirect(next_url, code=303)
@@ -364,7 +385,11 @@ def create_app(config: Optional[Config] = None) -> Flask:
     @app.get("/api/session")
     def api_session():
         return jsonify(
-            {"username": config.auth_username, "csrf": csrf_token(session)}
+            {
+                "username": config.auth_username,
+                "user_id": current_user_id(),
+                "csrf": csrf_token(session),
+            }
         )
 
     @app.get("/api/meta")
@@ -476,7 +501,11 @@ def create_app(config: Optional[Config] = None) -> Flask:
         try:
             return snapshot(
                 conn,
-                db_path=str(config.db_path),
+                db_path=(
+                    str(config.tenant_db_path(current_user_id()))
+                    if current_user_id()
+                    else None
+                ),
                 credits_per_usd=config.credits_per_usd,
             )
         finally:
@@ -503,8 +532,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return jsonify({"detail": "unsupported content type"}), 415
         payload = request.get_data(cache=False, as_text=False)
         try:
+            tenant_id = canonical_tenant_id(
+                request.headers.get("X-AIStat-Tenant")
+            )
             timestamp = verify_snapshot_signature(
                 config.ingest_secret,
+                tenant_id,
                 request.headers.get("X-AIStat-Timestamp"),
                 request.headers.get("X-AIStat-Signature"),
                 payload,
@@ -512,18 +545,33 @@ def create_app(config: Optional[Config] = None) -> Flask:
             )
         except ValueError:
             return jsonify({"detail": "snapshot authentication failed"}), 401
+        tenant = security_store.get_tenant(tenant_id)
+        if tenant is None:
+            return jsonify({"detail": "snapshot authentication failed"}), 401
+        # From this point on, paths are derived from the canonical id read
+        # back from security.db, never directly from the request header.
+        tenant_id = int(tenant["user_id"])
         with ingest_lock():
-            if not security_store.record_ingest_timestamp(timestamp):
+            if not security_store.ingest_timestamp_is_fresh(
+                tenant_id, timestamp
+            ):
                 return jsonify({"detail": "snapshot replay rejected"}), 409
             try:
                 info = install_compressed_snapshot(
-                    payload, config.db_path, config.max_snapshot_bytes
+                    payload,
+                    config.tenant_db_path(tenant_id),
+                    config.max_snapshot_bytes,
                 )
             except SnapshotError:
                 return jsonify({"detail": "invalid snapshot"}), 422
+            if not security_store.record_tenant_snapshot(
+                tenant_id, timestamp, info.sha256
+            ):
+                return jsonify({"detail": "snapshot replay rejected"}), 409
         return jsonify(
             {
                 "status": "ok",
+                "tenant_id": tenant_id,
                 "sha256": info.sha256,
                 "size_bytes": info.size_bytes,
                 "schema_version": info.schema_version,

@@ -149,15 +149,19 @@ def validate_snapshot(path: Path) -> SnapshotInfo:
 def install_compressed_snapshot(
     payload: bytes, target_path: Path, max_bytes: int
 ) -> SnapshotInfo:
-    """Validate then atomically replace the public read-only data database."""
+    """Validate then atomically replace one trusted tenant database path."""
     target_path = Path(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.is_symlink():
+        raise SnapshotError("snapshot target must not be a symlink")
+    previous = target_path.with_name(target_path.name + ".previous")
+    if previous.is_symlink():
+        raise SnapshotError("snapshot backup must not be a symlink")
     temp_path = _temp_path(target_path.parent, ".db")
     try:
         _decompress_to_file(payload, temp_path, max_bytes)
         info = validate_snapshot(temp_path)
 
-        previous = target_path.with_name(target_path.name + ".previous")
         if target_path.exists():
             shutil.copy2(target_path, previous)
             try:
