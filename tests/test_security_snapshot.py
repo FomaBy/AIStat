@@ -38,6 +38,8 @@ def test_safe_next_url_rejects_browser_normalized_external_redirects():
     assert safe_next_url("/api/meta?x=1") == "/api/meta?x=1"
     assert safe_next_url("https://evil.example/") == "/"
     assert safe_next_url("//evil.example/") == "/"
+    assert safe_next_url("//[evil.example/") == "/"
+    assert safe_next_url("https://[evil.example/") == "/"
     assert safe_next_url(r"/\evil.example/") == "/"
     assert safe_next_url("/api\r\nX-Injected: yes") == "/"
     assert safe_next_url("/api\x00meta") == "/"

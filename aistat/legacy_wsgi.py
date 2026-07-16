@@ -377,10 +377,14 @@ def _safe_next(value):
         ord(char) <= 0x1F or 0x7F <= ord(char) <= 0x9F for char in value
     ):
         return "/"
-    parsed = urlsplit(value)
-    if parsed.scheme or parsed.netloc or not value.startswith("/"):
-        return "/"
     if value.startswith("//"):
+        return "/"
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        # Keep malformed authorities fail-closed and aligned with Flask.
+        return "/"
+    if parsed.scheme or parsed.netloc or not value.startswith("/"):
         return "/"
     return value
 

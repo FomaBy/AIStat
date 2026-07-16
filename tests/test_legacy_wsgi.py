@@ -580,6 +580,8 @@ def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
         ),
         ("https://evil.example/path", "/"),
         ("//evil.example/path", "/"),
+        ("//[evil.example/path", "/"),
+        ("https://[evil.example/path", "/"),
         (r"/\evil.example/path", "/"),
         ("/api\r\nevil.example", "/"),
         ("/api\x00evil.example", "/"),

@@ -476,6 +476,8 @@ def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
         ),
         ("https://evil.example/path", "/"),
         ("//evil.example/path", "/"),
+        ("//[evil.example/path", "/"),
+        ("https://[evil.example/path", "/"),
         (r"/\evil.example/path", "/"),
         ("/api\r\nevil.example", "/"),
         ("/api\x00evil.example", "/"),

@@ -112,10 +112,15 @@ def safe_next_url(candidate: Optional[str], default: str = "/") -> str:
         for char in candidate
     ):
         return default
-    parsed = urlsplit(candidate)
-    if parsed.scheme or parsed.netloc or not candidate.startswith("/"):
-        return default
     if candidate.startswith("//"):
+        return default
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        # Malformed authorities (for example an unterminated IPv6 literal)
+        # must fail closed instead of turning a public auth route into a 500.
+        return default
+    if parsed.scheme or parsed.netloc or not candidate.startswith("/"):
         return default
     return candidate
 
