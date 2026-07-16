@@ -1,5 +1,3 @@
-"""cPanel/Passenger entry point."""
+"""cPanel/Passenger entry point (Python 3.6+, standard library only)."""
 
-from aistat.wsgi import create_app
-
-application = create_app()
+from aistat.legacy_wsgi import application as application

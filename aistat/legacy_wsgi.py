@@ -1,0 +1,996 @@
+"""Dependency-free authenticated WSGI app for cPanel's system Python.
+
+Namecheap's generic Passenger application currently runs ``/usr/bin/python3``
+with a package index capped at Flask 2.0.3. This entry point deliberately uses
+only the Python 3.6 standard library, while preserving the security contract of
+the modern Flask WSGI app:
+
+* signed HttpOnly/Secure/SameSite sessions;
+* CSRF-protected login/logout and persistent login throttling;
+* strict Host/HTTPS checks and browser security headers;
+* HMAC-authenticated, replay-protected, atomic SQLite snapshot ingestion.
+"""
+
+import base64
+import fcntl
+import gzip
+import hashlib
+import hmac
+import html
+import io
+import json
+import mimetypes
+import os
+import secrets
+import shutil
+import sqlite3
+import tempfile
+import time
+import traceback
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, quote
+
+from . import __version__, aggregates
+from .db import SCHEMA_VERSION, connect, init_db
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+REQUIRED_TABLES = {
+    "runtimes",
+    "agents",
+    "projects",
+    "issues",
+    "daily_usage",
+    "issue_usage",
+    "runs",
+    "runtime_activity",
+    "sync_state",
+    "sync_beats",
+    "poll_cycles",
+    "model_pricing",
+}
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_LOCK_SECONDS = 15 * 60
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+DB_PATH = os.environ.get(
+    "AISTAT_DB_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "aistat.db")),
+)
+SECURITY_DB_PATH = os.environ.get(
+    "AISTAT_SECURITY_DB_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "security.db")),
+)
+ALLOWED_HOSTS = {
+    value.strip().lower()
+    for value in os.environ.get(
+        "AISTAT_ALLOWED_HOSTS", "localhost,127.0.0.1"
+    ).split(",")
+    if value.strip()
+}
+FORCE_HTTPS = _env_bool("AISTAT_FORCE_HTTPS", False)
+COOKIE_SECURE = _env_bool("AISTAT_SESSION_COOKIE_SECURE", FORCE_HTTPS)
+ADMIN_USERNAME = os.environ.get("AISTAT_ADMIN_USERNAME", "admin")
+PASSWORD_HASH = os.environ.get("AISTAT_PASSWORD_HASH", "")
+SESSION_SECRET = os.environ.get("AISTAT_SESSION_SECRET", "")
+INGEST_SECRET = os.environ.get("AISTAT_INGEST_SECRET", "")
+SESSION_SECONDS = int(os.environ.get("AISTAT_SESSION_HOURS", "12")) * 3600
+INGEST_MAX_AGE = int(os.environ.get("AISTAT_INGEST_MAX_AGE_SECONDS", "300"))
+MAX_SNAPSHOT_BYTES = int(
+    os.environ.get("AISTAT_MAX_SNAPSHOT_BYTES", str(64 * 1024 * 1024))
+)
+CREDITS_PER_USD = float(os.environ.get("AISTAT_CREDITS_PER_USD", "1.0"))
+
+
+def _validate_config():
+    for name, value in (
+        ("AISTAT_SESSION_SECRET", SESSION_SECRET),
+        ("AISTAT_INGEST_SECRET", INGEST_SECRET),
+    ):
+        if len(value.encode("utf-8")) < 32:
+            raise RuntimeError(name + " must contain at least 32 bytes")
+    if hmac.compare_digest(
+        SESSION_SECRET.encode("utf-8"), INGEST_SECRET.encode("utf-8")
+    ):
+        raise RuntimeError("session and ingest secrets must be independent")
+    if not ADMIN_USERNAME or not PASSWORD_HASH:
+        raise RuntimeError("dashboard credentials are not configured")
+    if os.path.abspath(DB_PATH) == os.path.abspath(SECURITY_DB_PATH):
+        raise RuntimeError("data and security databases must be different")
+    if not ALLOWED_HOSTS:
+        raise RuntimeError("AISTAT_ALLOWED_HOSTS must not be empty")
+
+
+def _chmod_private(path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _bootstrap():
+    for path in (DB_PATH, SECURITY_DB_PATH):
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, 0o700)
+    if not os.path.exists(DB_PATH):
+        conn = connect(DB_PATH)
+        try:
+            init_db(conn)
+        finally:
+            conn.close()
+        _chmod_private(DB_PATH)
+    conn = sqlite3.connect(SECURITY_DB_PATH)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS login_throttle (
+                client_key      TEXT PRIMARY KEY,
+                window_started  INTEGER NOT NULL,
+                failures        INTEGER NOT NULL,
+                locked_until    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS ingest_state (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                last_timestamp  INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO ingest_state (id, last_timestamp)
+            VALUES (1, 0);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _chmod_private(SECURITY_DB_PATH)
+
+
+_validate_config()
+_bootstrap()
+
+
+def _b64encode(data):
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64decode(value):
+    value += "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value.encode("ascii"))
+
+
+def _sign(data, secret):
+    return hmac.new(
+        secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def _cookie_header(name, value, max_age):
+    parts = [
+        "{}={}".format(name, value),
+        "Path=/",
+        "Max-Age={}".format(max_age),
+        "HttpOnly",
+        "SameSite=Lax",
+    ]
+    if COOKIE_SECURE:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def _cookies(environ):
+    cookie = SimpleCookie()
+    try:
+        cookie.load(environ.get("HTTP_COOKIE", ""))
+    except Exception:
+        return {}
+    return {key: morsel.value for key, morsel in cookie.items()}
+
+
+def _make_session():
+    payload = {
+        "u": ADMIN_USERNAME,
+        "exp": int(time.time()) + SESSION_SECONDS,
+        "csrf": secrets.token_urlsafe(32),
+    }
+    encoded = _b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    return encoded + "." + _sign(encoded, SESSION_SECRET), payload
+
+
+def _read_session(environ):
+    value = _cookies(environ).get("aistat_session")
+    if not value or "." not in value:
+        return None
+    encoded, signature = value.rsplit(".", 1)
+    if not hmac.compare_digest(_sign(encoded, SESSION_SECRET), signature):
+        return None
+    try:
+        payload = json.loads(_b64decode(encoded).decode("utf-8"))
+    except Exception:
+        return None
+    if payload.get("u") != ADMIN_USERNAME or int(payload.get("exp", 0)) < time.time():
+        return None
+    return payload
+
+
+def _make_login_csrf():
+    timestamp = str(int(time.time()))
+    token = secrets.token_urlsafe(24)
+    value = timestamp + "." + token
+    return value + "." + _sign("login:" + value, SESSION_SECRET)
+
+
+def _valid_login_csrf(environ, candidate):
+    cookie_value = _cookies(environ).get("aistat_login_csrf")
+    if not candidate or not cookie_value or not hmac.compare_digest(
+        candidate, cookie_value
+    ):
+        return False
+    try:
+        timestamp, token, signature = candidate.split(".", 2)
+        timestamp_int = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - timestamp_int) > 600:
+        return False
+    expected = _sign("login:" + timestamp + "." + token, SESSION_SECRET)
+    return hmac.compare_digest(expected, signature)
+
+
+def _safe_next(value):
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return "/"
+    if "://" in value:
+        return "/"
+    return value
+
+
+def _verify_password(password):
+    try:
+        method, salt, expected = PASSWORD_HASH.split("$", 2)
+        scheme, algorithm, iterations = method.split(":", 2)
+        if scheme != "pbkdf2":
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            algorithm,
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iterations),
+        ).hex()
+        return hmac.compare_digest(actual, expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def _client_key(environ):
+    address = environ.get("REMOTE_ADDR", "unknown").encode("utf-8")
+    return hmac.new(
+        SESSION_SECRET.encode("utf-8"), address, hashlib.sha256
+    ).hexdigest()
+
+
+def _security_connection():
+    conn = sqlite3.connect(SECURITY_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _login_retry_after(key):
+    now = int(time.time())
+    conn = _security_connection()
+    try:
+        row = conn.execute(
+            "SELECT window_started, failures, locked_until "
+            "FROM login_throttle WHERE client_key = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return 0
+        if row["locked_until"] > now:
+            return row["locked_until"] - now
+        if row["window_started"] + LOGIN_WINDOW_SECONDS <= now:
+            conn.execute(
+                "DELETE FROM login_throttle WHERE client_key = ?", (key,)
+            )
+            conn.commit()
+        return 0
+    finally:
+        conn.close()
+
+
+def _record_login_failure(key):
+    now = int(time.time())
+    conn = _security_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT window_started, failures, locked_until "
+            "FROM login_throttle WHERE client_key = ?",
+            (key,),
+        ).fetchone()
+        if not row or row["window_started"] + LOGIN_WINDOW_SECONDS <= now:
+            window_started, failures, locked_until = now, 1, 0
+        else:
+            window_started = row["window_started"]
+            failures = row["failures"] + 1
+            locked_until = row["locked_until"]
+        if failures >= LOGIN_MAX_FAILURES:
+            locked_until = max(locked_until, now + LOGIN_LOCK_SECONDS)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO login_throttle
+                (client_key, window_started, failures, locked_until)
+            VALUES (?, ?, ?, ?)
+            """,
+            (key, window_started, failures, locked_until),
+        )
+        conn.commit()
+        return max(0, locked_until - now)
+    finally:
+        conn.close()
+
+
+def _clear_login_failures(key):
+    conn = _security_connection()
+    try:
+        conn.execute("DELETE FROM login_throttle WHERE client_key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_ingest_timestamp(timestamp):
+    conn = _security_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = int(
+            conn.execute(
+                "SELECT last_timestamp FROM ingest_state WHERE id = 1"
+            ).fetchone()["last_timestamp"]
+        )
+        if timestamp <= current:
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE ingest_state SET last_timestamp = ? WHERE id = 1",
+            (timestamp,),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _secure_headers(environ):
+    headers = [
+        ("Cache-Control", "no-store"),
+        (
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; font-src 'self'; base-uri 'none'; "
+            "form-action 'self'; frame-ancestors 'none'",
+        ),
+        ("Cross-Origin-Opener-Policy", "same-origin"),
+        ("Cross-Origin-Resource-Policy", "same-origin"),
+        (
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=()",
+        ),
+        ("Referrer-Policy", "no-referrer"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+    ]
+    if _is_secure(environ):
+        headers.append(
+            ("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        )
+    return headers
+
+
+def _respond(environ, start_response, status, body=b"", content_type=None, headers=None):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    response_headers = list(headers or [])
+    if content_type:
+        response_headers.append(("Content-Type", content_type))
+    response_headers.append(("Content-Length", str(len(body))))
+    response_headers.extend(_secure_headers(environ))
+    start_response(status, response_headers)
+    return [body]
+
+
+def _json_response(environ, start_response, status, data, headers=None):
+    return _respond(
+        environ,
+        start_response,
+        status,
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        "application/json; charset=utf-8",
+        headers,
+    )
+
+
+def _is_secure(environ):
+    forwarded = environ.get("HTTP_X_FORWARDED_PROTO", "").split(",", 1)[0].strip()
+    return (
+        forwarded == "https"
+        or environ.get("HTTPS", "").lower() in ("on", "1", "true")
+        or environ.get("wsgi.url_scheme") == "https"
+    )
+
+
+def _host(environ):
+    value = environ.get("HTTP_HOST") or environ.get("SERVER_NAME", "")
+    if value.startswith("[") and "]" in value:
+        return value[1 : value.index("]")].lower()
+    return value.split(":", 1)[0].rstrip(".").lower()
+
+
+def _query(environ):
+    return parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+
+
+def _first(values, name, default=None):
+    value = values.get(name)
+    return value[0] if value else default
+
+
+def _read_form(environ):
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or "0")
+    except ValueError:
+        length = 0
+    if length < 0 or length > 64 * 1024:
+        raise ValueError("invalid form size")
+    body = environ["wsgi.input"].read(length)
+    return parse_qs(body.decode("utf-8"), keep_blank_values=True)
+
+
+def _data_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def _sync_state(conn):
+    beat = conn.execute(
+        "SELECT seq, at, phase FROM sync_beats WHERE id = 1"
+    ).fetchone()
+    cycle = conn.execute(
+        "SELECT id, started_at, finished_at, sources_ok, sources_failed "
+        "FROM poll_cycles ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return {
+        "beat": dict(beat) if beat else None,
+        "cycle": dict(cycle) if cycle else None,
+    }
+
+
+def _health(conn):
+    count_queries = {
+        "runtimes": "SELECT COUNT(*) FROM runtimes",
+        "agents": "SELECT COUNT(*) FROM agents",
+        "projects": "SELECT COUNT(*) FROM projects",
+        "issues": "SELECT COUNT(*) FROM issues",
+        "daily_usage": "SELECT COUNT(*) FROM daily_usage",
+        "issue_usage": "SELECT COUNT(*) FROM issue_usage",
+        "runs": "SELECT COUNT(*) FROM runs",
+        "runtime_activity": "SELECT COUNT(*) FROM runtime_activity",
+        "model_pricing": "SELECT COUNT(*) FROM model_pricing",
+        "poll_cycles": "SELECT COUNT(*) FROM poll_cycles",
+    }
+    row_counts = {
+        table: conn.execute(query).fetchone()[0]
+        for table, query in count_queries.items()
+    }
+    failing = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT source, last_error_at, last_error FROM sync_state "
+            "WHERE ok = 0 ORDER BY source"
+        )
+    ]
+    span = conn.execute(
+        "SELECT MIN(date), MAX(date), COUNT(*) FROM daily_usage"
+    ).fetchone()
+    pricing = conn.execute(
+        "SELECT model FROM model_pricing WHERE unpriced = 1 ORDER BY model"
+    ).fetchall()
+    return {
+        "status": "degraded" if failing else "ok",
+        "row_counts": row_counts,
+        "failing_sources": failing,
+        "daily_usage_span": {
+            "first_date": span[0],
+            "last_date": span[1],
+            "rows": span[2],
+        },
+        "pricing": {
+            "credits_per_usd": CREDITS_PER_USD,
+            "unpriced_models_in_usage": [row[0] for row in pricing],
+        },
+        "sync": _sync_state(conn),
+    }
+
+
+def _render_login(csrf, next_url, error=None):
+    error_html = ""
+    if error:
+        error_html = '<p class="error" role="alert">{}</p>'.format(
+            html.escape(error)
+        )
+    return """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход — AIStat</title>
+  <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="brand-mark" aria-hidden="true">AI</div>
+      <h1 id="login-title">AIStat</h1>
+      <p class="subtitle">Закрытая статистика использования Multica</p>
+      {error}
+      <form method="post" action="/login" autocomplete="on">
+        <input type="hidden" name="csrf" value="{csrf}">
+        <input type="hidden" name="next" value="{next_url}">
+        <label>Имя пользователя
+          <input type="text" name="username" maxlength="128"
+                 autocomplete="username" required autofocus>
+        </label>
+        <label>Пароль
+          <input type="password" name="password"
+                 autocomplete="current-password" required>
+        </label>
+        <button type="submit">Войти</button>
+      </form>
+      <p class="security-note">
+        Соединение защищено HTTPS. Пароль хранится только как стойкий хеш.
+      </p>
+    </section>
+  </main>
+</body>
+</html>""".format(
+        error=error_html,
+        csrf=html.escape(csrf, quote=True),
+        next_url=html.escape(next_url, quote=True),
+    )
+
+
+def _serve_static(environ, start_response, name):
+    allowed = {
+        "index.html",
+        "app.js",
+        "style.css",
+        "login.css",
+        "vendor/chart.umd.min.js",
+    }
+    if name not in allowed:
+        return _respond(environ, start_response, "404 Not Found", "Not found")
+    path = os.path.join(STATIC_DIR, *name.split("/"))
+    try:
+        with open(path, "rb") as source:
+            body = source.read()
+    except OSError:
+        return _respond(environ, start_response, "404 Not Found", "Not found")
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    if content_type.startswith("text/") or content_type == "application/javascript":
+        content_type += "; charset=utf-8"
+    return _respond(environ, start_response, "200 OK", body, content_type)
+
+
+def _snapshot_signature(timestamp, body):
+    digest = hashlib.sha256(body).hexdigest()
+    canonical = "{}\n{}".format(timestamp, digest).encode("ascii")
+    return "v1=" + hmac.new(
+        INGEST_SECRET.encode("utf-8"), canonical, hashlib.sha256
+    ).hexdigest()
+
+
+def _verify_snapshot_request(environ, body):
+    try:
+        timestamp = int(environ.get("HTTP_X_AISTAT_TIMESTAMP", ""))
+    except ValueError:
+        raise ValueError("invalid timestamp")
+    if abs(int(time.time()) - timestamp) > INGEST_MAX_AGE:
+        raise ValueError("stale timestamp")
+    supplied = environ.get("HTTP_X_AISTAT_SIGNATURE", "")
+    expected = _snapshot_signature(timestamp, body)
+    if not hmac.compare_digest(supplied, expected):
+        raise ValueError("invalid signature")
+    return timestamp
+
+
+def _unlink_if_exists(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _install_snapshot(payload):
+    if len(payload) > MAX_SNAPSHOT_BYTES:
+        raise ValueError("snapshot too large")
+    parent = os.path.dirname(DB_PATH)
+    handle, temp_path = tempfile.mkstemp(
+        prefix=".aistat-snapshot-", suffix=".db", dir=parent
+    )
+    os.close(handle)
+    _chmod_private(temp_path)
+    total = 0
+    try:
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as source:
+                with open(temp_path, "wb") as output:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_SNAPSHOT_BYTES:
+                            raise ValueError("snapshot too large")
+                        output.write(chunk)
+        except (OSError, EOFError):
+            raise ValueError("invalid gzip")
+
+        with open(temp_path, "rb") as source:
+            if source.read(16) != b"SQLite format 3\x00":
+                raise ValueError("not SQLite")
+        conn = sqlite3.connect(temp_path)
+        try:
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("integrity check failed")
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version < 1 or version > SCHEMA_VERSION:
+                raise ValueError("unsupported schema")
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if REQUIRED_TABLES - tables:
+                raise ValueError("missing tables")
+        finally:
+            conn.close()
+
+        previous = DB_PATH + ".previous"
+        if os.path.exists(DB_PATH):
+            shutil.copy2(DB_PATH, previous)
+            _chmod_private(previous)
+        _unlink_if_exists(DB_PATH + "-wal")
+        _unlink_if_exists(DB_PATH + "-shm")
+        os.replace(temp_path, DB_PATH)
+        _chmod_private(DB_PATH)
+        with open(DB_PATH, "rb") as source:
+            data = source.read()
+        return {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+            "schema_version": version,
+        }
+    finally:
+        _unlink_if_exists(temp_path)
+
+
+def _authenticated(environ):
+    return _read_session(environ)
+
+
+def _login(environ, start_response):
+    method = environ.get("REQUEST_METHOD", "GET")
+    query = _query(environ)
+    if method == "GET":
+        session = _read_session(environ)
+        if session:
+            return _respond(
+                environ,
+                start_response,
+                "303 See Other",
+                headers=[("Location", _safe_next(_first(query, "next", "/")))],
+            )
+        csrf = _make_login_csrf()
+        headers = [("Set-Cookie", _cookie_header("aistat_login_csrf", csrf, 600))]
+        return _respond(
+            environ,
+            start_response,
+            "200 OK",
+            _render_login(csrf, _safe_next(_first(query, "next", "/"))),
+            "text/html; charset=utf-8",
+            headers,
+        )
+    if method != "POST":
+        return _respond(environ, start_response, "405 Method Not Allowed")
+    try:
+        form = _read_form(environ)
+    except ValueError:
+        return _respond(environ, start_response, "400 Bad Request")
+    csrf = _first(form, "csrf", "")
+    next_url = _safe_next(_first(form, "next", "/"))
+    if not _valid_login_csrf(environ, csrf):
+        return _respond(
+            environ,
+            start_response,
+            "400 Bad Request",
+            _render_login(
+                _make_login_csrf(),
+                next_url,
+                "Не удалось проверить форму. Обновите страницу.",
+            ),
+            "text/html; charset=utf-8",
+        )
+    key = _client_key(environ)
+    retry = _login_retry_after(key)
+    if retry:
+        return _respond(
+            environ,
+            start_response,
+            "429 Too Many Requests",
+            _render_login(
+                csrf, next_url, "Слишком много попыток. Повторите вход позже."
+            ),
+            "text/html; charset=utf-8",
+            [("Retry-After", str(retry))],
+        )
+    username_ok = hmac.compare_digest(
+        _first(form, "username", ""), ADMIN_USERNAME
+    )
+    password_ok = _verify_password(_first(form, "password", ""))
+    if not (username_ok and password_ok):
+        retry = _record_login_failure(key)
+        message = (
+            "Слишком много попыток. Повторите вход позже."
+            if retry
+            else "Неверное имя пользователя или пароль."
+        )
+        headers = [("Retry-After", str(retry))] if retry else []
+        return _respond(
+            environ,
+            start_response,
+            "429 Too Many Requests" if retry else "401 Unauthorized",
+            _render_login(csrf, next_url, message),
+            "text/html; charset=utf-8",
+            headers,
+        )
+    _clear_login_failures(key)
+    session_value, _payload = _make_session()
+    headers = [
+        ("Location", next_url),
+        (
+            "Set-Cookie",
+            _cookie_header("aistat_session", session_value, SESSION_SECONDS),
+        ),
+        ("Set-Cookie", _cookie_header("aistat_login_csrf", "", 0)),
+    ]
+    return _respond(environ, start_response, "303 See Other", headers=headers)
+
+
+def _ingest(environ, start_response):
+    if environ.get("REQUEST_METHOD") != "POST":
+        return _respond(environ, start_response, "405 Method Not Allowed")
+    if (
+        environ.get("CONTENT_TYPE", "").split(";", 1)[0]
+        != "application/vnd.aistat.snapshot+gzip"
+    ):
+        return _json_response(
+            environ, start_response, "415 Unsupported Media Type", {"detail": "unsupported content type"}
+        )
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or "0")
+    except ValueError:
+        length = 0
+    if length <= 0 or length > MAX_SNAPSHOT_BYTES:
+        return _json_response(
+            environ, start_response, "413 Payload Too Large", {"detail": "snapshot too large"}
+        )
+    body = environ["wsgi.input"].read(length)
+    try:
+        timestamp = _verify_snapshot_request(environ, body)
+    except ValueError:
+        return _json_response(
+            environ, start_response, "401 Unauthorized", {"detail": "snapshot authentication failed"}
+        )
+    lock_path = os.path.join(os.path.dirname(SECURITY_DB_PATH), "ingest.lock")
+    with open(lock_path, "a+b") as lock:
+        _chmod_private(lock_path)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if not _record_ingest_timestamp(timestamp):
+                return _json_response(
+                    environ, start_response, "409 Conflict", {"detail": "snapshot replay rejected"}
+                )
+            try:
+                info = _install_snapshot(body)
+            except ValueError:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity", {"detail": "invalid snapshot"}
+                )
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    info["status"] = "ok"
+    return _json_response(environ, start_response, "200 OK", info)
+
+
+def _api(environ, start_response, path):
+    query = _query(environ)
+    session = _read_session(environ)
+    if path == "/api/session":
+        return _json_response(
+            environ,
+            start_response,
+            "200 OK",
+            {"username": ADMIN_USERNAME, "csrf": session["csrf"]},
+        )
+    conn = _data_connection()
+    try:
+        if path == "/api/meta":
+            data = aggregates.meta(conn)
+        elif path == "/api/summary":
+            data = aggregates.summary(
+                conn,
+                _first(query, "from"),
+                _first(query, "to"),
+                _first(query, "project"),
+                credits_per_usd=CREDITS_PER_USD,
+            )
+        elif path == "/api/daily":
+            try:
+                data = aggregates.daily_series(
+                    conn,
+                    _first(query, "group", "model"),
+                    _first(query, "from"),
+                    _first(query, "to"),
+                    _first(query, "project"),
+                )
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity", {"detail": str(exc)}
+                )
+        elif path == "/api/agents":
+            data = {
+                "agents": aggregates.agent_totals(
+                    conn,
+                    _first(query, "from"),
+                    _first(query, "to"),
+                    _first(query, "project"),
+                )
+            }
+        elif path == "/api/projects":
+            data = {
+                "projects": aggregates.projects_overview(
+                    conn, credits_per_usd=CREDITS_PER_USD
+                )
+            }
+        elif path == "/api/efficiency":
+            raw_limit = _first(query, "limit")
+            try:
+                limit = int(raw_limit) if raw_limit else None
+            except ValueError:
+                limit = 0
+            if limit is not None and not 1 <= limit <= 1000:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity", {"detail": "invalid limit"}
+                )
+            data = {
+                "issues": aggregates.issue_efficiency(
+                    conn, _first(query, "project"), limit
+                )
+            }
+        elif path in ("/api/health", "/health"):
+            data = _health(conn)
+        elif path == "/api/sync":
+            data = _sync_state(conn)
+        elif path == "/api/events":
+            return _respond(environ, start_response, "204 No Content")
+        else:
+            return _json_response(
+                environ, start_response, "404 Not Found", {"detail": "not found"}
+            )
+        return _json_response(environ, start_response, "200 OK", data)
+    finally:
+        conn.close()
+
+
+def application(environ, start_response):
+    try:
+        host = _host(environ)
+        if host not in ALLOWED_HOSTS:
+            return _respond(environ, start_response, "400 Bad Request", "Invalid host")
+        if FORCE_HTTPS and not _is_secure(environ):
+            if environ.get("REQUEST_METHOD", "GET") not in ("GET", "HEAD"):
+                return _respond(environ, start_response, "400 Bad Request", "HTTPS required")
+            location = "https://" + environ.get("HTTP_HOST", host) + environ.get(
+                "PATH_INFO", "/"
+            )
+            if environ.get("QUERY_STRING"):
+                location += "?" + environ["QUERY_STRING"]
+            return _respond(
+                environ,
+                start_response,
+                "308 Permanent Redirect",
+                headers=[("Location", location)],
+            )
+
+        path = environ.get("PATH_INFO") or "/"
+        if path == "/healthz":
+            return _json_response(
+                environ,
+                start_response,
+                "200 OK",
+                {"status": "ok", "version": __version__},
+            )
+        if path == "/login":
+            return _login(environ, start_response)
+        if path == "/login.css":
+            return _serve_static(environ, start_response, "login.css")
+        if path == "/api/ingest/snapshot":
+            return _ingest(environ, start_response)
+
+        session = _authenticated(environ)
+        if not session:
+            if path.startswith("/api/") or path == "/health":
+                return _json_response(
+                    environ,
+                    start_response,
+                    "401 Unauthorized",
+                    {"detail": "authentication required"},
+                )
+            next_url = quote(
+                _safe_next(
+                    path
+                    + (
+                        "?" + environ["QUERY_STRING"]
+                        if environ.get("QUERY_STRING")
+                        else ""
+                    )
+                ),
+                safe="",
+            )
+            return _respond(
+                environ,
+                start_response,
+                "303 See Other",
+                headers=[("Location", "/login?next=" + next_url)],
+            )
+
+        if path == "/logout":
+            if environ.get("REQUEST_METHOD") != "POST":
+                return _respond(environ, start_response, "405 Method Not Allowed")
+            candidate = environ.get("HTTP_X_CSRF_TOKEN", "")
+            if not hmac.compare_digest(candidate, session.get("csrf", "")):
+                return _json_response(
+                    environ, start_response, "400 Bad Request", {"detail": "invalid CSRF token"}
+                )
+            return _respond(
+                environ,
+                start_response,
+                "303 See Other",
+                headers=[
+                    ("Location", "/login"),
+                    ("Set-Cookie", _cookie_header("aistat_session", "", 0)),
+                ],
+            )
+        if path.startswith("/api/") or path == "/health":
+            return _api(environ, start_response, path)
+        if path == "/":
+            return _serve_static(environ, start_response, "index.html")
+        return _serve_static(environ, start_response, path.lstrip("/"))
+    except Exception:
+        error_stream = environ.get("wsgi.errors")
+        if error_stream is not None:
+            traceback.print_exc(file=error_stream)
+        return _respond(
+            environ, start_response, "500 Internal Server Error", "Internal server error"
+        )

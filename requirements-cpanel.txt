@@ -1,2 +1,1 @@
-Flask>=3.1.2,<4
-click>=8.3.3,<9
+# cPanel Passenger uses a dependency-free standard-library WSGI entry point.
