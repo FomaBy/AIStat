@@ -20,6 +20,7 @@ const state = {
   csrf: null,
   lastSyncMarker: null,
   syncPollTimer: null,
+  focusSyncTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -347,6 +348,26 @@ function stopSyncPolling() {
   state.syncPollTimer = null;
 }
 
+// Returning to the dashboard (window regains focus or the tab becomes
+// visible) re-reads the data so displayed stats are current without a manual
+// reload. `pollSync` hits the lightweight /api/sync endpoint and only fires a
+// full refresh when the data actually changed, so an unchanged return costs a
+// single request. focus and visibilitychange can both fire for one return; a
+// short debounce coalesces them into one check.
+function refreshOnReturn() {
+  if (document.visibilityState === "hidden") return;
+  if (state.focusSyncTimer) return;
+  state.focusSyncTimer = setTimeout(() => {
+    state.focusSyncTimer = null;
+    pollSync().catch(console.error);
+  }, 200);
+}
+
+function watchWindowFocus() {
+  document.addEventListener("visibilitychange", refreshOnReturn);
+  window.addEventListener("focus", refreshOnReturn);
+}
+
 function connectEvents() {
   const source = new EventSource("/api/events");
   source.onopen = () => {
@@ -454,6 +475,7 @@ async function boot() {
   });
   await refreshAll();
   connectEvents();
+  watchWindowFocus();
 }
 
 boot().catch((err) => {
