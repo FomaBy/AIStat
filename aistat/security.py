@@ -28,6 +28,7 @@ LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCK_SECONDS = 15 * 60
 LOGIN_MAX_FAILURES = 5
 INGEST_SIGNATURE_PREFIX = "v1="
+OAUTH_STATE_TTL_SECONDS = 10 * 60
 
 
 class SecurityConfigError(ValueError):
@@ -139,7 +140,12 @@ def verify_snapshot_signature(
 
 
 class SecurityStore:
-    """Persistent login throttle and ingest replay state."""
+    """Persistent login throttle, ingest replay state and user accounts.
+
+    Accounts live here rather than in the Multica data snapshot because that
+    database is replaced wholesale on every ingest (``os.replace``), which
+    would wipe any user rows stored alongside it.
+    """
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -168,6 +174,27 @@ class SecurityStore:
                 );
                 INSERT OR IGNORE INTO ingest_state (id, last_timestamp)
                 VALUES (1, 0);
+                CREATE TABLE IF NOT EXISTS users (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at      INTEGER NOT NULL,
+                    display_name    TEXT,
+                    email           TEXT,
+                    is_admin        INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS oauth_identities (
+                    provider        TEXT NOT NULL,
+                    subject         TEXT NOT NULL,
+                    user_id         INTEGER NOT NULL,
+                    email           TEXT,
+                    linked_at       INTEGER NOT NULL,
+                    PRIMARY KEY (provider, subject)
+                );
+                CREATE TABLE IF NOT EXISTS oauth_state (
+                    state           TEXT PRIMARY KEY,
+                    provider        TEXT NOT NULL,
+                    next_url        TEXT,
+                    created_at      INTEGER NOT NULL
+                );
                 """
             )
             conn.commit()
@@ -277,6 +304,102 @@ class SecurityStore:
             )
             conn.commit()
             return True
+        finally:
+            conn.close()
+
+    def find_or_create_user_by_identity(
+        self,
+        provider: str,
+        subject: str,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> int:
+        """Return the AIStat user id linked to ``(provider, subject)``.
+
+        The same external identity always maps to the same user; a new user
+        and identity are created atomically on first sight.
+        """
+        now = int(time.time()) if now is None else int(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row:
+                conn.commit()
+                return int(row["user_id"])
+            cursor = conn.execute(
+                "INSERT INTO users (created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 0)",
+                (now, display_name, email),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, now),
+            )
+            conn.commit()
+            return user_id
+        finally:
+            conn.close()
+
+    def put_oauth_state(
+        self,
+        state: str,
+        provider: str,
+        next_url: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> None:
+        """Persist a one-time OAuth ``state`` value with a bounded lifetime."""
+        now = int(time.time()) if now is None else int(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM oauth_state WHERE created_at + ? <= ?",
+                (OAUTH_STATE_TTL_SECONDS, now),
+            )
+            conn.execute(
+                "INSERT INTO oauth_state (state, provider, next_url, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (state, provider, next_url, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def take_oauth_state(
+        self, state: str, now: Optional[int] = None
+    ) -> Optional[dict]:
+        """Consume a stored OAuth ``state`` exactly once.
+
+        Returns ``{"provider", "next_url"}`` for a fresh, known state and
+        ``None`` for an unknown, already-consumed or expired one. The row is
+        deleted on any match so a state can never be replayed.
+        """
+        now = int(time.time()) if now is None else int(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT provider, next_url, created_at "
+                "FROM oauth_state WHERE state = ?",
+                (state,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            conn.execute("DELETE FROM oauth_state WHERE state = ?", (state,))
+            conn.commit()
+            if row["created_at"] + OAUTH_STATE_TTL_SECONDS <= now:
+                return None
+            return {"provider": row["provider"], "next_url": row["next_url"]}
         finally:
             conn.close()
 
