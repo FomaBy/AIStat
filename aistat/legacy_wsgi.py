@@ -1150,6 +1150,8 @@ def _api(environ, start_response, path):
                     conn, _first(query, "project"), limit
                 )
             }
+        elif path == "/api/model-efficiency":
+            data = aggregates.efficiency_breakdown(conn, _first(query, "project"))
         elif path in ("/api/health", "/health"):
             data = _health(conn)
         elif path == "/api/sync":

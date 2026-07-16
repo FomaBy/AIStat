@@ -78,6 +78,24 @@ def test_efficiency_endpoint(api):
     assert client.get("/api/efficiency", params={"project": "P2"}).json() == {"issues": []}
 
 
+def test_model_efficiency_endpoint(api):
+    client, _ = api
+    data = client.get("/api/model-efficiency").json()
+    assert data["cost_per_sp"] == pytest.approx(0.0005)
+    assert data["weighted_efficiency"] == pytest.approx(0.00025)
+    assert [m["model"] for m in data["models"]] == ["m-claude", "m-shared"]
+    empty = client.get("/api/model-efficiency", params={"project": "P2"}).json()
+    assert empty["models"] == []
+    assert empty["cost_per_sp"] is None
+
+
+def test_summary_endpoint_has_cost_efficiency(api):
+    client, _ = api
+    s = client.get("/api/summary").json()
+    assert s["cost_per_sp"] == pytest.approx(0.0005)
+    assert s["weighted_efficiency"] == pytest.approx(0.00025)
+
+
 def test_health_endpoints(api):
     client, _ = api
     for path in ("/health", "/api/health"):

@@ -226,6 +226,19 @@ def test_login_api_and_security_headers(legacy):
     assert "Secure" in cookies or "aistat_session=" in cookies
 
 
+def test_model_efficiency_endpoint(legacy):
+    status, _, _ = request(legacy.application, "/api/model-efficiency")
+    assert status == "401 Unauthorized"
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/model-efficiency", cookie=cookies
+    )
+    assert status == "200 OK"
+    data = legacy.json.loads(body.decode("utf-8"))
+    assert [m["model"] for m in data["models"]] == ["m-claude", "m-shared"]
+    assert abs(data["cost_per_sp"] - 0.0005) < 1e-9
+
+
 def test_logout_requires_csrf(legacy):
     cookies = login(legacy)
     status, _, body = request(

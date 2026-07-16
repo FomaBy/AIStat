@@ -234,6 +234,18 @@ def test_signed_snapshot_install_and_replay_rejection(public_app, tmp_path):
     assert summary["total_tokens"] == 5_700_000
 
 
+def test_model_efficiency_endpoint_behind_auth(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert client.get("/api/model-efficiency").status_code == 401
+    login(client)
+    data = client.get(
+        "/api/model-efficiency", base_url="https://localhost"
+    ).get_json()
+    assert [m["model"] for m in data["models"]] == ["m-claude", "m-shared"]
+    assert data["cost_per_sp"] == pytest.approx(0.0005)
+
+
 def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
     app, _ = public_app
     client = app.test_client()

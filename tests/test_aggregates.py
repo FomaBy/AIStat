@@ -193,6 +193,94 @@ def test_summary_period_filter(agg_conn):
     assert s["has_unpriced"] is False
 
 
+# -- efficiency breakdown (tokens / cost / weighted) -----------------------------
+
+
+def test_efficiency_breakdown_tokens_cost_weighted(agg_conn):
+    # Only I1 counts (SP>0 + usage). It ran on m-claude (A1) and m-shared (A2)
+    # 1h each → 50/50. Tokens 1000 in / 500 out = 1500.
+    #   cost = 0.5*(1000*1.0)/1e6 + 0.5*(1000*2.0 + 500*4.0)/1e6 = 0.0025 USD
+    #   active hours = 1h + 1h = 2h
+    eff = ag.efficiency_breakdown(agg_conn)
+    assert eff["tokens_per_sp"] == pytest.approx(300.0)      # 1500 / 5
+    assert eff["cost_usd"] == pytest.approx(0.0025)
+    assert eff["cost_per_sp"] == pytest.approx(0.0005)       # 0.0025 / 5
+    assert eff["active_hours"] == pytest.approx(2.0)
+    # weighted = SP-weighted mean of cost/hours/sp = (0.0025/2) / 5
+    assert eff["weighted_efficiency"] == pytest.approx(0.00025)
+    assert eff["has_unpriced"] is False
+    assert eff["cost_issues"] == 1
+
+
+def test_efficiency_breakdown_per_model_cheapest_first(agg_conn):
+    models = ag.efficiency_breakdown(agg_conn)["models"]
+    assert [m["model"] for m in models] == ["m-claude", "m-shared"]  # cheaper first
+    by_model = {m["model"]: m for m in models}
+    # Each took half of I1: 2.5 SP, 750 tokens, 1h.
+    assert by_model["m-claude"]["story_points"] == pytest.approx(2.5)
+    assert by_model["m-claude"]["cost_per_sp"] == pytest.approx(0.0002)   # 0.0005/2.5
+    assert by_model["m-claude"]["weighted_efficiency"] == pytest.approx(0.0002)
+    assert by_model["m-shared"]["cost_per_sp"] == pytest.approx(0.0008)   # 0.002/2.5
+    assert by_model["m-shared"]["tokens_per_sp"] == pytest.approx(300.0)
+
+
+def test_efficiency_breakdown_project_filter(agg_conn):
+    # P2 has no issue with SP>0 and usage → nothing to measure.
+    empty = ag.efficiency_breakdown(agg_conn, project_id="P2")
+    assert empty["models"] == []
+    assert empty["cost_per_sp"] is None
+    assert empty["weighted_efficiency"] is None
+    assert empty["tokens_per_sp"] is None
+    # P1 carries all of I1.
+    assert ag.efficiency_breakdown(agg_conn, project_id="P1")["cost_per_sp"] == pytest.approx(0.0005)
+
+
+def test_efficiency_breakdown_flags_unpriced_model(agg_conn):
+    # An issue whose only run used an unpriced model surfaces the model with
+    # no cost (never $0) and flips the unpriced flag; priced rows stay intact.
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A4', 'Mystery', 'm-mystery', 'R4', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I6', 'T-6', 'unpriced model', 'done', 'P1', 4, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I6', 1, 900, 0, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run6', 'I6', 'A4', 'R4', 'completed',
+       '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', '{now}');
+    """)
+    agg_conn.commit()
+    eff = ag.efficiency_breakdown(agg_conn)
+    assert eff["has_unpriced"] is True
+    by_model = {m["model"]: m for m in eff["models"]}
+    mystery = by_model["m-mystery"]
+    assert mystery["cost_usd"] is None
+    assert mystery["cost_per_sp"] is None
+    assert mystery["weighted_efficiency"] is None
+    assert mystery["has_unpriced"] is True
+    # Priced cost is unchanged; cost_per_sp now spreads it over 5 + 4 SP.
+    assert eff["cost_usd"] == pytest.approx(0.0025)
+    assert eff["cost_per_sp"] == pytest.approx(0.0025 / 9)
+    # Weighted efficiency ignores the unpriced (not fully priced) issue.
+    assert eff["weighted_efficiency"] == pytest.approx(0.00025)
+
+
+def test_summary_adds_cost_and_weighted_efficiency(agg_conn):
+    s = ag.summary(agg_conn)
+    assert s["cost_per_sp"] == pytest.approx(0.0005)
+    assert s["weighted_efficiency"] == pytest.approx(0.00025)
+    assert s["efficiency_hours"] == pytest.approx(2.0)
+    assert s["efficiency_has_unpriced"] is False
+    beta = ag.summary(agg_conn, project_id="P2")
+    assert beta["cost_per_sp"] is None
+    assert beta["weighted_efficiency"] is None
+
+
 # -- Jira exclusion --------------------------------------------------------------
 
 

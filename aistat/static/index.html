@@ -52,7 +52,9 @@
     <div class="card"><div class="card-label">Стоимость</div><div class="card-value" id="card-cost">—</div><div class="card-sub" id="card-cost-sub"></div></div>
     <div class="card"><div class="card-label">Кредиты</div><div class="card-value" id="card-credits">—</div><div class="card-sub" id="card-credits-sub"></div></div>
     <div class="card"><div class="card-label">Story Points</div><div class="card-value" id="card-sp">—</div><div class="card-sub" id="card-sp-sub"></div></div>
-    <div class="card"><div class="card-label">Эффективность</div><div class="card-value" id="card-eff">—</div><div class="card-sub">токенов на 1 SP · меньше — лучше</div></div>
+    <div class="card"><div class="card-label">Эффективность токенов</div><div class="card-value" id="card-eff">—</div><div class="card-sub">токенов на 1 SP · меньше — лучше</div></div>
+    <div class="card"><div class="card-label">Эффективность стоимости</div><div class="card-value" id="card-cost-eff">—</div><div class="card-sub">USD на 1 SP · меньше — лучше</div></div>
+    <div class="card"><div class="card-label">Взвешенная эффективность</div><div class="card-value" id="card-weighted-eff">—</div><div class="card-sub">USD/час на 1 SP · меньше — лучше</div></div>
   </section>
 
   <main class="grid">
@@ -103,6 +105,21 @@
         </table>
       </div>
       <p class="note">Токены проектов — точные суммы по задачам (<code>multica issue usage</code>); стоимость ≈ оценена по моделям агентов, выполнявших задачи. Эффективность считается только по задачам со story points и загруженной статистикой.</p>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>Эффективность по моделям <span class="est-mark">≈ стоимость на 1 SP · меньше — лучше</span></h2>
+      <div class="table-wrap">
+        <table id="table-model-efficiency">
+          <thead><tr>
+            <th>Модель</th><th class="num">SP</th><th class="num">Токены</th>
+            <th class="num">Токены / SP</th><th class="num">Стоимость ≈</th>
+            <th class="num">Стоимость / SP ≈</th><th class="num">Взвеш. ≈ ($/ч·SP)</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note">Разрез по моделям среди задач со story points и загруженной статистикой; SP и стоимость делятся между моделями по длительности их запусков. Сортировка — по стоимости на 1 SP, дешевле сверху. «Взвешенная» — стоимость в час на 1 SP; формула и обоснование: <code>docs/metrics-efficiency.md</code>.</p>
     </section>
 
     <section class="panel panel-wide">

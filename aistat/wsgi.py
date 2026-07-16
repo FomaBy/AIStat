@@ -461,6 +461,16 @@ def create_app(config: Optional[Config] = None) -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/model-efficiency")
+    def api_model_efficiency():
+        conn = data_connection()
+        try:
+            return jsonify(
+                aggregates.efficiency_breakdown(conn, request.args.get("project"))
+            )
+        finally:
+            conn.close()
+
     def health_payload():
         conn = data_connection()
         try:

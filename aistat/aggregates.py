@@ -29,6 +29,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
+# Run durations come out of SQLite's julianday() in days; efficiency reports
+# money-per-hour, so durations are converted to hours with this factor.
+HOURS_PER_DAY = 24.0
+
 
 def _total(row: Dict[str, Any]) -> int:
     return sum(int(row[k] or 0) for k in TOKEN_KINDS)
@@ -342,8 +346,13 @@ def _pricing_rates(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
     }
 
 
-def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]]:
-    """Per issue: weight of each model, from run durations (fallback counts)."""
+def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Per issue: ``{model: {'dur': run-duration-in-days, 'n': run-count}}``.
+
+    Duration is started_at→completed_at in days (julianday), missing
+    timestamps → 0. Used both to weight a model's share of an issue and to
+    report the active hours it spent on it.
+    """
     stats: Dict[str, Dict[str, Dict[str, float]]] = {}
     rows = conn.execute(
         """
@@ -358,8 +367,13 @@ def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]
         stats.setdefault(row["issue_id"], {})[row["model"]] = {
             "dur": row["dur"] or 0.0, "n": row["n"],
         }
+    return stats
+
+
+def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]]:
+    """Per issue: weight of each model, from run durations (fallback counts)."""
     weights: Dict[str, Dict[str, float]] = {}
-    for issue_id, models in stats.items():
+    for issue_id, models in _issue_model_stats(conn).items():
         keys = list(models)
         weights[issue_id] = _weights(
             keys,
@@ -537,6 +551,172 @@ def issue_efficiency(conn: sqlite3.Connection, project_id: Optional[str] = None,
     return out
 
 
+# -- efficiency (tokens / cost / weighted) ----------------------------------------
+
+
+def efficiency_breakdown(conn: sqlite3.Connection,
+                         project_id: Optional[str] = None) -> Dict[str, Any]:
+    """Three efficiency metrics over the issues that count toward efficiency
+    (is_jira = 0, story points > 0, a synced usage row, optional project),
+    plus a per-model breakdown. Formulas and rationale:
+    ``docs/metrics-efficiency.md``.
+
+    - Token efficiency (``tokens_per_sp``, lower is better) — exact tokens ÷
+      story points — spans every counted issue.
+    - Cost efficiency (``cost_per_sp``, USD ÷ SP) and weighted efficiency span
+      the subset that also has runs, so the exact token counts can be split
+      across the models that ran the issue and priced. Tokens landing on an
+      unpriced/unknown model are surfaced in ``unpriced_tokens`` and flagged,
+      never priced as 0.
+    - Weighted efficiency (``weighted_efficiency``, USD per active hour per SP,
+      lower is better) is the SP-weighted mean of each fully priced issue's
+      cost ÷ active-hours ÷ story-points; algebraically ``Σ(cost_i / hours_i)
+      ÷ Σ sp_i``. It is scale-invariant, so models/projects/periods compare
+      fairly (see the doc for the derivation).
+
+    The per-model rows carry the same three metrics for one model's share of
+    the counted issues (story points and tokens split by run duration, cost by
+    the model's official rate), sorted cheapest cost-per-SP first so it is
+    obvious which model delivers a story point for less.
+    """
+    rates = _pricing_rates(conn)
+    stats = _issue_model_stats(conn)
+
+    where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
+             "AND i.story_points > 0")
+    params: List[Any] = []
+    if project_id is not None:
+        where += " AND i.project_id = ?"
+        params.append(project_id)
+    rows = conn.execute(
+        f"""
+        SELECT i.id, i.story_points,
+               u.total_input_tokens, u.total_output_tokens,
+               u.total_cache_read_tokens, u.total_cache_write_tokens
+        FROM issues i JOIN issue_usage u ON u.issue_id = i.id
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+
+    tokens = {k: 0 for k in TOKEN_KINDS}
+    sp_sum = 0.0
+    cost_usd = 0.0
+    cost_sp = 0.0
+    active_hours = 0.0
+    unpriced_tokens = 0.0
+    has_unpriced = False
+    any_priced = False
+    cost_issues = 0
+    weighted_num = 0.0   # Σ cost_i / hours_i over fully priced issues
+    weighted_den = 0.0   # Σ sp_i over those same issues
+    models: Dict[str, Dict[str, Any]] = {}
+
+    def bucket(model: str) -> Dict[str, Any]:
+        return models.setdefault(model, {
+            "tokens": {k: 0.0 for k in TOKEN_KINDS},
+            "story_points": 0.0, "cost_usd": 0.0, "active_hours": 0.0,
+            "weighted_num": 0.0, "weighted_den": 0.0, "priced": True,
+        })
+
+    for row in rows:
+        sp = row["story_points"]
+        sp_sum += sp
+        for kind in TOKEN_KINDS:
+            tokens[kind] += row[f"total_{kind}"] or 0
+        issue_models = stats.get(row["id"])
+        if not issue_models:
+            continue  # usage but no runs → not attributable to a model
+        cost_issues += 1
+        cost_sp += sp
+        keys = list(issue_models)
+        weights = _weights(
+            keys,
+            {m: v["dur"] for m, v in issue_models.items()},
+            {m: v["n"] for m, v in issue_models.items()},
+        )
+        issue_hours = sum(v["dur"] for v in issue_models.values()) * HOURS_PER_DAY
+        active_hours += issue_hours
+        issue_total = sum(int(row[f"total_{k}"] or 0) for k in TOKEN_KINDS)
+        issue_cost = 0.0
+        issue_priced = True
+        for model, weight in weights.items():
+            b = bucket(model)
+            for kind in TOKEN_KINDS:
+                b["tokens"][kind] += (row[f"total_{kind}"] or 0) * weight
+            b["story_points"] += sp * weight
+            model_hours = issue_models[model]["dur"] * HOURS_PER_DAY
+            b["active_hours"] += model_hours
+            rate = rates.get(model)
+            if rate is None or rate["unpriced"]:
+                unpriced_tokens += issue_total * weight
+                has_unpriced = True
+                issue_priced = False
+                b["priced"] = False
+                continue
+            model_cost = (
+                (row["total_input_tokens"] or 0) * weight * rate["input_rate"]
+                + (row["total_output_tokens"] or 0) * weight * rate["output_rate"]
+                + (row["total_cache_read_tokens"] or 0) * weight * rate["cache_read_rate"]
+                + (row["total_cache_write_tokens"] or 0) * weight * rate["cache_write_rate"]
+            ) / 1_000_000
+            issue_cost += model_cost
+            any_priced = True
+            b["cost_usd"] += model_cost
+            if model_hours > 0:
+                b["weighted_num"] += model_cost / model_hours
+                b["weighted_den"] += sp * weight
+        cost_usd += issue_cost
+        # Weighted efficiency only over fully priced issues, so cost_i is whole.
+        if issue_priced and issue_hours > 0 and sp > 0:
+            weighted_num += issue_cost / issue_hours
+            weighted_den += sp
+
+    model_rows = []
+    for model, b in models.items():
+        priced = b["priced"]
+        m_tokens = {k: round(v) for k, v in b["tokens"].items()}
+        m_total = sum(m_tokens.values())
+        m_sp = b["story_points"]
+        model_rows.append({
+            "model": model,
+            **m_tokens,
+            "total_tokens": m_total,
+            "story_points": m_sp,
+            "active_hours": b["active_hours"],
+            "cost_usd": b["cost_usd"] if priced else None,
+            "tokens_per_sp": (m_total / m_sp) if m_sp > 0 else None,
+            "cost_per_sp": (b["cost_usd"] / m_sp) if (priced and m_sp > 0) else None,
+            "weighted_efficiency": (
+                b["weighted_num"] / b["weighted_den"]
+                if (priced and b["weighted_den"] > 0) else None
+            ),
+            "has_unpriced": not priced,
+        })
+    # Cheapest cost per story point first; unpriced models sink to the bottom.
+    model_rows.sort(key=lambda m: (m["cost_per_sp"] is None, m["cost_per_sp"] or 0.0))
+
+    total_tokens = sum(tokens.values())
+    return {
+        "estimated": True,
+        **tokens,
+        "total_tokens": total_tokens,
+        "story_points": sp_sum,
+        "cost_story_points": cost_sp,
+        "cost_usd": cost_usd,
+        "active_hours": active_hours,
+        "unpriced_tokens": round(unpriced_tokens),
+        "has_unpriced": has_unpriced,
+        "cost_issues": cost_issues,
+        "tokens_per_sp": (total_tokens / sp_sum) if sp_sum > 0 else None,
+        "cost_per_sp": (cost_usd / cost_sp) if (cost_sp > 0 and any_priced) else None,
+        "weighted_efficiency": (
+            weighted_num / weighted_den if weighted_den > 0 else None
+        ),
+        "models": model_rows,
+    }
+
+
 # -- summary + meta ---------------------------------------------------------------
 
 
@@ -597,18 +777,7 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         """,
         sp_params,
     ).fetchone()
-    eff_row = conn.execute(
-        f"""
-        SELECT SUM(u.total_input_tokens + u.total_output_tokens
-                   + u.total_cache_read_tokens + u.total_cache_write_tokens) AS tokens,
-               SUM(i.story_points) AS sp
-        FROM issues i JOIN issue_usage u ON u.issue_id = i.id
-        WHERE i.story_points IS NOT NULL AND i.story_points > 0 AND {sp_where}
-        """,
-        sp_params,
-    ).fetchone()
-    eff_tokens = eff_row["tokens"] or 0
-    eff_sp = eff_row["sp"] or 0.0
+    eff = efficiency_breakdown(conn, project_id)
 
     last_cycle = conn.execute(
         "SELECT started_at, finished_at, sources_ok, sources_failed "
@@ -630,9 +799,15 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "story_points": sp_row["sp_sum"] or 0,
         "issues": sp_row["issues"],
         "issues_with_sp": sp_row["with_sp"] or 0,
-        "efficiency_tokens": eff_tokens,
-        "efficiency_sp": eff_sp,
-        "tokens_per_sp": (eff_tokens / eff_sp) if eff_sp > 0 else None,
+        "efficiency_tokens": eff["total_tokens"],
+        "efficiency_sp": eff["story_points"],
+        "tokens_per_sp": eff["tokens_per_sp"],
+        "cost_per_sp": eff["cost_per_sp"],
+        "weighted_efficiency": eff["weighted_efficiency"],
+        "efficiency_cost_usd": eff["cost_usd"],
+        "efficiency_cost_sp": eff["cost_story_points"],
+        "efficiency_hours": eff["active_hours"],
+        "efficiency_has_unpriced": eff["has_unpriced"],
         "unpriced_models": unpriced_models,
         "last_cycle": dict(last_cycle) if last_cycle else None,
     }

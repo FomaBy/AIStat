@@ -46,6 +46,13 @@ function fmtCredits(n) {
   return n.toLocaleString("ru-RU", { maximumFractionDigits: 2 });
 }
 
+// Cost efficiency values (USD per SP, USD per hour per SP) can be well below a
+// cent, so keep up to 4 fraction digits while still reading as money.
+function fmtUSDFine(n) {
+  if (n == null) return "—";
+  return "$" + n.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+}
+
 function fmtNum(n) {
   if (n == null) return "—";
   return n.toLocaleString("ru-RU", { maximumFractionDigits: 1 });
@@ -258,6 +265,29 @@ function renderEfficiency(issues) {
   }
 }
 
+function renderModelEfficiency(data) {
+  const tbody = $("table-model-efficiency").querySelector("tbody");
+  tbody.innerHTML = "";
+  const models = (data && data.models) || [];
+  for (const m of models) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(m.model)}${m.has_unpriced ? " *" : ""}</td>
+      <td class="num">${fmtNum(m.story_points)}</td>
+      <td class="num">${fmtTokens(m.total_tokens)}</td>
+      <td class="num">${m.tokens_per_sp == null ? "—" : fmtTokens(m.tokens_per_sp)}</td>
+      <td class="num">${m.cost_usd == null ? "—" : fmtUSDFine(m.cost_usd)}</td>
+      <td class="num">${m.cost_per_sp == null ? "—" : fmtUSDFine(m.cost_per_sp)}</td>
+      <td class="num">${m.weighted_efficiency == null ? "—" : fmtUSDFine(m.weighted_efficiency)}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!models.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="7" class="note">Нет задач со story points и загруженной статистикой для разреза по моделям.</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
 function renderSummary(s) {
   const est = s.estimated ? "≈ " : "";
   $("card-tokens").textContent = est + fmtTokens(s.total_tokens);
@@ -269,6 +299,13 @@ function renderSummary(s) {
   $("card-sp").textContent = fmtNum(s.story_points);
   $("card-sp-sub").textContent = `задач: ${s.issues} · с SP: ${s.issues_with_sp}`;
   $("card-eff").textContent = s.tokens_per_sp == null ? "—" : fmtTokens(s.tokens_per_sp);
+  // Cost/weighted efficiency lean on model attribution + pricing, so they are
+  // always estimates (≈); a trailing * marks unpriced tokens in the mix.
+  const effStar = s.efficiency_has_unpriced ? " *" : "";
+  $("card-cost-eff").textContent =
+    s.cost_per_sp == null ? "—" : "≈ " + fmtUSDFine(s.cost_per_sp) + effStar;
+  $("card-weighted-eff").textContent =
+    s.weighted_efficiency == null ? "—" : "≈ " + fmtUSDFine(s.weighted_efficiency) + effStar;
   $("sync-label").textContent = "синхронизация: " +
     (s.last_cycle ? fmtDateTime(s.last_cycle.finished_at) : "ещё не было");
   const unpriced = s.unpriced_models || [];
@@ -287,12 +324,13 @@ function esc(text) {
 
 async function refreshAll() {
   $("estimate-note").hidden = !(state.project || state.group !== "model");
-  const [summary, daily, agents, projects, efficiency, health] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, health] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
     fetchJSON("/api/projects"),
     fetchJSON("/api/efficiency" + (state.project ? `?project=${state.project}&limit=15` : "?limit=15")),
+    fetchJSON("/api/model-efficiency" + (state.project ? `?project=${state.project}` : "")),
     fetchJSON("/api/health"),
   ]);
   renderSummary(summary);
@@ -301,6 +339,7 @@ async function refreshAll() {
   renderAgentsTable(agents.agents);
   renderProjects(projects.projects);
   renderEfficiency(efficiency.issues);
+  renderModelEfficiency(modelEfficiency);
 
   const badge = $("health-badge");
   badge.hidden = false;

@@ -7,6 +7,7 @@ Endpoints:
     GET /api/agents      — per-agent totals (?from&to&project)
     GET /api/projects    — per-project cuts (tokens, est. cost, SP, statuses, efficiency)
     GET /api/efficiency  — per-issue tokens/SP, worst first (?project&limit)
+    GET /api/model-efficiency — per-model token/cost/weighted efficiency (?project)
     GET /api/health      — health snapshot (alias of /health)
     GET /api/events      — SSE: `update` after every poller data batch
                            (live phase or full cycle), `cycle` on full cycles
@@ -162,6 +163,14 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         conn = db()
         try:
             return {"issues": aggregates.issue_efficiency(conn, project, limit)}
+        finally:
+            conn.close()
+
+    @app.get("/api/model-efficiency")
+    def api_model_efficiency(project: Optional[str] = Query(None)):
+        conn = db()
+        try:
+            return aggregates.efficiency_breakdown(conn, project)
         finally:
             conn.close()
 
