@@ -6,9 +6,41 @@ import pytest
 
 from aistat.config import Config
 from aistat.db import connect, init_db
-from aistat.migrate import migrate_owner_database
+from aistat import migrate
+from aistat.migrate import REQUIRED_TABLES, migrate_owner_database
 from aistat.security import SecurityConfigError, SecurityStore
 from conftest import seed_aggregate_fixture
+
+
+class _NoBackupConnection:
+    """Mimics a Python 3.6 sqlite3 connection: no Connection.backup()."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        if name == "backup":
+            raise AttributeError("backup")
+        return getattr(self._real, name)
+
+
+class _NoBackupSqlite:
+    """sqlite3 stand-in whose connections lack backup(), as on Python 3.6."""
+
+    def __getattr__(self, name):
+        return getattr(sqlite3, name)
+
+    def connect(self, *args, **kwargs):
+        return _NoBackupConnection(sqlite3.connect(*args, **kwargs))
+
+
+def _table_counts(conn):
+    return {
+        table: conn.execute(
+            "SELECT COUNT(*) FROM {}".format(table)
+        ).fetchone()[0]
+        for table in sorted(REQUIRED_TABLES)
+    }
 
 
 def tenant_config(tmp_path):
@@ -90,3 +122,86 @@ def test_owner_migration_preserves_wal_data_and_is_idempotent(tmp_path):
         first["owner_user_id"]
     )
     assert tenant["last_snapshot_sha256"] == first["sha256"]
+
+
+def test_owner_migration_python36_fallback_handles_wal_database(
+    tmp_path, monkeypatch
+):
+    config = tenant_config(tmp_path)
+    source = connect(config.db_path)
+    init_db(source)
+    seed_aggregate_fixture(source)
+    source.execute(
+        "UPDATE daily_usage SET input_tokens = input_tokens + 123 "
+        "WHERE runtime_id = 'R1'"
+    )
+    source.commit()
+    assert source.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert config.db_path.with_name("aistat.db-wal").is_file()
+    expected_counts = _table_counts(source)
+
+    monkeypatch.setattr(migrate, "sqlite3", _NoBackupSqlite())
+    first = migrate_owner_database(config, now=1000)
+    source.close()
+
+    target = config.tenant_db_path(first["owner_user_id"])
+    assert first["migrated"] is True
+    assert [p.name for p in config.tenants_dir.iterdir()] == [target.name]
+    assert not config.db_path.exists()
+    assert config.db_path.with_name("aistat.db.migrated").is_file()
+    assert not target.with_name(target.name + "-wal").exists()
+    assert not target.with_name(target.name + "-shm").exists()
+
+    # The copy must be a standalone database readable without the source
+    # WAL sidecars, exactly how _validate_database opens it.
+    conn = sqlite3.connect("file:{}?mode=ro".format(target), uri=True)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert _table_counts(conn) == expected_counts
+    total = conn.execute(
+        "SELECT SUM(input_tokens + output_tokens + cache_read_tokens + "
+        "cache_write_tokens) FROM daily_usage"
+    ).fetchone()[0]
+    conn.close()
+    assert total == 4_700_123
+
+    second = migrate_owner_database(config, now=2000)
+    assert second["owner_user_id"] == first["owner_user_id"]
+    assert second["sha256"] == first["sha256"]
+    assert second["migrated"] is False
+
+
+def test_owner_migration_fallback_failure_preserves_source(
+    tmp_path, monkeypatch
+):
+    config = tenant_config(tmp_path)
+    source = connect(config.db_path)
+    init_db(source)
+    seed_aggregate_fixture(source)
+    source.commit()
+    source.close()
+
+    monkeypatch.setattr(migrate, "sqlite3", _NoBackupSqlite())
+    real_copy2 = migrate.shutil.copy2
+
+    def broken_copy(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(migrate.shutil, "copy2", broken_copy)
+    with pytest.raises(OSError):
+        migrate_owner_database(config, now=1000)
+
+    assert config.db_path.is_file()
+    assert not config.db_path.with_name("aistat.db.migrated").exists()
+    assert list(config.tenants_dir.iterdir()) == []
+    conn = sqlite3.connect(str(config.db_path))
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    conn.close()
+
+    monkeypatch.setattr(migrate.shutil, "copy2", real_copy2)
+    result = migrate_owner_database(config, now=2000)
+    assert result["migrated"] is True
+    target = config.tenant_db_path(result["owner_user_id"])
+    conn = sqlite3.connect("file:{}?mode=ro".format(target), uri=True)
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    conn.close()

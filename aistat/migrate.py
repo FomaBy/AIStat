@@ -163,6 +163,30 @@ def _coherent_copy(source_path, target_dir):
         prefix=".aistat-owner-migration-", suffix=".db", dir=target_dir
     )
     os.close(handle)
+    try:
+        _copy_database(source_path, temp_path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        # Rewriting the copy's journal mode may leave -wal/-shm sidecars;
+        # the standalone copy must be the only file left behind.
+        for stale in (temp_path + "-wal", temp_path + "-shm"):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
+    return temp_path
+
+
+def _copy_database(source_path, temp_path):
     source = sqlite3.connect(source_path)
     target = sqlite3.connect(temp_path)
     try:
@@ -176,20 +200,27 @@ def _coherent_copy(source_path, target_dir):
             # checkpoint followed by a file copy is coherent.
             target.close()
             target = None
-            source.execute("PRAGMA wal_checkpoint(FULL)")
+            busy = source.execute(
+                "PRAGMA wal_checkpoint(FULL)"
+            ).fetchone()[0]
+            if busy:
+                raise MigrationError(
+                    "cannot checkpoint legacy WAL database before copying"
+                )
             source.commit()
             shutil.copy2(source_path, temp_path)
+            # The copied file header still marks WAL mode, and without the
+            # source -wal/-shm sidecars such a copy cannot be opened
+            # read-only; make it a standalone rollback-journal database.
+            target = sqlite3.connect(temp_path)
+            target.execute("PRAGMA journal_mode = DELETE")
+            target.commit()
     except sqlite3.Error as exc:
         raise MigrationError("cannot copy legacy database: {}".format(exc))
     finally:
         if target is not None:
             target.close()
         source.close()
-    try:
-        os.chmod(temp_path, 0o600)
-    except OSError:
-        pass
-    return temp_path
 
 
 def _archive_legacy_source(source_path, target_path):
