@@ -251,6 +251,18 @@ def test_model_efficiency_endpoint(legacy):
     assert abs(data["cost_per_sp"] - 0.0005) < 1e-9
 
 
+def test_legacy_hour_filters_accept_repeated_dimensions(legacy):
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application,
+        "/api/summary?from=2026-01-01T10%3A00Z&to=2026-01-01T11%3A00Z"
+        "&project=P1&agent=A2&model=m-shared",
+        cookie=cookies,
+    )
+    assert status == "200 OK"
+    assert legacy.json.loads(body.decode("utf-8"))["total_tokens"] == 600000
+
+
 def test_logout_requires_csrf(legacy):
     cookies = login(legacy)
     status, _, body = request(

@@ -12,8 +12,12 @@ const PALETTE = [
 ];
 
 const state = {
-  project: "",   // project id or "" for all
+  projects: [],
+  agents: [],
+  models: [],
   days: "30",    // "" = all time
+  from: "",      // UTC datetime-local value
+  to: "",        // UTC datetime-local value
   group: "model",
   lastDate: null, // max date present in daily_usage (from /api/meta)
   charts: {},
@@ -78,11 +82,19 @@ async function fetchJSON(url) {
 }
 
 function periodRange() {
+  if (state.from || state.to) {
+    return { from: utcDateTime(state.from), to: utcDateTime(state.to) };
+  }
   // The period is anchored to the newest data date, not the browser clock.
-  if (!state.days || !state.lastDate) return { from: null, to: null };
+  if (!state.days || state.days === "custom" || !state.lastDate) return { from: null, to: null };
   const last = new Date(state.lastDate + "T00:00:00Z");
   const from = new Date(last.getTime() - (Number(state.days) - 1) * 86400000);
   return { from: from.toISOString().slice(0, 10), to: state.lastDate };
+}
+
+function utcDateTime(value) {
+  if (!value) return null;
+  return value.length === 16 ? value + ":00Z" : value + "Z";
 }
 
 function query(params) {
@@ -90,7 +102,9 @@ function query(params) {
   const q = new URLSearchParams();
   if (from) q.set("from", from);
   if (to) q.set("to", to);
-  if (state.project) q.set("project", state.project);
+  for (const project of state.projects) q.append("project", project);
+  for (const agent of state.agents) q.append("agent", agent);
+  for (const model of state.models) q.append("model", model);
   for (const [k, v] of Object.entries(params || {})) q.set(k, v);
   const s = q.toString();
   return s ? "?" + s : "";
@@ -323,14 +337,16 @@ function esc(text) {
 // ---------- refresh ----------
 
 async function refreshAll() {
-  $("estimate-note").hidden = !(state.project || state.group !== "model");
+  $("estimate-note").hidden = !(
+    state.projects.length || state.agents.length || state.group !== "model" || state.from || state.to
+  );
   const [summary, daily, agents, projects, efficiency, modelEfficiency, health] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
-    fetchJSON("/api/projects"),
-    fetchJSON("/api/efficiency" + (state.project ? `?project=${state.project}&limit=15` : "?limit=15")),
-    fetchJSON("/api/model-efficiency" + (state.project ? `?project=${state.project}` : "")),
+    fetchJSON("/api/projects" + query()),
+    fetchJSON("/api/efficiency" + query({ limit: "15" })),
+    fetchJSON("/api/model-efficiency" + query()),
     fetchJSON("/api/health"),
   ]);
   renderSummary(summary);
@@ -462,22 +478,47 @@ async function setupSession() {
 async function refreshMeta() {
   const meta = await fetchJSON("/api/meta");
   state.lastDate = meta.date_span.last;
-  const select = $("filter-project");
-  const current = select.value;
-  while (select.options.length > 1) select.remove(1);
-  for (const p of meta.projects) {
+  populateMultiSelect("filter-project", meta.projects, (p) => p.id, (p) => p.title, state.projects);
+  populateMultiSelect("filter-agent", meta.agents, (a) => a.id, (a) => a.name, state.agents);
+  populateMultiSelect("filter-model", meta.models, (m) => m, (m) => m, state.models);
+}
+
+function populateMultiSelect(id, items, valueOf, labelOf, selected) {
+  const select = $(id);
+  while (select.options.length) select.remove(0);
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = id === "filter-project" ? "Все проекты"
+    : id === "filter-agent" ? "Все агенты" : "Все модели";
+  all.selected = !selected.length;
+  select.appendChild(all);
+  for (const item of items) {
     const option = document.createElement("option");
-    option.value = p.id;
-    option.textContent = p.title;
+    option.value = valueOf(item);
+    option.textContent = labelOf(item);
+    option.selected = selected.includes(option.value);
     select.appendChild(option);
   }
-  select.value = current;
+}
+
+function selectedValues(id) {
+  return [...$(id).selectedOptions].map((option) => option.value).filter(Boolean);
+}
+
+function setSelectedValues(id, values) {
+  for (const option of $(id).options) {
+    option.selected = option.value ? values.includes(option.value) : !values.length;
+  }
 }
 
 function syncFiltersToUrl() {
   const q = new URLSearchParams();
-  if (state.project) q.set("project", state.project);
+  for (const project of state.projects) q.append("project", project);
+  for (const agent of state.agents) q.append("agent", agent);
+  for (const model of state.models) q.append("model", model);
   if (state.days !== "30") q.set("days", state.days || "all");
+  if (state.from) q.set("from", state.from);
+  if (state.to) q.set("to", state.to);
   if (state.group !== "model") q.set("group", state.group);
   const qs = q.toString();
   history.replaceState(null, "", qs ? "?" + qs : location.pathname);
@@ -485,28 +526,63 @@ function syncFiltersToUrl() {
 
 function readFiltersFromUrl() {
   const q = new URLSearchParams(location.search);
-  if (q.has("project")) state.project = q.get("project");
+  state.projects = q.getAll("project");
+  state.agents = q.getAll("agent");
+  state.models = q.getAll("model");
   if (q.has("days")) state.days = q.get("days") === "all" ? "" : q.get("days");
+  state.from = q.get("from") || "";
+  state.to = q.get("to") || "";
+  if (state.from || state.to) state.days = "custom";
   if (q.has("group")) state.group = q.get("group");
-  $("filter-project").value = state.project;
+  setSelectedValues("filter-project", state.projects);
+  setSelectedValues("filter-agent", state.agents);
+  setSelectedValues("filter-model", state.models);
   $("filter-period").value = state.days;
   $("filter-group").value = state.group;
+  $("filter-from").value = state.from;
+  $("filter-to").value = state.to;
 }
 
 async function boot() {
   await setupSession();
   await refreshMeta();
   readFiltersFromUrl();
-  $("filter-project").addEventListener("change", (e) => {
-    state.project = e.target.value;
+  $("filter-project").addEventListener("change", () => {
+    state.projects = selectedValues("filter-project");
+    syncFiltersToUrl();
+    refreshAll().catch(console.error);
+  });
+  $("filter-agent").addEventListener("change", () => {
+    state.agents = selectedValues("filter-agent");
+    syncFiltersToUrl();
+    refreshAll().catch(console.error);
+  });
+  $("filter-model").addEventListener("change", () => {
+    state.models = selectedValues("filter-model");
     syncFiltersToUrl();
     refreshAll().catch(console.error);
   });
   $("filter-period").addEventListener("change", (e) => {
     state.days = e.target.value;
+    if (state.days !== "custom") {
+      state.from = "";
+      state.to = "";
+      $("filter-from").value = "";
+      $("filter-to").value = "";
+    }
     syncFiltersToUrl();
     refreshAll().catch(console.error);
   });
+  for (const id of ["filter-from", "filter-to"]) {
+    $(id).addEventListener("change", () => {
+      state.from = $("filter-from").value;
+      state.to = $("filter-to").value;
+      state.days = "custom";
+      $("filter-period").value = "custom";
+      syncFiltersToUrl();
+      refreshAll().catch(console.error);
+    });
+  }
   $("filter-group").addEventListener("change", (e) => {
     state.group = e.target.value;
     syncFiltersToUrl();

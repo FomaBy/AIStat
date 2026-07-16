@@ -24,7 +24,9 @@ have BOTH story points > 0 and a synced usage row; issues without story
 points are excluded from the metric entirely rather than treated as 0.
 """
 
+import re
 import sqlite3
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
@@ -32,6 +34,108 @@ TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_writ
 # Run durations come out of SQLite's julianday() in days; efficiency reports
 # money-per-hour, so durations are converted to hours with this factor.
 HOURS_PER_DAY = 24.0
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z?$")
+
+
+def _filter_values(values: Optional[List[str]]) -> Tuple[str, ...]:
+    """Return distinct, non-empty query values in their original order."""
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for value in values:
+        value = str(value).strip()
+        if value and value not in out:
+            out.append(value)
+    return tuple(out)
+
+
+def _parse_bound(value: Optional[str], name: str, is_end: bool) -> Tuple[Optional[datetime], bool]:
+    """Parse the public UTC filter format.
+
+    Date-only ``to`` remains backwards compatible with the old inclusive day
+    filter: it becomes the start of the following day. Datetimes are a
+    half-open interval, so ``from=10:00&to=11:00`` selects one hour.
+    """
+    if value is None or not str(value).strip():
+        return None, False
+    raw = str(value).strip()
+    try:
+        if _DATE_RE.match(raw):
+            result = datetime.strptime(raw, "%Y-%m-%d")
+            return (result + timedelta(days=1) if is_end else result), False
+        if _DATETIME_RE.match(raw):
+            raw = raw[:-1] if raw.endswith("Z") else raw
+            fmt = "%Y-%m-%dT%H:%M:%S" if len(raw) == 19 else "%Y-%m-%dT%H:%M"
+            return datetime.strptime(raw, fmt), True
+    except ValueError:
+        pass
+    raise ValueError(
+        "%s must be YYYY-MM-DD or UTC YYYY-MM-DDTHH:MM[:SS]Z" % name
+    )
+
+
+def make_filters(date_from: Optional[str] = None, date_to: Optional[str] = None,
+                 project_ids: Optional[List[str]] = None,
+                 agent_ids: Optional[List[str]] = None,
+                 models: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Validate and normalize filters shared by every HTTP implementation.
+
+    Token facts are supplied by Multica per day. A range that cuts through a
+    day is therefore allocated by the real dated task-run intervals and is
+    explicitly returned as an estimate by affected aggregates.
+    """
+    start, start_has_time = _parse_bound(date_from, "from", False)
+    end, end_has_time = _parse_bound(date_to, "to", True)
+    if start is not None and end is not None and start >= end:
+        raise ValueError("from must be earlier than to")
+    return {
+        "from": start,
+        "to": end,
+        "projects": _filter_values(project_ids),
+        "agents": _filter_values(agent_ids),
+        "models": _filter_values(models),
+        "time_estimated": (
+            (start_has_time and start is not None and start.time().isoformat() != "00:00:00")
+            or (end_has_time and end is not None and end.time().isoformat() != "00:00:00")
+        ),
+    }
+
+
+def _coerce_filters(date_from: Optional[str] = None, date_to: Optional[str] = None,
+                    project_id: Optional[str] = None,
+                    filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if filters is not None:
+        return filters
+    return make_filters(date_from, date_to, [project_id] if project_id else None)
+
+
+def _filter_dates(filters: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Inclusive SQLite date bounds that cover a half-open datetime window."""
+    start, end = filters["from"], filters["to"]
+    date_from = start.date().isoformat() if start is not None else None
+    date_to = (end - timedelta(microseconds=1)).date().isoformat() if end is not None else None
+    return date_from, date_to
+
+
+def _day_fraction(date: str, filters: Dict[str, Any]) -> float:
+    """Part of a UTC day inside the selected half-open time interval."""
+    day_start = datetime.strptime(date, "%Y-%m-%d")
+    day_end = day_start + timedelta(days=1)
+    start = max(day_start, filters["from"]) if filters["from"] else day_start
+    end = min(day_end, filters["to"]) if filters["to"] else day_end
+    return max(0.0, (end - start).total_seconds() / (HOURS_PER_DAY * 3600.0))
+
+
+def _where_values(column: str, values: Tuple[str, ...],
+                  params: List[str]) -> str:
+    if not values:
+        return ""
+    params.extend(values)
+    return " AND %s IN (%s)" % (column, ", ".join("?" for _ in values))
 
 
 def _total(row: Dict[str, Any]) -> int:
@@ -63,43 +167,106 @@ def _weights(keys: List[str], durations: Dict[str, float],
     return {k: 1.0 / len(keys) for k in keys}
 
 
+def _run_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse Multica's UTC run timestamp without requiring Python 3.7+."""
+    if not value:
+        return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1]
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _overlap_seconds(start: datetime, end: datetime,
+                     lower: datetime, upper: datetime) -> float:
+    """Duration of two half-open UTC intervals in seconds."""
+    left, right = max(start, lower), min(end, upper)
+    return max(0.0, (right - left).total_seconds())
+
+
+def _run_intervals(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any]]]:
+    """Dated task intervals grouped by agent.
+
+    ``runs`` is the durable record of when a task was actually worked on.
+    Rows with missing/invalid timestamps remain available for date-only legacy
+    attribution but are never invented into a partial-hour allocation.
+    """
+    intervals: Dict[str, List[Dict[str, Any]]] = {}
+    for row in conn.execute(
+        """
+        SELECT r.agent_id, i.project_id, r.started_at, r.completed_at
+        FROM runs r LEFT JOIN issues i ON i.id = r.issue_id
+        WHERE r.agent_id IS NOT NULL
+        """
+    ):
+        item = dict(row)
+        item["start"] = _run_datetime(item.pop("started_at"))
+        item["end"] = _run_datetime(item.pop("completed_at"))
+        intervals.setdefault(item["agent_id"], []).append(item)
+    return intervals
+
+
+def _run_filter_fractions(conn: sqlite3.Connection,
+                          filters: Dict[str, Any]) -> Tuple[bool, Dict[str, float]]:
+    """Return each issue's token/SP share covered by run-level filters.
+
+    Issue usage is cumulative, not a timestamped token stream. We therefore
+    allocate it over the issue's *dated* run duration. A selected agent,
+    model, or time interval receives its duration share; the denominator is
+    always every valid interval for the issue, so selecting a short hour never
+    inflates to the whole task. No completed interval means no contribution to
+    a time-filtered result.
+    """
+    needs_runs = bool(
+        filters["agents"] or filters["models"]
+        or filters["from"] is not None or filters["to"] is not None
+    )
+    if not needs_runs:
+        return False, {}
+    rows = conn.execute(
+        """
+        SELECT r.issue_id, r.agent_id, a.model, r.started_at, r.completed_at
+        FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
+        WHERE r.issue_id IS NOT NULL
+        """
+    ).fetchall()
+    by_issue: Dict[str, List[sqlite3.Row]] = {}
+    for row in rows:
+        by_issue.setdefault(row["issue_id"], []).append(row)
+    fractions = {}
+    for issue_id, issue_rows in by_issue.items():
+        total = 0.0
+        selected = 0.0
+        for row in issue_rows:
+            start, end = _run_datetime(row["started_at"]), _run_datetime(row["completed_at"])
+            if start is None or end is None or end <= start:
+                continue
+            duration = (end - start).total_seconds()
+            total += duration
+            if filters["agents"] and row["agent_id"] not in filters["agents"]:
+                continue
+            if filters["models"] and row["model"] not in filters["models"]:
+                continue
+            if filters["from"] is not None or filters["to"] is not None:
+                lower = filters["from"] or datetime.min
+                upper = filters["to"] or datetime.max
+                selected += _overlap_seconds(start, end, lower, upper)
+            else:
+                selected += duration
+        if total > 0 and selected > 0:
+            fractions[issue_id] = min(1.0, selected / total)
+    return True, fractions
+
+
 # -- attribution of daily_usage rows to agents and projects -------------------
 
 
-def _run_stats(conn: sqlite3.Connection) -> Tuple[Dict, Dict]:
-    """Per (agent_id, date): run duration/count totals and per-project splits.
-
-    A run's date is the date of its start (runs spanning midnight count
-    toward the start date — a documented approximation). Duration is
-    started_at→completed_at in days (julianday), missing timestamps → 0.
-    """
-    by_agent_date: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    by_agent_date_project: Dict[Tuple[str, str], Dict[Optional[str], Dict[str, Any]]] = {}
-    rows = conn.execute(
-        """
-        SELECT r.agent_id,
-               substr(COALESCE(r.started_at, r.created_at), 1, 10) AS date,
-               i.project_id,
-               COUNT(*) AS n,
-               SUM(MAX(COALESCE(julianday(r.completed_at) - julianday(r.started_at), 0), 0)) AS dur
-        FROM runs r
-        LEFT JOIN issues i ON i.id = r.issue_id
-        GROUP BY r.agent_id, date, i.project_id
-        """
-    )
-    for row in rows:
-        key = (row["agent_id"], row["date"])
-        agg = by_agent_date.setdefault(key, {"dur": 0.0, "n": 0})
-        agg["dur"] += row["dur"] or 0.0
-        agg["n"] += row["n"]
-        by_agent_date_project.setdefault(key, {})[row["project_id"]] = {
-            "dur": row["dur"] or 0.0, "n": row["n"],
-        }
-    return by_agent_date, by_agent_date_project
-
-
 def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
-                 date_to: Optional[str] = None) -> List[Dict[str, Any]]:
+                 date_to: Optional[str] = None,
+                 filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Split every daily_usage row down to (date, model, agent, project).
 
     Returns one share per (date, runtime, model, agent, project) with
@@ -110,6 +277,8 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
         when the agent had no runs that day to point at a project.
     Cost fields are None for unpriced models (never 0).
     """
+    filters = _coerce_filters(date_from, date_to, filters=filters)
+    date_from, date_to = _filter_dates(filters)
     agents = conn.execute(
         "SELECT id, name, model, runtime_id FROM agents"
     ).fetchall()
@@ -117,9 +286,10 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
     for a in agents:
         pair_agents.setdefault((a["runtime_id"], a["model"]), []).append(a["id"])
 
-    by_agent_date, by_agent_date_project = _run_stats(conn)
+    intervals = _run_intervals(conn)
 
     where, params = _date_clause("date", date_from, date_to)
+    where += _where_values("model", filters["models"], params)
     usage = conn.execute(
         f"SELECT * FROM daily_usage WHERE {where}", params
     ).fetchall()
@@ -138,6 +308,7 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
             "project_id": project_id,
             "weight": weight,
             "agent_estimated": agent_estimated,
+            "estimated": agent_estimated or filters["time_estimated"],
         }
         for kind in TOKEN_KINDS:
             share[kind] = (row[kind] or 0) * weight
@@ -151,16 +322,69 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
     for row in usage:
         candidates = pair_agents.get((row["runtime_id"], row["model"]), [])
         if not candidates:
-            emit(row, None, None, 1.0, agent_estimated=True)
+            # Without an agent run there is no dated interval to allocate a
+            # partial day. The full-date dashboard keeps the legacy
+            # unattributed bucket, but a clock-range must not invent one.
+            if not filters["time_estimated"]:
+                emit(row, None, None, 1.0, agent_estimated=True)
             continue
         ambiguous = len(candidates) > 1
-        durations = {a: by_agent_date.get((a, row["date"]), {}).get("dur", 0.0)
-                     for a in candidates}
-        counts = {a: by_agent_date.get((a, row["date"]), {}).get("n", 0)
-                  for a in candidates}
-        agent_weights = _weights(candidates, durations, counts)
+        day_start = datetime.strptime(row["date"], "%Y-%m-%d")
+        day_end = day_start + timedelta(days=1)
+        selected_start = max(day_start, filters["from"]) if filters["from"] else day_start
+        selected_end = min(day_end, filters["to"]) if filters["to"] else day_end
+
+        # Allocate a daily row by actual dated task intervals. The
+        # denominator always stays the entire day: selecting 10:00–11:00
+        # intentionally shows only the corresponding fraction of that day's
+        # tokens, rather than re-normalising the selected hour to 100%.
+        full_seconds = 0.0
+        selected: Dict[Tuple[str, Optional[str]], float] = {}
+        counts: Dict[Tuple[str, Optional[str]], int] = {}
+        for agent_id in candidates:
+            for item in intervals.get(agent_id, []):
+                start, end = item["start"], item["end"]
+                key = (agent_id, item["project_id"])
+                counts[key] = counts.get(key, 0) + 1
+                if start is None or end is None or end <= start:
+                    continue
+                full = _overlap_seconds(start, end, day_start, day_end)
+                if full <= 0:
+                    continue
+                full_seconds += full
+                partial = _overlap_seconds(start, end, selected_start, selected_end)
+                if partial > 0:
+                    selected[key] = selected.get(key, 0.0) + partial
+
+        if filters["time_estimated"]:
+            if full_seconds <= 0:
+                continue
+            for (agent_id, project_id), seconds in selected.items():
+                if filters["agents"] and agent_id not in filters["agents"]:
+                    continue
+                if filters["projects"] and project_id not in filters["projects"]:
+                    continue
+                emit(row, agent_id, project_id, seconds / full_seconds, ambiguous)
+            continue
+
+        # Date-only filtering keeps the earlier duration/count/equal fallback
+        # so historical days without complete run timestamps remain visible.
+        durations = {a: 0.0 for a in candidates}
+        agent_counts = {a: 0 for a in candidates}
+        by_project: Dict[str, Dict[Optional[str], Dict[str, float]]] = {}
+        for (agent_id, project_id), seconds in selected.items():
+            durations[agent_id] += seconds
+            agent_counts[agent_id] += counts.get((agent_id, project_id), 0)
+            project = by_project.setdefault(agent_id, {}).setdefault(
+                project_id, {"dur": 0.0, "n": 0}
+            )
+            project["dur"] += seconds
+            project["n"] += counts.get((agent_id, project_id), 0)
+        # Rows entirely outside the selected date window have no SQL match;
+        # a zero-duration day falls back to the known candidate agents.
+        agent_weights = _weights(candidates, durations, agent_counts)
         for agent_id, agent_weight in agent_weights.items():
-            projects = by_agent_date_project.get((agent_id, row["date"]), {})
+            projects = by_project.get(agent_id, {})
             if not projects:
                 emit(row, agent_id, None, agent_weight, ambiguous)
                 continue
@@ -168,7 +392,7 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
             project_weights = _weights(
                 project_keys,
                 {p: v["dur"] for p, v in projects.items()},
-                {p: v["n"] for p, v in projects.items()},
+                {p: int(v["n"]) for p, v in projects.items()},
             )
             for project_id, project_weight in project_weights.items():
                 emit(row, agent_id, project_id, agent_weight * project_weight,
@@ -197,7 +421,7 @@ def _sum_shares(shares: List[Dict[str, Any]], key_fn) -> List[Dict[str, Any]]:
         else:
             g["cost_usd"] += s["cost_usd"]
             g["cost_credits"] += s["cost_credits"] or 0.0
-        g["estimated"] = g["estimated"] or s["agent_estimated"]
+        g["estimated"] = g["estimated"] or s["estimated"]
     out = []
     for g in groups.values():
         for kind in TOKEN_KINDS:
@@ -212,7 +436,8 @@ def _sum_shares(shares: List[Dict[str, Any]], key_fn) -> List[Dict[str, Any]]:
 
 def daily_series(conn: sqlite3.Connection, group: str = "model",
                  date_from: Optional[str] = None, date_to: Optional[str] = None,
-                 project_id: Optional[str] = None) -> Dict[str, Any]:
+                 project_id: Optional[str] = None,
+                 filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Per-day token/cost series stacked by model, agent or project.
 
     ``group=model`` without a project filter reads daily_usage directly and
@@ -222,9 +447,13 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
     """
     if group not in ("model", "agent", "project"):
         raise ValueError(f"unsupported group: {group}")
+    filters = _coerce_filters(date_from, date_to, project_id, filters)
+    date_from, date_to = _filter_dates(filters)
 
-    if group == "model" and project_id is None:
+    if (group == "model" and not filters["projects"] and not filters["agents"]
+            and not filters["time_estimated"]):
         where, params = _date_clause("date", date_from, date_to)
+        where += _where_values("model", filters["models"], params)
         rows = conn.execute(
             f"""
             SELECT date, model AS key,
@@ -243,16 +472,29 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
         series = []
         for r in rows:
             d = dict(r)
+            fraction = _day_fraction(d["date"], filters)
+            if fraction <= 0:
+                continue
+            for kind in TOKEN_KINDS:
+                d[kind] = round((d[kind] or 0) * fraction)
+            if d["cost_usd"] is not None:
+                d["cost_usd"] *= fraction
+            if d["cost_credits"] is not None:
+                d["cost_credits"] *= fraction
             unpriced = d.pop("unpriced_rows") > 0
             d["has_unpriced"] = unpriced
-            d["estimated"] = False
+            d["estimated"] = filters["time_estimated"]
             d["total_tokens"] = _total(d)
             series.append(d)
-        return {"group": group, "estimated": False, "rows": series}
+        return {
+            "group": group, "estimated": filters["time_estimated"], "rows": series,
+        }
 
-    shares = daily_shares(conn, date_from, date_to)
-    if project_id is not None:
-        shares = [s for s in shares if s["project_id"] == project_id]
+    shares = daily_shares(conn, filters=filters)
+    if filters["projects"]:
+        shares = [s for s in shares if s["project_id"] in filters["projects"]]
+    if filters["agents"]:
+        shares = [s for s in shares if s["agent_id"] in filters["agents"]]
     if group == "model":
         key_fn = lambda s: (s["date"], s["model"])  # noqa: E731
     elif group == "agent":
@@ -269,7 +511,7 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
         rows.append(g)
     return {
         "group": group,
-        # Any project filter / non-model grouping relies on attribution.
+        # Any dimension attribution or a partial-day range is an estimate.
         "estimated": True,
         "rows": rows,
     }
@@ -295,26 +537,35 @@ def _label(group: str, key: Optional[str], names: Dict[str, Dict[str, str]]) -> 
 
 def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
                  date_to: Optional[str] = None,
-                 project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+                 project_id: Optional[str] = None,
+                 filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Tokens / cost / credits per agent over the period (attribution-based)."""
-    shares = daily_shares(conn, date_from, date_to)
-    if project_id is not None:
-        shares = [s for s in shares if s["project_id"] == project_id]
+    filters = _coerce_filters(date_from, date_to, project_id, filters)
+    shares = daily_shares(conn, filters=filters)
+    if filters["projects"]:
+        shares = [s for s in shares if s["project_id"] in filters["projects"]]
+    if filters["agents"]:
+        shares = [s for s in shares if s["agent_id"] in filters["agents"]]
     grouped = _sum_shares(shares, lambda s: s["agent_id"])
     agents = {r["id"]: dict(r) for r in conn.execute(
         "SELECT id, name, model, runtime_id FROM agents"
     )}
     runtimes = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM runtimes")}
+    run_from, run_to = _filter_dates(filters)
     run_where, run_params = _date_clause(
-        "substr(COALESCE(r.started_at, r.created_at), 1, 10)", date_from, date_to
+        "substr(COALESCE(r.started_at, r.created_at), 1, 10)", run_from, run_to
     )
-    if project_id is not None:
-        run_where += " AND i.project_id = ?"
-        run_params.append(project_id)
+    if filters["projects"]:
+        run_where += _where_values("i.project_id", filters["projects"], run_params)
+    if filters["agents"]:
+        run_where += _where_values("r.agent_id", filters["agents"], run_params)
+    if filters["models"]:
+        run_where += _where_values("a.model", filters["models"], run_params)
     run_counts = {r["agent_id"]: r["n"] for r in conn.execute(
         f"""
         SELECT r.agent_id, COUNT(*) AS n FROM runs r
         LEFT JOIN issues i ON i.id = r.issue_id
+        LEFT JOIN agents a ON a.id = r.agent_id
         WHERE {run_where} GROUP BY r.agent_id
         """,
         run_params,
@@ -417,15 +668,23 @@ def issue_cost_estimate(usage: Dict[str, Any], model_weights: Dict[str, float],
 
 
 def projects_overview(conn: sqlite3.Connection,
-                      credits_per_usd: float = 1.0) -> List[Dict[str, Any]]:
+                      credits_per_usd: float = 1.0,
+                      filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Per project: exact tokens, estimated cost/credits, SP, statuses,
     efficiency (tokens per story point over issues with SP and usage)."""
     rates = _pricing_rates(conn)
     model_weights = _issue_model_weights(conn)
 
+    filters = _coerce_filters(filters=filters)
+    needs_run_filter, fractions = _run_filter_fractions(conn, filters)
+    project_where, project_params = "1=1", []
+    project_where += _where_values("id", filters["projects"], project_params)
     projects = [dict(r) for r in conn.execute(
-        "SELECT id, title, status FROM projects ORDER BY title"
+        "SELECT id, title, status FROM projects WHERE %s ORDER BY title" % project_where,
+        project_params,
     )]
+    issue_where, issue_params = "i.is_jira = 0", []
+    issue_where += _where_values("i.project_id", filters["projects"], issue_params)
     issues = conn.execute(
         """
         SELECT i.id, i.project_id, i.status, i.story_points,
@@ -433,8 +692,9 @@ def projects_overview(conn: sqlite3.Connection,
                u.total_cache_read_tokens, u.total_cache_write_tokens,
                (u.issue_id IS NOT NULL) AS has_usage
         FROM issues i LEFT JOIN issue_usage u ON u.issue_id = i.id
-        WHERE i.is_jira = 0
-        """
+        WHERE %s
+        """ % issue_where,
+        issue_params,
     ).fetchall()
 
     by_project: Dict[str, List[sqlite3.Row]] = {}
@@ -456,16 +716,21 @@ def projects_overview(conn: sqlite3.Connection,
         eff_sp = 0.0
         eff_issues = 0
         for row in rows:
+            factor = fractions.get(row["id"], 0.0) if needs_run_filter else 1.0
+            if factor <= 0:
+                continue
             statuses[row["status"]] = statuses.get(row["status"], 0) + 1
             if row["story_points"] is not None:
-                sp_sum += row["story_points"]
+                sp_sum += row["story_points"] * factor
                 sp_issues += 1
             if not row["has_usage"]:
                 continue
             with_usage += 1
+            usage = dict(row)
             for kind in TOKEN_KINDS:
-                tokens[kind] += row[f"total_{kind}"] or 0
-            est = issue_cost_estimate(dict(row), model_weights.get(row["id"], {}), rates)
+                usage[f"total_{kind}"] = (row[f"total_{kind}"] or 0) * factor
+                tokens[kind] += usage[f"total_{kind}"]
+            est = issue_cost_estimate(usage, model_weights.get(row["id"], {}), rates)
             if est["attributed"]:
                 cost_usd += est["cost_usd"]
                 unpriced_tokens += est["unpriced_tokens"]
@@ -474,15 +739,18 @@ def projects_overview(conn: sqlite3.Connection,
             # Efficiency counts only issues with story points > 0 AND usage;
             # issues without SP are excluded, never treated as SP=0.
             if row["story_points"] is not None and row["story_points"] > 0:
-                eff_tokens += sum(row[f"total_{k}"] or 0 for k in TOKEN_KINDS)
-                eff_sp += row["story_points"]
+                eff_tokens += sum(usage[f"total_{k}"] for k in TOKEN_KINDS)
+                eff_sp += row["story_points"] * factor
                 eff_issues += 1
         total_tokens = sum(tokens.values())
         out.append({
             "project_id": project["id"],
             "title": project["title"],
             "project_status": project["status"],
-            "issues": len(rows),
+            "issues": sum(
+                1 for row in rows
+                if (fractions.get(row["id"], 0.0) if needs_run_filter else 1.0) > 0
+            ),
             "issues_with_usage": with_usage,
             "statuses": statuses,
             **tokens,
@@ -490,6 +758,7 @@ def projects_overview(conn: sqlite3.Connection,
             "cost_usd": cost_usd,
             "cost_credits": cost_usd * credits_per_usd,
             "cost_estimated": True,
+            "estimated": needs_run_filter,
             "cost_unattributed_issues": unattributed,
             "unpriced_tokens": unpriced_tokens,
             "story_points": sp_sum,
@@ -504,17 +773,18 @@ def projects_overview(conn: sqlite3.Connection,
 
 
 def issue_efficiency(conn: sqlite3.Connection, project_id: Optional[str] = None,
-                     limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                     limit: Optional[int] = None,
+                     filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Per-issue efficiency: total tokens ÷ story points, worst first.
 
     Only issues with story points > 0 and a synced usage row participate;
     issues without story points are excluded from the metric (never SP=0).
     """
+    filters = _coerce_filters(project_id=project_id, filters=filters)
+    needs_run_filter, fractions = _run_filter_fractions(conn, filters)
     params: List[Any] = []
     where = "i.is_jira = 0 AND i.story_points IS NOT NULL AND i.story_points > 0"
-    if project_id is not None:
-        where += " AND i.project_id = ?"
-        params.append(project_id)
+    where += _where_values("i.project_id", filters["projects"], params)
     rows = conn.execute(
         f"""
         SELECT i.id, i.identifier, i.title, i.status, i.story_points,
@@ -542,8 +812,14 @@ def issue_efficiency(conn: sqlite3.Connection, project_id: Optional[str] = None,
     for r in rows:
         d = dict(r)
         issue_id = d.pop("id")
+        factor = fractions.get(issue_id, 0.0) if needs_run_filter else 1.0
+        if factor <= 0:
+            continue
         d["issue_id"] = issue_id
         d["agents"] = agents_by_issue.get(issue_id, [])
+        d["total_tokens"] = round(d["total_tokens"] * factor)
+        d["story_points"] *= factor
+        d["estimated"] = needs_run_filter
         d["tokens_per_sp"] = d["total_tokens"] / d["story_points"]
         out.append(d)
     if limit is not None:
@@ -555,7 +831,8 @@ def issue_efficiency(conn: sqlite3.Connection, project_id: Optional[str] = None,
 
 
 def efficiency_breakdown(conn: sqlite3.Connection,
-                         project_id: Optional[str] = None) -> Dict[str, Any]:
+                         project_id: Optional[str] = None,
+                         filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Three efficiency metrics over the issues that count toward efficiency
     (is_jira = 0, story points > 0, a synced usage row, optional project),
     plus a per-model breakdown. Formulas and rationale:
@@ -579,15 +856,15 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     the model's official rate), sorted cheapest cost-per-SP first so it is
     obvious which model delivers a story point for less.
     """
+    filters = _coerce_filters(project_id=project_id, filters=filters)
+    needs_run_filter, fractions = _run_filter_fractions(conn, filters)
     rates = _pricing_rates(conn)
     stats = _issue_model_stats(conn)
 
     where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
              "AND i.story_points > 0")
     params: List[Any] = []
-    if project_id is not None:
-        where += " AND i.project_id = ?"
-        params.append(project_id)
+    where += _where_values("i.project_id", filters["projects"], params)
     rows = conn.execute(
         f"""
         SELECT i.id, i.story_points,
@@ -620,13 +897,23 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         })
 
     for row in rows:
-        sp = row["story_points"]
+        factor = fractions.get(row["id"], 0.0) if needs_run_filter else 1.0
+        if factor <= 0:
+            continue
+        sp = row["story_points"] * factor
         sp_sum += sp
         for kind in TOKEN_KINDS:
-            tokens[kind] += row[f"total_{kind}"] or 0
+            tokens[kind] += (row[f"total_{kind}"] or 0) * factor
         issue_models = stats.get(row["id"])
         if not issue_models:
             continue  # usage but no runs → not attributable to a model
+        if filters["models"]:
+            issue_models = {
+                model: values for model, values in issue_models.items()
+                if model in filters["models"]
+            }
+            if not issue_models:
+                continue
         cost_issues += 1
         cost_sp += sp
         keys = list(issue_models)
@@ -635,17 +922,17 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             {m: v["dur"] for m, v in issue_models.items()},
             {m: v["n"] for m, v in issue_models.items()},
         )
-        issue_hours = sum(v["dur"] for v in issue_models.values()) * HOURS_PER_DAY
+        issue_hours = sum(v["dur"] for v in issue_models.values()) * HOURS_PER_DAY * factor
         active_hours += issue_hours
-        issue_total = sum(int(row[f"total_{k}"] or 0) for k in TOKEN_KINDS)
+        issue_total = sum((row[f"total_{k}"] or 0) * factor for k in TOKEN_KINDS)
         issue_cost = 0.0
         issue_priced = True
         for model, weight in weights.items():
             b = bucket(model)
             for kind in TOKEN_KINDS:
-                b["tokens"][kind] += (row[f"total_{kind}"] or 0) * weight
+                b["tokens"][kind] += (row[f"total_{kind}"] or 0) * factor * weight
             b["story_points"] += sp * weight
-            model_hours = issue_models[model]["dur"] * HOURS_PER_DAY
+            model_hours = issue_models[model]["dur"] * HOURS_PER_DAY * factor
             b["active_hours"] += model_hours
             rate = rates.get(model)
             if rate is None or rate["unpriced"]:
@@ -655,10 +942,10 @@ def efficiency_breakdown(conn: sqlite3.Connection,
                 b["priced"] = False
                 continue
             model_cost = (
-                (row["total_input_tokens"] or 0) * weight * rate["input_rate"]
-                + (row["total_output_tokens"] or 0) * weight * rate["output_rate"]
-                + (row["total_cache_read_tokens"] or 0) * weight * rate["cache_read_rate"]
-                + (row["total_cache_write_tokens"] or 0) * weight * rate["cache_write_rate"]
+                (row["total_input_tokens"] or 0) * factor * weight * rate["input_rate"]
+                + (row["total_output_tokens"] or 0) * factor * weight * rate["output_rate"]
+                + (row["total_cache_read_tokens"] or 0) * factor * weight * rate["cache_read_rate"]
+                + (row["total_cache_write_tokens"] or 0) * factor * weight * rate["cache_write_rate"]
             ) / 1_000_000
             issue_cost += model_cost
             any_priced = True
@@ -722,34 +1009,42 @@ def efficiency_breakdown(conn: sqlite3.Connection,
 
 def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
             date_to: Optional[str] = None, project_id: Optional[str] = None,
-            credits_per_usd: float = 1.0) -> Dict[str, Any]:
-    """Headline cards. Tokens/cost/credits honor the period filter (and the
-    project filter via attribution — flagged estimated). Story points and
-    efficiency are project-scope facts from issues/issue_usage; the period
-    filter does not apply to them (documented in the README)."""
-    if project_id is None:
+            credits_per_usd: float = 1.0,
+            filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Headline cards for the selected dimensions and run-time window.
+
+    Whole-day model totals remain exact. Agent/project and partial-day ranges
+    are duration-weighted estimates over the dated task runs; the same run
+    share is applied to task SP and efficiency inputs.
+    """
+    filters = _coerce_filters(date_from, date_to, project_id, filters)
+    date_from, date_to = _filter_dates(filters)
+    if (not filters["projects"] and not filters["agents"]
+            and not filters["time_estimated"]):
         where, params = _date_clause("date", date_from, date_to)
-        row = conn.execute(
-            f"""
-            SELECT SUM(input_tokens) AS input_tokens,
-                   SUM(output_tokens) AS output_tokens,
-                   SUM(cache_read_tokens) AS cache_read_tokens,
-                   SUM(cache_write_tokens) AS cache_write_tokens,
-                   SUM(cost_usd) AS cost_usd,
-                   SUM(cost_credits) AS cost_credits,
-                   SUM(1 - cost_priced) AS unpriced_rows
-            FROM daily_usage WHERE {where}
-            """,
-            params,
-        ).fetchone()
-        tokens = {k: row[k] or 0 for k in TOKEN_KINDS}
-        cost_usd = row["cost_usd"]
-        cost_credits = row["cost_credits"]
-        has_unpriced = (row["unpriced_rows"] or 0) > 0
-        estimated = False
+        where += _where_values("model", filters["models"], params)
+        tokens = {k: 0 for k in TOKEN_KINDS}
+        cost_usd = cost_credits = 0.0
+        has_unpriced = False
+        usage_rows = conn.execute(
+            f"SELECT * FROM daily_usage WHERE {where}", params
+        ).fetchall()
+        for usage in usage_rows:
+            fraction = _day_fraction(usage["date"], filters)
+            for kind in TOKEN_KINDS:
+                tokens[kind] += round((usage[kind] or 0) * fraction)
+            if usage["cost_usd"] is None:
+                has_unpriced = True
+            else:
+                cost_usd += usage["cost_usd"] * fraction
+                cost_credits += (usage["cost_credits"] or 0.0) * fraction
+        estimated = filters["time_estimated"]
     else:
-        shares = [s for s in daily_shares(conn, date_from, date_to)
-                  if s["project_id"] == project_id]
+        shares = daily_shares(conn, filters=filters)
+        if filters["projects"]:
+            shares = [s for s in shares if s["project_id"] in filters["projects"]]
+        if filters["agents"]:
+            shares = [s for s in shares if s["agent_id"] in filters["agents"]]
         agg = _sum_shares(shares, lambda s: "all")
         if agg:
             g = agg[0]
@@ -766,27 +1061,52 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
     # story-point and efficiency facts (tokens already exclude them, as Jira
     # issues have no runs/usage).
     sp_where, sp_params = "i.is_jira = 0", []
-    if project_id is not None:
-        sp_where, sp_params = "i.is_jira = 0 AND i.project_id = ?", [project_id]
-    sp_row = conn.execute(
-        f"""
-        SELECT SUM(i.story_points) AS sp_sum,
-               SUM(CASE WHEN i.story_points IS NOT NULL THEN 1 ELSE 0 END) AS with_sp,
-               COUNT(*) AS issues
-        FROM issues i WHERE {sp_where}
-        """,
-        sp_params,
-    ).fetchone()
-    eff = efficiency_breakdown(conn, project_id)
+    if filters["projects"]:
+        sp_where += _where_values("i.project_id", filters["projects"], sp_params)
+    needs_run_filter, fractions = _run_filter_fractions(conn, filters)
+    if needs_run_filter:
+        sp_sum = 0.0
+        with_sp = 0
+        issue_count = 0
+        for issue in conn.execute(
+            "SELECT i.id, i.story_points FROM issues i WHERE %s" % sp_where,
+            sp_params,
+        ):
+            factor = fractions.get(issue["id"], 0.0)
+            if factor <= 0:
+                continue
+            issue_count += 1
+            if issue["story_points"] is not None:
+                sp_sum += issue["story_points"] * factor
+                with_sp += 1
+    else:
+        sp_row = conn.execute(
+            f"""
+            SELECT SUM(i.story_points) AS sp_sum,
+                   SUM(CASE WHEN i.story_points IS NOT NULL THEN 1 ELSE 0 END) AS with_sp,
+                   COUNT(*) AS issues
+            FROM issues i WHERE {sp_where}
+            """,
+            sp_params,
+        ).fetchone()
+        sp_sum = sp_row["sp_sum"] or 0
+        with_sp = sp_row["with_sp"] or 0
+        issue_count = sp_row["issues"]
+    # Task-level values use the same duration fraction when the selection
+    # contains a run dimension or a date/time range.
+    eff = efficiency_breakdown(conn, filters=filters)
 
     last_cycle = conn.execute(
         "SELECT started_at, finished_at, sources_ok, sources_failed "
         "FROM poll_cycles ORDER BY id DESC LIMIT 1"
     ).fetchone()
+    unpriced_where, unpriced_params = "mp.model IS NULL", []
+    unpriced_where += _where_values("du.model", filters["models"], unpriced_params)
     unpriced_models = [r["model"] for r in conn.execute(
         "SELECT DISTINCT du.model FROM daily_usage du LEFT JOIN model_pricing mp "
         "ON mp.model = du.model AND mp.unpriced = 0 "
-        "WHERE mp.model IS NULL ORDER BY du.model"
+        "WHERE %s ORDER BY du.model" % unpriced_where,
+        unpriced_params,
     )]
 
     return {
@@ -796,9 +1116,9 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "cost_credits": cost_credits,
         "has_unpriced": has_unpriced,
         "estimated": estimated,
-        "story_points": sp_row["sp_sum"] or 0,
-        "issues": sp_row["issues"],
-        "issues_with_sp": sp_row["with_sp"] or 0,
+        "story_points": sp_sum,
+        "issues": issue_count,
+        "issues_with_sp": with_sp,
         "efficiency_tokens": eff["total_tokens"],
         "efficiency_sp": eff["story_points"],
         "tokens_per_sp": eff["tokens_per_sp"],

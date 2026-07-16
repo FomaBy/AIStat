@@ -201,6 +201,13 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return empty_data_connection()
         return connect_readonly(path)
 
+    def query_filters():
+        return aggregates.make_filters(
+            request.args.get("from"), request.args.get("to"),
+            request.args.getlist("project"), request.args.getlist("agent"),
+            request.args.getlist("model"),
+        )
+
     @contextmanager
     def ingest_lock():
         with ingest_lock_path.open("a+b") as handle:
@@ -402,15 +409,17 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.get("/api/summary")
     def api_summary():
+        try:
+            filters = query_filters()
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
         conn = data_connection()
         try:
             return jsonify(
                 aggregates.summary(
                     conn,
-                    request.args.get("from"),
-                    request.args.get("to"),
-                    request.args.get("project"),
                     credits_per_usd=config.credits_per_usd,
+                    filters=filters,
                 )
             )
         finally:
@@ -424,9 +433,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 result = aggregates.daily_series(
                     conn,
                     request.args.get("group", "model"),
-                    request.args.get("from"),
-                    request.args.get("to"),
-                    request.args.get("project"),
+                    filters=query_filters(),
                 )
             except ValueError as exc:
                 return jsonify({"detail": str(exc)}), 422
@@ -436,15 +443,16 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.get("/api/agents")
     def api_agents():
+        try:
+            filters = query_filters()
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
         conn = data_connection()
         try:
             return jsonify(
                 {
                     "agents": aggregates.agent_totals(
-                        conn,
-                        request.args.get("from"),
-                        request.args.get("to"),
-                        request.args.get("project"),
+                        conn, filters=filters,
                     )
                 }
             )
@@ -453,12 +461,17 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.get("/api/projects")
     def api_projects():
+        try:
+            filters = query_filters()
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
         conn = data_connection()
         try:
             return jsonify(
                 {
                     "projects": aggregates.projects_overview(
-                        conn, credits_per_usd=config.credits_per_usd
+                        conn, credits_per_usd=config.credits_per_usd,
+                        filters=filters,
                     )
                 }
             )
@@ -474,12 +487,16 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return jsonify({"detail": "limit must be an integer"}), 422
         if limit is not None and not 1 <= limit <= 1000:
             return jsonify({"detail": "limit must be between 1 and 1000"}), 422
+        try:
+            filters = query_filters()
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
         conn = data_connection()
         try:
             return jsonify(
                 {
                     "issues": aggregates.issue_efficiency(
-                        conn, request.args.get("project"), limit
+                        conn, limit=limit, filters=filters,
                     )
                 }
             )
@@ -488,10 +505,14 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.get("/api/model-efficiency")
     def api_model_efficiency():
+        try:
+            filters = query_filters()
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
         conn = data_connection()
         try:
             return jsonify(
-                aggregates.efficiency_breakdown(conn, request.args.get("project"))
+                aggregates.efficiency_breakdown(conn, filters=filters)
             )
         finally:
             conn.close()

@@ -46,6 +46,24 @@ def test_summary_endpoint(api):
     assert filtered["total_tokens"] == 3_400_000
 
 
+def test_hour_and_dimension_filters_are_validated_and_applied(api):
+    client, _ = api
+    params = [
+        ("from", "2026-01-01T10:00Z"),
+        ("to", "2026-01-01T11:00Z"),
+        ("project", "P1"),
+        ("agent", "A2"),
+        ("model", "m-shared"),
+    ]
+    summary = client.get("/api/summary", params=params).json()
+    assert summary["estimated"] is True
+    assert summary["total_tokens"] == 600_000
+    assert summary["cost_usd"] == pytest.approx(1.2)
+    assert client.get(
+        "/api/summary", params={"from": "2026-01-01T11:00Z", "to": "2026-01-01T10:00Z"}
+    ).status_code == 422
+
+
 def test_daily_endpoint(api):
     client, _ = api
     daily = client.get("/api/daily", params={"group": "agent"}).json()

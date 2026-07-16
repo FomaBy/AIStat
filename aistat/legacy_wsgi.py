@@ -1232,6 +1232,15 @@ def _api(environ, start_response, path):
                 "csrf": session["csrf"],
             },
         )
+    try:
+        filters = aggregates.make_filters(
+            _first(query, "from"), _first(query, "to"),
+            query.get("project"), query.get("agent"), query.get("model"),
+        )
+    except ValueError as exc:
+        return _json_response(
+            environ, start_response, "422 Unprocessable Entity", {"detail": str(exc)}
+        )
     conn = _data_connection(session)
     try:
         if path == "/api/meta":
@@ -1239,19 +1248,15 @@ def _api(environ, start_response, path):
         elif path == "/api/summary":
             data = aggregates.summary(
                 conn,
-                _first(query, "from"),
-                _first(query, "to"),
-                _first(query, "project"),
                 credits_per_usd=CREDITS_PER_USD,
+                filters=filters,
             )
         elif path == "/api/daily":
             try:
                 data = aggregates.daily_series(
                     conn,
                     _first(query, "group", "model"),
-                    _first(query, "from"),
-                    _first(query, "to"),
-                    _first(query, "project"),
+                    filters=filters,
                 )
             except ValueError as exc:
                 return _json_response(
@@ -1260,16 +1265,13 @@ def _api(environ, start_response, path):
         elif path == "/api/agents":
             data = {
                 "agents": aggregates.agent_totals(
-                    conn,
-                    _first(query, "from"),
-                    _first(query, "to"),
-                    _first(query, "project"),
+                    conn, filters=filters,
                 )
             }
         elif path == "/api/projects":
             data = {
                 "projects": aggregates.projects_overview(
-                    conn, credits_per_usd=CREDITS_PER_USD
+                    conn, credits_per_usd=CREDITS_PER_USD, filters=filters,
                 )
             }
         elif path == "/api/efficiency":
@@ -1284,11 +1286,11 @@ def _api(environ, start_response, path):
                 )
             data = {
                 "issues": aggregates.issue_efficiency(
-                    conn, _first(query, "project"), limit
+                    conn, limit=limit, filters=filters,
                 )
             }
         elif path == "/api/model-efficiency":
-            data = aggregates.efficiency_breakdown(conn, _first(query, "project"))
+            data = aggregates.efficiency_breakdown(conn, filters=filters)
         elif path in ("/api/health", "/health"):
             data = _health(conn)
         elif path == "/api/sync":

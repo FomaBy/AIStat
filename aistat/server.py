@@ -25,7 +25,7 @@ import asyncio
 import json
 import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -95,6 +95,14 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     def db() -> sqlite3.Connection:
         return connect(config.db_path)
 
+    def request_filters(date_from, date_to, projects, agents, models):
+        try:
+            return aggregates.make_filters(
+                date_from, date_to, projects, agents, models
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
     @app.get("/api/meta")
     def api_meta():
         conn = db()
@@ -107,13 +115,16 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     def api_summary(
         date_from: Optional[str] = Query(None, alias="from"),
         date_to: Optional[str] = Query(None, alias="to"),
-        project: Optional[str] = Query(None),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
     ):
         conn = db()
         try:
             return aggregates.summary(
-                conn, date_from, date_to, project,
+                conn,
                 credits_per_usd=config.credits_per_usd,
+                filters=request_filters(date_from, date_to, project, agent, model),
             )
         finally:
             conn.close()
@@ -123,11 +134,16 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         group: str = Query("model"),
         date_from: Optional[str] = Query(None, alias="from"),
         date_to: Optional[str] = Query(None, alias="to"),
-        project: Optional[str] = Query(None),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
     ):
         conn = db()
         try:
-            return aggregates.daily_series(conn, group, date_from, date_to, project)
+            return aggregates.daily_series(
+                conn, group,
+                filters=request_filters(date_from, date_to, project, agent, model),
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         finally:
@@ -137,40 +153,68 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     def api_agents(
         date_from: Optional[str] = Query(None, alias="from"),
         date_to: Optional[str] = Query(None, alias="to"),
-        project: Optional[str] = Query(None),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
     ):
         conn = db()
         try:
-            return {"agents": aggregates.agent_totals(conn, date_from, date_to, project)}
+            return {"agents": aggregates.agent_totals(
+                conn,
+                filters=request_filters(date_from, date_to, project, agent, model),
+            )}
         finally:
             conn.close()
 
     @app.get("/api/projects")
-    def api_projects():
+    def api_projects(
+        date_from: Optional[str] = Query(None, alias="from"),
+        date_to: Optional[str] = Query(None, alias="to"),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
+    ):
         conn = db()
         try:
             return {"projects": aggregates.projects_overview(
-                conn, credits_per_usd=config.credits_per_usd
+                conn, credits_per_usd=config.credits_per_usd,
+                filters=request_filters(date_from, date_to, project, agent, model),
             )}
         finally:
             conn.close()
 
     @app.get("/api/efficiency")
     def api_efficiency(
-        project: Optional[str] = Query(None),
+        date_from: Optional[str] = Query(None, alias="from"),
+        date_to: Optional[str] = Query(None, alias="to"),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
         limit: Optional[int] = Query(None, ge=1, le=1000),
     ):
         conn = db()
         try:
-            return {"issues": aggregates.issue_efficiency(conn, project, limit)}
+            return {"issues": aggregates.issue_efficiency(
+                conn, limit=limit,
+                filters=request_filters(date_from, date_to, project, agent, model),
+            )}
         finally:
             conn.close()
 
     @app.get("/api/model-efficiency")
-    def api_model_efficiency(project: Optional[str] = Query(None)):
+    def api_model_efficiency(
+        date_from: Optional[str] = Query(None, alias="from"),
+        date_to: Optional[str] = Query(None, alias="to"),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
+    ):
         conn = db()
         try:
-            return aggregates.efficiency_breakdown(conn, project)
+            return aggregates.efficiency_breakdown(
+                conn,
+                filters=request_filters(date_from, date_to, project, agent, model),
+            )
         finally:
             conn.close()
 

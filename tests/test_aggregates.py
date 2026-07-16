@@ -44,6 +44,75 @@ def test_daily_by_model_respects_period(agg_conn):
     assert sum(r["total_tokens"] for r in result["rows"]) == 700_000
 
 
+def test_hour_range_uses_dated_run_intervals_without_renormalizing(agg_conn):
+    """A partial day retains only the run-time share of that day's tokens.
+
+    On 2026-01-01 the shared runtime has five dated active hours: A2 has
+    10–11 and 12–14, A3 has 12–13 and 14–15. Selecting 10–11 therefore
+    receives A2's 1/5 share (600k) rather than all 3M shared-model tokens.
+    A1's single 10–11 run owns its entire 1M Claude daily row.
+    """
+    filters = ag.make_filters("2026-01-01T10:00Z", "2026-01-01T11:00Z")
+    result = ag.daily_series(agg_conn, group="model", filters=filters)
+    by_model = {r["key"]: r for r in result["rows"]}
+    assert result["estimated"] is True
+    assert by_model["m-claude"]["total_tokens"] == 1_000_000
+    assert by_model["m-shared"]["total_tokens"] == 600_000
+    assert by_model["m-shared"]["cost_usd"] == pytest.approx(1.2)
+    assert sum(r["total_tokens"] for r in result["rows"]) == 1_600_000
+
+
+def test_hour_range_combines_agent_model_and_project_filters(agg_conn):
+    filters = ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T11:00Z",
+        project_ids=["P1"], agent_ids=["A2"], models=["m-shared"],
+    )
+    summary = ag.summary(agg_conn, filters=filters)
+    assert summary["estimated"] is True
+    assert summary["total_tokens"] == 600_000
+    assert summary["cost_usd"] == pytest.approx(1.2)
+    assert summary["story_points"] == pytest.approx(2.5)
+
+    no_match = ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T11:00Z",
+        project_ids=["P2"], agent_ids=["A2"], models=["m-shared"],
+    )
+    assert ag.summary(agg_conn, filters=no_match)["total_tokens"] == 0
+
+
+def test_hour_range_excludes_runs_without_complete_dated_interval(agg_conn):
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A5', 'Incomplete', 'm-claude', 'R1', '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run-incomplete', 'I1', 'A5', 'R1', 'completed',
+       '2026-01-01T10:00:00Z', NULL, '{now}');
+    """)
+    agg_conn.commit()
+    filters = ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T11:00Z", agent_ids=["A5"]
+    )
+    assert ag.summary(agg_conn, filters=filters)["total_tokens"] == 0
+
+
+def test_task_views_apply_dated_run_filter_share(agg_conn):
+    filters = ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T11:00Z", agent_ids=["A2"]
+    )
+    projects = {p["title"]: p for p in ag.projects_overview(agg_conn, filters=filters)}
+    # I1 has two equal one-hour runs (A1 and A2), so A2's selected hour owns
+    # half of its cumulative task usage and SP. I2 starts at noon and is out.
+    assert projects["Alpha"]["total_tokens"] == pytest.approx(750)
+    assert projects["Alpha"]["story_points"] == pytest.approx(2.5)
+    issue = ag.issue_efficiency(agg_conn, filters=filters)
+    assert issue[0]["identifier"] == "T-1"
+    assert issue[0]["estimated"] is True
+    assert issue[0]["total_tokens"] == 750
+    assert issue[0]["story_points"] == pytest.approx(2.5)
+
+
 def test_daily_by_agent_splits_shared_pair_by_duration(agg_conn):
     result = ag.daily_series(agg_conn, group="agent")
     assert result["estimated"] is True
