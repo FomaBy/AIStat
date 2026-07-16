@@ -205,6 +205,27 @@ def test_logout_requires_csrf(legacy):
     assert "Max-Age=0" in "\n".join(header_values(headers, "Set-Cookie"))
 
 
+def test_logout_accepts_form_csrf_for_shared_host_waf(legacy):
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/session", cookie=cookies
+    )
+    csrf = legacy.json.loads(body.decode("utf-8"))["csrf"]
+    form = urlencode({"csrf": csrf}).encode("utf-8")
+
+    status, headers, _ = request(
+        legacy.application,
+        "/logout",
+        method="POST",
+        body=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        cookie=cookies,
+    )
+
+    assert status == "303 See Other"
+    assert "Max-Age=0" in "\n".join(header_values(headers, "Set-Cookie"))
+
+
 def test_signed_snapshot_ingest(legacy, tmp_path):
     source = tmp_path / "source.db"
     conn = connect(source)

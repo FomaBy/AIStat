@@ -387,7 +387,7 @@ async function setupSession() {
       const response = await fetch("/logout", {
         method: "POST",
         credentials: "same-origin",
-        headers: { "X-CSRF-Token": state.csrf },
+        body: new URLSearchParams({ csrf: state.csrf }),
       });
       if (!response.ok) throw new Error(`logout → HTTP ${response.status}`);
       location.assign("/login");

@@ -969,6 +969,8 @@ def application(environ, start_response):
             if environ.get("REQUEST_METHOD") != "POST":
                 return _respond(environ, start_response, "405 Method Not Allowed")
             candidate = environ.get("HTTP_X_CSRF_TOKEN", "")
+            if not candidate:
+                candidate = _first(_read_form(environ), "csrf", "")
             if not hmac.compare_digest(candidate, session.get("csrf", "")):
                 return _json_response(
                     environ, start_response, "400 Bad Request", {"detail": "invalid CSRF token"}
