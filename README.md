@@ -35,6 +35,22 @@ HTTP-вызовов к серверу. Хранилище — один файл 
 публичный сайт подписанный snapshot SQLite. Multica credential при этом
 никогда не покидает локальный компьютер.
 
+## Постоянные локальные развёртки dev / main
+
+Две всегда поднятые локальные развёртки бок о бок (через launchd): ветка `dev`
+на `http://127.0.0.1:8788` автоматически подхватывает свежие пуши в `origin/dev`,
+ветка `main` на `http://127.0.0.1:8789` обновляется только по запросу. Один
+скрипт — [`deploy/local_deploy.sh`](deploy/local_deploy.sh):
+
+```bash
+deploy/local_deploy.sh install     # поднять обе развёртки (dev + main)
+deploy/local_deploy.sh release     # выпустить dev → origin/main со сборкой и перевыкатить main
+deploy/local_deploy.sh status      # состояние, HEAD, health по портам
+```
+
+Полная инструкция (обновление dev, релиз в main, логи, удаление, настройка):
+[`docs/deployment-local.md`](docs/deployment-local.md).
+
 ## Запуск по частям
 
 Поллер (фоновая синхронизация; новый цикл стартует каждые 45 с по умолчанию,
