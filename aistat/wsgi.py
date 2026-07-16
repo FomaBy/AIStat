@@ -33,7 +33,9 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from . import __version__, aggregates
+from markupsafe import escape
+
+from . import __version__, aggregates, oauth
 from .config import Config
 from .db import connect, connect_readonly, init_db
 from .health import snapshot
@@ -91,7 +93,19 @@ def create_app(config: Optional[Config] = None) -> Flask:
         "login_css",
         "healthz",
         "ingest_snapshot",
+        "oauth_start",
+        "oauth_callback",
     }
+
+    def oauth_session_authorized() -> bool:
+        """True when the current session is an allow-listed OAuth login.
+
+        Re-checked on every request so removing an email from the allow-list
+        revokes access immediately. Fail-closed: no allow-list => no access.
+        """
+        return bool(session.get("user_id")) and oauth.is_email_authorized(
+            config.oauth_allowed_emails, session.get("email")
+        )
 
     def normalized_host() -> str:
         host = request.host.rsplit("@", 1)[-1]
@@ -121,6 +135,8 @@ def create_app(config: Optional[Config] = None) -> Flask:
         if request.endpoint in public_endpoints:
             return None
         if session.get("user") == config.auth_username:
+            return None
+        if oauth_session_authorized():
             return None
         if wants_json():
             return jsonify({"detail": "authentication required"}), 401
@@ -261,6 +277,54 @@ def create_app(config: Optional[Config] = None) -> Flask:
     @app.get("/login.css")
     def login_css():
         return send_from_directory(STATIC_DIR, "login.css")
+
+    def oauth_pending(email):
+        shown = escape(email or "—")
+        body = (
+            "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<title>Нет доступа — AIStat</title>"
+            "<link rel=\"stylesheet\" href=\"/login.css\"></head><body>"
+            "<main class=\"login-shell\"><section class=\"login-card\">"
+            "<h1>AIStat</h1><p class=\"subtitle\">Вход выполнен как {email}, "
+            "но у аккаунта пока нет доступа к статистике. Обратитесь к "
+            "администратору.</p><p><a href=\"/login\">Войти как администратор</a>"
+            "</p></section></main></body></html>"
+        ).format(email=shown)
+        return body, 403
+
+    @app.get("/auth/<provider>/start")
+    def oauth_start(provider):
+        provider_config = config.oauth_providers.get(provider)
+        if provider_config is None:
+            abort(404)
+        next_url = safe_next_url(request.args.get("next"))
+        authorize_url = oauth.begin(security_store, provider_config, next_url)
+        return redirect(authorize_url, code=303)
+
+    @app.get("/auth/<provider>/callback")
+    def oauth_callback(provider):
+        provider_config = config.oauth_providers.get(provider)
+        if provider_config is None:
+            abort(404)
+        try:
+            result = oauth.finish(security_store, provider_config, request.args)
+        except oauth.OAuthError:
+            response, status = render_login(
+                "Не удалось выполнить вход через провайдера. Попробуйте снова.",
+                400,
+            )
+            return response, status
+        session.clear()
+        session["user_id"] = result["user_id"]
+        session["email"] = result["email"]
+        session["provider"] = provider
+        session.permanent = True
+        csrf_token(session)
+        if not oauth.is_email_authorized(
+            config.oauth_allowed_emails, result["email"]
+        ):
+            return oauth_pending(result["email"])
+        return redirect(safe_next_url(result["next_url"]), code=303)
 
     @app.get("/healthz")
     def healthz():

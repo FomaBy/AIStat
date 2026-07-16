@@ -3,11 +3,12 @@
 import ast
 import importlib
 import io
+import json
 import os
 import re
 import runpy
 from http.cookies import SimpleCookie
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.util import setup_testing_defaults
 
 import pytest
@@ -36,6 +37,21 @@ def legacy(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("AISTAT_SESSION_SECRET", SESSION_SECRET)
     monkeypatch.setenv("AISTAT_INGEST_SECRET", INGEST_SECRET)
+    monkeypatch.setenv("AISTAT_OAUTH_PROVIDERS", "google")
+    monkeypatch.setenv(
+        "AISTAT_OAUTH_GOOGLE_AUTHORIZE_URL", "https://accounts.example/authorize"
+    )
+    monkeypatch.setenv("AISTAT_OAUTH_GOOGLE_TOKEN_URL", "https://oauth.example/token")
+    monkeypatch.setenv(
+        "AISTAT_OAUTH_GOOGLE_USERINFO_URL", "https://api.example/userinfo"
+    )
+    monkeypatch.setenv("AISTAT_OAUTH_GOOGLE_SCOPES", "openid email profile")
+    monkeypatch.setenv("AISTAT_OAUTH_GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AISTAT_OAUTH_GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv(
+        "AISTAT_OAUTH_GOOGLE_REDIRECT_URI", "https://localhost/auth/google/callback"
+    )
+    monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", "allowed@example.com")
 
     import aistat.legacy_wsgi as module
 
@@ -132,10 +148,40 @@ def login(module):
 
 
 def test_source_parses_as_python_36():
-    source = open("aistat/legacy_wsgi.py", encoding="utf-8").read()
-    ast.parse(source, filename="legacy_wsgi.py", feature_version=(3, 6))
-    source = open("aistat.cgi", encoding="utf-8").read()
-    ast.parse(source, filename="aistat.cgi", feature_version=(3, 6))
+    # legacy_wsgi imports oauth at runtime on cPanel's Python 3.6, so the
+    # shared core must parse as 3.6 too.
+    for path in ("aistat/legacy_wsgi.py", "aistat/oauth.py", "aistat.cgi"):
+        source = open(path, encoding="utf-8").read()
+        ast.parse(source, filename=path, feature_version=(3, 6))
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._data = json.dumps(payload).encode("utf-8")
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            data, self._data = self._data, b""
+            return data
+        data, self._data = self._data[:size], self._data[size:]
+        return data
+
+    def close(self):
+        pass
+
+
+def install_fake_http(monkeypatch, identity):
+    def fake_urlopen(request, timeout=None):
+        if request.full_url.endswith("/token"):
+            return _FakeResponse({"access_token": "at"})
+        return _FakeResponse(identity)
+
+    monkeypatch.setattr("aistat.oauth.urlopen", fake_urlopen)
+
+
+def state_from(headers):
+    location = header_values(headers, "Location")[0]
+    return parse_qs(urlsplit(location).query)["state"][0]
 
 
 def test_cgi_loads_only_aistat_private_environment(tmp_path, monkeypatch):
@@ -291,3 +337,79 @@ def test_host_allowlist(legacy):
     )
     assert captured["status"] == "400 Bad Request"
     assert body == b"Invalid host"
+
+
+def test_oauth_unknown_provider_is_404(legacy):
+    status, _, _ = request(legacy.application, "/auth/nope/start")
+    assert status == "404 Not Found"
+
+
+def test_oauth_start_redirects_to_provider_with_state(legacy):
+    status, headers, _ = request(
+        legacy.application, "/auth/google/start?next=/api/meta"
+    )
+    assert status == "303 See Other"
+    location = header_values(headers, "Location")[0]
+    assert location.startswith("https://accounts.example/authorize")
+    assert "state=" in location
+
+
+def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
+    install_fake_http(
+        monkeypatch, {"sub": "g-1", "email": "allowed@example.com", "name": "Al"}
+    )
+    status, headers, _ = request(
+        legacy.application, "/auth/google/start?next=/api/meta"
+    )
+    state = state_from(headers)
+    status, headers, _ = request(
+        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location") == ["/api/meta"]
+    cookies = cookie_jar(headers)
+    status, _, body = request(legacy.application, "/api/meta", cookie=cookies)
+    assert status == "200 OK"
+    data = legacy.json.loads(body.decode("utf-8"))
+    assert [p["title"] for p in data["projects"]] == ["Alpha", "Beta"]
+
+
+def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
+    install_fake_http(
+        monkeypatch, {"sub": "g-2", "email": "stranger@example.com", "name": "S"}
+    )
+    status, headers, _ = request(legacy.application, "/auth/google/start")
+    state = state_from(headers)
+    status, headers, _ = request(
+        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+    )
+    assert status == "403 Forbidden"
+    cookies = cookie_jar(headers)
+    status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
+    assert status == "401 Unauthorized"
+
+
+def test_oauth_callback_rejects_forged_state(legacy):
+    status, _, _ = request(
+        legacy.application, "/auth/google/callback?state=forged&code=abc"
+    )
+    assert status == "400 Bad Request"
+    status, _, _ = request(legacy.application, "/api/meta")
+    assert status == "401 Unauthorized"
+
+
+def test_oauth_state_is_single_use(legacy, monkeypatch):
+    install_fake_http(
+        monkeypatch, {"sub": "g-3", "email": "allowed@example.com"}
+    )
+    status, headers, _ = request(legacy.application, "/auth/google/start")
+    state = state_from(headers)
+    first = request(
+        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+    )
+    assert first[0] == "303 See Other"
+    # replaying the now-consumed state is rejected
+    second = request(
+        legacy.application, "/auth/google/callback?state=%s&code=abc" % state
+    )
+    assert second[0] == "400 Bad Request"

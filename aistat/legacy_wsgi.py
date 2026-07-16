@@ -30,10 +30,11 @@ import traceback
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote
 
-from . import __version__, aggregates
+from . import __version__, aggregates, oauth
 from .db import SCHEMA_VERSION, connect, init_db
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+OAUTH_STATE_TTL_SECONDS = 10 * 60
 REQUIRED_TABLES = {
     "runtimes",
     "agents",
@@ -87,6 +88,8 @@ MAX_SNAPSHOT_BYTES = int(
     os.environ.get("AISTAT_MAX_SNAPSHOT_BYTES", str(64 * 1024 * 1024))
 )
 CREDITS_PER_USD = float(os.environ.get("AISTAT_CREDITS_PER_USD", "1.0"))
+OAUTH_PROVIDERS = oauth.providers_from_env(os.environ)
+OAUTH_ALLOWED_EMAILS = oauth.allowed_emails_from_env(os.environ)
 
 
 def _validate_config():
@@ -143,6 +146,27 @@ def _bootstrap():
             );
             INSERT OR IGNORE INTO ingest_state (id, last_timestamp)
             VALUES (1, 0);
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      INTEGER NOT NULL,
+                display_name    TEXT,
+                email           TEXT,
+                is_admin        INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS oauth_identities (
+                provider        TEXT NOT NULL,
+                subject         TEXT NOT NULL,
+                user_id         INTEGER NOT NULL,
+                email           TEXT,
+                linked_at       INTEGER NOT NULL,
+                PRIMARY KEY (provider, subject)
+            );
+            CREATE TABLE IF NOT EXISTS oauth_state (
+                state           TEXT PRIMARY KEY,
+                provider        TEXT NOT NULL,
+                next_url        TEXT,
+                created_at      INTEGER NOT NULL
+            );
             """
         )
         conn.commit()
@@ -204,6 +228,20 @@ def _make_session():
     return encoded + "." + _sign(encoded, SESSION_SECRET), payload
 
 
+def _make_oauth_session(user_id, email, provider):
+    payload = {
+        "uid": int(user_id),
+        "email": email,
+        "provider": provider,
+        "exp": int(time.time()) + SESSION_SECONDS,
+        "csrf": secrets.token_urlsafe(32),
+    }
+    encoded = _b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    return encoded + "." + _sign(encoded, SESSION_SECRET), payload
+
+
 def _read_session(environ):
     value = _cookies(environ).get("aistat_session")
     if not value or "." not in value:
@@ -215,9 +253,29 @@ def _read_session(environ):
         payload = json.loads(_b64decode(encoded).decode("utf-8"))
     except Exception:
         return None
-    if payload.get("u") != ADMIN_USERNAME or int(payload.get("exp", 0)) < time.time():
+    if int(payload.get("exp", 0)) < time.time():
         return None
     return payload
+
+
+def _email_authorized(email):
+    return oauth.is_email_authorized(OAUTH_ALLOWED_EMAILS, email)
+
+
+def _session_grants_access(payload):
+    """Whether a valid session may reach private data (fail-closed for OAuth).
+
+    The admin password session is unchanged. An OAuth session is honoured only
+    while its email stays on the allow-list, so de-listing revokes access on the
+    next request.
+    """
+    if not payload:
+        return False
+    if payload.get("u") == ADMIN_USERNAME:
+        return True
+    if payload.get("uid") and _email_authorized(payload.get("email")):
+        return True
+    return False
 
 
 def _make_login_csrf():
@@ -366,6 +424,86 @@ def _record_ingest_timestamp(timestamp):
         return True
     finally:
         conn.close()
+
+
+class _LegacyOAuthStore(object):
+    """Account/state operations for the OAuth core, on the shared security db.
+
+    Mirrors ``aistat.security.SecurityStore``'s account methods with the same
+    SQL and one-time semantics, kept inline so ``legacy_wsgi`` stays free of the
+    ``dataclasses``-based config import and remains Python 3.6-clean.
+    """
+
+    def put_oauth_state(self, state, provider, next_url=None, now=None):
+        now = int(time.time()) if now is None else int(now)
+        conn = _security_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM oauth_state WHERE created_at + ? <= ?",
+                (OAUTH_STATE_TTL_SECONDS, now),
+            )
+            conn.execute(
+                "INSERT INTO oauth_state (state, provider, next_url, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (state, provider, next_url, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def take_oauth_state(self, state, now=None):
+        now = int(time.time()) if now is None else int(now)
+        conn = _security_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT provider, next_url, created_at "
+                "FROM oauth_state WHERE state = ?",
+                (state,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            conn.execute("DELETE FROM oauth_state WHERE state = ?", (state,))
+            conn.commit()
+            if row["created_at"] + OAUTH_STATE_TTL_SECONDS <= now:
+                return None
+            return {"provider": row["provider"], "next_url": row["next_url"]}
+        finally:
+            conn.close()
+
+    def find_or_create_user_by_identity(
+        self, provider, subject, email=None, display_name=None, now=None
+    ):
+        now = int(time.time()) if now is None else int(now)
+        conn = _security_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row:
+                conn.commit()
+                return int(row["user_id"])
+            cursor = conn.execute(
+                "INSERT INTO users (created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 0)",
+                (now, display_name, email),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, now),
+            )
+            conn.commit()
+            return user_id
+        finally:
+            conn.close()
 
 
 def _secure_headers(environ):
@@ -569,6 +707,96 @@ def _render_login(csrf, next_url, error=None):
     )
 
 
+def _render_oauth_pending(email):
+    return """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Нет доступа — AIStat</title>
+  <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-card">
+      <h1>AIStat</h1>
+      <p class="subtitle">Вход выполнен как {email}, но у аккаунта пока нет
+      доступа к статистике. Обратитесь к администратору.</p>
+      <p><a href="/login">Войти как администратор</a></p>
+    </section>
+  </main>
+</body>
+</html>""".format(
+        email=html.escape(email or "—")
+    )
+
+
+def _oauth(environ, start_response, path):
+    parts = path.strip("/").split("/")
+    if len(parts) != 3 or parts[0] != "auth" or parts[2] not in ("start", "callback"):
+        return _respond(environ, start_response, "404 Not Found", "Not found")
+    provider = OAUTH_PROVIDERS.get(parts[1])
+    if provider is None:
+        return _respond(environ, start_response, "404 Not Found", "Not found")
+    if environ.get("REQUEST_METHOD", "GET") != "GET":
+        return _respond(environ, start_response, "405 Method Not Allowed")
+    store = _LegacyOAuthStore()
+    query = _query(environ)
+    if parts[2] == "start":
+        next_url = _safe_next(_first(query, "next", "/"))
+        authorize_url = oauth.begin(store, provider, next_url)
+        return _respond(
+            environ,
+            start_response,
+            "303 See Other",
+            headers=[("Location", authorize_url)],
+        )
+    params = {
+        "state": _first(query, "state"),
+        "code": _first(query, "code"),
+        "error": _first(query, "error"),
+    }
+    try:
+        result = oauth.finish(store, provider, params)
+    except oauth.OAuthError:
+        csrf = _make_login_csrf()
+        headers = [("Set-Cookie", _cookie_header("aistat_login_csrf", csrf, 600))]
+        return _respond(
+            environ,
+            start_response,
+            "400 Bad Request",
+            _render_login(
+                csrf,
+                "/",
+                "Не удалось выполнить вход через провайдера. Попробуйте снова.",
+            ),
+            "text/html; charset=utf-8",
+            headers,
+        )
+    session_value, _payload = _make_oauth_session(
+        result["user_id"], result["email"], parts[1]
+    )
+    set_cookie = (
+        "Set-Cookie",
+        _cookie_header("aistat_session", session_value, SESSION_SECONDS),
+    )
+    if not _email_authorized(result["email"]):
+        return _respond(
+            environ,
+            start_response,
+            "403 Forbidden",
+            _render_oauth_pending(result["email"]),
+            "text/html; charset=utf-8",
+            [set_cookie],
+        )
+    next_url = _safe_next(result["next_url"])
+    return _respond(
+        environ,
+        start_response,
+        "303 See Other",
+        headers=[("Location", next_url), set_cookie],
+    )
+
+
 def _serve_static(environ, start_response, name):
     allowed = {
         "index.html",
@@ -694,7 +922,7 @@ def _login(environ, start_response):
     query = _query(environ)
     if method == "GET":
         session = _read_session(environ)
-        if session:
+        if session and _session_grants_access(session):
             return _respond(
                 environ,
                 start_response,
@@ -937,9 +1165,11 @@ def application(environ, start_response):
             return _serve_static(environ, start_response, "login.css")
         if path == "/api/ingest/snapshot":
             return _ingest(environ, start_response)
+        if path.startswith("/auth/"):
+            return _oauth(environ, start_response, path)
 
         session = _authenticated(environ)
-        if not session:
+        if not session or not _session_grants_access(session):
             if path.startswith("/api/") or path == "/health":
                 return _json_response(
                     environ,

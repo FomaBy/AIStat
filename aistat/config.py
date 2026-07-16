@@ -7,7 +7,9 @@ can be tuned without code changes. Defaults are chosen for this workspace.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
+
+from . import oauth
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -116,6 +118,16 @@ class Config:
         default_factory=lambda: _env_csv(
             "AISTAT_ALLOWED_HOSTS", ("localhost", "127.0.0.1", "testserver")
         )
+    )
+    # Enabled OAuth providers, keyed by name (built from the generic
+    # AISTAT_OAUTH_* env schema; empty unless an operator configures one).
+    oauth_providers: Dict[str, "oauth.OAuthProvider"] = field(
+        default_factory=lambda: oauth.providers_from_env(os.environ)
+    )
+    # Emails allowed to reach private statistics after an OAuth login.
+    # Fail-closed: empty means a valid OAuth login grants no data access.
+    oauth_allowed_emails: FrozenSet[str] = field(
+        default_factory=lambda: oauth.allowed_emails_from_env(os.environ)
     )
     force_https: bool = field(
         default_factory=lambda: _env_bool("AISTAT_FORCE_HTTPS", False)

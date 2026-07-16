@@ -1,11 +1,14 @@
 """Public WSGI authentication, headers and signed snapshot ingestion."""
 
+import json
 import re
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from werkzeug.security import generate_password_hash
 
+from aistat import oauth
 from aistat.config import Config
 from aistat.db import SCHEMA_VERSION, connect, init_db
 from aistat.security import snapshot_signature
@@ -16,6 +19,45 @@ from conftest import seed_aggregate_fixture
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "session-" + "s" * 48
 INGEST_SECRET = "ingest-" + "i" * 48
+
+OAUTH_PROVIDER = oauth.OAuthProvider(
+    name="google",
+    authorize_url="https://accounts.example/authorize",
+    token_url="https://oauth.example/token",
+    userinfo_url="https://api.example/userinfo",
+    scopes=("openid", "email", "profile"),
+    client_id="client-id",
+    client_secret="client-secret",
+    redirect_uri="https://localhost/auth/google/callback",
+)
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._data = json.dumps(payload).encode("utf-8")
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            data, self._data = self._data, b""
+            return data
+        data, self._data = self._data[:size], self._data[size:]
+        return data
+
+    def close(self):
+        pass
+
+
+def install_fake_http(monkeypatch, identity):
+    def fake_urlopen(request, timeout=None):
+        if request.full_url.endswith("/token"):
+            return _FakeResponse({"access_token": "at"})
+        return _FakeResponse(identity)
+
+    monkeypatch.setattr("aistat.oauth.urlopen", fake_urlopen)
+
+
+def state_from(location):
+    return parse_qs(urlsplit(location).query)["state"][0]
 
 
 @pytest.fixture
@@ -33,6 +75,8 @@ def public_app(tmp_path):
     config.allowed_hosts = ("localhost", "testserver", "aistat.app")
     config.force_https = False
     config.session_cookie_secure = True
+    config.oauth_providers = {"google": OAUTH_PROVIDER}
+    config.oauth_allowed_emails = frozenset({"allowed@example.com"})
 
     conn = connect(config.db_path)
     init_db(conn)
@@ -216,3 +260,79 @@ def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
         },
     )
     assert invalid.status_code == 422
+
+
+def test_oauth_unknown_provider_is_404(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert (
+        client.get("/auth/nope/start", base_url="https://localhost").status_code
+        == 404
+    )
+
+
+def test_oauth_start_redirects_to_provider_with_state(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    response = client.get(
+        "/auth/google/start?next=/api/meta", base_url="https://localhost"
+    )
+    assert response.status_code == 303
+    location = response.headers["Location"]
+    assert location.startswith("https://accounts.example/authorize")
+    assert "state=" in location
+
+
+def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
+    app, _ = public_app
+    install_fake_http(
+        monkeypatch, {"sub": "g-1", "email": "allowed@example.com", "name": "Al"}
+    )
+    client = app.test_client()
+    start = client.get(
+        "/auth/google/start?next=/api/meta", base_url="https://localhost"
+    )
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 303
+    assert callback.headers["Location"] == "/api/meta"
+    # the allow-listed OAuth session now reaches private data
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 200
+
+
+def test_oauth_callback_unauthorized_is_fail_closed(public_app, monkeypatch):
+    app, _ = public_app
+    install_fake_http(
+        monkeypatch, {"sub": "g-2", "email": "stranger@example.com", "name": "S"}
+    )
+    client = app.test_client()
+    start = client.get("/auth/google/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 403
+    # identity established, but a non-listed email sees no private data
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+
+def test_oauth_callback_rejects_forged_state(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    callback = client.get(
+        "/auth/google/callback?state=forged&code=abc",
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 400
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+
+def test_password_login_unaffected_by_oauth(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert login(client).status_code == 303
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 200
