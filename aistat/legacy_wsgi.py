@@ -1293,6 +1293,8 @@ def _api(environ, start_response, path):
             }
         elif path == "/api/model-efficiency":
             data = aggregates.efficiency_breakdown(conn, filters=filters)
+        elif path == "/api/efficiency-breakdown":
+            data = aggregates.efficiency_chart_breakdown(conn, filters=filters)
         elif path in ("/api/health", "/health"):
             data = _health(conn)
         elif path == "/api/sync":

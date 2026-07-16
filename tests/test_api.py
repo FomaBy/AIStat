@@ -107,6 +107,28 @@ def test_model_efficiency_endpoint(api):
     assert empty["cost_per_sp"] is None
 
 
+def test_efficiency_breakdown_endpoint(api):
+    client, _ = api
+    data = client.get("/api/efficiency-breakdown").json()
+    assert data["metric"] == "tokens_per_sp"
+    assert data["estimated"] is True
+    assert {row["key"] for row in data["agents"]} == {"A1", "A2"}
+    assert data["time"]["granularity"] == "day"
+
+    hourly = client.get(
+        "/api/efficiency-breakdown",
+        params=[("from", "2026-01-01T10:00Z"), ("to", "2026-01-01T10:30Z"),
+                ("agent", "A2"), ("model", "m-shared")],
+    ).json()
+    assert hourly["time"]["granularity"] == "hour"
+    assert hourly["time"]["rows"][0]["total_tokens"] == 375
+    assert [row["key"] for row in hourly["agents"]] == ["A2"]
+    assert client.get(
+        "/api/efficiency-breakdown",
+        params={"from": "2026-01-01T11:00Z", "to": "2026-01-01T10:00Z"},
+    ).status_code == 422
+
+
 def test_summary_endpoint_has_cost_efficiency(api):
     client, _ = api
     s = client.get("/api/summary").json()

@@ -275,6 +275,20 @@ def test_model_efficiency_endpoint_behind_auth(public_app):
     assert data["cost_per_sp"] == pytest.approx(0.0005)
 
 
+def test_efficiency_breakdown_endpoint_behind_auth(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert client.get("/api/efficiency-breakdown").status_code == 401
+    login(client)
+    data = client.get(
+        "/api/efficiency-breakdown?from=2026-01-01T10%3A00Z"
+        "&to=2026-01-01T10%3A30Z&agent=A2&model=m-shared",
+        base_url="https://localhost",
+    ).get_json()
+    assert data["time"]["granularity"] == "hour"
+    assert data["time"]["rows"][0]["total_tokens"] == 375
+
+
 def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
     app, config = public_app
     client = app.test_client()

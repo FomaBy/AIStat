@@ -511,6 +511,18 @@ def create_app(config: Optional[Config] = None) -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/efficiency-breakdown")
+    def api_efficiency_breakdown():
+        try:
+            filters = query_filters()
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(aggregates.efficiency_chart_breakdown(conn, filters=filters))
+        finally:
+            conn.close()
+
     def health_payload():
         conn = data_connection()
         try:

@@ -302,6 +302,68 @@ function renderModelEfficiency(data) {
   }
 }
 
+function efficiencyBarConfig(rows) {
+  return {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.label),
+      datasets: [{
+        data: rows.map((r) => r.tokens_per_sp),
+        backgroundColor: rows.map((_, i) => colorFor(i)),
+        borderWidth: 0,
+        maxBarThickness: 36,
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => fmtTokens(ctx.parsed.x) + " токенов / SP" } },
+      },
+      scales: { x: { ticks: { callback: (v) => fmtTokens(v) } } },
+    },
+  };
+}
+
+function renderEfficiencyBreakdown(data) {
+  const agents = (data && data.agents) || [];
+  const models = (data && data.models) || [];
+  const time = (data && data.time) || { granularity: "day", rows: [] };
+  const rows = time.rows || [];
+  const granularity = time.granularity === "hour" ? "часам UTC" : "дням UTC";
+  $("efficiency-time-title").innerHTML =
+    `Эффективность во времени <span class="est-mark">≈ по ${granularity} · токены / SP · меньше — лучше</span>`;
+  upsertChart("chart-efficiency-agents", efficiencyBarConfig(agents));
+  upsertChart("chart-efficiency-models", efficiencyBarConfig(models));
+  upsertChart("chart-efficiency-time", {
+    type: "line",
+    data: {
+      labels: rows.map((r) => r.label),
+      datasets: [{
+        label: "Токены / SP",
+        data: rows.map((r) => r.tokens_per_sp),
+        borderColor: colorFor(0),
+        backgroundColor: colorFor(0),
+        pointRadius: 3,
+        pointHoverRadius: 5,
+        tension: 0.2,
+        spanGaps: false,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => fmtTokens(ctx.parsed.y) + " токенов / SP" } },
+      },
+      scales: { y: { ticks: { callback: (v) => fmtTokens(v) } } },
+    },
+  });
+}
+
 function renderSummary(s) {
   const est = s.estimated ? "≈ " : "";
   $("card-tokens").textContent = est + fmtTokens(s.total_tokens);
@@ -340,13 +402,14 @@ async function refreshAll() {
   $("estimate-note").hidden = !(
     state.projects.length || state.agents.length || state.group !== "model" || state.from || state.to
   );
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, health] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
     fetchJSON("/api/projects" + query()),
     fetchJSON("/api/efficiency" + query({ limit: "15" })),
     fetchJSON("/api/model-efficiency" + query()),
+    fetchJSON("/api/efficiency-breakdown" + query()),
     fetchJSON("/api/health"),
   ]);
   renderSummary(summary);
@@ -356,6 +419,7 @@ async function refreshAll() {
   renderProjects(projects.projects);
   renderEfficiency(efficiency.issues);
   renderModelEfficiency(modelEfficiency);
+  renderEfficiencyBreakdown(efficiencyBreakdown);
 
   const badge = $("health-badge");
   badge.hidden = false;

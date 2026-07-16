@@ -124,6 +124,22 @@
       <p class="note">Токены проектов — точные суммы по задачам (<code>multica issue usage</code>); стоимость ≈ оценена по моделям агентов, выполнявших задачи. Эффективность считается только по задачам со story points и загруженной статистикой.</p>
     </section>
 
+    <section class="panel">
+      <h2>Эффективность по агентам <span class="est-mark">≈ токены / SP · меньше — лучше</span></h2>
+      <div class="chart-box chart-box-small"><canvas id="chart-efficiency-agents"></canvas></div>
+    </section>
+
+    <section class="panel">
+      <h2>Эффективность по моделям <span class="est-mark">≈ токены / SP · меньше — лучше</span></h2>
+      <div class="chart-box chart-box-small"><canvas id="chart-efficiency-models"></canvas></div>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2 id="efficiency-time-title">Эффективность во времени <span class="est-mark">≈ токены / SP · меньше — лучше</span></h2>
+      <div class="chart-box"><canvas id="chart-efficiency-time"></canvas></div>
+      <p class="note">Токены и SP каждой задачи распределяются по длительности подтверждённых запусков. В явно заданном интервале до 48 часов график строится по часам UTC; иначе — по дням UTC. Задачи без датированных запусков не получают выдуманную атрибуцию и не попадают в эти графики.</p>
+    </section>
+
     <section class="panel panel-wide">
       <h2>Эффективность по моделям <span class="est-mark">≈ стоимость на 1 SP · меньше — лучше</span></h2>
       <div class="table-wrap">

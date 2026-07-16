@@ -226,6 +226,60 @@ def test_issue_efficiency_list(agg_conn):
     assert ag.issue_efficiency(agg_conn, project_id="P2") == []
 
 
+# -- chartable token efficiency -------------------------------------------------
+
+
+def test_efficiency_chart_breakdown_allocates_agents_models_and_time(agg_conn):
+    charts = ag.efficiency_chart_breakdown(agg_conn)
+    agents = {row["key"]: row for row in charts["agents"]}
+    models = {row["key"]: row for row in charts["models"]}
+
+    # I1 ran for one hour on A1 and A2 simultaneously: each gets half of
+    # its 1,500 tokens and 5 SP, with the same 300 tokens/SP efficiency.
+    for key in ("A1", "A2"):
+        assert agents[key]["total_tokens"] == 750
+        assert agents[key]["story_points"] == pytest.approx(2.5)
+        assert agents[key]["tokens_per_sp"] == pytest.approx(300)
+        assert agents[key]["estimated"] is True
+    for key in ("m-claude", "m-shared"):
+        assert models[key]["total_tokens"] == 750
+        assert models[key]["story_points"] == pytest.approx(2.5)
+        assert models[key]["tokens_per_sp"] == pytest.approx(300)
+
+    assert charts["time"]["granularity"] == "day"
+    assert charts["time"]["rows"] == [{
+        "key": "2026-01-01", "label": "2026-01-01",
+        "total_tokens": 1500, "story_points": 5.0, "issues": 1,
+        "tokens_per_sp": 300.0, "estimated": True,
+    }]
+
+
+def test_efficiency_chart_breakdown_uses_hour_buckets_and_fixed_denominator(agg_conn):
+    filters = ag.make_filters("2026-01-01T10:00Z", "2026-01-01T10:30Z")
+    charts = ag.efficiency_chart_breakdown(agg_conn, filters=filters)
+    assert charts["time"]["granularity"] == "hour"
+    row = charts["time"]["rows"][0]
+    # The selected half-hour is half of each one-hour run and one quarter of
+    # I1's two-run duration, never re-expanded to the whole task.
+    assert row["key"] == "2026-01-01T10:00Z"
+    assert row["total_tokens"] == 750
+    assert row["story_points"] == pytest.approx(2.5)
+    assert row["tokens_per_sp"] == pytest.approx(300)
+    assert {item["key"] for item in charts["agents"]} == {"A1", "A2"}
+
+
+def test_efficiency_chart_breakdown_uses_days_for_long_windows(agg_conn):
+    charts = ag.efficiency_chart_breakdown(
+        agg_conn, filters=ag.make_filters("2026-01-01", "2026-01-04")
+    )
+    assert charts["time"]["granularity"] == "day"
+    assert [row["key"] for row in charts["time"]["rows"]] == [
+        "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04",
+    ]
+    assert charts["time"]["rows"][0]["tokens_per_sp"] == pytest.approx(300)
+    assert all(row["tokens_per_sp"] is None for row in charts["time"]["rows"][1:])
+
+
 # -- summary ---------------------------------------------------------------------
 
 

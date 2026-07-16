@@ -255,6 +255,22 @@ def test_model_efficiency_endpoint(legacy):
     assert abs(data["cost_per_sp"] - 0.0005) < 1e-9
 
 
+def test_efficiency_breakdown_endpoint(legacy):
+    status, _, _ = request(legacy.application, "/api/efficiency-breakdown")
+    assert status == "401 Unauthorized"
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application,
+        "/api/efficiency-breakdown?from=2026-01-01T10%3A00Z"
+        "&to=2026-01-01T10%3A30Z&agent=A2&model=m-shared",
+        cookie=cookies,
+    )
+    assert status == "200 OK"
+    data = legacy.json.loads(body.decode("utf-8"))
+    assert data["time"]["granularity"] == "hour"
+    assert data["time"]["rows"][0]["total_tokens"] == 375
+
+
 def test_legacy_hour_filters_accept_repeated_dimensions(legacy):
     cookies = login(legacy)
     status, _, body = request(

@@ -8,6 +8,7 @@ Endpoints:
     GET /api/projects    — per-project cuts (tokens, est. cost, SP, statuses, efficiency)
     GET /api/efficiency  — per-issue tokens/SP, worst first (?project&limit)
     GET /api/model-efficiency — per-model token/cost/weighted efficiency (?project)
+    GET /api/efficiency-breakdown — token/SP cuts by agent, model and time
     GET /api/health      — health snapshot (alias of /health)
     GET /api/events      — SSE: `update` after every poller data batch
                            (live phase or full cycle), `cycle` on full cycles
@@ -215,6 +216,25 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 conn,
                 filters=request_filters(date_from, date_to, project, agent, model),
             )
+        finally:
+            conn.close()
+
+    @app.get("/api/efficiency-breakdown")
+    def api_efficiency_breakdown(
+        date_from: Optional[str] = Query(None, alias="from"),
+        date_to: Optional[str] = Query(None, alias="to"),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
+    ):
+        conn = db()
+        try:
+            return aggregates.efficiency_chart_breakdown(
+                conn,
+                filters=request_filters(date_from, date_to, project, agent, model),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         finally:
             conn.close()
 

@@ -34,6 +34,7 @@ TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_writ
 # Run durations come out of SQLite's julianday() in days; efficiency reports
 # money-per-hour, so durations are converted to hours with this factor.
 HOURS_PER_DAY = 24.0
+EFFICIENCY_HOURLY_MAX_HOURS = 48.0
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z?$")
@@ -825,6 +826,211 @@ def issue_efficiency(conn: sqlite3.Connection, project_id: Optional[str] = None,
     if limit is not None:
         out = out[:limit]
     return out
+
+
+# -- chartable token efficiency -------------------------------------------------
+
+
+def _bucket_start(value: datetime, granularity: str) -> datetime:
+    """Return the UTC hour/day bucket containing ``value``."""
+    if granularity == "hour":
+        return value.replace(minute=0, second=0, microsecond=0)
+    return value.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _bucket_end(start: datetime, granularity: str) -> datetime:
+    return start + timedelta(hours=1 if granularity == "hour" else 24)
+
+
+def _bucket_key(start: datetime, granularity: str) -> str:
+    if granularity == "hour":
+        return start.strftime("%Y-%m-%dT%H:00Z")
+    return start.date().isoformat()
+
+
+def efficiency_chart_breakdown(
+        conn: sqlite3.Connection,
+        project_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Token efficiency cuts for the dashboard charts.
+
+    ``issue_usage`` contains an exact cumulative token total, while story
+    points belong to the issue rather than an individual agent/model/run.  To
+    show either fact in a run-level cut, both are allocated by a valid dated
+    run's duration divided by *all* valid dated run durations of that issue.
+    A dimension or time filter selects shares from that fixed denominator; it
+    never renormalizes a short interval to a whole issue.  This is necessarily
+    an estimate, and issues without usable dated runs are omitted rather than
+    assigned invented agent/model/time values.
+
+    Time uses UTC hour buckets only for an explicitly bounded window of at
+    most 48 hours.  All other selections use day buckets, keeping ordinary
+    7/14/30/90-day dashboard ranges readable.
+    """
+    filters = _coerce_filters(project_id=project_id, filters=filters)
+    params: List[Any] = []
+    where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
+             "AND i.story_points > 0")
+    where += _where_values("i.project_id", filters["projects"], params)
+    rows = conn.execute(
+        f"""
+        SELECT i.id AS issue_id, i.story_points,
+               u.total_input_tokens, u.total_output_tokens,
+               u.total_cache_read_tokens, u.total_cache_write_tokens,
+               r.agent_id, a.name AS agent_name, a.model,
+               r.started_at, r.completed_at
+        FROM issues i
+        JOIN issue_usage u ON u.issue_id = i.id
+        JOIN runs r ON r.issue_id = i.id
+        LEFT JOIN agents a ON a.id = r.agent_id
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+
+    by_issue: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        start = _run_datetime(row["started_at"])
+        end = _run_datetime(row["completed_at"])
+        if start is None or end is None or end <= start:
+            continue
+        issue = by_issue.setdefault(row["issue_id"], {
+            "story_points": float(row["story_points"]),
+            "tokens": {
+                kind: float(row[f"total_{kind}"] or 0) for kind in TOKEN_KINDS
+            },
+            "runs": [],
+        })
+        issue["runs"].append({
+            "agent_id": row["agent_id"],
+            "agent_name": row["agent_name"],
+            "model": row["model"],
+            "start": start,
+            "end": end,
+        })
+
+    def empty_bucket(key: str, label: str) -> Dict[str, Any]:
+        return {
+            "key": key,
+            "label": label,
+            "total_tokens": 0.0,
+            "story_points": 0.0,
+            "issues": set(),
+        }
+
+    agents: Dict[str, Dict[str, Any]] = {}
+    models: Dict[str, Dict[str, Any]] = {}
+    time_segments: List[Dict[str, Any]] = []
+    lower = filters["from"] or datetime.min
+    upper = filters["to"] or datetime.max
+
+    for issue_id, issue in by_issue.items():
+        total_seconds = sum(
+            (run["end"] - run["start"]).total_seconds() for run in issue["runs"]
+        )
+        if total_seconds <= 0:
+            continue
+        total_tokens = sum(issue["tokens"].values())
+        for run in issue["runs"]:
+            matches_agent = (
+                not filters["agents"] or run["agent_id"] in filters["agents"]
+            )
+            matches_model = (
+                not filters["models"] or run["model"] in filters["models"]
+            )
+            if not (matches_agent and matches_model):
+                continue
+            start, end = max(run["start"], lower), min(run["end"], upper)
+            seconds = _overlap_seconds(run["start"], run["end"], lower, upper)
+            if seconds <= 0:
+                continue
+            share = seconds / total_seconds
+            contribution = {
+                "issue_id": issue_id,
+                "start": start,
+                "end": end,
+                "total_tokens": total_tokens * share,
+                "story_points": issue["story_points"] * share,
+            }
+            time_segments.append(contribution)
+
+            if run["agent_id"] and run["agent_name"]:
+                bucket = agents.setdefault(
+                    run["agent_id"], empty_bucket(run["agent_id"], run["agent_name"])
+                )
+                bucket["total_tokens"] += contribution["total_tokens"]
+                bucket["story_points"] += contribution["story_points"]
+                bucket["issues"].add(issue_id)
+            if run["model"]:
+                bucket = models.setdefault(
+                    run["model"], empty_bucket(run["model"], run["model"])
+                )
+                bucket["total_tokens"] += contribution["total_tokens"]
+                bucket["story_points"] += contribution["story_points"]
+                bucket["issues"].add(issue_id)
+
+    bounded_short_window = (
+        filters["from"] is not None and filters["to"] is not None
+        and (filters["to"] - filters["from"]).total_seconds()
+        <= EFFICIENCY_HOURLY_MAX_HOURS * 3600.0
+    )
+    granularity = "hour" if bounded_short_window else "day"
+    time: Dict[str, Dict[str, Any]] = {}
+    if time_segments:
+        window_start = filters["from"] or min(s["start"] for s in time_segments)
+        window_end = filters["to"] or max(s["end"] for s in time_segments)
+        current = _bucket_start(window_start, granularity)
+        while current < window_end:
+            key = _bucket_key(current, granularity)
+            time[key] = empty_bucket(key, key)
+            current = _bucket_end(current, granularity)
+        for segment in time_segments:
+            cursor = _bucket_start(segment["start"], granularity)
+            while cursor < segment["end"]:
+                bucket_end = _bucket_end(cursor, granularity)
+                overlap = _overlap_seconds(
+                    segment["start"], segment["end"], cursor, bucket_end
+                )
+                if overlap > 0:
+                    fraction = overlap / (segment["end"] - segment["start"]).total_seconds()
+                    bucket = time[_bucket_key(cursor, granularity)]
+                    bucket["total_tokens"] += segment["total_tokens"] * fraction
+                    bucket["story_points"] += segment["story_points"] * fraction
+                    bucket["issues"].add(segment["issue_id"])
+                cursor = bucket_end
+
+    def output(rows: Dict[str, Dict[str, Any]], sort_key) -> List[Dict[str, Any]]:
+        out = []
+        for row in rows.values():
+            total = row["total_tokens"]
+            sp = row["story_points"]
+            out.append({
+                "key": row["key"],
+                "label": row["label"],
+                "total_tokens": round(total),
+                "story_points": sp,
+                "issues": len(row["issues"]),
+                "tokens_per_sp": (total / sp) if sp > 0 else None,
+                "estimated": True,
+            })
+        out.sort(key=sort_key)
+        return out
+
+    by_efficiency = lambda row: (
+        row["tokens_per_sp"] is None,
+        row["tokens_per_sp"] if row["tokens_per_sp"] is not None else 0.0,
+        row["label"],
+    )
+    return {
+        "metric": "tokens_per_sp",
+        "estimated": True,
+        "agents": output(agents, by_efficiency),
+        "models": output(models, by_efficiency),
+        "time": {
+            "granularity": granularity,
+            "rows": output(time, lambda row: row["key"]),
+        },
+    }
 
 
 # -- efficiency (tokens / cost / weighted) ----------------------------------------
