@@ -230,6 +230,11 @@ def _run_filter_selection(conn: sqlite3.Connection,
 
         {"fraction": selected / total run seconds (0..1],
          "models": {model: {"dur": selected overlap in days, "n": run count}}}
+
+    ``models`` may carry a ``None`` key: the share of matching runs whose
+    agent has no model (or that have no agent). Consumers treat it as an
+    unpriced model, so that share is surfaced in ``unpriced_tokens`` /
+    ``has_unpriced`` rather than silently priced as a known model.
     """
     needs_runs = bool(
         filters["agents"] or filters["models"]
@@ -262,8 +267,10 @@ def _run_filter_selection(conn: sqlite3.Connection,
         if overlap <= 0:
             continue
         selected[issue_id] = selected.get(issue_id, 0.0) + overlap
-        if row["model"] is None:
-            continue  # a model-less run still counts toward the share
+        # A matching run without model metadata keeps its own share under the
+        # None key — the same representation _issue_model_stats() uses for a
+        # model-less agent — so the unknown part stays unpriced instead of
+        # being renormalized onto the known models (FAN-1247).
         model = models.setdefault(issue_id, {}).setdefault(
             row["model"], {"dur": 0.0, "n": 0}
         )

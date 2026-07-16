@@ -20,7 +20,7 @@ from aistat.config import Config
 from aistat.migrate import migrate_owner_database
 from aistat.security import SecurityStore
 from aistat.snapshot import create_compressed_snapshot
-from conftest import seed_aggregate_fixture
+from conftest import seed_aggregate_fixture, seed_model_less_fixture
 
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "legacy-session-" + "s" * 48
@@ -161,6 +161,7 @@ def test_source_parses_as_python_36():
     # legacy_wsgi imports oauth at runtime on cPanel's Python 3.6, so the
     # shared core must parse as 3.6 too.
     for path in (
+        "aistat/aggregates.py",
         "aistat/legacy_wsgi.py",
         "aistat/migrate.py",
         "aistat/oauth.py",
@@ -298,6 +299,44 @@ def test_model_efficiency_filters(legacy):
     assert [m["model"] for m in combined["models"]] == ["m-shared"]
     assert abs(combined["active_hours"] - 0.5) < 1e-9
     assert abs(combined["weighted_efficiency"] - 0.0016) < 1e-9
+
+
+def test_model_efficiency_keeps_model_less_share(legacy):
+    # FAN-1247: requests read the migrated owner tenant DB — the only tenant
+    # the fixture creates — so the mixed fixture is seeded there.
+    tenant_dbs = [
+        os.path.join(legacy.TENANTS_DIR, name)
+        for name in os.listdir(legacy.TENANTS_DIR) if name.endswith(".db")
+    ]
+    assert len(tenant_dbs) == 1
+    conn = connect(tenant_dbs[0])
+    seed_model_less_fixture(conn)
+    conn.close()
+    cookies = login(legacy)
+
+    def get(query):
+        status, _, body = request(
+            legacy.application, "/api/model-efficiency" + query, cookie=cookies
+        )
+        assert status == "200 OK"
+        return legacy.json.loads(body.decode("utf-8"))
+
+    mixed = get("?from=2026-01-04&to=2026-01-04&project=P3")
+    assert [m["model"] for m in mixed["models"]] == ["m-claude", None]
+    assert mixed["unpriced_tokens"] == 500
+    assert mixed["has_unpriced"] is True
+    assert abs(mixed["active_hours"] - 2.0) < 1e-6
+    assert abs(mixed["cost_per_sp"] - 0.000125) < 1e-9
+    assert mixed["weighted_efficiency"] is None
+    null_only = get("?agent=A5")
+    assert [m["model"] for m in null_only["models"]] == [None]
+    assert null_only["cost_per_sp"] is None
+    assert null_only["weighted_efficiency"] is None
+    assert null_only["unpriced_tokens"] == 500
+    exact = get("?project=P3")
+    assert [m["model"] for m in exact["models"]] == ["m-claude", None]
+    assert abs(exact["cost_per_sp"] - 0.000125) < 1e-9
+    assert exact["weighted_efficiency"] is None
 
 
 def test_summary_estimation_flags(legacy):

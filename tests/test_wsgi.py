@@ -16,7 +16,7 @@ from aistat.migrate import migrate_owner_database
 from aistat.security import SecurityStore, snapshot_signature
 from aistat.snapshot import create_compressed_snapshot
 from aistat.wsgi import create_app
-from conftest import seed_aggregate_fixture
+from conftest import seed_aggregate_fixture, seed_model_less_fixture
 
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "session-" + "s" * 48
@@ -316,6 +316,39 @@ def test_model_efficiency_filters_behind_auth(public_app):
     assert [m["model"] for m in combined["models"]] == ["m-shared"]
     assert combined["active_hours"] == pytest.approx(0.5)
     assert combined["weighted_efficiency"] == pytest.approx(0.0016)
+
+
+def test_model_efficiency_keeps_model_less_share_behind_auth(public_app):
+    # FAN-1247: the app reads the migrated owner tenant DB, so the mixed
+    # known/model-null fixture is seeded there.
+    app, config = public_app
+    conn = connect(config.tenant_db_path(config.publish_tenant_id))
+    seed_model_less_fixture(conn)
+    conn.close()
+    client = app.test_client()
+    login(client)
+
+    def get(query):
+        return client.get(
+            "/api/model-efficiency" + query, base_url="https://localhost"
+        ).get_json()
+
+    mixed = get("?from=2026-01-04&to=2026-01-04&project=P3")
+    assert [m["model"] for m in mixed["models"]] == ["m-claude", None]
+    assert mixed["unpriced_tokens"] == 500
+    assert mixed["has_unpriced"] is True
+    assert mixed["active_hours"] == pytest.approx(2.0)
+    assert mixed["cost_per_sp"] == pytest.approx(0.000125)
+    assert mixed["weighted_efficiency"] is None
+    null_only = get("?agent=A5")
+    assert [m["model"] for m in null_only["models"]] == [None]
+    assert null_only["cost_per_sp"] is None
+    assert null_only["weighted_efficiency"] is None
+    assert null_only["unpriced_tokens"] == 500
+    exact = get("?project=P3")
+    assert [m["model"] for m in exact["models"]] == ["m-claude", None]
+    assert exact["cost_per_sp"] == pytest.approx(0.000125)
+    assert exact["weighted_efficiency"] is None
 
 
 def test_summary_estimation_flags_behind_auth(public_app):

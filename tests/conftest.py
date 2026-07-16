@@ -93,6 +93,37 @@ def seed_aggregate_fixture(conn):
     conn.commit()
 
 
+def seed_model_less_fixture(conn):
+    """FAN-1247: one issue whose two selected hour-long runs split between a
+    known model (A1 / m-claude) and an agent without model metadata (A5).
+
+    Expected split for a window covering both hours: the known model owns
+    500 tokens / 2 SP / 1 hour / $0.0005, the model-less half stays unpriced
+    (unpriced_tokens=500, has_unpriced), total active hours 2.0.
+    """
+    now = "2026-01-04T00:00:00Z"
+    conn.executescript(f"""
+    INSERT INTO projects (id, title, status, synced_at) VALUES
+      ('P3', 'Gamma', 'in_progress', '{now}');
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A5', 'Modelless', NULL, 'R4', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I8', 'T-8', 'mixed model metadata', 'done', 'P3', 4, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I8', 1, 1000, 0, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run9', 'I8', 'A1', 'R1', 'completed',
+       '2026-01-04T10:00:00Z', '2026-01-04T11:00:00Z', '{now}'),
+      ('run10', 'I8', 'A5', 'R4', 'completed',
+       '2026-01-04T11:00:00Z', '2026-01-04T12:00:00Z', '{now}');
+    """)
+    conn.commit()
+
+
 @pytest.fixture
 def agg_conn(conn):
     seed_aggregate_fixture(conn)

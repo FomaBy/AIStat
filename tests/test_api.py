@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 import aistat.server as server_module
 from aistat.config import Config
 from aistat.db import connect, init_db
-from conftest import seed_aggregate_fixture
+from conftest import seed_aggregate_fixture, seed_model_less_fixture
 
 
 @pytest.fixture
@@ -145,6 +145,43 @@ def test_model_efficiency_filters_use_one_run_overlap_set(api):
     assert summary["cost_per_sp"] == pytest.approx(0.0008)
     assert summary["weighted_efficiency"] == pytest.approx(0.0008)
     assert summary["efficiency_hours"] == pytest.approx(1.0)
+
+
+def test_model_efficiency_keeps_model_less_share(api):
+    # FAN-1247: mixed known/model-null, all-null and exact project-only cuts.
+    client, conn = api
+    seed_model_less_fixture(conn)
+
+    mixed = client.get("/api/model-efficiency", params=[
+        ("from", "2026-01-04"), ("to", "2026-01-04"), ("project", "P3"),
+    ]).json()
+    assert [m["model"] for m in mixed["models"]] == ["m-claude", None]
+    assert mixed["unpriced_tokens"] == 500
+    assert mixed["has_unpriced"] is True
+    assert mixed["active_hours"] == pytest.approx(2.0)
+    assert mixed["cost_usd"] == pytest.approx(0.0005)
+    assert mixed["cost_per_sp"] == pytest.approx(0.000125)
+    assert mixed["weighted_efficiency"] is None
+
+    null_only = client.get("/api/model-efficiency", params={"agent": "A5"}).json()
+    assert [m["model"] for m in null_only["models"]] == [None]
+    assert null_only["cost_per_sp"] is None
+    assert null_only["weighted_efficiency"] is None
+    assert null_only["unpriced_tokens"] == 500
+    assert null_only["active_hours"] == pytest.approx(1.0)
+
+    exact = client.get("/api/model-efficiency", params={"project": "P3"}).json()
+    assert [m["model"] for m in exact["models"]] == ["m-claude", None]
+    assert exact["cost_per_sp"] == pytest.approx(0.000125)
+    assert exact["unpriced_tokens"] == 500
+    assert exact["weighted_efficiency"] is None
+
+    summary = client.get("/api/summary", params=[
+        ("from", "2026-01-04"), ("to", "2026-01-04"), ("project", "P3"),
+    ]).json()
+    assert summary["cost_per_sp"] == pytest.approx(0.000125)
+    assert summary["weighted_efficiency"] is None
+    assert summary["efficiency_has_unpriced"] is True
 
 
 def test_efficiency_breakdown_endpoint(api):

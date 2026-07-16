@@ -8,6 +8,7 @@ A2/A3 by run durations 3h/2h → 0.6/0.4; A3's day is 50/50 Alpha/Beta.
 import pytest
 
 from aistat import aggregates as ag
+from conftest import seed_model_less_fixture
 
 
 # -- weights helper ------------------------------------------------------------
@@ -513,6 +514,69 @@ def test_efficiency_breakdown_asymmetric_overlap_by_model(agg_conn):
     assert by_model["m-shared"]["cost_usd"] == pytest.approx(0.0008)
     assert eff["cost_usd"] == pytest.approx(0.0012)
     assert eff["weighted_efficiency"] == pytest.approx(0.0012 / 1.5 / 1.8)
+
+
+def test_efficiency_breakdown_keeps_model_less_share(agg_conn):
+    # FAN-1247: a selected run without model metadata keeps its own share as
+    # an unpriced None-model row instead of being priced as a known model.
+    seed_model_less_fixture(agg_conn)
+    mixed = ag.efficiency_breakdown(agg_conn, filters=ag.make_filters(
+        "2026-01-04", "2026-01-04", ["P3"]
+    ))
+    assert [m["model"] for m in mixed["models"]] == ["m-claude", None]
+    by_model = {m["model"]: m for m in mixed["models"]}
+    assert by_model["m-claude"]["total_tokens"] == 500
+    assert by_model["m-claude"]["story_points"] == pytest.approx(2.0)
+    assert by_model["m-claude"]["active_hours"] == pytest.approx(1.0)
+    assert by_model["m-claude"]["cost_usd"] == pytest.approx(0.0005)
+    assert by_model[None]["cost_usd"] is None
+    assert by_model[None]["has_unpriced"] is True
+    assert by_model[None]["active_hours"] == pytest.approx(1.0)
+    assert mixed["cost_usd"] == pytest.approx(0.0005)
+    assert mixed["active_hours"] == pytest.approx(2.0)
+    assert mixed["cost_per_sp"] == pytest.approx(0.000125)
+    assert mixed["unpriced_tokens"] == 500
+    assert mixed["has_unpriced"] is True
+    # A partially unpriced issue never yields a fully-priced weighted metric.
+    assert mixed["weighted_efficiency"] is None
+
+    # Half-covering window: both shares shrink together, hours applied once.
+    partial = ag.efficiency_breakdown(agg_conn, filters=ag.make_filters(
+        "2026-01-04T10:30Z", "2026-01-04T11:30Z", ["P3"]
+    ))
+    assert partial["active_hours"] == pytest.approx(1.0)
+    assert partial["cost_usd"] == pytest.approx(0.00025)
+    assert partial["unpriced_tokens"] == 250
+    assert partial["has_unpriced"] is True
+
+    # All-model-less selection: unpriced share survives, no invented money.
+    null_only = ag.efficiency_breakdown(
+        agg_conn, filters=ag.make_filters(agent_ids=["A5"])
+    )
+    assert [m["model"] for m in null_only["models"]] == [None]
+    assert null_only["cost_per_sp"] is None
+    assert null_only["weighted_efficiency"] is None
+    assert null_only["active_hours"] == pytest.approx(1.0)
+    assert null_only["unpriced_tokens"] == 500
+    assert null_only["has_unpriced"] is True
+
+    # Project-only (lifetime stats) agrees with the covering filtered window.
+    exact = ag.efficiency_breakdown(agg_conn, project_id="P3")
+    assert [m["model"] for m in exact["models"]] == ["m-claude", None]
+    assert exact["cost_usd"] == pytest.approx(0.0005)
+    assert exact["active_hours"] == pytest.approx(2.0)
+    assert exact["cost_per_sp"] == pytest.approx(0.000125)
+    assert exact["unpriced_tokens"] == 500
+    assert exact["weighted_efficiency"] is None
+
+    # Summary inherits the same fail-safe fields.
+    s = ag.summary(agg_conn, filters=ag.make_filters(
+        "2026-01-04", "2026-01-04", ["P3"]
+    ))
+    assert s["cost_per_sp"] == pytest.approx(0.000125)
+    assert s["weighted_efficiency"] is None
+    assert s["efficiency_hours"] == pytest.approx(2.0)
+    assert s["efficiency_has_unpriced"] is True
 
 
 def test_summary_agent_filter_uses_filtered_cost_and_hours(agg_conn):
