@@ -91,6 +91,23 @@ def test_projects_endpoint_uses_configured_credit_rate(api):
     assert projects["Alpha"]["cost_credits"] == pytest.approx(0.013)  # 2 credits/$
 
 
+def test_projects_filtered_cost_matches_model_efficiency(api):
+    # FAN-1251: the combined project+agent+model+time filter that made
+    # /api/projects ($0.00125) and /api/model-efficiency ($0.002) disagree
+    # must now report $0.002 in both.
+    client, _ = api
+    params = [
+        ("from", "2026-01-01T10:00Z"), ("to", "2026-01-01T11:00Z"),
+        ("project", "P1"), ("agent", "A2"), ("model", "m-shared"),
+    ]
+    alpha = {p["title"]: p for p in
+             client.get("/api/projects", params=params).json()["projects"]}["Alpha"]
+    assert alpha["total_tokens"] == pytest.approx(750)
+    assert alpha["cost_usd"] == pytest.approx(0.002)
+    eff = client.get("/api/model-efficiency", params=params).json()
+    assert alpha["cost_usd"] == pytest.approx(eff["cost_usd"]) == pytest.approx(0.002)
+
+
 def test_efficiency_endpoint(api):
     client, _ = api
     issues = client.get("/api/efficiency").json()["issues"]

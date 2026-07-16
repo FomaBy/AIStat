@@ -272,6 +272,26 @@ def test_efficiency_breakdown_endpoint(legacy):
     assert data["time"]["rows"][0]["total_tokens"] == 375
 
 
+def test_projects_filtered_cost_matches_model_efficiency(legacy):
+    # FAN-1251: /api/projects and /api/model-efficiency must agree ($0.002)
+    # for the combined project+agent+model+time filter.
+    cookies = login(legacy)
+
+    def get(path):
+        status, _, body = request(legacy.application, path, cookie=cookies)
+        assert status == "200 OK"
+        return legacy.json.loads(body.decode("utf-8"))
+
+    query = ("?from=2026-01-01T10%3A00Z&to=2026-01-01T11%3A00Z"
+             "&project=P1&agent=A2&model=m-shared")
+    projects = get("/api/projects" + query)["projects"]
+    alpha = {p["title"]: p for p in projects}["Alpha"]
+    assert alpha["total_tokens"] == 750
+    assert abs(alpha["cost_usd"] - 0.002) < 1e-9
+    eff = get("/api/model-efficiency" + query)
+    assert abs(eff["cost_usd"] - 0.002) < 1e-9
+
+
 def test_model_efficiency_filters(legacy):
     # FAN-1244: one filtered run-overlap set for cost, hours and models.
     cookies = login(legacy)

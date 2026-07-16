@@ -208,6 +208,57 @@ def test_projects_overview_cost_estimate(agg_conn):
     assert projects["Beta"]["cost_unattributed_issues"] == 1
 
 
+def test_projects_overview_filtered_cost_uses_matching_run_models(agg_conn):
+    """FAN-1251: a run filter must price project cost from the matching runs'
+    models — the same run-overlap set that feeds tokens, SP and
+    model-efficiency — never the issue's lifetime model weights.
+
+    I1 ran one hour each on A1/m-claude and A2/m-shared. Inside 10:00-11:00
+    (which excludes I2's noon runs) each cut prices only its own run, so
+    /api/projects and /api/model-efficiency report the same cost.
+    """
+    def alpha(**kw):
+        f = ag.make_filters("2026-01-01T10:00Z", "2026-01-01T11:00Z", **kw)
+        row = {p["title"]: p
+               for p in ag.projects_overview(agg_conn, filters=f)}["Alpha"]
+        return row, f
+
+    # Canonical repro: only A2/m-shared selected → 750 tokens priced entirely
+    # as m-shared ($0.002). The bug blended in the excluded m-claude run's
+    # lifetime weight and returned $0.00125.
+    row, f = alpha(project_ids=["P1"], agent_ids=["A2"], models=["m-shared"])
+    assert row["total_tokens"] == pytest.approx(750)
+    assert row["story_points"] == pytest.approx(2.5)
+    assert row["cost_usd"] == pytest.approx(0.002)
+    assert row["unpriced_tokens"] == 0
+    assert row["cost_unattributed_issues"] == 0
+    assert ag.efficiency_breakdown(agg_conn, filters=f)["cost_usd"] == pytest.approx(0.002)
+
+    # The other agent's model priced alone: 500 input × m-claude $1/M =
+    # $0.0005 — the weight follows the matching run, not the 50/50 lifetime.
+    row, f = alpha(agent_ids=["A1"])
+    assert row["cost_usd"] == pytest.approx(0.0005)
+    assert ag.efficiency_breakdown(agg_conn, filters=f)["cost_usd"] == pytest.approx(0.0005)
+
+    # Repeated agent dimension selecting both runs rebuilds the exact 50/50
+    # split → I1's lifetime cost, still agreeing across the two views.
+    row, f = alpha(agent_ids=["A1", "A2"])
+    assert row["cost_usd"] == pytest.approx(0.0025)
+    assert ag.efficiency_breakdown(agg_conn, filters=f)["cost_usd"] == pytest.approx(0.0025)
+
+
+def test_projects_overview_partial_hour_overlap_scales_filtered_cost(agg_conn):
+    # FAN-1251 partial-hour: 30 min of A2's hour on I1 → share 0.25, priced as
+    # m-shared only → $0.001, identical in projects and model-efficiency.
+    f = ag.make_filters("2026-01-01T10:00Z", "2026-01-01T10:30Z",
+                        project_ids=["P1"], agent_ids=["A2"], models=["m-shared"])
+    alpha = {p["title"]: p
+             for p in ag.projects_overview(agg_conn, filters=f)}["Alpha"]
+    assert alpha["total_tokens"] == pytest.approx(375)
+    assert alpha["cost_usd"] == pytest.approx(0.001)
+    assert ag.efficiency_breakdown(agg_conn, filters=f)["cost_usd"] == pytest.approx(0.001)
+
+
 def test_project_efficiency_excludes_missing_and_zero_sp(agg_conn):
     projects = {p["title"]: p for p in ag.projects_overview(agg_conn)}
     # Alpha: only I1 qualifies (I2 has no SP) → 1500 / 5.

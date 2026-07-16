@@ -658,17 +658,22 @@ def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str
     return stats
 
 
+def _model_weights(models: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """Normalized model weights for one issue from its ``{model: {dur, n}}``
+    stats, using run durations with a count fallback (:func:`_weights`)."""
+    return _weights(
+        list(models),
+        {m: v["dur"] for m, v in models.items()},
+        {m: v["n"] for m, v in models.items()},
+    )
+
+
 def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]]:
     """Per issue: weight of each model, from run durations (fallback counts)."""
-    weights: Dict[str, Dict[str, float]] = {}
-    for issue_id, models in _issue_model_stats(conn).items():
-        keys = list(models)
-        weights[issue_id] = _weights(
-            keys,
-            {m: v["dur"] for m, v in models.items()},
-            {m: v["n"] for m, v in models.items()},
-        )
-    return weights
+    return {
+        issue_id: _model_weights(models)
+        for issue_id, models in _issue_model_stats(conn).items()
+    }
 
 
 def issue_cost_estimate(usage: Dict[str, Any], model_weights: Dict[str, float],
@@ -710,10 +715,13 @@ def projects_overview(conn: sqlite3.Connection,
     """Per project: exact tokens, estimated cost/credits, SP, statuses,
     efficiency (tokens per story point over issues with SP and usage)."""
     rates = _pricing_rates(conn)
-    model_weights = _issue_model_weights(conn)
-
     filters = _coerce_filters(filters=filters)
-    needs_run_filter, fractions = _run_filter_fractions(conn, filters)
+    needs_run_filter, selection = _run_filter_selection(conn, filters)
+    # Unfiltered cost prices each issue's exact tokens with its lifetime model
+    # weights; a run filter instead prices only the *matching* runs' models,
+    # taken from the same run-overlap set that supplies the token/SP share, so
+    # cost can never disagree with tokens for the selected slice (FAN-1251).
+    model_weights = {} if needs_run_filter else _issue_model_weights(conn)
     project_where, project_params = "1=1", []
     project_where += _where_values("id", filters["projects"], project_params)
     projects = [dict(r) for r in conn.execute(
@@ -753,9 +761,15 @@ def projects_overview(conn: sqlite3.Connection,
         eff_sp = 0.0
         eff_issues = 0
         for row in rows:
-            factor = fractions.get(row["id"], 0.0) if needs_run_filter else 1.0
-            if factor <= 0:
-                continue
+            if needs_run_filter:
+                entry = selection.get(row["id"])
+                if entry is None:
+                    continue
+                factor = entry["fraction"]
+                weights = _model_weights(entry["models"])
+            else:
+                factor = 1.0
+                weights = model_weights.get(row["id"], {})
             statuses[row["status"]] = statuses.get(row["status"], 0) + 1
             if row["story_points"] is not None:
                 sp_sum += row["story_points"] * factor
@@ -767,7 +781,7 @@ def projects_overview(conn: sqlite3.Connection,
             for kind in TOKEN_KINDS:
                 usage[f"total_{kind}"] = (row[f"total_{kind}"] or 0) * factor
                 tokens[kind] += usage[f"total_{kind}"]
-            est = issue_cost_estimate(usage, model_weights.get(row["id"], {}), rates)
+            est = issue_cost_estimate(usage, weights, rates)
             if est["attributed"]:
                 cost_usd += est["cost_usd"]
                 unpriced_tokens += est["unpriced_tokens"]
@@ -786,7 +800,7 @@ def projects_overview(conn: sqlite3.Connection,
             "project_status": project["status"],
             "issues": sum(
                 1 for row in rows
-                if (fractions.get(row["id"], 0.0) if needs_run_filter else 1.0) > 0
+                if not needs_run_filter or row["id"] in selection
             ),
             "issues_with_usage": with_usage,
             "statuses": statuses,

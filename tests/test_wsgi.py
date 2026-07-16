@@ -289,6 +289,26 @@ def test_efficiency_breakdown_endpoint_behind_auth(public_app):
     assert data["time"]["rows"][0]["total_tokens"] == 375
 
 
+def test_projects_filtered_cost_matches_model_efficiency_behind_auth(public_app):
+    # FAN-1251: /api/projects and /api/model-efficiency must agree ($0.002)
+    # for the combined project+agent+model+time filter.
+    app, _ = public_app
+    client = app.test_client()
+    login(client)
+    query = ("?from=2026-01-01T10%3A00Z&to=2026-01-01T11%3A00Z"
+             "&project=P1&agent=A2&model=m-shared")
+    projects = client.get(
+        "/api/projects" + query, base_url="https://localhost"
+    ).get_json()["projects"]
+    alpha = {p["title"]: p for p in projects}["Alpha"]
+    assert alpha["total_tokens"] == pytest.approx(750)
+    assert alpha["cost_usd"] == pytest.approx(0.002)
+    eff = client.get(
+        "/api/model-efficiency" + query, base_url="https://localhost"
+    ).get_json()
+    assert eff["cost_usd"] == pytest.approx(0.002)
+
+
 def test_model_efficiency_filters_behind_auth(public_app):
     # FAN-1244: one filtered run-overlap set for cost, hours and models.
     app, _ = public_app
