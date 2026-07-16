@@ -289,6 +289,35 @@ def test_efficiency_breakdown_endpoint_behind_auth(public_app):
     assert data["time"]["rows"][0]["total_tokens"] == 375
 
 
+def test_model_efficiency_filters_behind_auth(public_app):
+    # FAN-1244: one filtered run-overlap set for cost, hours and models.
+    app, _ = public_app
+    client = app.test_client()
+    login(client)
+
+    def get(query):
+        return client.get(
+            "/api/model-efficiency" + query, base_url="https://localhost"
+        ).get_json()
+
+    agent = get("?agent=A2")
+    assert [m["model"] for m in agent["models"]] == ["m-shared"]
+    assert agent["cost_usd"] == pytest.approx(0.002)
+    assert agent["active_hours"] == pytest.approx(1.0)
+    assert agent["weighted_efficiency"] == pytest.approx(0.0008)
+    model = get("?model=m-shared")
+    assert [m["model"] for m in model["models"]] == ["m-shared"]
+    assert model["weighted_efficiency"] == pytest.approx(0.0008)
+    window = get("?from=2026-01-01T10%3A00Z&to=2026-01-01T10%3A30Z")
+    assert window["cost_usd"] == pytest.approx(0.00125)
+    assert window["active_hours"] == pytest.approx(1.0)
+    combined = get("?from=2026-01-01T10%3A00Z&to=2026-01-01T10%3A30Z"
+                   "&project=P1&agent=A2&model=m-shared")
+    assert [m["model"] for m in combined["models"]] == ["m-shared"]
+    assert combined["active_hours"] == pytest.approx(0.5)
+    assert combined["weighted_efficiency"] == pytest.approx(0.0016)
+
+
 def test_summary_estimation_flags_behind_auth(public_app):
     app, _ = public_app
     client = app.test_client()

@@ -108,6 +108,45 @@ def test_model_efficiency_endpoint(api):
     assert empty["cost_per_sp"] is None
 
 
+def test_model_efficiency_filters_use_one_run_overlap_set(api):
+    # FAN-1244: agent/model/time/combined filters build cost, hours and
+    # model membership from the same filtered run overlaps.
+    client, _ = api
+    agent = client.get("/api/model-efficiency", params={"agent": "A2"}).json()
+    assert [m["model"] for m in agent["models"]] == ["m-shared"]
+    assert agent["cost_usd"] == pytest.approx(0.002)
+    assert agent["active_hours"] == pytest.approx(1.0)
+    assert agent["cost_per_sp"] == pytest.approx(0.0008)
+    assert agent["weighted_efficiency"] == pytest.approx(0.0008)
+
+    model = client.get("/api/model-efficiency", params={"model": "m-shared"}).json()
+    assert [m["model"] for m in model["models"]] == ["m-shared"]
+    assert model["active_hours"] == pytest.approx(1.0)
+    assert model["weighted_efficiency"] == pytest.approx(0.0008)
+
+    window = client.get("/api/model-efficiency", params=[
+        ("from", "2026-01-01T10:00Z"), ("to", "2026-01-01T10:30Z"),
+    ]).json()
+    assert [m["model"] for m in window["models"]] == ["m-claude", "m-shared"]
+    assert window["cost_usd"] == pytest.approx(0.00125)
+    assert window["active_hours"] == pytest.approx(1.0)
+    assert window["weighted_efficiency"] == pytest.approx(0.0005)
+
+    combined = client.get("/api/model-efficiency", params=[
+        ("from", "2026-01-01T10:00Z"), ("to", "2026-01-01T10:30Z"),
+        ("project", "P1"), ("agent", "A2"), ("model", "m-shared"),
+    ]).json()
+    assert [m["model"] for m in combined["models"]] == ["m-shared"]
+    assert combined["cost_usd"] == pytest.approx(0.001)
+    assert combined["active_hours"] == pytest.approx(0.5)
+    assert combined["weighted_efficiency"] == pytest.approx(0.0016)
+
+    summary = client.get("/api/summary", params={"agent": "A2"}).json()
+    assert summary["cost_per_sp"] == pytest.approx(0.0008)
+    assert summary["weighted_efficiency"] == pytest.approx(0.0008)
+    assert summary["efficiency_hours"] == pytest.approx(1.0)
+
+
 def test_efficiency_breakdown_endpoint(api):
     client, _ = api
     data = client.get("/api/efficiency-breakdown").json()

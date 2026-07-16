@@ -271,6 +271,35 @@ def test_efficiency_breakdown_endpoint(legacy):
     assert data["time"]["rows"][0]["total_tokens"] == 375
 
 
+def test_model_efficiency_filters(legacy):
+    # FAN-1244: one filtered run-overlap set for cost, hours and models.
+    cookies = login(legacy)
+
+    def get(query):
+        status, _, body = request(
+            legacy.application, "/api/model-efficiency" + query, cookie=cookies
+        )
+        assert status == "200 OK"
+        return legacy.json.loads(body.decode("utf-8"))
+
+    agent = get("?agent=A2")
+    assert [m["model"] for m in agent["models"]] == ["m-shared"]
+    assert abs(agent["cost_usd"] - 0.002) < 1e-9
+    assert abs(agent["active_hours"] - 1.0) < 1e-9
+    assert abs(agent["weighted_efficiency"] - 0.0008) < 1e-9
+    model = get("?model=m-shared")
+    assert [m["model"] for m in model["models"]] == ["m-shared"]
+    assert abs(model["weighted_efficiency"] - 0.0008) < 1e-9
+    window = get("?from=2026-01-01T10%3A00Z&to=2026-01-01T10%3A30Z")
+    assert abs(window["cost_usd"] - 0.00125) < 1e-9
+    assert abs(window["active_hours"] - 1.0) < 1e-9
+    combined = get("?from=2026-01-01T10%3A00Z&to=2026-01-01T10%3A30Z"
+                   "&project=P1&agent=A2&model=m-shared")
+    assert [m["model"] for m in combined["models"]] == ["m-shared"]
+    assert abs(combined["active_hours"] - 0.5) < 1e-9
+    assert abs(combined["weighted_efficiency"] - 0.0016) < 1e-9
+
+
 def test_summary_estimation_flags(legacy):
     cookies = login(legacy)
     status, _, body = request(

@@ -210,16 +210,26 @@ def _run_intervals(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any]]]:
     return intervals
 
 
-def _run_filter_fractions(conn: sqlite3.Connection,
-                          filters: Dict[str, Any]) -> Tuple[bool, Dict[str, float]]:
-    """Return each issue's token/SP share covered by run-level filters.
+def _run_filter_selection(conn: sqlite3.Connection,
+                          filters: Dict[str, Any]
+                          ) -> Tuple[bool, Dict[str, Dict[str, Any]]]:
+    """One filtered run-overlap set per issue for every run-level metric.
 
     Issue usage is cumulative, not a timestamped token stream. We therefore
-    allocate it over the issue's *dated* run duration. A selected agent,
-    model, or time interval receives its duration share; the denominator is
-    always every valid interval for the issue, so selecting a short hour never
-    inflates to the whole task. No completed interval means no contribution to
-    a time-filtered result.
+    allocate it over the issue's *dated* run intervals: each run is matched
+    against the agent and model filters and intersected with the time window
+    exactly once, and that single selection feeds the issue's token/SP share
+    (``fraction``), its model membership and the per-model active durations —
+    so cost and hours can never disagree with the share (FAN-1244). The
+    denominator is always every valid interval for the issue, so selecting a
+    short hour never inflates to the whole task. Runs without a complete
+    dated interval are never invented into the selection, and an issue with
+    no matching overlap is omitted entirely.
+
+    Returns ``(needs_runs, selection)`` where ``selection[issue_id]`` is::
+
+        {"fraction": selected / total run seconds (0..1],
+         "models": {model: {"dur": selected overlap in days, "n": run count}}}
     """
     needs_runs = bool(
         filters["agents"] or filters["models"]
@@ -227,39 +237,58 @@ def _run_filter_fractions(conn: sqlite3.Connection,
     )
     if not needs_runs:
         return False, {}
-    rows = conn.execute(
+    lower = filters["from"] or datetime.min
+    upper = filters["to"] or datetime.max
+    totals: Dict[str, float] = {}
+    selected: Dict[str, float] = {}
+    models: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for row in conn.execute(
         """
         SELECT r.issue_id, r.agent_id, a.model, r.started_at, r.completed_at
         FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
         WHERE r.issue_id IS NOT NULL
         """
-    ).fetchall()
-    by_issue: Dict[str, List[sqlite3.Row]] = {}
-    for row in rows:
-        by_issue.setdefault(row["issue_id"], []).append(row)
-    fractions = {}
-    for issue_id, issue_rows in by_issue.items():
-        total = 0.0
-        selected = 0.0
-        for row in issue_rows:
-            start, end = _run_datetime(row["started_at"]), _run_datetime(row["completed_at"])
-            if start is None or end is None or end <= start:
-                continue
-            duration = (end - start).total_seconds()
-            total += duration
-            if filters["agents"] and row["agent_id"] not in filters["agents"]:
-                continue
-            if filters["models"] and row["model"] not in filters["models"]:
-                continue
-            if filters["from"] is not None or filters["to"] is not None:
-                lower = filters["from"] or datetime.min
-                upper = filters["to"] or datetime.max
-                selected += _overlap_seconds(start, end, lower, upper)
-            else:
-                selected += duration
-        if total > 0 and selected > 0:
-            fractions[issue_id] = min(1.0, selected / total)
-    return True, fractions
+    ):
+        start, end = _run_datetime(row["started_at"]), _run_datetime(row["completed_at"])
+        if start is None or end is None or end <= start:
+            continue
+        issue_id = row["issue_id"]
+        totals[issue_id] = totals.get(issue_id, 0.0) + (end - start).total_seconds()
+        if filters["agents"] and row["agent_id"] not in filters["agents"]:
+            continue
+        if filters["models"] and row["model"] not in filters["models"]:
+            continue
+        overlap = _overlap_seconds(start, end, lower, upper)
+        if overlap <= 0:
+            continue
+        selected[issue_id] = selected.get(issue_id, 0.0) + overlap
+        if row["model"] is None:
+            continue  # a model-less run still counts toward the share
+        model = models.setdefault(issue_id, {}).setdefault(
+            row["model"], {"dur": 0.0, "n": 0}
+        )
+        model["dur"] += overlap / (HOURS_PER_DAY * 3600.0)
+        model["n"] += 1
+    out: Dict[str, Dict[str, Any]] = {}
+    for issue_id, total in totals.items():
+        share = selected.get(issue_id, 0.0)
+        if total > 0 and share > 0:
+            out[issue_id] = {
+                "fraction": min(1.0, share / total),
+                "models": models.get(issue_id, {}),
+            }
+    return True, out
+
+
+def _run_filter_fractions(conn: sqlite3.Connection,
+                          filters: Dict[str, Any]) -> Tuple[bool, Dict[str, float]]:
+    """Each issue's token/SP share covered by run-level filters, derived from
+    :func:`_run_filter_selection` so every consumer applies the same filtered
+    run set exactly once."""
+    needs_runs, selection = _run_filter_selection(conn, filters)
+    return needs_runs, {
+        issue_id: entry["fraction"] for issue_id, entry in selection.items()
+    }
 
 
 # -- attribution of daily_usage rows to agents and projects -------------------
@@ -1057,15 +1086,23 @@ def efficiency_breakdown(conn: sqlite3.Connection,
       ÷ Σ sp_i``. It is scale-invariant, so models/projects/periods compare
       fairly (see the doc for the derivation).
 
+    An agent/model/time selection uses one filtered run-overlap set for
+    everything (FAN-1244): tokens and SP take the issue's selected duration
+    share, model membership and weights come from the *matching* runs only
+    (an excluded agent's model never appears), and active hours are the
+    actual selected overlaps — the filter share is never applied to them a
+    second time. Unfiltered and project-only calls keep the exact lifetime
+    run stats.
+
     The per-model rows carry the same three metrics for one model's share of
     the counted issues (story points and tokens split by run duration, cost by
     the model's official rate), sorted cheapest cost-per-SP first so it is
     obvious which model delivers a story point for less.
     """
     filters = _coerce_filters(project_id=project_id, filters=filters)
-    needs_run_filter, fractions = _run_filter_fractions(conn, filters)
+    needs_run_filter, selection = _run_filter_selection(conn, filters)
     rates = _pricing_rates(conn)
-    stats = _issue_model_stats(conn)
+    stats = {} if needs_run_filter else _issue_model_stats(conn)
 
     where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
              "AND i.story_points > 0")
@@ -1103,23 +1140,21 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         })
 
     for row in rows:
-        factor = fractions.get(row["id"], 0.0) if needs_run_filter else 1.0
-        if factor <= 0:
-            continue
+        if needs_run_filter:
+            entry = selection.get(row["id"])
+            if entry is None:
+                continue
+            factor = entry["fraction"]
+            issue_models = entry["models"]
+        else:
+            factor = 1.0
+            issue_models = stats.get(row["id"])
         sp = row["story_points"] * factor
         sp_sum += sp
         for kind in TOKEN_KINDS:
             tokens[kind] += (row[f"total_{kind}"] or 0) * factor
-        issue_models = stats.get(row["id"])
         if not issue_models:
-            continue  # usage but no runs → not attributable to a model
-        if filters["models"]:
-            issue_models = {
-                model: values for model, values in issue_models.items()
-                if model in filters["models"]
-            }
-            if not issue_models:
-                continue
+            continue  # usage but no (matching) runs → not attributable to a model
         cost_issues += 1
         cost_sp += sp
         keys = list(issue_models)
@@ -1128,7 +1163,9 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             {m: v["dur"] for m, v in issue_models.items()},
             {m: v["n"] for m, v in issue_models.items()},
         )
-        issue_hours = sum(v["dur"] for v in issue_models.values()) * HOURS_PER_DAY * factor
+        # ``dur`` is already the selected overlap when a run filter applies,
+        # so the filter share must not scale the hours a second time.
+        issue_hours = sum(v["dur"] for v in issue_models.values()) * HOURS_PER_DAY
         active_hours += issue_hours
         issue_total = sum((row[f"total_{k}"] or 0) * factor for k in TOKEN_KINDS)
         issue_cost = 0.0
@@ -1138,7 +1175,7 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             for kind in TOKEN_KINDS:
                 b["tokens"][kind] += (row[f"total_{kind}"] or 0) * factor * weight
             b["story_points"] += sp * weight
-            model_hours = issue_models[model]["dur"] * HOURS_PER_DAY * factor
+            model_hours = issue_models[model]["dur"] * HOURS_PER_DAY
             b["active_hours"] += model_hours
             rate = rates.get(model)
             if rate is None or rate["unpriced"]:

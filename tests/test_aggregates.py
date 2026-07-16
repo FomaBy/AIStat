@@ -435,6 +435,95 @@ def test_efficiency_breakdown_flags_unpriced_model(agg_conn):
     assert eff["weighted_efficiency"] == pytest.approx(0.00025)
 
 
+def test_efficiency_breakdown_filters_use_one_run_overlap_set(agg_conn):
+    # FAN-1244 repro. agent=A2 must count only A2's one-hour m-shared run on
+    # I1: tokens 750, SP 2.5, cost (500 in × $2 + 250 out × $4)/1e6 = 0.002,
+    # and active hours equal that selected hour — never lifetime × share.
+    eff = ag.efficiency_breakdown(agg_conn, filters=ag.make_filters(agent_ids=["A2"]))
+    assert [m["model"] for m in eff["models"]] == ["m-shared"]  # no m-claude
+    assert eff["cost_story_points"] == pytest.approx(2.5)
+    assert eff["cost_usd"] == pytest.approx(0.002)
+    assert eff["active_hours"] == pytest.approx(1.0)
+    assert eff["cost_per_sp"] == pytest.approx(0.0008)
+    assert eff["weighted_efficiency"] == pytest.approx(0.0008)
+
+    # Combined half-hour: 30 selected minutes of A2 → share 0.25 for tokens
+    # and SP, but hours are the actual 0.5h overlap, applied exactly once.
+    combined = ag.efficiency_breakdown(agg_conn, filters=ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T10:30Z", ["P1"], ["A2"], ["m-shared"]
+    ))
+    assert [m["model"] for m in combined["models"]] == ["m-shared"]
+    assert combined["cost_story_points"] == pytest.approx(1.25)
+    assert combined["cost_usd"] == pytest.approx(0.001)
+    assert combined["active_hours"] == pytest.approx(0.5)
+    assert combined["cost_per_sp"] == pytest.approx(0.0008)
+    assert combined["weighted_efficiency"] == pytest.approx(0.0016)
+
+    # Model-only and time-only cuts use the same single selection.
+    model_only = ag.efficiency_breakdown(
+        agg_conn, filters=ag.make_filters(models=["m-shared"])
+    )
+    assert [m["model"] for m in model_only["models"]] == ["m-shared"]
+    assert model_only["active_hours"] == pytest.approx(1.0)
+    assert model_only["weighted_efficiency"] == pytest.approx(0.0008)
+    time_only = ag.efficiency_breakdown(agg_conn, filters=ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T10:30Z"
+    ))
+    assert [m["model"] for m in time_only["models"]] == ["m-claude", "m-shared"]
+    assert time_only["cost_usd"] == pytest.approx(0.00125)
+    assert time_only["active_hours"] == pytest.approx(1.0)
+    assert time_only["weighted_efficiency"] == pytest.approx(0.0005)
+
+
+def test_efficiency_breakdown_asymmetric_overlap_by_model(agg_conn):
+    # Models cover different parts of the window: m-claude 09:00–11:00 (1h of
+    # 2h inside 10:00–11:30) vs m-shared 11:00–11:30 (its whole 0.5h inside).
+    # Hours must be those real overlaps and the weights 2/3 vs 1/3 — lifetime
+    # durations (2h vs 0.5h → 0.8/0.2) would attribute cost incorrectly.
+    now = "2026-01-03T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I7', 'T-7', 'asymmetric overlap', 'done', 'P1', 3, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I7', 1, 1000, 500, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run7', 'I7', 'A1', 'R1', 'completed',
+       '2026-01-03T09:00:00Z', '2026-01-03T11:00:00Z', '{now}'),
+      ('run8', 'I7', 'A2', 'R2', 'completed',
+       '2026-01-03T11:00:00Z', '2026-01-03T11:30:00Z', '{now}');
+    """)
+    agg_conn.commit()
+    eff = ag.efficiency_breakdown(agg_conn, filters=ag.make_filters(
+        "2026-01-03T10:00Z", "2026-01-03T11:30Z"
+    ))
+    # Selected 1.5h of the 2.5h total → share 0.6: SP 1.8, tokens 900.
+    assert eff["cost_story_points"] == pytest.approx(1.8)
+    assert eff["active_hours"] == pytest.approx(1.5)
+    by_model = {m["model"]: m for m in eff["models"]}
+    assert by_model["m-claude"]["active_hours"] == pytest.approx(1.0)
+    assert by_model["m-shared"]["active_hours"] == pytest.approx(0.5)
+    assert by_model["m-claude"]["story_points"] == pytest.approx(1.2)   # 1.8 × 2/3
+    assert by_model["m-shared"]["story_points"] == pytest.approx(0.6)   # 1.8 × 1/3
+    # m-claude: 600 in × 2/3 × $1/M; m-shared: (200 in × $2 + 100 out × $4)/1e6.
+    assert by_model["m-claude"]["cost_usd"] == pytest.approx(0.0004)
+    assert by_model["m-shared"]["cost_usd"] == pytest.approx(0.0008)
+    assert eff["cost_usd"] == pytest.approx(0.0012)
+    assert eff["weighted_efficiency"] == pytest.approx(0.0012 / 1.5 / 1.8)
+
+
+def test_summary_agent_filter_uses_filtered_cost_and_hours(agg_conn):
+    s = ag.summary(agg_conn, filters=ag.make_filters(agent_ids=["A2"]))
+    assert s["cost_per_sp"] == pytest.approx(0.0008)
+    assert s["weighted_efficiency"] == pytest.approx(0.0008)
+    assert s["efficiency_hours"] == pytest.approx(1.0)
+    assert s["efficiency_cost_usd"] == pytest.approx(0.002)
+    assert s["efficiency_cost_sp"] == pytest.approx(2.5)
+
+
 def test_summary_adds_cost_and_weighted_efficiency(agg_conn):
     s = ag.summary(agg_conn)
     assert s["cost_per_sp"] == pytest.approx(0.0005)
