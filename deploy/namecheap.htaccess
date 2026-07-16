@@ -1,0 +1,5 @@
+Options -Indexes -MultiViews
+RewriteEngine On
+RewriteCond %{REQUEST_URI} !^/\.well-known/
+RewriteCond %{REQUEST_URI} !^/cgi-bin/
+RewriteRule ^(.*)$ /cgi-bin/aistat.cgi/$1 [L,QSA]

@@ -3,7 +3,9 @@
 import ast
 import importlib
 import io
+import os
 import re
+import runpy
 from http.cookies import SimpleCookie
 from urllib.parse import urlencode
 from wsgiref.util import setup_testing_defaults
@@ -132,6 +134,36 @@ def login(module):
 def test_source_parses_as_python_36():
     source = open("aistat/legacy_wsgi.py", encoding="utf-8").read()
     ast.parse(source, filename="legacy_wsgi.py", feature_version=(3, 6))
+    source = open("aistat.cgi", encoding="utf-8").read()
+    ast.parse(source, filename="aistat.cgi", feature_version=(3, 6))
+
+
+def test_cgi_loads_only_aistat_private_environment(tmp_path, monkeypatch):
+    env_file = tmp_path / "aistat.env"
+    env_file.write_text(
+        "# production settings\n"
+        "AISTAT_ALLOWED_HOSTS=aistat.app\n"
+        "UNRELATED_SECRET=must-not-load\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AISTAT_CGI_ENV_FILE", str(env_file))
+    monkeypatch.delenv("AISTAT_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("UNRELATED_SECRET", raising=False)
+
+    namespace = runpy.run_path("aistat.cgi", run_name="aistat_cgi_test")
+    namespace["_load_private_environment"]()
+
+    assert os.environ["AISTAT_ALLOWED_HOSTS"] == "aistat.app"
+    assert "UNRELATED_SECRET" not in os.environ
+
+
+def test_cgi_drops_attacker_controlled_proxy_header(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://attacker.invalid")
+    namespace = runpy.run_path("aistat.cgi", run_name="aistat_cgi_test")
+
+    namespace["_drop_untrusted_cgi_proxy"]()
+
+    assert "HTTP_PROXY" not in os.environ
 
 
 def test_login_api_and_security_headers(legacy):

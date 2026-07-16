@@ -2,9 +2,16 @@
 
 ## Архитектура
 
-Namecheap Shared Hosting поддерживает WSGI, но не ASGI. Поэтому локальный
-FastAPI остаётся средой разработки, а cPanel запускает
-`passenger_wsgi.py` → `aistat.wsgi`.
+Локальный FastAPI остаётся средой разработки. Публичный пакет содержит два
+совместимых входа:
+
+- `passenger_wsgi.py` → `aistat.legacy_wsgi` для серверов с рабочим Passenger;
+- `aistat.cgi` → `aistat.legacy_wsgi` для Namecheap Shared Hosting с LiteSpeed,
+  где системный WSGI launcher может отсутствовать.
+
+Оба входа используют один dependency-free Python 3.6+ WSGI-контур. CGI-вариант
+запускается отдельным процессом на запрос, что медленнее Passenger, но
+предсказуемо работает на shared-тарифе без установки старых web-зависимостей.
 
 Multica CLI и его токен **не устанавливаются на публичный сервер**. Локальный
 доверенный Mac продолжает собирать данные через `multica`, создаёт согласованный
@@ -45,15 +52,7 @@ curl -I https://aistat.app/
 не должен выдавать ошибку сертификата. HSTS включается приложением только на
 HTTPS-запросах.
 
-## 3. Создать Python App
-
-В `cPanel → Setup Python App`:
-
-- Python: 3.11 или новее;
-- Application root: `aistat_app`;
-- Application URL: домен `aistat.app`, путь `/`;
-- Startup file: `passenger_wsgi.py`;
-- Entry point: `application`.
+## 3. Развернуть приложение
 
 Собрать архив:
 
@@ -61,12 +60,31 @@ HTTPS-запросах.
 ./scripts/build_cpanel_package.sh
 ```
 
-Загрузить содержимое `dist/aistat-cpanel.zip` в application root. В созданном
-virtualenv выполнить:
+Загрузить содержимое `dist/aistat-cpanel.zip` в `$HOME/aistat_app`.
+Дополнительные Python-пакеты не требуются.
 
-```bash
-pip install -r requirements.txt
-```
+### Вариант A: LiteSpeed CGI на Namecheap Shared Hosting
+
+Скопировать:
+
+- `aistat.cgi` в `$HOME/public_html/cgi-bin/aistat.cgi` и задать права `0755`;
+- `.htaccess.example` в `$HOME/public_html/.htaccess`.
+
+Шлюз читает секретные переменные из
+`$HOME/aistat-private/aistat.env`; этот каталог должен иметь права `0700`.
+
+### Вариант B: рабочий Passenger
+
+В `cPanel → Setup Python App`:
+
+- Python: системная Python 3.6 или новее;
+- Application root: `aistat_app`;
+- Application URL: домен `aistat.app`, путь `/`;
+- Startup file: `passenger_wsgi.py`;
+- Entry point: `application`.
+
+Если запросы завершаются ошибкой `lswsgi3: No such file or directory`, отключить
+Passenger-привязку и использовать CGI-вариант выше.
 
 ## 4. Хранить данные вне web root
 
@@ -77,7 +95,8 @@ mkdir -p "$HOME/aistat-private"
 chmod 700 "$HOME/aistat-private"
 ```
 
-В Environment Variables приложения задать:
+Для Passenger задать Environment Variables приложения. Для CGI сохранить те же
+строки в `$HOME/aistat-private/aistat.env`:
 
 ```text
 AISTAT_DB_PATH=/home/CPANEL_USER/aistat-private/aistat.db

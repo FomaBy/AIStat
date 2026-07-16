@@ -8,7 +8,8 @@ rm -rf "$TARGET" "$ARCHIVE"
 mkdir -p "$TARGET"
 
 cp -R aistat "$TARGET/"
-cp passenger_wsgi.py pricing.json "$TARGET/"
+cp passenger_wsgi.py aistat.cgi pricing.json "$TARGET/"
+cp deploy/namecheap.htaccess "$TARGET/.htaccess.example"
 cp requirements-cpanel.txt "$TARGET/requirements.txt"
 find "$TARGET" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$TARGET" -type f -name '*.pyc' -delete

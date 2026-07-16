@@ -1,7 +1,5 @@
 """Poller cycle against a stubbed CLI runner: idempotency and error handling."""
 
-import pytest
-
 from aistat.cli import CliError
 from aistat.config import Config
 from aistat.poller import CycleResult, Poller
