@@ -4,15 +4,31 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ENV_FILE="${AISTAT_ENV_FILE:-$HOME/.config/aistat/production.env}"
-if [ ! -r "$ENV_FILE" ]; then
-  echo "AIStat production env is missing or unreadable: $ENV_FILE" >&2
-  exit 1
+if [ -r "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
 fi
 
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
+export AISTAT_PUBLISH_URL="${AISTAT_PUBLISH_URL:-https://aistat.app/api/ingest/snapshot}"
+export AISTAT_PUBLISH_INTERVAL_SECONDS="${AISTAT_PUBLISH_INTERVAL_SECONDS:-300}"
+
+if [ -z "${AISTAT_INGEST_SECRET:-}" ]; then
+  KEYCHAIN_ACCOUNT="${AISTAT_KEYCHAIN_ACCOUNT:-$USER}"
+  KEYCHAIN_SERVICE="${AISTAT_KEYCHAIN_SERVICE:-aistat.app ingest}"
+  if ! command -v security >/dev/null 2>&1; then
+    echo "AISTAT_INGEST_SECRET is unset and macOS Keychain is unavailable" >&2
+    exit 1
+  fi
+  AISTAT_INGEST_SECRET="$(
+    security find-generic-password \
+      -a "$KEYCHAIN_ACCOUNT" \
+      -s "$KEYCHAIN_SERVICE" \
+      -w
+  )"
+  export AISTAT_INGEST_SECRET
+fi
 
 if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv

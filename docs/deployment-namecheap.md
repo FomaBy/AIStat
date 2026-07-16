@@ -65,7 +65,7 @@ HTTPS-запросах.
 virtualenv выполнить:
 
 ```bash
-pip install -r requirements-cpanel.txt
+pip install -r requirements.txt
 ```
 
 ## 4. Хранить данные вне web root
@@ -96,27 +96,40 @@ AISTAT_INGEST_SECRET=<второй секрет>
 
 ## 5. Включить безопасную синхронизацию Multica
 
-На локальном Mac создать `~/.config/aistat/production.env` с правами `600`:
+На локальном Mac сохранить ingest secret в login Keychain:
+
+```bash
+security add-generic-password \
+  -U \
+  -a "$USER" \
+  -s "aistat.app ingest" \
+  -w '<тот же ingest secret>'
+```
+
+`sync_to_host.sh` по умолчанию берёт этот секрет из Keychain, публикует на
+`https://aistat.app/api/ingest/snapshot` и использует интервал 300 секунд:
+
+```bash
+cd /Users/sergeyfomin/Documents/AIStat
+./sync_to_host.sh
+```
+
+Для нестандартного URL/интервала можно создать
+`~/.config/aistat/production.env` с правами `600`; хранить там ingest secret
+не требуется:
 
 ```text
 AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot
-AISTAT_INGEST_SECRET=<тот же ingest secret>
 AISTAT_PUBLISH_INTERVAL_SECONDS=300
-```
-
-```bash
-chmod 600 ~/.config/aistat/production.env
-cd /Users/sergeyfomin/Documents/AIStat
-./sync_to_host.sh
 ```
 
 Первичная ручная проверка:
 
 ```bash
-set -a
-. ~/.config/aistat/production.env
-set +a
-.venv/bin/python -m aistat.publish
+AISTAT_INGEST_SECRET="$(security find-generic-password \
+  -a "$USER" -s 'aistat.app ingest' -w)" \
+  AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot \
+  .venv/bin/python -m aistat.publish
 ```
 
 Для автозапуска скопировать `deploy/com.aistat.sync.plist.example` в
