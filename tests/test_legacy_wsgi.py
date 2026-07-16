@@ -410,6 +410,42 @@ def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
     assert [p["title"] for p in data["projects"]] == ["Alpha", "Beta"]
 
 
+@pytest.mark.parametrize(
+    ("next_url", "expected_location"),
+    [
+        ("/api/meta?tab=security", "/api/meta?tab=security"),
+        (
+            "/api/meta?return=https://example.test",
+            "/api/meta?return=https://example.test",
+        ),
+        ("https://evil.example/path", "/"),
+        ("//evil.example/path", "/"),
+        (r"/\evil.example/path", "/"),
+        ("/api\r\nevil.example", "/"),
+        ("/api\x00evil.example", "/"),
+        ("http:\\evil.example/path", "/"),
+    ],
+)
+def test_oauth_callback_sanitizes_next_url_for_browser(
+    legacy, monkeypatch, next_url, expected_location
+):
+    install_fake_http(
+        monkeypatch, {"sub": "g-next", "email": "allowed@example.com"}
+    )
+    status, headers, _ = request(
+        legacy.application, "/auth/google/start?" + urlencode({"next": next_url})
+    )
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, headers, _ = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location") == [expected_location]
+
+
 def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
     install_fake_http(
         monkeypatch, {"sub": "g-2", "email": "stranger@example.com", "name": "S"}

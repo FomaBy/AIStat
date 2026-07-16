@@ -3,7 +3,7 @@
 import json
 import re
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from werkzeug.security import generate_password_hash
@@ -313,6 +313,43 @@ def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
     assert callback.headers["Location"] == "/api/meta"
     # the allow-listed OAuth session now reaches private data
     assert client.get("/api/meta", base_url="https://localhost").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("next_url", "expected_location"),
+    [
+        ("/api/meta?tab=security", "/api/meta?tab=security"),
+        (
+            "/api/meta?return=https://example.test",
+            "/api/meta?return=https://example.test",
+        ),
+        ("https://evil.example/path", "/"),
+        ("//evil.example/path", "/"),
+        (r"/\evil.example/path", "/"),
+        ("/api\r\nevil.example", "/"),
+        ("/api\x00evil.example", "/"),
+        ("http:\\evil.example/path", "/"),
+    ],
+)
+def test_oauth_callback_sanitizes_next_url_for_browser(
+    public_app, monkeypatch, next_url, expected_location
+):
+    app, _ = public_app
+    install_fake_http(
+        monkeypatch, {"sub": "g-next", "email": "allowed@example.com"}
+    )
+    client = app.test_client()
+    start = client.get(
+        "/auth/google/start?" + urlencode({"next": next_url}),
+        base_url="https://localhost",
+    )
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 303
+    assert callback.headers.getlist("Location") == [expected_location]
 
 
 def test_oauth_callback_unauthorized_is_fail_closed(public_app, monkeypatch):

@@ -28,7 +28,7 @@ import tempfile
 import time
 import traceback
 from http.cookies import SimpleCookie
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from . import __version__, aggregates, oauth
 from .db import SCHEMA_VERSION, connect, init_db
@@ -309,9 +309,19 @@ def _valid_login_csrf(environ, candidate):
 
 
 def _safe_next(value):
-    if not value or not value.startswith("/") or value.startswith("//"):
+    if not value:
         return "/"
-    if "://" in value:
+    # Special-scheme URL parsers treat a backslash as a path separator, so
+    # ``/\\evil.example`` would leave this origin in a browser.  Never place
+    # control characters in the raw Location header either.
+    if "\\" in value or any(
+        ord(char) <= 0x1F or 0x7F <= ord(char) <= 0x9F for char in value
+    ):
+        return "/"
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or not value.startswith("/"):
+        return "/"
+    if value.startswith("//"):
         return "/"
     return value
 

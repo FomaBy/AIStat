@@ -92,6 +92,16 @@ def validate_csrf(session, candidate: Optional[str]) -> bool:
 def safe_next_url(candidate: Optional[str], default: str = "/") -> str:
     if not candidate:
         return default
+    # Browsers normalize ``\\`` to ``/`` in special URLs.  Thus a value such
+    # as ``/\\evil.example`` looks path-relative to ``urlsplit`` but is an
+    # authority-relative redirect to a browser.  Control characters are also
+    # unsafe in a response Location header, so reject both classes before URL
+    # parsing rather than trying to repair them.
+    if "\\" in candidate or any(
+        ord(char) <= 0x1F or 0x7F <= ord(char) <= 0x9F
+        for char in candidate
+    ):
+        return default
     parsed = urlsplit(candidate)
     if parsed.scheme or parsed.netloc or not candidate.startswith("/"):
         return default
