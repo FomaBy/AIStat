@@ -306,6 +306,59 @@ def test_recovers_from_malformed_url_state(dashboard):
     assert _element_value(cdp, "filter-to") == "2026-01-01T10:00"
 
 
+def test_recovers_from_calendar_invalid_from(dashboard):
+    """The QA reproduction for FAN-1269: a calendar-impossible ``from``
+    (February 30) must be dropped like any other invalid value even though
+    Chrome's lenient Date.parse rolls it over to March 2 — the dashboard
+    boots on the surviving state instead of dying on HTTP 422."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?from=2026-02-30T00:00&to=2026-03-03T00:00"
+                  "&group=agent")
+    cdp.wait_for(BOOTED_JS)
+    error = _filter_error(cdp)
+    assert error is not None and "сброшены: from." in error
+    assert dict(_search_params(cdp)) == {
+        "days": "custom", "to": "2026-03-03T00:00", "group": "agent"}
+    assert _element_value(cdp, "filter-from") == ""
+    assert _element_value(cdp, "filter-to") == "2026-03-03T00:00"
+    assert _element_value(cdp, "filter-group") == "agent"
+
+
+def test_recovers_from_calendar_invalid_to(dashboard):
+    """The second FAN-1269 QA reproduction: April 31 in ``to`` is dropped,
+    the valid ``from`` survives and the dashboard loads."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?from=2026-04-01T00:00&to=2026-04-31T00:00"
+                  "&group=agent")
+    cdp.wait_for(BOOTED_JS)
+    error = _filter_error(cdp)
+    assert error is not None and "сброшены: to." in error
+    assert dict(_search_params(cdp)) == {
+        "days": "custom", "from": "2026-04-01T00:00", "group": "agent"}
+    assert _element_value(cdp, "filter-from") == "2026-04-01T00:00"
+    assert _element_value(cdp, "filter-to") == ""
+
+
+def test_calendar_validation_holds_in_real_chrome(dashboard):
+    """isValidDateTimeLocal must judge calendar reality itself (FAN-1269):
+    the bug lived exactly in real Chrome, whose Date.parse normalizes
+    impossible dates instead of returning NaN, so the validator is probed
+    directly in the page against impossible days, non-leap February 29 and
+    impossible times."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    invalid = ["2026-02-29T00:00", "2027-02-29T00:00", "2026-02-30T12:00",
+               "2026-04-31T00:00", "2026-06-31T23:59", "2026-01-32T00:00",
+               "2026-13-01T00:00", "2026-00-01T00:00", "2026-01-00T00:00",
+               "2026-01-01T24:00", "2026-01-01T10:60", "2026-01-01T10:00:60"]
+    valid = ["2028-02-29T00:00", "2026-02-28T23:59", "2026-04-30T00:00",
+             "2026-12-31T23:59:59"]
+    results = cdp.eval(
+        json.dumps(invalid + valid) + ".map(isValidDateTimeLocal)")
+    assert results == [False] * len(invalid) + [True] * len(valid)
+
+
 def test_recovers_from_reverse_range_url(dashboard):
     """A reverse (and equal) from/to range never becomes active state: the
     range is reset, the URL returns to canonical /, data loads."""

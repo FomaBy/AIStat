@@ -378,6 +378,13 @@ def test_dashboard_validates_url_filter_state():
     for guard in ("PERIOD_VALUES", "GROUP_VALUES", "isValidDateTimeLocal",
                   "rangeIsOrdered", "syncFiltersToUrl", "showFilterError"):
         assert guard in read, guard
+    # Chrome's lenient Date.parse normalizes calendar-impossible dates
+    # (2026-02-30 parses as March 2) instead of returning NaN, so the
+    # validator must judge the parts itself via a UTC round-trip and never
+    # delegate to the parser (FAN-1269).
+    validator = _js_function(app_js, "isValidDateTimeLocal")
+    assert "Date.parse" not in validator
+    assert "Date.UTC" in validator
     # The interactive range inputs share the ordering guard, so a reverse
     # range typed by hand never reaches state or the URL either.
     boot = _js_function(app_js, "boot")

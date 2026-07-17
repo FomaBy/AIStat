@@ -103,11 +103,19 @@ function utcDateTime(value) {
 }
 
 // A datetime-local value the API accepts: full date plus minutes (optionally
-// seconds) that names a real UTC instant — Date.parse returns NaN for ISO
-// strings with rolled-over parts like 2026-02-30.
+// seconds) that names a real calendar instant. Chrome's Date.parse falls
+// back to a lenient parser that rolls impossible parts over (2026-02-30
+// parses as March 2) instead of returning NaN, so validity is judged by
+// re-reading each part from a UTC round-trip, never by the parser (FAN-1269).
 function isValidDateTimeLocal(value) {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(value) &&
-    !Number.isNaN(Date.parse(utcDateTime(value)));
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value || "");
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] =
+    match.slice(1).map((part) => Number(part || 0));
+  const utc = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return utc.getUTCFullYear() === year && utc.getUTCMonth() === month - 1 &&
+    utc.getUTCDate() === day && utc.getUTCHours() === hour &&
+    utc.getUTCMinutes() === minute && utc.getUTCSeconds() === second;
 }
 
 // The API rejects from >= to, so an unordered pair must never become active
