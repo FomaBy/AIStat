@@ -3,7 +3,11 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
-from aistat.security import OAUTH_STATE_TTL_SECONDS, SecurityStore
+from aistat.security import (
+    OAUTH_STATE_TTL_SECONDS,
+    SecurityStore,
+    session_id_hash,
+)
 
 
 def test_find_or_create_user_is_idempotent_per_identity(tmp_path):
@@ -132,3 +136,47 @@ def test_account_model_does_not_disturb_throttle_or_ingest(tmp_path):
     assert store.login_retry_after("client", now=100) == 0
     assert store.record_tenant_snapshot(user_id, 500, "a" * 64) is True
     assert store.record_tenant_snapshot(user_id, 500, "a" * 64) is False
+
+
+def test_session_lifecycle_revocation_and_expiry(tmp_path):
+    path = tmp_path / "security.db"
+    store = SecurityStore(path)
+    first = store.create_session(7, ttl_seconds=100, now=1000)
+    second = store.create_session(7, ttl_seconds=100, now=1000)
+    assert first != second
+    assert store.session_is_active(first, now=1050)
+    assert store.session_is_active(second, now=1050)
+
+    # revocation kills exactly the targeted session
+    store.revoke_session(first)
+    assert not store.session_is_active(first, now=1050)
+    assert store.session_is_active(second, now=1050)
+
+    # expiry fails closed even while the row still exists
+    assert not store.session_is_active(second, now=1100)
+
+    # unknown, empty and non-string ids fail closed without errors
+    assert not store.session_is_active("never-issued", now=1050)
+    assert not store.session_is_active(None, now=1050)
+    assert not store.session_is_active(12345, now=1050)
+    store.revoke_session(None)
+    store.revoke_session(12345)
+
+
+def test_sessions_store_only_hashes_and_purge_expired_rows(tmp_path):
+    path = tmp_path / "security.db"
+    store = SecurityStore(path)
+    stale = store.create_session(7, ttl_seconds=100, now=1000)
+    fresh = store.create_session(7, ttl_seconds=100, now=1200)
+    conn = sqlite3.connect(str(path))
+    try:
+        rows = [
+            row[0]
+            for row in conn.execute("SELECT sid_hash FROM sessions")
+        ]
+    finally:
+        conn.close()
+    # the stale row was purged by the later create_session transaction
+    assert rows == [session_id_hash(fresh)]
+    assert stale not in rows
+    assert fresh not in rows

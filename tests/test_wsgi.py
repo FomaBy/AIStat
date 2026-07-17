@@ -152,6 +152,125 @@ def test_login_cookie_api_and_logout_csrf(public_app):
     assert client.get("/api/meta").status_code == 401
 
 
+def session_cookie_from(response):
+    for header in response.headers.getlist("Set-Cookie"):
+        if header.startswith("aistat_session="):
+            return header.split(";", 1)[0]
+    raise AssertionError("no session cookie issued")
+
+
+def replay(app, cookie):
+    # use_cookies=False so the client's own (empty) jar does not overwrite
+    # the replayed Cookie header.
+    return app.test_client(use_cookies=False).get(
+        "/api/meta", base_url="https://localhost", headers={"Cookie": cookie}
+    )
+
+
+def test_logout_revokes_replayed_session_cookie(public_app):
+    # FAN-1229: replaying a cookie captured before logout must fail closed.
+    app, _ = public_app
+    client = app.test_client()
+    stolen = session_cookie_from(login(client))
+    assert replay(app, stolen).status_code == 200
+
+    auth = client.get("/api/session", base_url="https://localhost").get_json()
+    denied = client.post(
+        "/logout",
+        headers={"X-CSRF-Token": "wrong"},
+        base_url="https://localhost",
+    )
+    assert denied.status_code == 400
+    # an invalid CSRF token must not revoke anything
+    assert replay(app, stolen).status_code == 200
+
+    out = client.post(
+        "/logout",
+        headers={"X-CSRF-Token": auth["csrf"]},
+        base_url="https://localhost",
+    )
+    assert out.status_code == 303
+    for _ in range(3):
+        assert replay(app, stolen).status_code == 401
+    # the dead cookie renders the login form instead of a redirect loop
+    page = app.test_client(use_cookies=False).get(
+        "/login", base_url="https://localhost", headers={"Cookie": stolen}
+    )
+    assert page.status_code == 200
+
+
+def test_logout_revokes_only_the_current_session(public_app):
+    app, _ = public_app
+    first = app.test_client()
+    second = app.test_client()
+    assert login(first).status_code == 303
+    assert login(second).status_code == 303
+    csrf = first.get(
+        "/api/session", base_url="https://localhost"
+    ).get_json()["csrf"]
+    assert first.post(
+        "/logout",
+        headers={"X-CSRF-Token": csrf},
+        base_url="https://localhost",
+    ).status_code == 303
+    assert first.get(
+        "/api/meta", base_url="https://localhost"
+    ).status_code == 401
+    assert second.get(
+        "/api/meta", base_url="https://localhost"
+    ).status_code == 200
+
+
+def test_session_revocation_survives_worker_restart(public_app):
+    # Sessions live in security.db, so a fresh worker process honours both
+    # existing sessions and revocations performed by another worker.
+    app, config = public_app
+    client = app.test_client()
+    stolen = session_cookie_from(login(client))
+    restarted = create_app(config)
+    restarted.config.update(TESTING=True)
+    assert replay(restarted, stolen).status_code == 200
+    csrf = client.get(
+        "/api/session", base_url="https://localhost"
+    ).get_json()["csrf"]
+    assert client.post(
+        "/logout",
+        headers={"X-CSRF-Token": csrf},
+        base_url="https://localhost",
+    ).status_code == 303
+    for _ in range(3):
+        assert replay(restarted, stolen).status_code == 401
+
+
+def test_oauth_logout_revokes_replayed_cookie(public_app, monkeypatch):
+    app, _ = public_app
+    install_fake_http(
+        monkeypatch, {"sub": "g-out", "email": "allowed@example.com"}
+    )
+    client = app.test_client()
+    start = client.get(
+        "/auth/google/start", base_url="https://localhost"
+    )
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc"
+        % state_from(start.headers["Location"]),
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 303
+    stolen = session_cookie_from(callback)
+    assert replay(app, stolen).status_code == 200
+    csrf = client.get(
+        "/api/session", base_url="https://localhost"
+    ).get_json()["csrf"]
+    assert client.post(
+        "/logout",
+        headers={"X-CSRF-Token": csrf},
+        base_url="https://localhost",
+    ).status_code == 303
+    for _ in range(3):
+        assert replay(app, stolen).status_code == 401
+
+
 def test_wsgi_hour_filters_accept_repeated_dimensions(public_app):
     app, _ = public_app
     client = app.test_client()

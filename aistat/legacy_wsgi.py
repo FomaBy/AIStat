@@ -186,6 +186,12 @@ def _bootstrap():
                 last_snapshot_at       INTEGER,
                 last_snapshot_sha256   TEXT
             );
+            CREATE TABLE IF NOT EXISTS sessions (
+                sid_hash    TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                created_at  INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL
+            );
             """
         )
         # Serialize the inspect-and-alter migration across WSGI workers.
@@ -280,11 +286,67 @@ def _cookies(environ):
     return {key: morsel.value for key, morsel in cookie.items()}
 
 
+def _session_id_hash(sid):
+    # Only the hash is persisted, so reading security.db never yields a value
+    # that can be replayed as a cookie.
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()
+
+
+def _create_session_record(user_id, expires_at, now=None):
+    now = int(time.time()) if now is None else int(now)
+    sid = secrets.token_urlsafe(32)
+    conn = _security_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+        conn.execute(
+            "INSERT INTO sessions (sid_hash, user_id, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (_session_id_hash(sid), int(user_id), now, int(expires_at)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return sid
+
+
+def _session_is_active(sid, now=None):
+    if not sid or not isinstance(sid, str):
+        return False
+    now = int(time.time()) if now is None else int(now)
+    conn = _security_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE sid_hash = ? AND expires_at > ?",
+            (_session_id_hash(sid), now),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def _revoke_session(sid):
+    if not sid or not isinstance(sid, str):
+        return
+    conn = _security_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM sessions WHERE sid_hash = ?", (_session_id_hash(sid),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _make_session():
+    now = int(time.time())
+    expires_at = now + SESSION_SECONDS
     payload = {
         "u": ADMIN_USERNAME,
         "uid": OWNER_USER_ID,
-        "exp": int(time.time()) + SESSION_SECONDS,
+        "sid": _create_session_record(OWNER_USER_ID, expires_at, now),
+        "exp": expires_at,
         "csrf": secrets.token_urlsafe(32),
     }
     encoded = _b64encode(
@@ -294,11 +356,14 @@ def _make_session():
 
 
 def _make_oauth_session(user_id, email, provider):
+    now = int(time.time())
+    expires_at = now + SESSION_SECONDS
     payload = {
         "uid": int(user_id),
         "email": email,
         "provider": provider,
-        "exp": int(time.time()) + SESSION_SECONDS,
+        "sid": _create_session_record(user_id, expires_at, now),
+        "exp": expires_at,
         "csrf": secrets.token_urlsafe(32),
     }
     encoded = _b64encode(
@@ -319,6 +384,9 @@ def _read_session(environ):
     except Exception:
         return None
     if int(payload.get("exp", 0)) < time.time():
+        return None
+    # Pre-revocation cookies carry no server-side id and fail closed here.
+    if not _session_is_active(payload.get("sid")):
         return None
     return payload
 
@@ -1384,6 +1452,7 @@ def application(environ, start_response):
                 return _json_response(
                     environ, start_response, "400 Bad Request", {"detail": "invalid CSRF token"}
                 )
+            _revoke_session(session.get("sid"))
             return _respond(
                 environ,
                 start_response,

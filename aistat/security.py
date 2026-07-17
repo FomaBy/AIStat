@@ -125,6 +125,15 @@ def safe_next_url(candidate: Optional[str], default: str = "/") -> str:
     return candidate
 
 
+def session_id_hash(sid: str) -> str:
+    """Digest stored instead of the raw session id.
+
+    Reading security.db must never yield a value usable as a live cookie, so
+    only this one-way hash of the high-entropy id is persisted.
+    """
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()
+
+
 def client_key(session_secret: str, remote_addr: Optional[str]) -> str:
     address = (remote_addr or "unknown").encode("utf-8")
     return hmac.new(
@@ -226,6 +235,12 @@ class SecurityStore:
                     last_snapshot_at       INTEGER,
                     last_snapshot_sha256   TEXT
                 );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    sid_hash    TEXT PRIMARY KEY,
+                    user_id     INTEGER NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    expires_at  INTEGER NOT NULL
+                );
                 """
             )
             # Serialize the inspect-and-alter migration across WSGI workers.
@@ -315,6 +330,69 @@ class SecurityStore:
         try:
             conn.execute(
                 "DELETE FROM login_throttle WHERE client_key = ?", (key,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def create_session(
+        self, user_id: int, ttl_seconds: int, now: Optional[int] = None
+    ) -> str:
+        """Register a new server-side session and return its secret id.
+
+        Expired rows are purged in the same transaction so the table stays
+        bounded by the number of live sessions.
+        """
+        now = int(time.time()) if now is None else int(now)
+        sid = secrets.token_urlsafe(32)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM sessions WHERE expires_at <= ?", (now,)
+            )
+            conn.execute(
+                "INSERT INTO sessions "
+                "(sid_hash, user_id, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    session_id_hash(sid),
+                    int(user_id),
+                    now,
+                    now + int(ttl_seconds),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return sid
+
+    def session_is_active(
+        self, sid: Optional[str], now: Optional[int] = None
+    ) -> bool:
+        if not sid or not isinstance(sid, str):
+            return False
+        now = int(time.time()) if now is None else int(now)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE sid_hash = ? AND expires_at > ?",
+                (session_id_hash(sid), now),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def revoke_session(self, sid: Optional[str]) -> None:
+        """Atomically revoke exactly the one session behind ``sid``."""
+        if not sid or not isinstance(sid, str):
+            return
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM sessions WHERE sid_hash = ?",
+                (session_id_hash(sid),),
             )
             conn.commit()
         finally:

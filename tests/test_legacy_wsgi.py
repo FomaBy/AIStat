@@ -450,6 +450,141 @@ def test_logout_accepts_form_csrf_for_shared_host_waf(legacy):
     assert "Max-Age=0" in "\n".join(header_values(headers, "Set-Cookie"))
 
 
+def session_csrf(module, cookies):
+    status, _, body = request(module.application, "/api/session", cookie=cookies)
+    assert status == "200 OK"
+    return module.json.loads(body.decode("utf-8"))["csrf"]
+
+
+def logout(module, cookies):
+    status, _, _ = request(
+        module.application,
+        "/logout",
+        method="POST",
+        headers={"X-CSRF-Token": session_csrf(module, cookies)},
+        cookie=cookies,
+    )
+    assert status == "303 See Other"
+
+
+def test_logout_revokes_replayed_session_cookie(legacy):
+    # FAN-1229: a cookie captured before logout must die server-side, not
+    # only in the browser jar.
+    cookies = login(legacy)
+    logout(legacy, cookies)
+    for _ in range(3):
+        status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
+        assert status == "401 Unauthorized"
+    # the stale cookie may not resurrect a login redirect loop either
+    status, _, _ = request(legacy.application, "/login", cookie=cookies)
+    assert status == "200 OK"
+
+
+def test_invalid_logout_csrf_does_not_revoke_session(legacy):
+    cookies = login(legacy)
+    status, _, _ = request(
+        legacy.application,
+        "/logout",
+        method="POST",
+        headers={"X-CSRF-Token": "wrong"},
+        cookie=cookies,
+    )
+    assert status == "400 Bad Request"
+    status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
+    assert status == "200 OK"
+
+
+def test_logout_revokes_only_the_current_session(legacy):
+    first = login(legacy)
+    second = login(legacy)
+    logout(legacy, first)
+    assert request(legacy.application, "/api/meta", cookie=first)[0] == (
+        "401 Unauthorized"
+    )
+    assert request(legacy.application, "/api/meta", cookie=second)[0] == (
+        "200 OK"
+    )
+
+
+def test_session_state_survives_cgi_process_restart(legacy):
+    # Session validity and revocation live in security.db, so neither a live
+    # session nor a logout may be forgotten when the CGI process is recycled.
+    cookies = login(legacy)
+    restarted = importlib.reload(legacy)
+    status, _, _ = request(restarted.application, "/api/meta", cookie=cookies)
+    assert status == "200 OK"
+    logout(restarted, cookies)
+    replayed = importlib.reload(restarted)
+    for _ in range(3):
+        status, _, _ = request(
+            replayed.application, "/api/meta", cookie=cookies
+        )
+        assert status == "401 Unauthorized"
+
+
+def test_expired_session_record_is_rejected_and_purged(legacy):
+    cookies = login(legacy)
+    conn = sqlite3.connect(legacy.SECURITY_DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE sessions SET expires_at = ?",
+            (int(legacy.time.time()) - 1,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
+    assert status == "401 Unauthorized"
+    # the next login purges expired rows inside its own transaction
+    login(legacy)
+    conn = sqlite3.connect(legacy.SECURITY_DB_PATH)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+
+
+def test_session_table_stores_only_hashed_ids(legacy):
+    cookies = login(legacy)
+    value = dict(
+        part.split("=", 1) for part in cookies.split("; ")
+    )["aistat_session"]
+    payload = legacy.json.loads(
+        legacy._b64decode(value.rsplit(".", 1)[0]).decode("utf-8")
+    )
+    sid = payload["sid"]
+    conn = sqlite3.connect(legacy.SECURITY_DB_PATH)
+    try:
+        rows = [
+            row[0] for row in conn.execute("SELECT sid_hash FROM sessions")
+        ]
+    finally:
+        conn.close()
+    assert rows == [legacy._session_id_hash(sid)]
+    assert sid not in rows
+
+
+def test_oauth_logout_revokes_replayed_cookie(legacy, monkeypatch):
+    install_fake_http(
+        monkeypatch, {"sub": "g-out", "email": "allowed@example.com"}
+    )
+    status, headers, _ = request(legacy.application, "/auth/google/start")
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, headers, _ = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "303 See Other"
+    cookies = cookie_jar(headers, start_cookies)
+    logout(legacy, cookies)
+    for _ in range(3):
+        status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
+        assert status == "401 Unauthorized"
+
+
 def test_signed_snapshot_ingest(legacy, tmp_path):
     source = tmp_path / "source.db"
     conn = connect(source)

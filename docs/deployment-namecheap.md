@@ -278,6 +278,10 @@ ln -sfn ~/aistat_releases/<предыдущий> ~/aistat_app
 
 - все страницы, API и статические dashboard-assets требуют входа;
 - cookie: signed, `HttpOnly`, `Secure`, `SameSite=Lax`, срок по умолчанию 12 ч;
+- каждая сессия имеет server-side запись в security.db (хранится только
+  SHA-256 хеш идентификатора); logout удаляет запись, поэтому скопированный
+  до выхода cookie сразу получает `401`, а истёкшие записи чистятся при
+  новых входах;
 - login и logout защищены CSRF;
 - после пяти неудачных входов IP-hash блокируется на 15 минут;
 - CSP, HSTS, `frame-ancestors 'none'`, `nosniff`, no-referrer и no-store;

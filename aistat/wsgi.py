@@ -98,6 +98,17 @@ def create_app(config: Optional[Config] = None) -> Flask:
         "oauth_callback",
     }
 
+    session_ttl_seconds = int(config.session_hours) * 3600
+
+    def session_is_active() -> bool:
+        """True while the session's server-side record exists in security.db.
+
+        Logout deletes that record, so a cookie captured before logout fails
+        closed here — as does any cookie minted before server-side sessions
+        existed (no ``sid`` claim at all).
+        """
+        return security_store.session_is_active(session.get("sid"))
+
     def oauth_session_authorized() -> bool:
         """True when the current session is an allow-listed OAuth login.
 
@@ -135,9 +146,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
         if request.endpoint in public_endpoints:
             return None
-        if session.get("user") == config.auth_username:
+        if session.get("user") == config.auth_username and session_is_active():
             return None
-        if oauth_session_authorized():
+        if oauth_session_authorized() and session_is_active():
             return None
         if wants_json():
             return jsonify({"detail": "authentication required"}), 401
@@ -250,7 +261,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if request.method == "GET":
-            if session.get("user") == config.auth_username:
+            if (
+                session.get("user") == config.auth_username
+                and session_is_active()
+            ):
                 return redirect(safe_next_url(request.args.get("next")), code=303)
             return render_login()
 
@@ -293,6 +307,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
         session.clear()
         session["user"] = config.auth_username
         session["user_id"] = owner_user_id
+        session["sid"] = security_store.create_session(
+            owner_user_id, session_ttl_seconds
+        )
         session.permanent = True
         csrf_token(session)
         return redirect(next_url, code=303)
@@ -302,6 +319,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
         candidate = request.headers.get("X-CSRF-Token") or request.form.get("csrf")
         if not validate_csrf(session, candidate):
             return jsonify({"detail": "invalid CSRF token"}), 400
+        security_store.revoke_session(session.get("sid"))
         session.clear()
         if wants_json():
             return jsonify({"status": "ok"})
@@ -371,6 +389,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
         session["user_id"] = result["user_id"]
         session["email"] = result["email"]
         session["provider"] = provider
+        session["sid"] = security_store.create_session(
+            result["user_id"], session_ttl_seconds
+        )
         session.permanent = True
         csrf_token(session)
         if not oauth.is_email_authorized(
