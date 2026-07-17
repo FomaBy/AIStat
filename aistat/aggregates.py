@@ -540,16 +540,24 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
         key_fn = lambda s: (s["date"], s["project_id"])  # noqa: E731
     grouped = _sum_shares(shares, key_fn)
     names = _display_names(conn)
+    # A project axis (grouping by or filtering on project) is always an
+    # attribution estimate — one daily row is divided across projects. Any
+    # other row is exact when a single agent owns its (runtime, model) pair
+    # for the whole day; the per-row flag already carries that.
+    proj_estimated = group == "project" or bool(filters["projects"])
     rows = []
     for g in sorted(grouped, key=lambda g: (g["_key"][0], g["_key"][1] or "")):
         date, key = g.pop("_key")
         g["date"] = date
         g["key"] = _label(group, key, names)
+        if proj_estimated:
+            g["estimated"] = True
         rows.append(g)
     return {
         "group": group,
-        # Any dimension attribution or a partial-day range is an estimate.
-        "estimated": True,
+        # Derive the headline flag from the actual rows, not merely from the
+        # presence of a filter: a unique-agent split stays exact (FAN-1253).
+        "estimated": proj_estimated or any(r["estimated"] for r in rows),
         "rows": rows,
     }
 
@@ -1334,11 +1342,17 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
             tokens = {k: g[k] for k in TOKEN_KINDS}
             cost_usd, cost_credits = g["cost_usd"], g["cost_credits"]
             has_unpriced = g["has_unpriced"]
+            estimated = g["estimated"]
         else:
             tokens = {k: 0 for k in TOKEN_KINDS}
             cost_usd = cost_credits = 0.0
             has_unpriced = False
-        estimated = True
+            estimated = filters["time_estimated"]
+        # The token card is estimated only when an actual share was ambiguous
+        # (shared pair / unattributed) or a partial hour was allocated — both
+        # carried by the aggregated flag — or a project attribution is in play.
+        # A unique (runtime, model) agent split stays exact (FAN-1253).
+        estimated = estimated or bool(filters["projects"])
 
     # Jira-imported issues never ran in Multica; exclude them from the
     # story-point and efficiency facts (tokens already exclude them, as Jira

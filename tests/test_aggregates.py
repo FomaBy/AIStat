@@ -145,6 +145,23 @@ def test_daily_project_filter(agg_conn):
     assert sum(r["total_tokens"] for r in result["rows"]) == 600_000
 
 
+def test_daily_unique_agent_filter_is_exact(agg_conn):
+    # FAN-1253: A1 alone owns (R1, m-claude), so a model series under an A1
+    # filter is an exact attribution — the top-level flag must follow the rows.
+    result = ag.daily_series(
+        agg_conn, group="model", filters=ag.make_filters(agent_ids=["A1"])
+    )
+    assert result["estimated"] is False
+    assert all(r["estimated"] is False for r in result["rows"])
+    assert sum(r["total_tokens"] for r in result["rows"]) == 1_000_000
+
+    # A shared-pair agent filter still splits by duration → estimated.
+    shared = ag.daily_series(
+        agg_conn, group="model", filters=ag.make_filters(agent_ids=["A2"])
+    )
+    assert shared["estimated"] is True
+
+
 def test_daily_rejects_unknown_group(agg_conn):
     with pytest.raises(ValueError):
         ag.daily_series(agg_conn, group="runtime")
@@ -426,6 +443,26 @@ def test_summary_estimation_metadata_per_field(agg_conn):
     assert pr["estimated"] is True
     assert pr["sp_estimated"] is False
     assert pr["efficiency_estimated"] is False
+
+
+def test_summary_unique_agent_filter_keeps_tokens_exact(agg_conn):
+    # FAN-1253: A1 alone owns (R1, m-claude); filtering by A1 is an exact token
+    # attribution, so the token card must not be flagged estimated even though
+    # task-level SP/efficiency stay run-duration estimates.
+    a1 = ag.summary(agg_conn, filters=ag.make_filters(agent_ids=["A1"]))
+    assert a1["estimated"] is False
+    assert a1["total_tokens"] == 1_000_000
+    assert a1["cost_usd"] == pytest.approx(1.0)
+    assert a1["sp_estimated"] is True and a1["efficiency_estimated"] is True
+
+    # A shared pair stays estimated, and adding a project axis is never exact.
+    a2 = ag.summary(agg_conn, filters=ag.make_filters(agent_ids=["A2"]))
+    assert a2["estimated"] is True
+    a1_p1 = ag.summary(
+        agg_conn, filters=ag.make_filters(agent_ids=["A1"], project_ids=["P1"])
+    )
+    assert a1_p1["estimated"] is True
+    assert a1_p1["total_tokens"] == 1_000_000
 
 
 def test_issue_efficiency_model_filter_marks_estimated(agg_conn):
