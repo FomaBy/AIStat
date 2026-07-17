@@ -162,6 +162,19 @@ def test_daily_unique_agent_filter_is_exact(agg_conn):
     assert shared["estimated"] is True
 
 
+def test_daily_empty_partial_hour_keeps_estimated(agg_conn):
+    # FAN-1253 re-QA: a partial-hour window with no overlapping runs yields no
+    # rows, yet the slice is still an estimate — an empty result must not erase
+    # the headline flag (summary reports the same slice as estimated).
+    filters = ag.make_filters(
+        date_from="2026-01-01T16:00Z", date_to="2026-01-01T17:00Z"
+    )
+    result = ag.daily_series(agg_conn, group="model", filters=filters)
+    assert result["rows"] == []
+    assert result["estimated"] is True
+    assert ag.summary(agg_conn, filters=filters)["estimated"] is True
+
+
 def test_daily_rejects_unknown_group(agg_conn):
     with pytest.raises(ValueError):
         ag.daily_series(agg_conn, group="runtime")
@@ -195,6 +208,18 @@ def test_agent_totals_project_filter(agg_conn):
     # Only A3 worked on Beta: half of her 1.2M share.
     assert agents["QA Shared"]["total_tokens"] == 600_000
     assert "Dev Shared" not in agents
+
+
+def test_agent_totals_project_filter_marks_unique_agent_estimated(agg_conn):
+    # FAN-1253 re-QA: a project filter keeps only the project-attributed share
+    # of each daily row, so even a unique-pair agent row is an estimate — the
+    # marker must not be dropped just because the split happens to be 100%.
+    filtered = {a["name"]: a for a in ag.agent_totals(agg_conn, project_id="P1")}
+    assert filtered["Solo Claude"]["total_tokens"] == 1_000_000
+    assert filtered["Solo Claude"]["estimated"] is True
+    # Without the project axis the same unique agent stays exact.
+    plain = {a["name"]: a for a in ag.agent_totals(agg_conn)}
+    assert plain["Solo Claude"]["estimated"] is False
 
 
 def test_agent_run_counts_follow_half_open_filtered_intervals(agg_conn):

@@ -316,6 +316,20 @@ def test_dashboard_renderers_mark_estimated_values():
     assert "≈" in render_efficiency
 
 
+def test_dashboard_note_follows_actual_estimation():
+    """FAN-1253 re-QA: the shared ≈-note must be driven by the real API
+    estimation flags, not merely by the presence of a filter — an exact
+    unique-agent whole-day slice must leave it hidden."""
+    app_js = (Path(server_module.__file__).parent / "static" / "app.js"
+              ).read_text(encoding="utf-8")
+    refresh = _js_function(app_js, "refreshAll")
+    assert "estimate-note" in refresh
+    # The note reacts to the returned flags, so an exact result hides it.
+    assert "summary.estimated" in refresh
+    assert "daily.estimated" in refresh
+    assert "a.estimated" in refresh
+
+
 def test_dashboard_efficiency_charts_have_accessible_alternatives():
     """Static contract (FAN-1242): each efficiency chart canvas carries an
     accessible name, a hidden no-data message and a table alternative, and

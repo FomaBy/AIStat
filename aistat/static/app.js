@@ -437,10 +437,6 @@ function esc(text) {
 // ---------- refresh ----------
 
 async function refreshAll() {
-  $("estimate-note").hidden = !(
-    state.projects.length || state.agents.length || state.models.length ||
-    state.group !== "model" || state.from || state.to
-  );
   const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
@@ -451,6 +447,20 @@ async function refreshAll() {
     fetchJSON("/api/efficiency-breakdown" + query()),
     fetchJSON("/api/health"),
   ]);
+  // The ≈-note legends the token-attribution markers. Drive it from the real
+  // API flags, not merely from the presence of a filter: a unique-agent
+  // whole-day slice is exact, so it must stay hidden (FAN-1253). Show it only
+  // when a filter/group is active AND the token, daily or an agent value is
+  // actually estimated.
+  const filterActive = Boolean(
+    state.projects.length || state.agents.length || state.models.length ||
+    state.group !== "model" || state.from || state.to
+  );
+  const tokensEstimated = Boolean(
+    summary.estimated || daily.estimated ||
+    agents.agents.some((a) => a.estimated)
+  );
+  $("estimate-note").hidden = !(filterActive && tokensEstimated);
   renderSummary(summary);
   renderDaily(daily);
   renderAgentsChart(agents.agents);

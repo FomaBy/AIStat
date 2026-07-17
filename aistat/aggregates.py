@@ -557,7 +557,13 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
         "group": group,
         # Derive the headline flag from the actual rows, not merely from the
         # presence of a filter: a unique-agent split stays exact (FAN-1253).
-        "estimated": proj_estimated or any(r["estimated"] for r in rows),
+        # A partial-hour window is always an estimate even when it selects no
+        # rows, so it is OR-ed in directly rather than relying on row flags
+        # that an empty result would otherwise erase (FAN-1253 re-QA).
+        "estimated": (
+            proj_estimated or filters["time_estimated"]
+            or any(r["estimated"] for r in rows)
+        ),
         "rows": rows,
     }
 
@@ -636,6 +642,11 @@ def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
         g["model"] = agent["model"] if agent else None
         g["runtime"] = runtimes.get(agent["runtime_id"]) if agent else None
         g["runs"] = run_counts.get(agent_id, 0)
+        # A project filter keeps only each daily row's project-attributed share,
+        # so an agent row is estimated even when a single agent owns the
+        # (runtime, model) pair — mirror summary/daily_series (FAN-1253 re-QA).
+        if filters["projects"]:
+            g["estimated"] = True
         out.append(g)
     out.sort(key=lambda g: -g["total_tokens"])
     return out
@@ -1297,12 +1308,15 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
             filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Headline cards for the selected dimensions and run-time window.
 
-    Whole-day model totals remain exact. Agent/project and partial-day ranges
-    are duration-weighted estimates over the dated task runs; the same run
-    share is applied to task SP and efficiency inputs.
+    Whole-day model totals remain exact. A whole-day agent filter is exact too
+    when that agent uniquely owns its (runtime, model) pair; a shared pair,
+    a project attribution or a partial-day range make the token cards a
+    duration-weighted estimate over the dated task runs. The same run share is
+    applied to task SP and efficiency inputs.
 
-    ``estimated`` covers only the token/cost cards; a model-only or date-only
-    selection keeps them exact. Task-level facts have their own precision:
+    ``estimated`` covers only the token/cost cards; a model-only, date-only or
+    unique-agent whole-day selection keeps them exact. Task-level facts have
+    their own precision:
     any agent/model/date selection allocates SP and efficiency inputs by run
     duration shares, reported as ``sp_estimated`` / ``efficiency_estimated``.
     A project-only selection keeps them exact (issues belong to projects
