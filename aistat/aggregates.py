@@ -382,13 +382,21 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
             for item in intervals.get(agent_id, []):
                 start, end = item["start"], item["end"]
                 key = (agent_id, item["project_id"])
-                counts[key] = counts.get(key, 0) + 1
                 if start is None or end is None or end <= start:
+                    # No complete dated interval to overlap. The run stays
+                    # available for the date-only count fallback, but only for
+                    # the day its one known timestamp lands on — so it steers a
+                    # single day's split instead of leaking into every day, and
+                    # is never invented into a duration (FAN-1254).
+                    anchor = start or end
+                    if anchor is not None and day_start <= anchor < day_end:
+                        counts[key] = counts.get(key, 0) + 1
                     continue
                 full = _overlap_seconds(start, end, day_start, day_end)
                 if full <= 0:
                     continue
                 full_seconds += full
+                counts[key] = counts.get(key, 0) + 1
                 partial = _overlap_seconds(start, end, selected_start, selected_end)
                 if partial > 0:
                     selected[key] = selected.get(key, 0.0) + partial
@@ -406,17 +414,24 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
 
         # Date-only filtering keeps the earlier duration/count/equal fallback
         # so historical days without complete run timestamps remain visible.
+        # Drive the split from the run counts, not just the runs that produced a
+        # selected duration: a run with an incomplete timestamp carries a count
+        # but no duration, and it must still steer both the agent and the
+        # project split instead of collapsing the day into an unattributed
+        # project (FAN-1254). Complete runs contribute their duration too, which
+        # wins over the count whenever any is present.
         durations = {a: 0.0 for a in candidates}
         agent_counts = {a: 0 for a in candidates}
         by_project: Dict[str, Dict[Optional[str], Dict[str, float]]] = {}
-        for (agent_id, project_id), seconds in selected.items():
+        for (agent_id, project_id), n in counts.items():
+            seconds = selected.get((agent_id, project_id), 0.0)
             durations[agent_id] += seconds
-            agent_counts[agent_id] += counts.get((agent_id, project_id), 0)
+            agent_counts[agent_id] += n
             project = by_project.setdefault(agent_id, {}).setdefault(
                 project_id, {"dur": 0.0, "n": 0}
             )
             project["dur"] += seconds
-            project["n"] += counts.get((agent_id, project_id), 0)
+            project["n"] += n
         # Rows entirely outside the selected date window have no SQL match;
         # a zero-duration day falls back to the known candidate agents.
         agent_weights = _weights(candidates, durations, agent_counts)

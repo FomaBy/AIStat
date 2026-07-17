@@ -175,6 +175,82 @@ def test_daily_empty_partial_hour_keeps_estimated(agg_conn):
     assert ag.summary(agg_conn, filters=filters)["estimated"] is True
 
 
+def _sql_ts(value):
+    return "NULL" if value is None else f"'{value}'"
+
+
+def _seed_incomplete_run(conn, started_at, completed_at):
+    """A6 uniquely owns (R5, m-solo) and works issue I6 (project P1) on
+    2026-01-05 with a single run whose timestamps are incomplete.
+
+    R5/m-solo carries 100 tokens that day, so a date-only slice has no
+    complete dated interval to allocate and must fall back to the run count —
+    which still points at agent A6 and project P1 (FAN-1254).
+    """
+    now = "2026-01-05T00:00:00Z"
+    conn.executescript(f"""
+    INSERT INTO runtimes (id, name, provider, status, synced_at) VALUES
+      ('R5', 'Solo RT', 'claude', 'online', '{now}');
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A6', 'Legacy Solo', 'm-solo', 'R5', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I6', 'T-6', 'incomplete run', 'done', 'P1', NULL, '{now}', '{now}');
+    INSERT INTO daily_usage (runtime_id, model, date, input_tokens, output_tokens,
+                             cache_read_tokens, cache_write_tokens,
+                             cost_usd, cost_credits, cost_priced, synced_at) VALUES
+      ('R5', 'm-solo', '2026-01-05', 100, 0, 0, 0, NULL, NULL, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run-legacy', 'I6', 'A6', 'R5', 'completed',
+       {_sql_ts(started_at)}, {_sql_ts(completed_at)}, '{now}');
+    """)
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    "started_at, completed_at",
+    [
+        ("2026-01-05T10:00:00Z", None),   # missing end
+        (None, "2026-01-05T10:00:00Z"),   # missing start
+    ],
+)
+def test_date_only_incomplete_run_keeps_project_attribution(
+    agg_conn, started_at, completed_at
+):
+    # FAN-1254: a date-only slice by agent keeps a run with an incomplete
+    # timestamp; adding the project filter must not drop the same 100 tokens.
+    # Before the fix the run carried a count but no selected duration, so the
+    # fallback emitted project_id=None and the project filter erased it.
+    _seed_incomplete_run(agg_conn, started_at, completed_at)
+
+    agent_only = ag.make_filters(agent_ids=["A6"])
+    combined = ag.make_filters(project_ids=["P1"], agent_ids=["A6"])
+    assert ag.summary(agg_conn, filters=agent_only)["total_tokens"] == 100
+    assert ag.summary(agg_conn, filters=combined)["total_tokens"] == 100
+    p1_agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn, project_id="P1")}
+    assert p1_agents["A6"]["total_tokens"] == 100
+
+    a6 = [s for s in ag.daily_shares(agg_conn, filters=agent_only)
+          if s["agent_id"] == "A6"]
+    assert len(a6) == 1
+    assert a6[0]["project_id"] == "P1"
+    assert sum(a6[0][k] for k in ag.TOKEN_KINDS) == 100
+
+
+def test_partial_hour_ignores_incomplete_run_without_inventing_duration(agg_conn):
+    # FAN-1254: the count fallback is date-only. A partial-hour window must
+    # still exclude a run with no complete dated interval rather than invent a
+    # duration for it.
+    _seed_incomplete_run(agg_conn, "2026-01-05T10:00:00Z", None)
+    hour = ag.make_filters(
+        "2026-01-05T10:00Z", "2026-01-05T11:00Z", agent_ids=["A6"]
+    )
+    assert ag.summary(agg_conn, filters=hour)["total_tokens"] == 0
+    assert [s for s in ag.daily_shares(agg_conn, filters=hour)
+            if s["agent_id"] == "A6"] == []
+
+
 def test_daily_rejects_unknown_group(agg_conn):
     with pytest.raises(ValueError):
         ag.daily_series(agg_conn, group="runtime")
