@@ -33,15 +33,13 @@ const ENTITY_ANCHORS = {
 const SINGLE_SERIES_COLOR = "#4f6df5";
 
 // typed key ("type\0id") -> color, assigned once and cached for the session.
-// Anchor colors are reserved up front so a fallback entity never steals them;
-// a fallback hashes its typed key to a palette slot and probes forward to the
-// first color not yet used in that identity space (deterministic collision
-// control). Caching by id — never by position — keeps a color fixed across
-// reorder, live refresh and group switches.
-const colorRegistry = { byKey: new Map(), usedByType: new Map() };
-for (const [type, anchors] of Object.entries(ENTITY_ANCHORS)) {
-  colorRegistry.usedByType.set(type, new Set(Object.values(anchors)));
-}
+// Fallback colors are derived only from the typed key. Keeping a mutable set of
+// colors already seen makes the result depend on which colliding identity was
+// rendered first, so collision handling must not consult encounter order.
+// Anchor colors are skipped by a deterministic probe; caching by id — never by
+// position — keeps a color fixed across reorder, live refresh and group
+// switches. Repeated colors are allowed once the fixed palette is exhausted.
+const colorRegistry = { byKey: new Map() };
 
 // FNV-1a over the typed key: a stable, well-spread starting index into the
 // palette that depends only on the entity's identity.
@@ -59,27 +57,25 @@ function entityColor(type, id) {
   const key = type + "\u0000" + id;
   const cached = colorRegistry.byKey.get(key);
   if (cached) return cached;
-  let used = colorRegistry.usedByType.get(type);
-  if (!used) {
-    used = new Set();
-    colorRegistry.usedByType.set(type, used);
-  }
   const anchors = ENTITY_ANCHORS[type];
   let color = anchors && Object.prototype.hasOwnProperty.call(anchors, id)
     ? anchors[id] : null;
   if (!color) {
-    const start = hashKey(key) % PALETTE.length;
+    // Re-seed the palette lookup separately from the legacy FNV start hash.
+    // This keeps identities that share a start slot (for example collision-6
+    // and collision-9) independent of the order in which they are encountered.
+    const start = hashKey(key + "\u0000palette") % PALETTE.length;
+    const reserved = new Set(anchors ? Object.values(anchors) : []);
     color = PALETTE[start];
     for (let i = 0; i < PALETTE.length; i++) {
       const candidate = PALETTE[(start + i) % PALETTE.length];
-      if (!used.has(candidate)) {
+      if (!reserved.has(candidate)) {
         color = candidate;
         break;
       }
     }
   }
   colorRegistry.byKey.set(key, color);
-  used.add(color);
   return color;
 }
 

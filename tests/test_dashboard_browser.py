@@ -419,6 +419,103 @@ def _chart_colors(cdp, canvas_id):
         ' return o; })()' % canvas_id)
 
 
+def _probe_entity_colors(cdp, identities):
+    """Return ``type:id -> color`` from the live page registry."""
+    return cdp.eval(
+        '(ids => Object.fromEntries(ids.map(([type, id]) => ['
+        'type + ":" + (id === null ? "<null>" : id), '
+        'entityColor(type, id)])))(' + json.dumps(identities) + ')')
+
+
+def _fresh_entity_colors(cdp, base, identities):
+    """Probe a new document with an empty result so only the fresh registry
+    and the explicit probe identities can claim fallback slots."""
+    cdp.open_page(base + "/?from=2030-01-01T00:00&to=2030-01-02T00:00")
+    cdp.wait_for(BOOTED_JS)
+    return _probe_entity_colors(cdp, identities)
+
+
+def _fresh_entity_color_snapshot(cdp, base, identities):
+    """Return colors plus palette cardinality after probing a fresh registry."""
+    cdp.open_page(base + "/?from=2030-01-01T00:00&to=2030-01-02T00:00")
+    cdp.wait_for(BOOTED_JS)
+    return cdp.eval(
+        '(ids => { const colors = Object.fromEntries(ids.map(([type, id]) => ['
+        'type + ":" + (id === null ? "<null>" : id), '
+        'entityColor(type, id)])); '
+        'return {colors, unique: new Set(Object.values(colors)).size, '
+        'paletteSize: PALETTE.length}; })(' + json.dumps(identities) + ')')
+
+
+def test_fallback_colors_are_order_independent_across_fresh_pages(dashboard):
+    """FAN-1315: collision-6/9, anchors, typed spaces and sentinels do not
+    depend on which identity first touched a fresh browser registry."""
+    cdp, base = dashboard
+    identities = [
+        ["model", "claude-fable-5"],
+        ["model", "collision-6"],
+        ["model", "collision-9"],
+        ["model", "typed-shared"],
+        ["agent", "typed-shared"],
+        ["project", "typed-shared"],
+        ["agent", None],
+        ["project", ""],
+    ]
+    forward = _fresh_entity_colors(cdp, base, identities)
+    reverse = _fresh_entity_colors(cdp, base, list(reversed(identities)))
+
+    assert forward == reverse
+    assert forward["model:claude-fable-5"] == "#ef4444"
+    assert forward["model:collision-6"] != forward["model:collision-9"]
+    assert "#ef4444" not in {
+        forward["model:collision-6"], forward["model:collision-9"]}
+    assert forward["agent:<null>"] == "#cbd5e1"
+    assert forward["project:"] == "#cbd5e1"
+
+
+def test_fallback_mapping_is_deterministic_after_palette_exhaustion(dashboard):
+    """Once every non-anchor palette slot has been claimed, repeats remain
+    stable and the full mapping is still independent of encounter order."""
+    cdp, base = dashboard
+    stable_ids = ["collision-6", "collision-9"] + [
+        f"exhaustion-{index}" for index in range(14)]
+    identities = [["model", stable_id] for stable_id in stable_ids]
+    forward = _fresh_entity_color_snapshot(cdp, base, identities)
+    reverse = _fresh_entity_color_snapshot(cdp, base, list(reversed(identities)))
+
+    assert forward["colors"] == reverse["colors"]
+    assert forward["colors"]["model:collision-6"] != \
+        forward["colors"]["model:collision-9"]
+    # More identities than palette slots exercise the repeated-color path;
+    # the fixed palette bounds the number of distinct fallback colors.
+    assert len(stable_ids) > forward["paletteSize"]
+    assert forward["unique"] <= forward["paletteSize"]
+    assert forward["unique"] < len(stable_ids)
+
+
+def test_fallback_mapping_survives_filter_and_reload(dashboard):
+    """A filter change keeps cached identity colors, and a reload with the
+    filtered URL reconstructs the same mapping in a fresh registry."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?project=P1")
+    cdp.wait_for(BOOTED_JS)
+    identities = [["model", "collision-6"], ["model", "collision-9"]]
+    before = _probe_entity_colors(cdp, identities)
+
+    cdp.eval('''(() => {
+      const select = document.getElementById("filter-project");
+      for (const option of select.options) option.selected = option.value === "P2";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('state.projects.length === 1 && state.projects[0] === "P2"')
+    assert _probe_entity_colors(cdp, identities) == before
+    assert "project=P2" in cdp.eval("location.search")
+
+    cdp.eval("window.__pre_reload = true; location.reload()")
+    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    assert _probe_entity_colors(cdp, identities) == before
+
+
 def test_entity_colors_follow_typed_identity(dashboard):
     """FAN-1237: color is a function of typed stable identity, not array
     position. Probed directly in real Chrome against the shipped registry."""
