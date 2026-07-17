@@ -238,6 +238,20 @@ metadata задачи, а не по проекту).
 | `AISTAT_PRICING_OVERRIDES` | — | необязательный второй JSON, переопределяющий/дополняющий тарифы |
 | `AISTAT_CREDITS_PER_USD` | `1.0` | курс: сколько кредитов в 1 USD стоимости |
 | `AISTAT_PORT` | `8787` | порт дашборда/API (используется `run.sh`) |
+| `AISTAT_WORKER_SECRET` | — | третий независимый HMAC-секрет (≥32 байт) канала «подключение своего Мультика»; без него приём токенов выключен |
+| `AISTAT_DEFAULT_SERVER_URL` | — | сервер Multica по умолчанию для подключений без явного `server_url` |
+| `AISTAT_WORKER_SYNC_URL` | — | (worker) базовый URL публичного хоста для pull-канала |
+| `AISTAT_WORKER_KEY_PATH` | `~/.config/aistat/worker.key` | (worker) ключ шифрования токенов; хранится отдельно от хранилища |
+| `AISTAT_WORKER_STORE_PATH` | `./data/worker_connections.db` | (worker) зашифрованное хранилище токенов, права `0600` |
+| `AISTAT_WORKER_PULL_INTERVAL_SECONDS` | `300` | (worker) период pull-цикла `worker_sync --watch` (мин. 60) |
+
+## Подключение своего Мультика
+
+Пользователь вводит API-токен своего Multica в кабинете; хост держит его
+только до подтверждённого handoff доверенному локальному worker'у, который
+хранит токены зашифрованными. Протокол (HMAC pull-канал, lease/ack,
+replay-защита), state machine, деплой и residual risk описаны в
+[docs/secure-token-handoff.md](docs/secure-token-handoff.md).
 
 ## Как работает ингест
 

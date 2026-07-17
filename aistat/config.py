@@ -178,6 +178,42 @@ class Config:
     allow_insecure_publish: bool = field(
         default_factory=lambda: _env_bool("AISTAT_ALLOW_INSECURE_PUBLISH", False)
     )
+    # "Connect your Multica" secure token handoff. The host accepts a user
+    # token only while this independent worker-channel secret is configured;
+    # the same secret authenticates the trusted local worker's pull channel.
+    worker_secret: Optional[str] = field(
+        default_factory=lambda: os.environ.get("AISTAT_WORKER_SECRET") or None
+    )
+    # Server URL stored for a connection when the user does not name one
+    # (the owner's default Multica server).
+    default_server_url: Optional[str] = field(
+        default_factory=lambda: os.environ.get("AISTAT_DEFAULT_SERVER_URL")
+        or None
+    )
+    # Trusted local worker only: base URL of the public host whose worker
+    # endpoints this machine pulls (e.g. https://aistat.app).
+    worker_sync_url: Optional[str] = field(
+        default_factory=lambda: os.environ.get("AISTAT_WORKER_SYNC_URL") or None
+    )
+    worker_pull_interval_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "AISTAT_WORKER_PULL_INTERVAL_SECONDS", 300
+        )
+    )
+    # Encrypted worker token store and its key. The key must live outside the
+    # store's directory; neither ships in the cPanel package.
+    worker_store_path: Path = field(
+        default_factory=lambda: _env_path(
+            "AISTAT_WORKER_STORE_PATH",
+            PROJECT_ROOT / "data" / "worker_connections.db",
+        )
+    )
+    worker_key_path: Path = field(
+        default_factory=lambda: _env_path(
+            "AISTAT_WORKER_KEY_PATH",
+            Path.home() / ".config" / "aistat" / "worker.key",
+        )
+    )
 
     def ensure_db_dir(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

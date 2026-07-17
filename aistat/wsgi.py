@@ -12,6 +12,7 @@ same aggregate API and static dashboard as the local FastAPI app, while adding:
 
 import hmac
 import fcntl
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -35,7 +36,7 @@ from werkzeug.security import check_password_hash
 
 from markupsafe import escape
 
-from . import __version__, aggregates, oauth
+from . import __version__, aggregates, handoff, oauth
 from .config import Config
 from .db import connect_readonly, init_db
 from .health import snapshot
@@ -96,6 +97,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
         "ingest_snapshot",
         "oauth_start",
         "oauth_callback",
+        # Worker pull-channel routes authenticate every request with the
+        # independent worker HMAC secret instead of a browser session.
+        "worker_connection_pull",
+        "worker_connection_ack",
     }
 
     session_ttl_seconds = int(config.session_hours) * 3600
@@ -661,6 +666,124 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 "schema_version": info.schema_version,
             }
         )
+
+    def valid_request_csrf() -> bool:
+        candidate = request.headers.get("X-CSRF-Token") or request.form.get(
+            "csrf"
+        )
+        return validate_csrf(session, candidate)
+
+    @app.get("/api/connection")
+    def api_connection():
+        user_id = current_user_id()
+        if user_id is None:
+            return jsonify({"detail": "authentication required"}), 401
+        status = security_store.connection_status(user_id)
+        if status is None:
+            return jsonify({"status": "none"})
+        del status["token_epoch"]
+        return jsonify(status)
+
+    @app.post("/api/connection")
+    def api_connection_submit():
+        # The token would wait on the host forever without a configured
+        # worker channel, so intake fails closed instead of accepting it.
+        if not config.worker_secret:
+            return jsonify(
+                {"detail": "connection intake is not configured"}
+            ), 503
+        if not valid_request_csrf():
+            return jsonify({"detail": "invalid CSRF token"}), 400
+        user_id = current_user_id()
+        if user_id is None:
+            return jsonify({"detail": "authentication required"}), 401
+        retry_after = security_store.connection_retry_after(user_id)
+        if retry_after:
+            response = jsonify({"detail": "too many submissions"})
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
+        security_store.record_connection_submission(user_id)
+        try:
+            token = handoff.validate_connection_token(
+                request.form.get("token")
+            )
+            server_url = handoff.validate_server_url(
+                request.form.get("server_url"), config.default_server_url
+            )
+            workspace_label = handoff.validate_workspace_label(
+                request.form.get("workspace_label")
+            )
+        except ValueError as exc:
+            # Validator messages never contain the submitted values.
+            return jsonify({"detail": str(exc)}), 422
+        try:
+            status = security_store.submit_connection(
+                user_id, server_url, workspace_label, token
+            )
+        except ValueError:
+            return jsonify({"detail": "unknown user"}), 400
+        del status["token_epoch"]
+        return jsonify(status)
+
+    @app.post("/api/connection/revoke")
+    def api_connection_revoke():
+        if not valid_request_csrf():
+            return jsonify({"detail": "invalid CSRF token"}), 400
+        user_id = current_user_id()
+        if user_id is None:
+            return jsonify({"detail": "authentication required"}), 401
+        if not security_store.revoke_connection(user_id):
+            return jsonify({"detail": "no connection"}), 404
+        return jsonify({"status": "revoked"})
+
+    class ReplayedWorkerNonce(Exception):
+        pass
+
+    def verified_worker_body(path: str):
+        payload = request.get_data(cache=False, as_text=False)
+        _, nonce = handoff.verify_worker_request(
+            config.worker_secret,
+            path,
+            request.headers.get("X-AIStat-Timestamp"),
+            request.headers.get("X-AIStat-Nonce"),
+            request.headers.get("X-AIStat-Signature"),
+            payload,
+            config.ingest_max_age_seconds,
+        )
+        if not security_store.consume_worker_nonce(
+            nonce, config.ingest_max_age_seconds
+        ):
+            raise ReplayedWorkerNonce()
+        return payload
+
+    @app.post(handoff.WORKER_PULL_PATH)
+    def worker_connection_pull():
+        if not config.worker_secret:
+            return jsonify({"detail": "not found"}), 404
+        try:
+            verified_worker_body(handoff.WORKER_PULL_PATH)
+        except ValueError:
+            return jsonify({"detail": "worker authentication failed"}), 401
+        except ReplayedWorkerNonce:
+            return jsonify({"detail": "worker replay rejected"}), 409
+        return jsonify(security_store.lease_pending_connections())
+
+    @app.post(handoff.WORKER_ACK_PATH)
+    def worker_connection_ack():
+        if not config.worker_secret:
+            return jsonify({"detail": "not found"}), 404
+        try:
+            payload = verified_worker_body(handoff.WORKER_ACK_PATH)
+        except ValueError:
+            return jsonify({"detail": "worker authentication failed"}), 401
+        except ReplayedWorkerNonce:
+            return jsonify({"detail": "worker replay rejected"}), 409
+        try:
+            body = json.loads(payload.decode("utf-8"))
+            results = security_store.apply_worker_acks(body.get("acks"))
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            return jsonify({"detail": "invalid request body"}), 400
+        return jsonify({"results": results})
 
     @app.get("/")
     def dashboard():

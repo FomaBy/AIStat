@@ -163,6 +163,7 @@ def test_source_parses_as_python_36():
     # shared core must parse as 3.6 too.
     for path in (
         "aistat/aggregates.py",
+        "aistat/handoff.py",
         "aistat/legacy_wsgi.py",
         "aistat/migrate.py",
         "aistat/oauth.py",
