@@ -11,6 +11,11 @@ const PALETTE = [
   "#0ea5e9", "#a855f7", "#22c55e", "#eab308", "#94a3b8",
 ];
 
+// Every value the period/group selects can hold; URL parameters outside these
+// sets are user input errors and must be dropped, not applied (FAN-1255).
+const PERIOD_VALUES = new Set(["7", "14", "30", "90", "", "custom"]);
+const GROUP_VALUES = new Set(["model", "agent", "project"]);
+
 const state = {
   projects: [],
   agents: [],
@@ -95,6 +100,20 @@ function periodRange() {
 function utcDateTime(value) {
   if (!value) return null;
   return value.length === 16 ? value + ":00Z" : value + "Z";
+}
+
+// A datetime-local value the API accepts: full date plus minutes (optionally
+// seconds) that names a real UTC instant — Date.parse returns NaN for ISO
+// strings with rolled-over parts like 2026-02-30.
+function isValidDateTimeLocal(value) {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(value) &&
+    !Number.isNaN(Date.parse(utcDateTime(value)));
+}
+
+// The API rejects from >= to, so an unordered pair must never become active
+// state; one-sided (half-open) ranges stay allowed.
+function rangeIsOrdered(from, to) {
+  return !from || !to || Date.parse(utcDateTime(from)) < Date.parse(utcDateTime(to));
 }
 
 function query(params) {
@@ -637,16 +656,56 @@ function syncFiltersToUrl() {
   history.replaceState(null, "", qs ? "?" + qs : location.pathname);
 }
 
+function showFilterError(message) {
+  const note = $("filter-error");
+  note.textContent = message;
+  note.hidden = false;
+}
+
+function clearFilterError() {
+  $("filter-error").hidden = true;
+  $("filter-error").textContent = "";
+}
+
+// URL state is user input: a hand-edited or truncated link must not strand
+// the dashboard on a 422 with every card at "—" (FAN-1255). Runs after
+// /api/meta filled the selects and before the first full load: invalid
+// parts are dropped, the URL is rewritten to the surviving state and a
+// visible note says what was reset.
 function readFiltersFromUrl() {
   const q = new URLSearchParams(location.search);
-  state.projects = q.getAll("project");
-  state.agents = q.getAll("agent");
-  state.models = q.getAll("model");
-  if (q.has("days")) state.days = q.get("days") === "all" ? "" : q.get("days");
-  state.from = q.get("from") || "";
-  state.to = q.get("to") || "";
+  const dropped = [];
+  const keepKnown = (param, selectId) => {
+    const values = q.getAll(param);
+    const known = new Set([...$(selectId).options].map((o) => o.value));
+    const kept = values.filter((v) => v && known.has(v));
+    if (kept.length !== values.length) dropped.push(param);
+    return kept;
+  };
+  state.projects = keepKnown("project", "filter-project");
+  state.agents = keepKnown("agent", "filter-agent");
+  state.models = keepKnown("model", "filter-model");
+  if (q.has("days")) {
+    const days = q.get("days") === "all" ? "" : q.get("days");
+    if (PERIOD_VALUES.has(days)) state.days = days;
+    else dropped.push("days");
+  }
+  const from = q.get("from") || "";
+  const to = q.get("to") || "";
+  state.from = isValidDateTimeLocal(from) ? from : "";
+  if (from && !state.from) dropped.push("from");
+  state.to = isValidDateTimeLocal(to) ? to : "";
+  if (to && !state.to) dropped.push("to");
+  if (!rangeIsOrdered(state.from, state.to)) {
+    state.from = "";
+    state.to = "";
+    dropped.push("диапазон from/to («С» должно быть раньше «По»)");
+  }
   if (state.from || state.to) state.days = "custom";
-  if (q.has("group")) state.group = q.get("group");
+  if (q.has("group")) {
+    if (GROUP_VALUES.has(q.get("group"))) state.group = q.get("group");
+    else dropped.push("group");
+  }
   setSelectedValues("filter-project", state.projects);
   setSelectedValues("filter-agent", state.agents);
   setSelectedValues("filter-model", state.models);
@@ -654,6 +713,35 @@ function readFiltersFromUrl() {
   $("filter-group").value = state.group;
   $("filter-from").value = state.from;
   $("filter-to").value = state.to;
+  if (dropped.length) {
+    syncFiltersToUrl();
+    showFilterError("Некорректные параметры фильтров в ссылке сброшены: " +
+      dropped.join(", ") + ". Показаны данные по оставшимся фильтрам.");
+  } else {
+    clearFilterError();
+  }
+}
+
+// One unambiguous way back to the canonical dashboard: every filter returns
+// to its default and the URL to bare "/".
+function resetFilters() {
+  state.projects = [];
+  state.agents = [];
+  state.models = [];
+  state.days = "30";
+  state.from = "";
+  state.to = "";
+  state.group = "model";
+  setSelectedValues("filter-project", []);
+  setSelectedValues("filter-agent", []);
+  setSelectedValues("filter-model", []);
+  $("filter-period").value = state.days;
+  $("filter-from").value = "";
+  $("filter-to").value = "";
+  $("filter-group").value = state.group;
+  clearFilterError();
+  syncFiltersToUrl();
+  refreshAll().catch(console.error);
 }
 
 async function boot() {
@@ -682,14 +770,24 @@ async function boot() {
       state.to = "";
       $("filter-from").value = "";
       $("filter-to").value = "";
+      clearFilterError();
     }
     syncFiltersToUrl();
     refreshAll().catch(console.error);
   });
   for (const id of ["filter-from", "filter-to"]) {
     $(id).addEventListener("change", () => {
-      state.from = $("filter-from").value;
-      state.to = $("filter-to").value;
+      const from = $("filter-from").value;
+      const to = $("filter-to").value;
+      if (!rangeIsOrdered(from, to)) {
+        // A reverse/equal range never becomes active state: data, URL and a
+        // future reload keep the last valid filters (FAN-1255).
+        showFilterError("«С (UTC)» должно быть раньше «По (UTC)»; диапазон не применён.");
+        return;
+      }
+      clearFilterError();
+      state.from = from;
+      state.to = to;
       state.days = "custom";
       $("filter-period").value = "custom";
       syncFiltersToUrl();
@@ -701,6 +799,7 @@ async function boot() {
     syncFiltersToUrl();
     refreshAll().catch(console.error);
   });
+  $("filter-reset").addEventListener("click", resetFilters);
   await refreshAll();
   connectEvents();
   watchWindowFocus();

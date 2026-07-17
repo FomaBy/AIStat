@@ -365,6 +365,42 @@ def test_dashboard_breakdown_renderer_handles_empty_and_partial_data():
     assert "Нет данных" in table  # an empty selection is spelled out
 
 
+def test_dashboard_validates_url_filter_state():
+    """Static contract (FAN-1255): readFiltersFromUrl runs after /api/meta
+    populated the selects and must validate every URL parameter — unknown
+    dimension IDs, non-option days/group values and malformed or unordered
+    from/to are dropped, the URL is rewritten to the surviving state and a
+    visible note says what was reset. The behavioural counterpart lives in
+    tests/test_dashboard_browser.py."""
+    app_js = (Path(server_module.__file__).parent / "static" / "app.js"
+              ).read_text(encoding="utf-8")
+    read = _js_function(app_js, "readFiltersFromUrl")
+    for guard in ("PERIOD_VALUES", "GROUP_VALUES", "isValidDateTimeLocal",
+                  "rangeIsOrdered", "syncFiltersToUrl", "showFilterError"):
+        assert guard in read, guard
+    # The interactive range inputs share the ordering guard, so a reverse
+    # range typed by hand never reaches state or the URL either.
+    boot = _js_function(app_js, "boot")
+    assert "rangeIsOrdered" in boot
+    assert "showFilterError" in boot
+
+
+def test_dashboard_has_filter_reset_and_error_note():
+    """Static contract (FAN-1255): the filter bar offers one unambiguous
+    reset to canonical / and a dedicated, initially hidden error note that
+    stays hidden while its hidden attribute is set."""
+    static = Path(server_module.__file__).parent / "static"
+    index_html = (static / "index.html").read_text(encoding="utf-8")
+    assert 'id="filter-reset"' in index_html
+    assert re.search(r'<span id="filter-error"[^>]*hidden', index_html)
+    style_css = (static / "style.css").read_text(encoding="utf-8")
+    assert ".filter-error[hidden]" in style_css
+    app_js = (static / "app.js").read_text(encoding="utf-8")
+    reset = _js_function(app_js, "resetFilters")
+    for step in ("syncFiltersToUrl", "clearFilterError", "refreshAll"):
+        assert step in reset, step
+
+
 # The SSE generator is tested directly: Starlette's TestClient buffers whole
 # responses, so an endless /api/events stream cannot be consumed through it.
 # The live HTTP path is covered by stage-3 manual verification (curl).

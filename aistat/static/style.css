@@ -73,7 +73,20 @@ body {
   padding: 6px 10px;
 }
 .filters select[multiple] { min-width: 150px; }
+.filter-reset {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: var(--panel);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.filter-reset:hover { color: var(--ink); border-color: #cbd3e3; }
 .note { color: var(--muted); font-size: 12px; }
+.filter-error { color: var(--bad); }
+.filter-error[hidden] { display: none; }
 
 .cards {
   display: grid;
