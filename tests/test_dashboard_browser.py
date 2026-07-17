@@ -410,6 +410,80 @@ def test_valid_empty_range_shows_zeros_not_failure(dashboard):
     assert tokens.rstrip().endswith("0")
 
 
+def _chart_colors(cdp, canvas_id):
+    """label -> backgroundColor for a bar chart's datasets, read live from the
+    rendered Chart.js instance."""
+    return cdp.eval(
+        '(() => { const c = state.charts["%s"]; const o = {};'
+        ' c.data.datasets.forEach((d) => { o[d.label] = d.backgroundColor; });'
+        ' return o; })()' % canvas_id)
+
+
+def test_entity_colors_follow_typed_identity(dashboard):
+    """FAN-1237: color is a function of typed stable identity, not array
+    position. Probed directly in real Chrome against the shipped registry."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    # Fable is anchored red in the model identity space, whatever the data order.
+    assert cdp.eval('entityColor("model", "claude-fable-5")') == "#ef4444"
+    # That red is reserved: no other model may be assigned it, and distinct
+    # models get distinct colors (deterministic collision control).
+    others = cdp.eval(
+        '["claude-opus-4-8","gpt-5.6-sol","gpt-5.6-terra","m-claude","m-shared"]'
+        '.map((m) => entityColor("model", m))')
+    assert "#ef4444" not in others
+    assert len(set(others)) == len(others)
+    # A stable id keeps its color no matter when it is asked or what is assigned
+    # around it — position/order never enters into it.
+    stable = cdp.eval(
+        '(() => { const a = entityColor("model", "probe-x");'
+        ' entityColor("model", "probe-y"); entityColor("model", "probe-z");'
+        ' return a === entityColor("model", "probe-x"); })()')
+    assert stable is True
+    # Unknown / unattributed identity gets the explicit sentinel, never a
+    # palette slot.
+    assert cdp.eval('entityColor("agent", null)') == "#cbd5e1"
+    assert cdp.eval('entityColor("project", "")') == "#cbd5e1"
+
+
+def test_daily_model_colors_match_across_metric_charts(dashboard):
+    """The exact reported bug (Fable red in the tokens chart, green in the cost
+    chart): a model must be one color on both daily charts, and that color must
+    be the identity registry's — not derived from its position in each chart's
+    own metric sort."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    tokens = _chart_colors(cdp, "chart-daily-tokens")
+    cost = _chart_colors(cdp, "chart-daily-cost")
+    assert tokens and set(tokens) == set(cost)
+    for model, color in tokens.items():
+        assert cost[model] == color
+        assert cdp.eval('entityColor("model", %s)' % json.dumps(model)) == color
+
+
+def test_model_colors_survive_group_switch(dashboard):
+    """Switching the daily grouping to agent and back to model leaves every
+    model's color untouched — the registry caches by identity, not position."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    before = _chart_colors(cdp, "chart-daily-tokens")
+    assert "m-shared" in before
+    change_group = '''((v) => {
+      const s = document.getElementById("filter-group");
+      s.value = v; s.dispatchEvent(new Event("change"));
+    })'''
+    cdp.eval(f'{change_group}("agent")')
+    cdp.wait_for('state.group === "agent" && state.charts["chart-daily-tokens"]'
+                 '.data.datasets.some((d) => d.label === "Solo Claude")')
+    cdp.eval(f'{change_group}("model")')
+    cdp.wait_for('state.group === "model" && state.charts["chart-daily-tokens"]'
+                 '.data.datasets.some((d) => d.label === "m-shared")')
+    assert _chart_colors(cdp, "chart-daily-tokens") == before
+
+
 def test_clear_button_returns_to_canonical_dashboard(dashboard):
     """One unambiguous reset: every filter back to its default, the URL back
     to bare /, data reloaded for the default period."""

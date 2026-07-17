@@ -11,6 +11,78 @@ const PALETTE = [
   "#0ea5e9", "#a855f7", "#22c55e", "#eab308", "#94a3b8",
 ];
 
+// Colors are assigned by typed entity identity (entity_type + stable id), never
+// by an element's position in the current array, so one entity keeps its color
+// across every chart, metric, legend, series and tooltip — and across reorder,
+// live refresh and model/agent/project switches (FAN-1237). model, agent and
+// project are separate identity spaces: the same label in two dimensions is not
+// the same entity unless explicitly anchored.
+//
+// A missing/unknown identity (unattributed agent, model-less run) gets one
+// explicit sentinel color instead of borrowing a palette slot.
+const UNATTRIBUTED_COLOR = "#cbd5e1";
+
+// Fixed, human-assigned colors that must never drift with the data. Fable is
+// red in every model view regardless of ordering (FAN-1237 acceptance).
+const ENTITY_ANCHORS = {
+  model: { "claude-fable-5": "#ef4444" },
+};
+
+// A single-series chart (efficiency over time) plots one metric, not an entity,
+// so it uses a stable brand color rather than the identity registry.
+const SINGLE_SERIES_COLOR = "#4f6df5";
+
+// typed key ("type\0id") -> color, assigned once and cached for the session.
+// Anchor colors are reserved up front so a fallback entity never steals them;
+// a fallback hashes its typed key to a palette slot and probes forward to the
+// first color not yet used in that identity space (deterministic collision
+// control). Caching by id — never by position — keeps a color fixed across
+// reorder, live refresh and group switches.
+const colorRegistry = { byKey: new Map(), usedByType: new Map() };
+for (const [type, anchors] of Object.entries(ENTITY_ANCHORS)) {
+  colorRegistry.usedByType.set(type, new Set(Object.values(anchors)));
+}
+
+// FNV-1a over the typed key: a stable, well-spread starting index into the
+// palette that depends only on the entity's identity.
+function hashKey(key) {
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function entityColor(type, id) {
+  if (id == null || id === "") return UNATTRIBUTED_COLOR;
+  const key = type + "\u0000" + id;
+  const cached = colorRegistry.byKey.get(key);
+  if (cached) return cached;
+  let used = colorRegistry.usedByType.get(type);
+  if (!used) {
+    used = new Set();
+    colorRegistry.usedByType.set(type, used);
+  }
+  const anchors = ENTITY_ANCHORS[type];
+  let color = anchors && Object.prototype.hasOwnProperty.call(anchors, id)
+    ? anchors[id] : null;
+  if (!color) {
+    const start = hashKey(key) % PALETTE.length;
+    color = PALETTE[start];
+    for (let i = 0; i < PALETTE.length; i++) {
+      const candidate = PALETTE[(start + i) % PALETTE.length];
+      if (!used.has(candidate)) {
+        color = candidate;
+        break;
+      }
+    }
+  }
+  colorRegistry.byKey.set(key, color);
+  used.add(color);
+  return color;
+}
+
 // Every value the period/group selects can hold; URL parameters outside these
 // sets are user input errors and must be dropped, not applied (FAN-1255).
 const PERIOD_VALUES = new Set(["7", "14", "30", "90", "", "custom"]);
@@ -139,10 +211,6 @@ function query(params) {
 
 // ---------- charts ----------
 
-function colorFor(index) {
-  return PALETTE[index % PALETTE.length];
-}
-
 function upsertChart(id, config) {
   const existing = state.charts[id];
   if (existing) {
@@ -156,19 +224,27 @@ function upsertChart(id, config) {
   return chart;
 }
 
-function stackedDailyConfig(rows, valueOf, valueFmt) {
+function stackedDailyConfig(rows, valueOf, valueFmt, group) {
   const dates = [...new Set(rows.map((r) => r.date))].sort();
-  const keyTotals = new Map();
-  for (const r of rows) keyTotals.set(r.key, (keyTotals.get(r.key) || 0) + (valueOf(r) || 0));
-  const keys = [...keyTotals.keys()].sort((a, b) => keyTotals.get(b) - keyTotals.get(a));
-  const byDateKey = new Map(rows.map((r) => [r.date + "\u0000" + r.key, r]));
-  const datasets = keys.map((key, i) => ({
-    label: key,
+  // Series are grouped by stable typed identity (r.id), not by display label:
+  // two entities that share a label stay distinct, and each keeps its registry
+  // color no matter how this metric happens to order them (FAN-1237). Sorting
+  // by total still controls stack/legend order; it no longer drives color.
+  const idTotals = new Map();
+  const idLabel = new Map();
+  for (const r of rows) {
+    idTotals.set(r.id, (idTotals.get(r.id) || 0) + (valueOf(r) || 0));
+    if (!idLabel.has(r.id)) idLabel.set(r.id, r.key);
+  }
+  const ids = [...idTotals.keys()].sort((a, b) => idTotals.get(b) - idTotals.get(a));
+  const byDateId = new Map(rows.map((r) => [r.date + "\u0000" + r.id, r]));
+  const datasets = ids.map((id) => ({
+    label: idLabel.get(id),
     data: dates.map((d) => {
-      const r = byDateKey.get(d + "\u0000" + key);
+      const r = byDateId.get(d + "\u0000" + id);
       return r ? valueOf(r) || 0 : 0;
     }),
-    backgroundColor: colorFor(i),
+    backgroundColor: entityColor(group, id),
     borderWidth: 0,
     maxBarThickness: 64,
   }));
@@ -200,8 +276,9 @@ function renderDaily(daily) {
   const rows = daily.rows;
   $("daily-est").hidden = !daily.estimated;
   $("cost-est").hidden = !daily.estimated;
-  upsertChart("chart-daily-tokens", stackedDailyConfig(rows, (r) => r.total_tokens, fmtTokens));
-  upsertChart("chart-daily-cost", stackedDailyConfig(rows, (r) => r.cost_usd, fmtUSD));
+  const group = daily.group;
+  upsertChart("chart-daily-tokens", stackedDailyConfig(rows, (r) => r.total_tokens, fmtTokens, group));
+  upsertChart("chart-daily-cost", stackedDailyConfig(rows, (r) => r.cost_usd, fmtUSD, group));
 }
 
 function renderAgentsChart(agents) {
@@ -212,7 +289,7 @@ function renderAgentsChart(agents) {
       labels,
       datasets: [{
         data: agents.map((a) => a.total_tokens),
-        backgroundColor: agents.map((_, i) => colorFor(i)),
+        backgroundColor: agents.map((a) => entityColor("agent", a.agent_id)),
         borderWidth: 2,
         borderColor: "#ffffff",
       }],
@@ -251,7 +328,7 @@ function renderProjects(projects) {
       labels: projects.map((p) => p.title),
       datasets: [{
         data: projects.map((p) => p.total_tokens),
-        backgroundColor: projects.map((_, i) => colorFor(i)),
+        backgroundColor: projects.map((p) => entityColor("project", p.project_id)),
         borderWidth: 0,
         maxBarThickness: 42,
       }],
@@ -330,14 +407,14 @@ function renderModelEfficiency(data) {
   }
 }
 
-function efficiencyBarConfig(rows) {
+function efficiencyBarConfig(rows, type) {
   return {
     type: "bar",
     data: {
       labels: rows.map((r) => r.label),
       datasets: [{
         data: rows.map((r) => r.tokens_per_sp),
-        backgroundColor: rows.map((_, i) => colorFor(i)),
+        backgroundColor: rows.map((r) => entityColor(type, r.key)),
         borderWidth: 0,
         maxBarThickness: 36,
       }],
@@ -394,8 +471,8 @@ function renderEfficiencyBreakdown(data) {
   renderBreakdownTable("table-efficiency-agents-data", agents);
   renderBreakdownTable("table-efficiency-models-data", models);
   renderBreakdownTable("table-efficiency-time-data", rows);
-  upsertChart("chart-efficiency-agents", efficiencyBarConfig(agents));
-  upsertChart("chart-efficiency-models", efficiencyBarConfig(models));
+  upsertChart("chart-efficiency-agents", efficiencyBarConfig(agents, "agent"));
+  upsertChart("chart-efficiency-models", efficiencyBarConfig(models, "model"));
   upsertChart("chart-efficiency-time", {
     type: "line",
     data: {
@@ -405,8 +482,8 @@ function renderEfficiencyBreakdown(data) {
         // A bucket without attributable SP stays null so the line breaks at
         // the gap (spanGaps: false) instead of inventing a zero.
         data: rows.map((r) => (r.tokens_per_sp == null ? null : r.tokens_per_sp)),
-        borderColor: colorFor(0),
-        backgroundColor: colorFor(0),
+        borderColor: SINGLE_SERIES_COLOR,
+        backgroundColor: SINGLE_SERIES_COLOR,
         pointRadius: 3,
         pointHoverRadius: 5,
         tension: 0.2,

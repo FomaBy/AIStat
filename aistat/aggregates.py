@@ -537,6 +537,10 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
             d["has_unpriced"] = unpriced
             d["estimated"] = filters["time_estimated"]
             d["total_tokens"] = _total(d)
+            # For a model series the stable identity is the model name itself;
+            # ``key`` doubles as the display label. ``id`` is emitted uniformly
+            # so the frontend colors every series by typed identity (FAN-1237).
+            d["id"] = d["key"]
             series.append(d)
         return {
             "group": group, "estimated": filters["time_estimated"], "rows": series,
@@ -564,6 +568,10 @@ def daily_series(conn: sqlite3.Connection, group: str = "model",
     for g in sorted(grouped, key=lambda g: (g["_key"][0], g["_key"][1] or "")):
         date, key = g.pop("_key")
         g["date"] = date
+        # Stable typed identity (model name / agent_id / project_id, None for
+        # the unattributed bucket) kept separate from the display label so the
+        # frontend colors series by identity, not by resolved name (FAN-1237).
+        g["id"] = key
         g["key"] = _label(group, key, names)
         if proj_estimated:
             g["estimated"] = True

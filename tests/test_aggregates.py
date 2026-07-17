@@ -139,6 +139,26 @@ def test_daily_by_project_attributes_by_runs(agg_conn):
     assert day1["Beta"]["total_tokens"] == 600_000
 
 
+def test_daily_rows_carry_stable_typed_id(agg_conn):
+    # FAN-1237: every daily row exposes a stable identity ``id`` separate from
+    # the display ``key``, so the frontend can color a series by typed identity
+    # instead of its position. For models identity == label; for agents and
+    # projects it is the stable id, and the unattributed bucket is id=None.
+    models = ag.daily_series(agg_conn, group="model")["rows"]
+    assert all(r["id"] == r["key"] for r in models)
+    assert {r["id"] for r in models} == {"m-claude", "m-shared", "m-mystery"}
+
+    agents = ag.daily_series(agg_conn, group="agent")["rows"]
+    by_id = {r["id"]: r for r in agents}
+    assert by_id["A1"]["key"] == "Solo Claude"   # stable id kept apart from name
+    assert None in by_id                          # unattributed bucket
+    assert by_id[None]["key"] == "(не атрибутировано)"
+
+    projects = ag.daily_series(agg_conn, group="project")["rows"]
+    labels = {r["id"]: r["key"] for r in projects}
+    assert labels["P1"] == "Alpha" and labels["P2"] == "Beta"
+
+
 def test_daily_project_filter(agg_conn):
     result = ag.daily_series(agg_conn, group="model", project_id="P2")
     assert result["estimated"] is True
