@@ -426,7 +426,11 @@ def create_app(config: Optional[Config] = None) -> Flask:
         )
         session.permanent = True
         csrf_token(session)
-        if not oauth.is_email_authorized(
+        owner_linked = (
+            owner_user_id is not None
+            and int(result["user_id"]) == owner_user_id
+        )
+        if not owner_linked and not oauth.is_email_authorized(
             config.oauth_allowed_emails, result["email"]
         ):
             return oauth_pending(result["email"])

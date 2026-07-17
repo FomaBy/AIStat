@@ -735,6 +735,33 @@ def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
     assert {p["id"] for p in response.get_json()["projects"]} == {"P1", "P2"}
 
 
+def test_oauth_callback_owner_with_empty_allowlist_grants_access(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    install_fake_http(
+        monkeypatch,
+        {
+            "sub": "g-empty-allowlist",
+            "email": "allowed@example.com",
+            "email_verified": True,
+        },
+    )
+    client = app.test_client()
+    start = client.get(
+        "/auth/google/start?next=/api/meta", base_url="https://localhost"
+    )
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 303
+    assert callback.headers["Location"] == "/api/meta"
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 200
+
+
 @pytest.mark.parametrize(
     ("next_url", "expected_location"),
     [
