@@ -3,11 +3,49 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from aistat.security import (
     OAUTH_STATE_TTL_SECONDS,
+    SecurityConfigError,
     SecurityStore,
     session_id_hash,
 )
+
+
+def test_link_identity_to_owner_is_idempotent(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    owner = store.ensure_owner_user("sergey", email="owner@example.com", now=10)
+    first = store.link_identity_to_owner(
+        "google", "sub-1", owner, email="owner@example.com", now=100
+    )
+    again = store.link_identity_to_owner(
+        "google", "sub-1", owner, email="owner@example.com", now=200
+    )
+    assert first == owner == again
+    # no extra user was created — only the owner exists
+    conn = store._connect()
+    try:
+        count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    finally:
+        conn.close()
+    assert count == 1
+
+
+def test_link_identity_to_owner_rejects_subject_owned_elsewhere(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    owner = store.ensure_owner_user("sergey", email="owner@example.com", now=10)
+    other = store.find_or_create_user_by_identity("google", "sub-2", now=20)
+    assert other != owner
+    with pytest.raises(SecurityConfigError):
+        store.link_identity_to_owner("google", "sub-2", owner, now=100)
+
+
+def test_link_identity_to_owner_requires_admin_owner(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    non_admin = store.find_or_create_user_by_identity("google", "sub-3", now=20)
+    with pytest.raises(SecurityConfigError):
+        store.link_identity_to_owner("google", "sub-4", non_admin, now=100)
 
 
 def test_find_or_create_user_is_idempotent_per_identity(tmp_path):

@@ -110,12 +110,19 @@ def create_app(config: Optional[Config] = None) -> Flask:
         return security_store.session_is_active(session.get("sid"))
 
     def oauth_session_authorized() -> bool:
-        """True when the current session is an allow-listed OAuth login.
+        """True when the current session is an authorised OAuth login.
 
-        Re-checked on every request so removing an email from the allow-list
-        revokes access immediately. Fail-closed: no allow-list => no access.
+        The owner's own OAuth login (linked to the admin user id) always counts.
+        Any other identity is re-checked against the allow-list on every request
+        so removing an email revokes access immediately. Fail-closed: no
+        allow-list and not the owner => no access.
         """
-        return bool(session.get("user_id")) and oauth.is_email_authorized(
+        uid = session.get("user_id")
+        if not uid:
+            return False
+        if owner_user_id is not None and uid == owner_user_id:
+            return True
+        return oauth.is_email_authorized(
             config.oauth_allowed_emails, session.get("email")
         )
 
@@ -250,11 +257,18 @@ def create_app(config: Optional[Config] = None) -> Flask:
             conn.close()
 
     def render_login(error=None, status=200):
+        next_url = safe_next_url(request.values.get("next"))
+        google_login_url = None
+        if "google" in config.oauth_providers:
+            google_login_url = "/auth/google/start?next=" + quote(
+                next_url, safe=""
+            )
         response = render_template(
             "login.html",
             csrf=csrf_token(session),
             error=error,
-            next_url=safe_next_url(request.values.get("next")),
+            next_url=next_url,
+            google_login_url=google_login_url,
         )
         return response, status
 
@@ -375,9 +389,27 @@ def create_app(config: Optional[Config] = None) -> Flask:
         if provider_config is None:
             abort(404)
         client_token = request.cookies.get(OAUTH_CLIENT_COOKIE)
+
+        def resolve_identity(subject, email, email_verified, display_name):
+            return oauth.owner_only_identity(
+                security_store,
+                provider,
+                subject,
+                email,
+                email_verified,
+                display_name,
+                allowed_emails=config.oauth_allowed_emails,
+                admin_email=config.admin_email,
+                owner_user_id=owner_user_id,
+            )
+
         try:
             result = oauth.finish(
-                security_store, provider_config, request.args, client_token
+                security_store,
+                provider_config,
+                request.args,
+                client_token,
+                resolve_identity,
             )
         except oauth.OAuthError:
             body, status = render_login(

@@ -47,6 +47,7 @@ class FakeStore:
     def __init__(self):
         self.states = {}
         self.identities = {}
+        self.owner_links = {}
         self._next_id = 0
 
     def put_oauth_state(
@@ -69,6 +70,18 @@ class FakeStore:
             self._next_id += 1
             self.identities[key] = self._next_id
         return self.identities[key]
+
+    def link_identity_to_owner(
+        self, provider, subject, owner_user_id, email=None, now=None
+    ):
+        key = (provider, subject)
+        linked = self.owner_links.get(key)
+        if linked is not None:
+            if linked != owner_user_id:
+                raise ValueError("identity linked to a non-owner user")
+            return linked
+        self.owner_links[key] = int(owner_user_id)
+        return int(owner_user_id)
 
 
 def fake_http(monkeypatch, token=None, identity=None, captured=None):
@@ -142,21 +155,43 @@ def test_fetch_identity_google_shape(monkeypatch):
     captured = []
     fake_http(
         monkeypatch,
-        identity={"sub": "123", "email": "a@example.com", "name": "Alice"},
+        identity={
+            "sub": "123",
+            "email": "a@example.com",
+            "email_verified": True,
+            "name": "Alice",
+        },
         captured=captured,
     )
-    subject, email, display_name = oauth.fetch_identity(PROVIDER, "tok")
-    assert (subject, email, display_name) == ("123", "a@example.com", "Alice")
+    identity = oauth.fetch_identity(PROVIDER, "tok")
+    assert identity == ("123", "a@example.com", True, "Alice")
     assert captured[0].get_header("Authorization") == "Bearer tok"
 
 
 def test_fetch_identity_accepts_alternate_field_names(monkeypatch):
-    # e.g. a Yandex-shaped userinfo body — same core, no code change
+    # e.g. a Yandex-shaped userinfo body — same core, no code change. The
+    # verified flag also accepts the string form some providers send.
     fake_http(
         monkeypatch,
-        identity={"id": "9", "default_email": "c@d.example", "real_name": "C"},
+        identity={
+            "id": "9",
+            "default_email": "c@d.example",
+            "verified_email": "true",
+            "real_name": "C",
+        },
     )
-    assert oauth.fetch_identity(PROVIDER, "tok") == ("9", "c@d.example", "C")
+    assert oauth.fetch_identity(PROVIDER, "tok") == ("9", "c@d.example", True, "C")
+
+
+def test_fetch_identity_unverified_email_is_fail_closed(monkeypatch):
+    # absent verified flag -> False; an explicit false stays false
+    fake_http(monkeypatch, identity={"sub": "1", "email": "u@e.com"})
+    assert oauth.fetch_identity(PROVIDER, "tok") == ("1", "u@e.com", False, None)
+    fake_http(
+        monkeypatch,
+        identity={"sub": "1", "email": "u@e.com", "email_verified": False},
+    )
+    assert oauth.fetch_identity(PROVIDER, "tok")[2] is False
 
 
 def test_fetch_identity_requires_subject(monkeypatch):
@@ -365,3 +400,82 @@ def test_is_email_authorized_is_fail_closed():
     assert oauth.is_email_authorized(frozenset({"a@b.c"}), None) is False
     assert oauth.is_email_authorized(frozenset({"a@b.c"}), "A@B.C") is True
     assert oauth.allowed_emails_from_env({}) == frozenset()
+
+
+def test_build_authorize_url_requires_https_redirect():
+    # the callback must be HTTPS: a plaintext redirect_uri would leak the code
+    insecure = oauth.OAuthProvider(
+        "p", PROVIDER.authorize_url, PROVIDER.token_url, PROVIDER.userinfo_url,
+        ("email",), "c", "s", "http://app/cb"
+    )
+    with pytest.raises(oauth.OAuthError):
+        oauth.build_authorize_url(insecure, "state")
+
+
+OWNER_ALLOWED = frozenset({"owner@example.com"})
+
+
+def test_owner_only_identity_links_verified_owner():
+    store = FakeStore()
+    uid = oauth.owner_only_identity(
+        store, "google", "sub-1", "Owner@Example.com", True, "Owner",
+        allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
+        owner_user_id=7,
+    )
+    assert uid == 7
+    assert store.owner_links == {("google", "sub-1"): 7}
+    # a second sign-in with the same identity maps back to the owner
+    again = oauth.owner_only_identity(
+        store, "google", "sub-1", "owner@example.com", True, "Owner",
+        allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
+        owner_user_id=7,
+    )
+    assert again == 7
+
+
+def test_owner_only_identity_allows_empty_allowlist_for_owner():
+    # the admin email is the gate; an unset allow-list still admits the owner
+    store = FakeStore()
+    uid = oauth.owner_only_identity(
+        store, "google", "s", "owner@example.com", True, None,
+        allowed_emails=frozenset(), admin_email="owner@example.com",
+        owner_user_id=3,
+    )
+    assert uid == 3
+
+
+@pytest.mark.parametrize(
+    ("email", "email_verified", "admin_email", "allowed", "owner_user_id"),
+    [
+        ("owner@example.com", False, "owner@example.com", OWNER_ALLOWED, 7),   # unverified
+        (None, True, "owner@example.com", OWNER_ALLOWED, 7),                   # no email
+        ("stranger@example.com", True, "owner@example.com", OWNER_ALLOWED, 7), # not owner
+        ("owner@example.com", True, None, OWNER_ALLOWED, 7),                   # no admin email
+        ("owner@example.com", True, "owner@example.com",
+         frozenset({"someone@else.com"}), 7),                                  # excluded by allow-list
+        ("owner@example.com", True, "owner@example.com", OWNER_ALLOWED, None), # owner not init
+    ],
+)
+def test_owner_only_identity_rejects_before_creating_account(
+    email, email_verified, admin_email, allowed, owner_user_id
+):
+    store = FakeStore()
+    with pytest.raises(oauth.OAuthError):
+        oauth.owner_only_identity(
+            store, "google", "sub-x", email, email_verified, "N",
+            allowed_emails=allowed, admin_email=admin_email,
+            owner_user_id=owner_user_id,
+        )
+    # a rejected login never writes an identity row
+    assert store.owner_links == {}
+
+
+def test_owner_only_identity_wraps_store_anomaly_as_oauth_error():
+    store = FakeStore()
+    store.owner_links[("google", "sub-x")] = 999  # linked to a different user
+    with pytest.raises(oauth.OAuthError):
+        oauth.owner_only_identity(
+            store, "google", "sub-x", "owner@example.com", True, "N",
+            allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
+            owner_user_id=7,
+        )

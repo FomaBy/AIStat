@@ -80,6 +80,7 @@ def public_app(tmp_path):
     config.session_cookie_secure = True
     config.oauth_providers = {"google": OAUTH_PROVIDER}
     config.oauth_allowed_emails = frozenset({"allowed@example.com"})
+    config.admin_email = "allowed@example.com"
 
     conn = connect(config.db_path)
     init_db(conn)
@@ -245,7 +246,8 @@ def test_session_revocation_survives_worker_restart(public_app):
 def test_oauth_logout_revokes_replayed_cookie(public_app, monkeypatch):
     app, _ = public_app
     install_fake_http(
-        monkeypatch, {"sub": "g-out", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-out", "email": "allowed@example.com", "email_verified": True},
     )
     client = app.test_client()
     start = client.get(
@@ -682,6 +684,16 @@ def test_oauth_unknown_provider_is_404(public_app):
     )
 
 
+def test_login_page_shows_google_button(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    page = client.get("/login", base_url="https://localhost").get_data(
+        as_text=True
+    )
+    assert "Войти через Google" in page
+    assert 'href="/auth/google/start?next=' in page
+
+
 def test_oauth_start_redirects_to_provider_with_state(public_app):
     app, _ = public_app
     client = app.test_client()
@@ -697,7 +709,13 @@ def test_oauth_start_redirects_to_provider_with_state(public_app):
 def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
     app, _ = public_app
     install_fake_http(
-        monkeypatch, {"sub": "g-1", "email": "allowed@example.com", "name": "Al"}
+        monkeypatch,
+        {
+            "sub": "g-1",
+            "email": "allowed@example.com",
+            "email_verified": True,
+            "name": "Al",
+        },
     )
     client = app.test_client()
     start = client.get(
@@ -710,10 +728,11 @@ def test_oauth_callback_authorized_grants_access(public_app, monkeypatch):
     )
     assert callback.status_code == 303
     assert callback.headers["Location"] == "/api/meta"
-    # the allow-listed OAuth session now reaches private data
+    # the owner's Google login is linked to the owner tenant, so it reaches the
+    # owner's own private data (not a fresh, empty account)
     response = client.get("/api/meta", base_url="https://localhost")
     assert response.status_code == 200
-    assert response.get_json()["projects"] == []
+    assert {p["id"] for p in response.get_json()["projects"]} == {"P1", "P2"}
 
 
 @pytest.mark.parametrize(
@@ -739,7 +758,8 @@ def test_oauth_callback_sanitizes_next_url_for_browser(
 ):
     app, _ = public_app
     install_fake_http(
-        monkeypatch, {"sub": "g-next", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-next", "email": "allowed@example.com", "email_verified": True},
     )
     client = app.test_client()
     start = client.get(
@@ -755,10 +775,19 @@ def test_oauth_callback_sanitizes_next_url_for_browser(
     assert callback.headers.getlist("Location") == [expected_location]
 
 
-def test_oauth_callback_unauthorized_is_fail_closed(public_app, monkeypatch):
-    app, _ = public_app
+def test_oauth_callback_non_owner_is_rejected_before_account(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    # a verified but non-owner email is refused before any account is created
     install_fake_http(
-        monkeypatch, {"sub": "g-2", "email": "stranger@example.com", "name": "S"}
+        monkeypatch,
+        {
+            "sub": "g-2",
+            "email": "stranger@example.com",
+            "email_verified": True,
+            "name": "S",
+        },
     )
     client = app.test_client()
     start = client.get("/auth/google/start", base_url="https://localhost")
@@ -767,8 +796,38 @@ def test_oauth_callback_unauthorized_is_fail_closed(public_app, monkeypatch):
         "/auth/google/callback?state=%s&code=abc" % state,
         base_url="https://localhost",
     )
-    assert callback.status_code == 403
-    # identity established, but a non-listed email sees no private data
+    # owner-only: the login fails closed with a generic error, no session
+    assert callback.status_code == 400
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+    # and no account row was written for the stranger
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM oauth_identities WHERE subject = ?", ("g-2",)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is None
+
+
+def test_oauth_callback_unverified_owner_email_is_rejected(
+    public_app, monkeypatch
+):
+    app, _ = public_app
+    # even the owner email is refused when the provider has not verified it
+    install_fake_http(
+        monkeypatch,
+        {"sub": "g-uv", "email": "allowed@example.com", "email_verified": False},
+    )
+    client = app.test_client()
+    start = client.get("/auth/google/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 400
     assert client.get("/api/meta", base_url="https://localhost").status_code == 401
 
 
@@ -842,7 +901,8 @@ def test_oauth_callback_rejects_cross_client_callback(public_app, monkeypatch):
 def test_oauth_overlapping_starts_share_browser_binding(public_app, monkeypatch):
     app, _ = public_app
     install_fake_http(
-        monkeypatch, {"sub": "g-tabs", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-tabs", "email": "allowed@example.com", "email_verified": True},
     )
     client = app.test_client()
     first = client.get("/auth/google/start", base_url="https://localhost")

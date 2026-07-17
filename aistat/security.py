@@ -607,6 +607,58 @@ class SecurityStore:
         finally:
             conn.close()
 
+    def link_identity_to_owner(
+        self,
+        provider: str,
+        subject: str,
+        owner_user_id: int,
+        email: Optional[str] = None,
+        now: Optional[int] = None,
+    ) -> int:
+        """Idempotently link ``(provider, subject)`` to the existing owner user.
+
+        Owner-only sign-in never creates a new account: the external identity is
+        attached to the pre-existing admin user so a provider login lands on the
+        owner tenant. A subject already linked to a *different* user, or an owner
+        row that is missing or not an admin, is rejected fail-closed.
+        """
+        now = int(time.time()) if now is None else int(now)
+        owner_user_id = int(owner_user_id)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row is not None:
+                if int(row["user_id"]) != owner_user_id:
+                    conn.rollback()
+                    raise SecurityConfigError(
+                        "oauth identity is linked to a non-owner user"
+                    )
+                conn.commit()
+                return owner_user_id
+            owner = conn.execute(
+                "SELECT is_admin FROM users WHERE id = ?", (owner_user_id,)
+            ).fetchone()
+            if owner is None or int(owner["is_admin"]) != 1:
+                conn.rollback()
+                raise SecurityConfigError(
+                    "owner user is missing or not an admin"
+                )
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, owner_user_id, email, now),
+            )
+            conn.commit()
+            return owner_user_id
+        finally:
+            conn.close()
+
     def put_oauth_state(
         self,
         state: str,

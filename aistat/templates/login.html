@@ -43,6 +43,14 @@
         <button type="submit">Войти</button>
       </form>
 
+      {% if google_login_url %}
+      <div class="oauth-divider">или</div>
+      <a class="oauth-button" href="{{ google_login_url }}">
+        <span class="g-mark" aria-hidden="true">G</span>
+        Войти через Google
+      </a>
+      {% endif %}
+
       <p class="security-note">
         Соединение защищено HTTPS. Пароль хранится только как стойкий хеш.
       </p>

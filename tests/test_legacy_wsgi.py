@@ -56,6 +56,7 @@ def configure_legacy_env(tmp_path, monkeypatch):
         "AISTAT_OAUTH_GOOGLE_REDIRECT_URI", "https://localhost/auth/google/callback"
     )
     monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", "allowed@example.com")
+    monkeypatch.setenv("AISTAT_ADMIN_EMAIL", "allowed@example.com")
 
 
 @pytest.fixture
@@ -567,7 +568,8 @@ def test_session_table_stores_only_hashed_ids(legacy):
 
 def test_oauth_logout_revokes_replayed_cookie(legacy, monkeypatch):
     install_fake_http(
-        monkeypatch, {"sub": "g-out", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-out", "email": "allowed@example.com", "email_verified": True},
     )
     status, headers, _ = request(legacy.application, "/auth/google/start")
     state = state_from(headers)
@@ -784,6 +786,14 @@ def test_host_allowlist(legacy):
     assert body == b"Invalid host"
 
 
+def test_login_page_shows_google_button(legacy):
+    status, _, body = request(legacy.application, "/login")
+    assert status == "200 OK"
+    page = body.decode("utf-8")
+    assert "Войти через Google" in page
+    assert "/auth/google/start?next=" in page
+
+
 def test_oauth_unknown_provider_is_404(legacy):
     status, _, _ = request(legacy.application, "/auth/nope/start")
     assert status == "404 Not Found"
@@ -817,9 +827,15 @@ def test_oauth_start_redirects_to_provider_with_state(legacy):
     assert "Path=/auth" in binding
 
 
-def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
+def test_oauth_login_grants_access_for_owner_email(legacy, monkeypatch):
     install_fake_http(
-        monkeypatch, {"sub": "g-1", "email": "allowed@example.com", "name": "Al"}
+        monkeypatch,
+        {
+            "sub": "g-1",
+            "email": "allowed@example.com",
+            "email_verified": True,
+            "name": "Al",
+        },
     )
     status, headers, _ = request(
         legacy.application, "/auth/google/start?next=/api/meta"
@@ -839,7 +855,8 @@ def test_oauth_login_grants_access_for_allowlisted_email(legacy, monkeypatch):
     status, _, body = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "200 OK"
     data = legacy.json.loads(body.decode("utf-8"))
-    assert data["projects"] == []
+    # linked to the owner tenant: the owner's own data, not an empty account
+    assert {p["id"] for p in data["projects"]} == {"P1", "P2"}
 
 
 @pytest.mark.parametrize(
@@ -864,7 +881,8 @@ def test_oauth_callback_sanitizes_next_url_for_browser(
     legacy, monkeypatch, next_url, expected_location
 ):
     install_fake_http(
-        monkeypatch, {"sub": "g-next", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-next", "email": "allowed@example.com", "email_verified": True},
     )
     status, headers, _ = request(
         legacy.application, "/auth/google/start?" + urlencode({"next": next_url})
@@ -881,8 +899,15 @@ def test_oauth_callback_sanitizes_next_url_for_browser(
 
 
 def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
+    # owner-only: a verified but non-owner email is refused before any account
     install_fake_http(
-        monkeypatch, {"sub": "g-2", "email": "stranger@example.com", "name": "S"}
+        monkeypatch,
+        {
+            "sub": "g-2",
+            "email": "stranger@example.com",
+            "email_verified": True,
+            "name": "S",
+        },
     )
     status, headers, _ = request(legacy.application, "/auth/google/start")
     state = state_from(headers)
@@ -892,10 +917,26 @@ def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
         "/auth/google/callback?state=%s&code=abc" % state,
         cookie=start_cookies,
     )
-    assert status == "403 Forbidden"
+    assert status == "400 Bad Request"
     cookies = cookie_jar(headers, start_cookies)
     status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "401 Unauthorized"
+
+
+def test_oauth_login_is_fail_closed_for_unverified_owner(legacy, monkeypatch):
+    install_fake_http(
+        monkeypatch,
+        {"sub": "g-uv", "email": "allowed@example.com", "email_verified": False},
+    )
+    status, headers, _ = request(legacy.application, "/auth/google/start")
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, _, _ = request(
+        legacy.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
 
 
 def test_oauth_callback_rejects_forged_state(legacy):
@@ -909,7 +950,8 @@ def test_oauth_callback_rejects_forged_state(legacy):
 
 def test_oauth_state_is_single_use(legacy, monkeypatch):
     install_fake_http(
-        monkeypatch, {"sub": "g-3", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-3", "email": "allowed@example.com", "email_verified": True},
     )
     status, headers, _ = request(legacy.application, "/auth/google/start")
     state = state_from(headers)
@@ -967,7 +1009,8 @@ def test_oauth_callback_rejects_cross_client_callback(legacy, monkeypatch):
 
 def test_oauth_overlapping_starts_share_browser_binding(legacy, monkeypatch):
     install_fake_http(
-        monkeypatch, {"sub": "g-tabs", "email": "allowed@example.com"}
+        monkeypatch,
+        {"sub": "g-tabs", "email": "allowed@example.com", "email_verified": True},
     )
     _, first_headers, _ = request(
         legacy.application, "/auth/google/start"

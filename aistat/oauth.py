@@ -55,6 +55,7 @@ __all__ = [
     "fetch_identity",
     "begin",
     "finish",
+    "owner_only_identity",
     "providers_from_env",
     "allowed_emails_from_env",
     "is_email_authorized",
@@ -160,8 +161,11 @@ def build_authorize_url(provider: "OAuthProvider", state: str) -> str:
 
     The user's ``next`` destination is never placed here — it is kept
     server-side with the state row — so this cannot become an open redirect.
+    The callback (``redirect_uri``) must itself be HTTPS: the browser returns
+    the authorization ``code`` there, so a plaintext callback would leak it.
     """
     _require_https(provider.authorize_url, "authorize")
+    _require_https(provider.redirect_uri, "redirect")
     if not state:
         raise OAuthError("state is required")
     params = urlencode(
@@ -234,15 +238,32 @@ def exchange_code(provider: "OAuthProvider", code: str) -> str:
     return token
 
 
+def _coerce_verified(*values) -> bool:
+    """Fail-closed boolean for a provider ``email_verified`` claim.
+
+    Providers spell it ``email_verified`` (OIDC) or ``verified_email`` (Google
+    v2 userinfo) and may send a JSON boolean or a string. Anything that is not
+    an explicit truthy value is treated as unverified.
+    """
+    for value in values:
+        if value is True:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {"true", "1", "yes"}:
+            return True
+    return False
+
+
 def fetch_identity(
     provider: "OAuthProvider", access_token: str
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """Resolve ``(subject, email, display_name)`` from the userinfo endpoint.
+) -> Tuple[str, Optional[str], bool, Optional[str]]:
+    """Resolve ``(subject, email, email_verified, display_name)`` from userinfo.
 
     Field names vary by provider, so common aliases are accepted: ``sub`` or
-    ``id`` for the subject, ``email`` or ``default_email`` for the email, and
-    ``name`` / ``display_name`` / ``real_name`` for the display name. The
-    subject is required and is what an account is keyed on.
+    ``id`` for the subject, ``email`` or ``default_email`` for the email,
+    ``email_verified`` or ``verified_email`` for the verified flag (fail-closed:
+    absent or non-truthy means ``False``), and ``name`` / ``display_name`` /
+    ``real_name`` for the display name. The subject is required and is what an
+    account is keyed on.
     """
     _require_https(provider.userinfo_url, "userinfo")
     if not access_token:
@@ -275,12 +296,15 @@ def fetch_identity(
     if subject is None or subject == "":
         raise OAuthError("identity response missing subject")
     email = payload.get("email") or payload.get("default_email")
+    email_verified = _coerce_verified(
+        payload.get("email_verified"), payload.get("verified_email")
+    )
     display_name = (
         payload.get("name")
         or payload.get("display_name")
         or payload.get("real_name")
     )
-    return str(subject), email, display_name
+    return str(subject), email, email_verified, display_name
 
 
 def begin(store, provider: "OAuthProvider", next_url, client_token, now=None) -> str:
@@ -305,7 +329,14 @@ def begin(store, provider: "OAuthProvider", next_url, client_token, now=None) ->
     return build_authorize_url(provider, state)
 
 
-def finish(store, provider: "OAuthProvider", params, client_token, now=None) -> dict:
+def finish(
+    store,
+    provider: "OAuthProvider",
+    params,
+    client_token,
+    resolve_identity=None,
+    now=None,
+) -> dict:
     """Validate an OAuth callback and resolve the account.
 
     ``params`` is the callback query mapping (supports ``.get``);
@@ -322,7 +353,14 @@ def finish(store, provider: "OAuthProvider", params, client_token, now=None) -> 
        flow started, so only the initiating browser can complete it — all
        before any token exchange;
     6. exchange the code and resolve the identity;
-    7. map the identity to a stable AIStat user id.
+    7. map the identity to a stable AIStat user id via ``resolve_identity``.
+
+    ``resolve_identity(subject, email, email_verified, display_name) -> int`` is
+    the account policy. It runs *after* the identity is known and may raise
+    :class:`OAuthError` to reject the login before any account row is written
+    (for example, the owner-only policy in :func:`owner_only_identity`). When it
+    is ``None`` the identity is linked or created unconditionally via the
+    store's ``find_or_create_user_by_identity`` (legacy open behaviour).
 
     Returns ``{"user_id", "email", "display_name", "next_url"}``. Raises
     :class:`OAuthError` on any failure. Establishing a session and deciding
@@ -350,20 +388,73 @@ def finish(store, provider: "OAuthProvider", params, client_token, now=None) -> 
     ):
         raise OAuthError("callback is not bound to the initiating browser")
     access_token = exchange_code(provider, code)
-    subject, email, display_name = fetch_identity(provider, access_token)
-    user_id = store.find_or_create_user_by_identity(
-        provider.name,
-        subject,
-        email=email,
-        display_name=display_name,
-        now=now,
+    subject, email, email_verified, display_name = fetch_identity(
+        provider, access_token
     )
+    if resolve_identity is None:
+        user_id = store.find_or_create_user_by_identity(
+            provider.name,
+            subject,
+            email=email,
+            display_name=display_name,
+            now=now,
+        )
+    else:
+        user_id = resolve_identity(subject, email, email_verified, display_name)
     return {
         "user_id": user_id,
         "email": email,
         "display_name": display_name,
         "next_url": record.get("next_url") or "/",
     }
+
+
+def owner_only_identity(
+    store,
+    provider_name,
+    subject,
+    email,
+    email_verified,
+    display_name,
+    allowed_emails,
+    admin_email,
+    owner_user_id,
+):
+    """Owner-only sign-in policy, applied identically by both WSGI contours.
+
+    A provider callback is accepted only when it carries a *verified* email that
+    equals the configured owner email (``AISTAT_ADMIN_EMAIL``); when an allow
+    list is configured, the email must also appear on it. The identity is linked
+    to the pre-existing owner account and never creates a new user, so open
+    registration stays off and the owner always lands on the owner tenant. Any
+    failed check raises :class:`OAuthError` *before* an account row could be
+    written, so a non-owner login leaves no trace.
+    """
+    if not email:
+        raise OAuthError("provider returned no email")
+    if email_verified is not True:
+        raise OAuthError("provider email is not verified")
+    normalized = email.strip().lower()
+    owner_email = (admin_email or "").strip().lower()
+    if not owner_email:
+        raise OAuthError("owner email is not configured")
+    if normalized != owner_email:
+        raise OAuthError("email is not permitted to sign in")
+    if allowed_emails and normalized not in allowed_emails:
+        raise OAuthError("email is not on the allow list")
+    if not owner_user_id:
+        raise OAuthError("owner account is not initialised")
+    try:
+        return store.link_identity_to_owner(
+            provider_name, subject, int(owner_user_id), email=email
+        )
+    except OAuthError:
+        raise
+    except Exception:
+        # A store-level anomaly (identity already linked to a different user, or
+        # a missing owner row) must fail the login closed, never 500 the public
+        # callback.
+        raise OAuthError("owner identity linking failed")
 
 
 _PROVIDER_FIELDS = (

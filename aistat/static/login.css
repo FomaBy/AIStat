@@ -114,6 +114,54 @@ button {
 button:hover { background: #405ddd; }
 button:focus-visible { outline: 3px solid rgba(79, 109, 245, 0.3); }
 
+.oauth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.oauth-divider::before,
+.oauth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.oauth-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 11px 16px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--ink);
+  background: #fff;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.oauth-button:hover { background: #f5f7ff; }
+.oauth-button:focus-visible { outline: 3px solid rgba(79, 109, 245, 0.3); }
+
+.oauth-button .g-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4f6df5, #06b6d4);
+  color: #fff;
+  font-weight: 800;
+  font-size: 11px;
+}
+
 .security-note {
   margin: 22px 0 0;
   color: var(--muted);

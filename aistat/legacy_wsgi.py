@@ -406,7 +406,10 @@ def _session_grants_access(payload):
         return False
     if payload.get("u") == ADMIN_USERNAME:
         return True
-    if payload.get("uid") and _email_authorized(payload.get("email")):
+    uid = payload.get("uid")
+    if uid and OWNER_USER_ID is not None and int(uid) == OWNER_USER_ID:
+        return True
+    if uid and _email_authorized(payload.get("email")):
         return True
     return False
 
@@ -687,6 +690,50 @@ class _LegacyOAuthStore(object):
         finally:
             conn.close()
 
+    def link_identity_to_owner(
+        self, provider, subject, owner_user_id, email=None, now=None
+    ):
+        """Idempotently link ``(provider, subject)`` to the existing owner user.
+
+        Mirrors ``SecurityStore.link_identity_to_owner``: owner-only sign-in
+        never creates a new account, and a subject already linked elsewhere or a
+        missing/non-admin owner row is rejected fail-closed.
+        """
+        now = int(time.time()) if now is None else int(now)
+        owner_user_id = int(owner_user_id)
+        conn = _security_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row is not None:
+                if int(row["user_id"]) != owner_user_id:
+                    conn.rollback()
+                    raise RuntimeError(
+                        "oauth identity is linked to a non-owner user"
+                    )
+                conn.commit()
+                return owner_user_id
+            owner = conn.execute(
+                "SELECT is_admin FROM users WHERE id = ?", (owner_user_id,)
+            ).fetchone()
+            if owner is None or int(owner["is_admin"]) != 1:
+                conn.rollback()
+                raise RuntimeError("owner user is missing or not an admin")
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, owner_user_id, email, now),
+            )
+            conn.commit()
+            return owner_user_id
+        finally:
+            conn.close()
+
 
 def _secure_headers(environ):
     headers = [
@@ -865,6 +912,15 @@ def _render_login(csrf, next_url, error=None):
         error_html = '<p class="error" role="alert">{}</p>'.format(
             html.escape(error)
         )
+    oauth_html = ""
+    if "google" in OAUTH_PROVIDERS:
+        google_url = "/auth/google/start?next=" + quote(next_url or "/", safe="")
+        oauth_html = (
+            '<div class="oauth-divider">или</div>'
+            '<a class="oauth-button" href="{url}">'
+            '<span class="g-mark" aria-hidden="true">G</span>'
+            "Войти через Google</a>"
+        ).format(url=html.escape(google_url, quote=True))
     return """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -893,6 +949,7 @@ def _render_login(csrf, next_url, error=None):
         </label>
         <button type="submit">Войти</button>
       </form>
+      {oauth}
       <p class="security-note">
         Соединение защищено HTTPS. Пароль хранится только как стойкий хеш.
       </p>
@@ -901,6 +958,7 @@ def _render_login(csrf, next_url, error=None):
 </body>
 </html>""".format(
         error=error_html,
+        oauth=oauth_html,
         csrf=html.escape(csrf, quote=True),
         next_url=html.escape(next_url, quote=True),
     )
@@ -969,8 +1027,24 @@ def _oauth(environ, start_response, path):
         "code": _first(query, "code"),
         "error": _first(query, "error"),
     }
+
+    def resolve_identity(subject, email, email_verified, display_name):
+        return oauth.owner_only_identity(
+            store,
+            parts[1],
+            subject,
+            email,
+            email_verified,
+            display_name,
+            allowed_emails=OAUTH_ALLOWED_EMAILS,
+            admin_email=ADMIN_EMAIL,
+            owner_user_id=OWNER_USER_ID,
+        )
+
     try:
-        result = oauth.finish(store, provider, params, client_token)
+        result = oauth.finish(
+            store, provider, params, client_token, resolve_identity
+        )
     except oauth.OAuthError:
         csrf = _make_login_csrf()
         headers = [
@@ -995,7 +1069,12 @@ def _oauth(environ, start_response, path):
         "Set-Cookie",
         _cookie_header("aistat_session", session_value, SESSION_SECONDS),
     )
-    if not _email_authorized(result["email"]):
+    # The owner's linked login always reaches data; other identities are gated
+    # by the allow-list. Mirrors _session_grants_access and the Flask contour.
+    owner_linked = (
+        OWNER_USER_ID is not None and int(result["user_id"]) == OWNER_USER_ID
+    )
+    if not owner_linked and not _email_authorized(result["email"]):
         return _respond(
             environ,
             start_response,
