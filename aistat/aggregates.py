@@ -588,25 +588,37 @@ def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "SELECT id, name, model, runtime_id FROM agents"
     )}
     runtimes = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM runtimes")}
-    run_from, run_to = _filter_dates(filters)
-    run_where, run_params = _date_clause(
-        "substr(COALESCE(r.started_at, r.created_at), 1, 10)", run_from, run_to
-    )
+    run_where, run_params = "1=1", []
     if filters["projects"]:
         run_where += _where_values("i.project_id", filters["projects"], run_params)
     if filters["agents"]:
         run_where += _where_values("r.agent_id", filters["agents"], run_params)
     if filters["models"]:
         run_where += _where_values("a.model", filters["models"], run_params)
-    run_counts = {r["agent_id"]: r["n"] for r in conn.execute(
+    run_counts: Dict[str, int] = {}
+    has_time_window = filters["from"] is not None or filters["to"] is not None
+    lower = filters["from"] or datetime.min
+    upper = filters["to"] or datetime.max
+    for row in conn.execute(
         f"""
-        SELECT r.agent_id, COUNT(*) AS n FROM runs r
+        SELECT r.agent_id, r.started_at, r.completed_at FROM runs r
         LEFT JOIN issues i ON i.id = r.issue_id
         LEFT JOIN agents a ON a.id = r.agent_id
-        WHERE {run_where} GROUP BY r.agent_id
+        WHERE {run_where}
         """,
         run_params,
-    )}
+    ):
+        if has_time_window:
+            start = _run_datetime(row["started_at"])
+            end = _run_datetime(row["completed_at"])
+            # A filtered run count is defined by the same half-open interval
+            # semantics as token attribution. Incomplete timestamps cannot be
+            # placed in a selected window without inventing a duration.
+            if (start is None or end is None or end <= start
+                    or _overlap_seconds(start, end, lower, upper) <= 0):
+                continue
+        agent_id = row["agent_id"]
+        run_counts[agent_id] = run_counts.get(agent_id, 0) + 1
     out = []
     for g in grouped:
         agent_id = g.pop("_key")

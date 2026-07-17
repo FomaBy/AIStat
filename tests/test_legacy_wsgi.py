@@ -391,6 +391,19 @@ def test_legacy_hour_filters_accept_repeated_dimensions(legacy):
     assert legacy.json.loads(body.decode("utf-8"))["total_tokens"] == 600000
 
 
+def test_legacy_agents_count_only_overlapping_hour_runs(legacy):
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application,
+        "/api/agents?from=2026-01-01T10%3A00Z&to=2026-01-01T11%3A00Z"
+        "&project=P1&agent=A2&model=m-shared",
+        cookie=cookies,
+    )
+    assert status == "200 OK"
+    agents = legacy.json.loads(body.decode("utf-8"))["agents"]
+    assert {agent["agent_id"]: agent["runs"] for agent in agents} == {"A2": 1}
+
+
 def test_logout_requires_csrf(legacy):
     cookies = login(legacy)
     status, _, body = request(

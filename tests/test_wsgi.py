@@ -171,6 +171,23 @@ def test_wsgi_hour_filters_accept_repeated_dimensions(public_app):
     assert response.get_json()["total_tokens"] == 600_000
 
 
+def test_wsgi_agents_count_only_overlapping_hour_runs(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert login(client).status_code == 303
+    response = client.get(
+        "/api/agents",
+        query_string=[
+            ("from", "2026-01-01T10:00Z"), ("to", "2026-01-01T11:00Z"),
+            ("project", "P1"), ("agent", "A2"), ("model", "m-shared"),
+        ],
+        base_url="https://localhost",
+    )
+    assert response.status_code == 200
+    assert {agent["agent_id"]: agent["runs"]
+            for agent in response.get_json()["agents"]} == {"A2": 1}
+
+
 def test_login_is_csrf_protected_and_throttled(public_app):
     app, _ = public_app
     client = app.test_client()

@@ -180,6 +180,34 @@ def test_agent_totals_project_filter(agg_conn):
     assert "Dev Shared" not in agents
 
 
+def test_agent_run_counts_follow_half_open_filtered_intervals(agg_conn):
+    # A2's normal runs are 10:00-11:00 and 12:00-14:00. The first extra run
+    # starts exactly at the upper bound and must not leak into the 10:00 hour;
+    # the second crosses into the selected date and proves date-only ranges
+    # use actual interval overlap rather than the run start date.
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run-boundary', 'I1', 'A2', 'R2', 'completed',
+       '2026-01-01T11:00:00Z', '2026-01-01T12:00:00Z', '{now}'),
+      ('run-cross-date', 'I1', 'A2', 'R2', 'completed',
+       '2025-12-31T23:30:00Z', '2026-01-01T00:30:00Z', '{now}');
+    """)
+    agg_conn.commit()
+
+    hour = ag.make_filters(
+        "2026-01-01T10:00Z", "2026-01-01T11:00Z",
+        project_ids=["P1"], agent_ids=["A2"], models=["m-shared"],
+    )
+    hourly_agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn, filters=hour)}
+    assert hourly_agents["A2"]["runs"] == 1
+
+    day = ag.make_filters("2026-01-01", "2026-01-01", agent_ids=["A2"])
+    daily_agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn, filters=day)}
+    assert daily_agents["A2"]["runs"] == 4
+
+
 # -- projects and efficiency --------------------------------------------------------
 
 

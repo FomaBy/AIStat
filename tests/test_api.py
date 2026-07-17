@@ -84,6 +84,15 @@ def test_agents_endpoint(api):
     assert shared["estimated"] is True
 
 
+def test_agents_endpoint_counts_only_overlapping_hour_runs(api):
+    client, _ = api
+    agents = client.get("/api/agents", params=[
+        ("from", "2026-01-01T10:00Z"), ("to", "2026-01-01T11:00Z"),
+        ("project", "P1"), ("agent", "A2"), ("model", "m-shared"),
+    ]).json()["agents"]
+    assert {agent["agent_id"]: agent["runs"] for agent in agents} == {"A2": 1}
+
+
 def test_projects_endpoint_uses_configured_credit_rate(api):
     client, _ = api
     projects = {p["title"]: p for p in client.get("/api/projects").json()["projects"]}
