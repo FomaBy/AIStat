@@ -40,6 +40,23 @@ ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { printf '[aistat-deploy] %s %s\n' "$(ts)" "$*"; }
 die() { printf '[aistat-deploy] %s ERROR: %s\n' "$(ts)" "$*" >&2; exit 1; }
 
+# Unambiguous `previous:` value for the PUBLISHED deploy-log line: the prior
+# release's basename when one exists, or `none` otherwise. Kept as a pure
+# helper so the focused test can exercise it without running a deploy.
+prev_label() {
+  if [ -n "${1-}" ]; then
+    basename "$1"
+  else
+    printf 'none\n'
+  fi
+}
+
+# Sourcing this script with AISTAT_DEPLOY_LIB_ONLY=1 loads the helpers above
+# (for focused tests) and stops before any deploy side effect.
+if [ -n "${AISTAT_DEPLOY_LIB_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 command -v git >/dev/null 2>&1     || die "git not found on host"
 command -v python3 >/dev/null 2>&1 || die "python3 not found on host"
 
@@ -83,7 +100,7 @@ if [ -e "$APP_LINK" ] && [ ! -L "$APP_LINK" ]; then
 fi
 PREV="$(readlink "$APP_LINK" 2>/dev/null || true)"
 ln -sfn "$RELEASE" "$APP_LINK"
-log "PUBLISHED $APP_LINK -> $(basename "$RELEASE") (previous: ${PREV:+$(basename "$PREV")}${PREV:-none})"
+log "PUBLISHED $APP_LINK -> $(basename "$RELEASE") (previous: $(prev_label "$PREV"))"
 
 # 6. Prune old releases, always keeping the live one plus KEEP_RELEASES-1 more.
 if [ "${KEEP_RELEASES}" -gt 0 ] 2>/dev/null; then
