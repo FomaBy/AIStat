@@ -3,7 +3,9 @@
 import gzip
 import hashlib
 import json
+import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
@@ -18,9 +20,11 @@ from aistat.security import (
 )
 from aistat.snapshot import (
     SnapshotError,
+    cleanup_orphan_snapshot_sidecars,
     create_compressed_snapshot,
     install_compressed_snapshot,
 )
+import aistat.snapshot as snapshot_module
 from conftest import seed_aggregate_fixture
 
 SECRET = "publisher-" + "p" * 48
@@ -106,6 +110,135 @@ def test_snapshot_round_trip_and_size_limit(tmp_path):
 
     with pytest.raises(SnapshotError):
         install_compressed_snapshot(payload, tmp_path / "small.db", 100)
+
+
+def test_snapshot_cleanup_does_not_leak_sidecars(tmp_path):
+    source = tmp_path / "source.db"
+    seeded_db(source)
+    stale_sidecars = [
+        tmp_path / ".aistat-snapshot-stale.db-wal",
+        tmp_path / ".aistat-snapshot-stale.db-shm",
+    ]
+    for sidecar in stale_sidecars:
+        sidecar.write_bytes(b"stale")
+    expected = gzip.decompress(create_compressed_snapshot(source))
+    assert all(not sidecar.exists() for sidecar in stale_sidecars)
+
+    for _ in range(100):
+        assert gzip.decompress(create_compressed_snapshot(source)) == expected
+
+    assert not list(tmp_path.glob(".aistat-snapshot-*.db"))
+    assert not list(tmp_path.glob(".aistat-snapshot-*.db-wal"))
+    assert not list(tmp_path.glob(".aistat-snapshot-*.db-shm"))
+
+
+def test_orphan_sidecar_cleanup_skips_owned_files_and_symlinks(
+    tmp_path, monkeypatch
+):
+    orphan = tmp_path / ".aistat-snapshot-orphan.db"
+    orphan_sidecar = Path(str(orphan) + "-shm")
+    orphan_sidecar.write_bytes(b"orphan-sidecar")
+
+    owned = tmp_path / ".aistat-snapshot-owned.db"
+    owned_sidecar = Path(str(owned) + "-shm")
+    owned_sidecar.write_bytes(b"owned-sidecar")
+
+    target = tmp_path / "outside.txt"
+    target.write_bytes(b"outside")
+    symlink = tmp_path / ".aistat-snapshot-link.db-shm"
+    symlink.symlink_to(target)
+
+    monkeypatch.setattr(
+        snapshot_module,
+        "_path_has_open_owner",
+        lambda path: path.name.startswith(".aistat-snapshot-owned"),
+    )
+
+    assert cleanup_orphan_snapshot_sidecars(tmp_path) == 1
+    assert not orphan_sidecar.exists()
+    assert owned_sidecar.exists()
+    assert symlink.is_symlink()
+    assert target.read_bytes() == b"outside"
+
+
+def test_snapshot_backup_failure_cleans_sidecars(tmp_path, monkeypatch):
+    source = tmp_path / "source.db"
+    seeded_db(source)
+    real_connect = snapshot_module.sqlite3.connect
+    created = []
+    real_temp_path = snapshot_module._temp_path
+
+    def temp_path(parent, suffix):
+        path = real_temp_path(parent, suffix)
+        created.append(path)
+        return path
+
+    class FailingBackupConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def backup(self, _target):
+            for suffix in ("-wal", "-shm"):
+                Path(str(created[0]) + suffix).touch()
+            raise sqlite3.OperationalError("backup failed")
+
+        def close(self):
+            self._connection.close()
+
+    def connect(path, *args, **kwargs):
+        connection = real_connect(path, *args, **kwargs)
+        if Path(path) == source:
+            return FailingBackupConnection(connection)
+        return connection
+
+    monkeypatch.setattr(snapshot_module, "_temp_path", temp_path)
+    monkeypatch.setattr(snapshot_module.sqlite3, "connect", connect)
+    with pytest.raises(SnapshotError, match="cannot create SQLite backup"):
+        create_compressed_snapshot(source)
+    assert not list(tmp_path.glob(".aistat-snapshot-*.db*"))
+
+
+def test_snapshot_compression_failure_cleans_sidecars(tmp_path, monkeypatch):
+    source = tmp_path / "source.db"
+    seeded_db(source)
+    created = []
+    real_temp_path = snapshot_module._temp_path
+
+    def temp_path(parent, suffix):
+        path = real_temp_path(parent, suffix)
+        created.append(path)
+        return path
+
+    def fail_compress(_payload, compresslevel):
+        assert compresslevel == 6
+        for suffix in ("-wal", "-shm"):
+            Path(str(created[0]) + suffix).touch()
+        raise RuntimeError("compression failed")
+
+    monkeypatch.setattr(snapshot_module, "_temp_path", temp_path)
+    monkeypatch.setattr(snapshot_module.gzip, "compress", fail_compress)
+    with pytest.raises(RuntimeError, match="compression failed"):
+        create_compressed_snapshot(source)
+    assert not list(tmp_path.glob(".aistat-snapshot-*.db*"))
+
+
+def test_snapshot_validation_failure_cleans_sidecars(tmp_path, monkeypatch):
+    source = tmp_path / "source.db"
+    seeded_db(source)
+    payload = create_compressed_snapshot(source)
+    created = []
+
+    def fail_validate(path):
+        created.append(path)
+        for suffix in ("-wal", "-shm"):
+            Path(str(path) + suffix).touch()
+        raise SnapshotError("validation failed")
+
+    monkeypatch.setattr(snapshot_module, "validate_snapshot", fail_validate)
+    with pytest.raises(SnapshotError, match="validation failed"):
+        install_compressed_snapshot(payload, tmp_path / "target.db", 64 * 1024 * 1024)
+    assert created
+    assert not list(tmp_path.glob(".aistat-snapshot-*.db*"))
 
 
 class FakeResponse:

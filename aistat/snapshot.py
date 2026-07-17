@@ -6,6 +6,7 @@ import io
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,9 @@ class SnapshotInfo:
     schema_version: int
 
 
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
+
+
 def _temp_path(parent: Path, suffix: str) -> Path:
     handle, name = tempfile.mkstemp(
         prefix=".aistat-snapshot-", suffix=suffix, dir=str(parent)
@@ -53,27 +57,91 @@ def _temp_path(parent: Path, suffix: str) -> Path:
     return path
 
 
+def _cleanup_snapshot_temp_files(temp_path: Path) -> None:
+    """Remove a temporary SQLite file and every sidecar it may have created."""
+    for suffix in ("",) + _SQLITE_SIDECAR_SUFFIXES:
+        Path(str(temp_path) + suffix).unlink(missing_ok=True)
+
+
+def _path_has_open_owner(path: Path) -> bool:
+    """Return whether a process currently has ``path`` open.
+
+    Orphan cleanup is best-effort maintenance. If the platform cannot answer
+    the ownership question, fail closed and leave the file for a later run.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", "--", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.stdout.strip():
+        return True
+    return result.returncode not in (0, 1)
+
+
+def cleanup_orphan_snapshot_sidecars(parent: Path) -> int:
+    """Remove unused snapshot sidecars from ``parent``.
+
+    Only the sidecars produced by :func:`_temp_path` are considered. A file is
+    removed only when its matching temporary database is already gone and the
+    sidecar is not open by a process; uncertain ownership, symlinks and
+    non-files are skipped. Returns the number of sidecars removed.
+    """
+    parent = Path(parent)
+    removed = 0
+    for path in parent.glob(".aistat-snapshot-*.db-*"):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not path.name.endswith(_SQLITE_SIDECAR_SUFFIXES)
+        ):
+            continue
+        temp_path = path.with_name(path.name[:-4])
+        if temp_path.exists() or _path_has_open_owner(path):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
 def create_compressed_snapshot(db_path: Path) -> bytes:
     """Use SQLite's backup API so WAL-backed local data is copied coherently."""
     db_path = Path(db_path)
     if not db_path.is_file():
         raise SnapshotError(f"database does not exist: {db_path}")
+    cleanup_orphan_snapshot_sidecars(db_path.parent)
     temp_path = _temp_path(db_path.parent, ".db")
-    source = sqlite3.connect(str(db_path))
-    target = sqlite3.connect(str(temp_path))
+    source = None
+    target = None
     try:
-        source.backup(target)
-        target.execute("PRAGMA journal_mode = DELETE")
-        target.commit()
-    except sqlite3.Error as exc:
-        raise SnapshotError(f"cannot create SQLite backup: {exc}") from exc
-    finally:
-        target.close()
-        source.close()
-    try:
+        source = sqlite3.connect(str(db_path))
+        target = sqlite3.connect(str(temp_path))
+        try:
+            source.backup(target)
+            target.execute("PRAGMA journal_mode = DELETE")
+            target.commit()
+        except sqlite3.Error as exc:
+            raise SnapshotError(f"cannot create SQLite backup: {exc}") from exc
         return gzip.compress(temp_path.read_bytes(), compresslevel=6)
     finally:
-        temp_path.unlink(missing_ok=True)
+        try:
+            if target is not None:
+                target.close()
+        finally:
+            try:
+                if source is not None:
+                    source.close()
+            finally:
+                _cleanup_snapshot_temp_files(temp_path)
 
 
 def _decompress_to_file(payload: bytes, target: Path, max_bytes: int) -> int:
@@ -183,4 +251,4 @@ def install_compressed_snapshot(
             pass
         return info
     finally:
-        temp_path.unlink(missing_ok=True)
+        _cleanup_snapshot_temp_files(temp_path)
