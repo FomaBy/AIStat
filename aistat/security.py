@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
+from . import handoff
 from .config import Config
 from .tenant import (
     canonical_tenant_id,
@@ -61,6 +62,24 @@ def validate_public_config(config: Config) -> None:
     if hmac.compare_digest(session_secret, ingest_secret):
         raise SecurityConfigError(
             "session and ingest secrets must be independent"
+        )
+    if config.worker_secret is not None:
+        worker_secret = _secret_bytes(
+            config.worker_secret, "AISTAT_WORKER_SECRET"
+        )
+        if hmac.compare_digest(worker_secret, session_secret) or (
+            hmac.compare_digest(worker_secret, ingest_secret)
+        ):
+            raise SecurityConfigError(
+                "the worker secret must be independent from other secrets"
+            )
+    try:
+        handoff.canonical_official_server_url(config.multica_official_url)
+    except ValueError as exc:
+        raise SecurityConfigError(
+            "AISTAT_MULTICA_OFFICIAL_URL must be a bare https host: {}".format(
+                exc
+            )
         )
     if not config.allowed_hosts:
         raise SecurityConfigError("AISTAT_ALLOWED_HOSTS must not be empty")
@@ -187,6 +206,9 @@ class SecurityStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=10)
         conn.row_factory = sqlite3.Row
+        # Deleted rows must not linger in free pages: this file temporarily
+        # holds user Multica tokens that are erased after the worker handoff.
+        conn.execute("PRAGMA secure_delete = ON")
         return conn
 
     def _init(self) -> None:
@@ -243,6 +265,7 @@ class SecurityStore:
                 );
                 """
             )
+            conn.executescript(handoff.CONNECTIONS_SCHEMA)
             # Serialize the inspect-and-alter migration across WSGI workers.
             # Without the write lock, concurrent first starts can both observe
             # the old schema and one loses the ALTER race with a duplicate
@@ -722,6 +745,76 @@ class SecurityStore:
             }
         finally:
             conn.close()
+
+    # --- "connect your Multica" token handoff (shared logic in handoff.py,
+    # --- so the legacy contour applies byte-identical state transitions).
+
+    def connection_status(
+        self,
+        user_id: int,
+        pending_ttl_seconds: int = handoff.PENDING_TTL_MAX_SECONDS,
+        now: Optional[int] = None,
+    ) -> Optional[dict]:
+        return handoff.connection_status(
+            self._connect, user_id, pending_ttl_seconds, now
+        )
+
+    def worker_ready(
+        self,
+        readiness_ttl_seconds: int = handoff.WORKER_READINESS_TTL_DEFAULT_SECONDS,
+        now: Optional[int] = None,
+    ) -> bool:
+        return handoff.worker_ready(
+            self._connect, readiness_ttl_seconds, now
+        )
+
+    def submit_connection(
+        self,
+        user_id: int,
+        server_url: str,
+        workspace_label: Optional[str],
+        token: str,
+        now: Optional[int] = None,
+    ) -> dict:
+        return handoff.submit_connection(
+            self._connect, user_id, server_url, workspace_label, token, now
+        )
+
+    def revoke_connection(
+        self, user_id: int, now: Optional[int] = None
+    ) -> bool:
+        return handoff.revoke_connection(self._connect, user_id, now)
+
+    def connection_retry_after(
+        self, user_id: int, now: Optional[int] = None
+    ) -> int:
+        return handoff.connection_retry_after(self._connect, user_id, now)
+
+    def record_connection_submission(
+        self, user_id: int, now: Optional[int] = None
+    ) -> None:
+        handoff.record_connection_submission(self._connect, user_id, now)
+
+    def consume_worker_nonce(
+        self, nonce: str, max_age_seconds: int, now: Optional[int] = None
+    ) -> bool:
+        return handoff.consume_worker_nonce(
+            self._connect, nonce, max_age_seconds, now
+        )
+
+    def lease_pending_connections(
+        self,
+        pending_ttl_seconds: int = handoff.PENDING_TTL_MAX_SECONDS,
+        now: Optional[int] = None,
+    ) -> dict:
+        return handoff.lease_pending_connections(
+            self._connect, pending_ttl_seconds, now
+        )
+
+    def apply_worker_acks(
+        self, acks, now: Optional[int] = None
+    ) -> list:
+        return handoff.apply_worker_acks(self._connect, acks, now)
 
 
 def _main(argv=None) -> int:

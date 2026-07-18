@@ -11,6 +11,10 @@ cp -R aistat "$TARGET/"
 cp passenger_wsgi.py aistat.cgi pricing.json "$TARGET/"
 cp deploy/namecheap.htaccess "$TARGET/.htaccess.example"
 cp requirements-cpanel.txt "$TARGET/requirements.txt"
+# The token-handoff worker (encrypted store + pull client) runs only on the
+# trusted local machine: its code, its `cryptography` dependency and any key
+# or store files must never reach the shared cPanel host.
+rm -f "$TARGET/aistat/worker_store.py" "$TARGET/aistat/worker_sync.py"
 find "$TARGET" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$TARGET" -type f -name '*.pyc' -delete
 
