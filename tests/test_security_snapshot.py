@@ -11,7 +11,7 @@ import pytest
 
 from aistat.config import Config
 from aistat.db import SCHEMA_VERSION, connect, init_db
-from aistat.publish import PublishError, publish_once
+from aistat.publish import PublishError, publish_once, publish_snapshot
 from aistat.security import (
     SecurityStore,
     safe_next_url,
@@ -345,3 +345,65 @@ def test_publisher_rejects_mismatched_host_confirmation(tmp_path):
 
     with pytest.raises(PublishError, match="does not match"):
         publish_once(config, opener=opener, now=1234)
+
+
+def test_publish_snapshot_signs_per_tenant(tmp_path):
+    """One ingest secret signs any tenant; the tenant is bound into the sig."""
+    db_path = tmp_path / "tenant.db"
+    seeded_db(db_path)
+    config = Config()
+    config.publish_url = "http://localhost/api/ingest/snapshot"
+    config.allow_insecure_publish = True
+    config.publish_interval_seconds = 300
+    config.ingest_secret = SECRET
+    config.publish_tenant_id = None  # no single-tenant selector configured
+
+    other_tenant = 4242
+
+    def opener(request, timeout):
+        assert request.headers["X-aistat-tenant"] == str(other_tenant)
+        verify_snapshot_signature(
+            SECRET,
+            other_tenant,
+            request.headers["X-aistat-timestamp"],
+            request.headers["X-aistat-signature"],
+            request.data,
+            300,
+            now=1234,
+        )
+        data = gzip.decompress(request.data)
+        return FakeResponse(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "tenant_id": other_tenant,
+                    "schema_version": SCHEMA_VERSION,
+                    "size_bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            ).encode("utf-8")
+        )
+
+    result = publish_snapshot(config, db_path, other_tenant, opener=opener, now=1234)
+    assert result["tenant_id"] == other_tenant
+
+
+def test_publish_snapshot_rejects_wrong_tenant_confirmation(tmp_path):
+    db_path = tmp_path / "tenant.db"
+    seeded_db(db_path)
+    config = Config()
+    config.publish_url = "http://localhost/upload"
+    config.allow_insecure_publish = True
+    config.publish_interval_seconds = 300
+    config.ingest_secret = SECRET
+
+    def opener(_request, timeout):
+        return FakeResponse(
+            json.dumps(
+                {"status": "ok", "tenant_id": 99, "schema_version": SCHEMA_VERSION,
+                 "size_bytes": 1, "sha256": "wrong"}
+            ).encode("utf-8")
+        )
+
+    with pytest.raises(PublishError, match="does not match"):
+        publish_snapshot(config, db_path, 7, opener=opener, now=1234)

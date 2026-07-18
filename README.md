@@ -247,6 +247,9 @@ metadata задачи, а не по проекту).
 | `AISTAT_WORKER_KEY_PATH` | `~/.config/aistat/worker.key` | (worker) ключ шифрования токенов; хранится отдельно от хранилища |
 | `AISTAT_WORKER_STORE_PATH` | `./data/worker_connections.db` | (worker) зашифрованное хранилище токенов, права `0600` |
 | `AISTAT_WORKER_PULL_INTERVAL_SECONDS` | `300` | (worker) период pull-цикла `worker_sync --watch` (мин. 60) |
+| `AISTAT_CLI_PROFILES_DIR` | `./data/cli_profiles` | (worker) task-owned HOME официального CLI: каждое подключение логинится в свой `--profile aistat-conn-<id>`, не касаясь `~/.multica` владельца |
+| `AISTAT_WORKER_TENANTS_DIR` | `./data/worker_tenants` | (worker) локальная staging-папка свежесобранных tenant-БД перед публикацией (отдельно от install-папки хоста) |
+| `AISTAT_WORKER_COLLECT_INTERVAL_SECONDS` | `300` | (worker) период цикла сбора `collector --watch` по всем активным подключениям |
 
 ## Подключение своего Мультика
 
@@ -262,6 +265,14 @@ pending-токену короткий TTL и требует готовый worke
 обязательно отзовите его в Multica после отключения. Протокол (HMAC pull-канал,
 lease/ack, replay-защита), state machine, fail-closed контроли, деплой и residual
 risk описаны в [docs/secure-token-handoff.md](docs/secure-token-handoff.md).
+
+После handoff доверенный worker сам собирает статистику по каждому подключению —
+логинит официальный CLI под изолированным per-user профилем токеном самого
+пользователя, выбирает его workspace, пишет в отдельную tenant-БД и публикует
+per-tenant snapshot. Полный per-user pipeline (изоляция профиля, stdin-контракт
+токена, пиннинг хоста, выбор workspace, failure isolation, backpressure и
+cleanup) описан в
+[docs/per-user-collection.md](docs/per-user-collection.md).
 
 ## Как работает ингест
 
