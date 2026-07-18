@@ -37,9 +37,9 @@ const SINGLE_SERIES_COLOR = "#4f6df5";
 // identities claim distinct free slots without making the mapping depend on
 // the order in which a chart happens to encounter them. Existing assignments
 // are deliberately retained when meta refreshes add new identities.
-const COLOR_LEDGER_VERSION = 1;
+const COLOR_LEDGER_VERSION = 2;
 const COLOR_LEDGER_NAMESPACE = "aistat.color-ledger";
-const COLOR_LEDGER_STORAGE_KEY = COLOR_LEDGER_NAMESPACE + ".v1";
+const COLOR_LEDGER_STORAGE_KEY = COLOR_LEDGER_NAMESPACE + ".v2";
 const COLOR_ENTITY_TYPES = new Set(["model", "agent", "project"]);
 
 const colorRegistry = {
@@ -126,37 +126,38 @@ function allowedFallbackColors(type) {
 function validateColorLedger(payload, scope) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
       payload.version !== COLOR_LEDGER_VERSION || payload.scope !== scope ||
-      !payload.assignments || typeof payload.assignments !== "object" ||
-      Array.isArray(payload.assignments)) return null;
+      !Array.isArray(payload.assignments)) return null;
 
   const restored = [];
-  for (const [type, assignments] of Object.entries(payload.assignments)) {
-    if (!COLOR_ENTITY_TYPES.has(type) || !assignments ||
-        typeof assignments !== "object" || Array.isArray(assignments)) return null;
+  const seenByType = new Map();
+  for (const assignment of payload.assignments) {
+    if (!Array.isArray(assignment) || assignment.length !== 3) return null;
+    const [type, rawId, color] = assignment;
+    if (!COLOR_ENTITY_TYPES.has(type) || typeof rawId !== "string" ||
+        typeof color !== "string") return null;
+
+    const id = normalizeEntityId(rawId);
     const anchors = ENTITY_ANCHORS[type] || {};
     const allowed = allowedFallbackColors(type);
-    const typedAssignments = [];
-    const used = new Set();
-    for (const [rawId, color] of Object.entries(assignments)) {
-      const id = normalizeEntityId(rawId);
-      // Anchors are always restored from code. Ignore any stored value for an
-      // anchor instead of allowing a stale or corrupted payload to override it.
-      if (Object.prototype.hasOwnProperty.call(anchors, id)) continue;
-      if (!id || id !== rawId || typeof color !== "string" || !allowed.has(color)) {
-        return null;
-      }
-      typedAssignments.push([type, id, color]);
-      used.add(color);
+    let history = seenByType.get(type);
+    if (!history) {
+      history = { ids: new Set(), colors: new Set(), capacity: allowed.size };
+      seenByType.set(type, history);
     }
-    // A persisted prefix before palette exhaustion must be injective. Once
-    // exhausted, repetition is valid only when it is a complete allocation
-    // history that includes every fallback color for the typed space.
-    if (typedAssignments.length <= allowed.size) {
-      if (used.size !== typedAssignments.length) return null;
-    } else if (used.size !== allowed.size) {
-      return null;
-    }
-    restored.push(...typedAssignments);
+    // The persisted representation is already normalized and ordered. Any
+    // duplicate identity, anchor, or normalized-away ID makes it unsafe to
+    // infer the original Map history, so discard the whole payload.
+    if (!id || id !== rawId || history.ids.has(id) ||
+        Object.prototype.hasOwnProperty.call(anchors, id) ||
+        !allowed.has(color)) return null;
+    // Before palette exhaustion, every non-anchor assignment must claim a new
+    // color. A repeat is valid only after the complete allowed palette has
+    // appeared in this typed space; this rejects a corrupt C+1 prefix while
+    // accepting production-created C+1 histories.
+    if (history.colors.size < history.capacity && history.colors.has(color)) return null;
+    history.ids.add(id);
+    history.colors.add(color);
+    restored.push([type, id, color]);
   }
   return restored;
 }
@@ -164,9 +165,10 @@ function validateColorLedger(payload, scope) {
 function persistColorLedger() {
   const storage = colorLedgerStorage();
   if (!storage || !colorRegistry.scope) return;
-  // Null-prototype records turn every normalized ID, including __proto__ and
-  // constructor, into a normal own JSON entry instead of mutating a prototype.
-  const assignments = Object.create(null);
+  // An array of tuples is intentional: JSON object enumeration would reorder
+  // numeric-looking IDs and cannot prove the original Map allocation order.
+  // Array entries also keep __proto__ and constructor as inert string values.
+  const assignments = [];
   for (const [key, color] of colorRegistry.byKey) {
     const separator = key.indexOf("\u0000");
     const type = separator < 0 ? "" : key.slice(0, separator);
@@ -174,8 +176,7 @@ function persistColorLedger() {
     if (!COLOR_ENTITY_TYPES.has(type) || !id ||
         !allowedFallbackColors(type).has(color) ||
         Object.prototype.hasOwnProperty.call(ENTITY_ANCHORS[type] || {}, id)) continue;
-    if (!assignments[type]) assignments[type] = Object.create(null);
-    assignments[type][id] = color;
+    assignments.push([type, id, color]);
   }
   try {
     storage.setItem(COLOR_LEDGER_STORAGE_KEY, JSON.stringify({
@@ -218,7 +219,7 @@ function initializeColorLedger(scope) {
 
     // Sweep every version/scope record before hydrating. A valid current
     // record is the sole survivor; this avoids retaining a previous user's
-    // identity when a stale version exists without the current .v1 key.
+    // identity when a stale version exists without the current .v2 key.
     for (const key of colorLedgerNamespaceKeys(storage)) {
       if (restored == null || key !== COLOR_LEDGER_STORAGE_KEY) storage.removeItem(key);
     }
@@ -235,6 +236,10 @@ function initializeColorLedger(scope) {
 
 function clearColorLedger() {
   colorRegistry.byKey.clear();
+  // A prior getter/key/remove/set failure marks storage unavailable. Logout
+  // must retry from a clean access state so a recovered storage can be purged.
+  colorRegistry.storage = null;
+  colorRegistry.storageChecked = false;
   clearColorLedgerStorage(colorLedgerStorage());
 }
 

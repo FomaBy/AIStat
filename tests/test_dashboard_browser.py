@@ -13,17 +13,22 @@ import os
 import select
 import shutil
 import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
 import time
 from pathlib import Path
+from wsgiref.simple_server import WSGIServer, make_server
 
 import pytest
+from werkzeug.security import generate_password_hash
 
 import aistat.server as server_module
 from aistat.config import Config
 from aistat.db import connect, init_db
+from aistat.migrate import migrate_owner_database
+from aistat.wsgi import create_app as create_wsgi_app
 from conftest import seed_aggregate_fixture
 
 CHROME_CANDIDATES = (
@@ -40,6 +45,31 @@ pytestmark = pytest.mark.skipif(
     CHROME is None, reason="no Chrome/Chromium binary for browser regression")
 
 BOOT_TIMEOUT = 15.0
+AUTH_PASSWORD = "correct horse battery staple"
+
+DOCUMENT_MARKER_SCRIPT = r'''(() => {
+  window.__aistat_document_marker = crypto.randomUUID();
+})();'''
+
+META_BOOT_TRACE_SCRIPT = r'''(() => {
+  window.__aistat_boot_trace = [];
+  const trace = window.__aistat_boot_trace;
+  const fetchImpl = window.fetch;
+  window.fetch = (...args) => {
+    const url = String(args[0] && args[0].url || args[0]);
+    if (!url.includes("/api/meta")) return fetchImpl(...args);
+    trace.push("meta:start");
+    return fetchImpl(...args).then((response) => {
+      trace.push("meta:end");
+      return response;
+    });
+  };
+  const getContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function(...args) {
+    trace.push("chart:canvas");
+    return getContext.apply(this, args);
+  };
+})();'''
 
 
 class Cdp:
@@ -238,6 +268,57 @@ def dashboard():
         tmp.cleanup()
 
 
+class _ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+@pytest.fixture(scope="module")
+def authenticated_dashboard():
+    """A real WSGI login/logout surface for browser session regressions."""
+    tmp = tempfile.TemporaryDirectory(prefix="aistat-auth-browser-")
+    config = Config()
+    config.db_path = Path(tmp.name) / "browser.db"
+    config.security_db_path = Path(tmp.name) / "security.db"
+    config.tenants_dir = Path(tmp.name) / "tenants"
+    config.auth_username = "sergey"
+    config.auth_password_hash = generate_password_hash(
+        AUTH_PASSWORD, method="pbkdf2:sha256:1000")
+    config.session_secret = "browser-session-" + "s" * 48
+    config.ingest_secret = "browser-ingest-" + "i" * 48
+    config.allowed_hosts = ("127.0.0.1", "localhost")
+    config.force_https = False
+    config.session_cookie_secure = False
+    config.oauth_providers = {}
+    config.oauth_allowed_emails = frozenset()
+    config.admin_email = None
+    config.credits_per_usd = 2.0
+
+    conn = connect(config.db_path)
+    init_db(conn)
+    seed_aggregate_fixture(conn)
+    conn.close()
+    migration = migrate_owner_database(config, now=1000)
+    config.publish_tenant_id = migration["owner_user_id"]
+
+    app = create_wsgi_app(config)
+    app.config.update(TESTING=True)
+    port = _free_port()
+    httpd = make_server(
+        "127.0.0.1", port, app, server_class=_ThreadingWSGIServer)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    cdp = Cdp(CHROME, Path(tmp.name) / "chrome-profile")
+    try:
+        yield cdp, f"http://127.0.0.1:{port}"
+    finally:
+        cdp.close()
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=10)
+        tmp.cleanup()
+
+
 def _element_value(cdp, element_id):
     return cdp.eval(f'document.getElementById("{element_id}").value')
 
@@ -255,6 +336,52 @@ def _filter_error(cdp):
     })()''')
 
 
+def _navigation_probe(extra_script=""):
+    return DOCUMENT_MARKER_SCRIPT + "\n" + extra_script
+
+
+def _reload_and_wait(cdp, condition=BOOTED_JS):
+    """Reload only after remembering this document's marker."""
+    previous = cdp.eval("window.__aistat_document_marker")
+    assert previous
+    cdp.eval("location.reload()")
+    cdp.wait_for(
+        "window.__aistat_document_marker !== %s && (%s)" % (
+            json.dumps(previous), condition))
+
+
+def _refresh_and_wait(cdp):
+    """Wait for this explicit refresh, not a stale already-booted card."""
+    nonce = cdp.eval('''(() => {
+      window.__aistat_refresh_nonce = (window.__aistat_refresh_nonce || 0) + 1;
+      window.__aistat_refresh_completed_nonce = 0;
+      return window.__aistat_refresh_nonce;
+    })()''')
+    cdp.eval('''(nonce => refreshMeta().then(refreshAll).then(() => {
+      window.__aistat_refresh_completed_nonce = nonce;
+    }))( %d )''' % nonce)
+    cdp.wait_for(
+        "window.__aistat_refresh_completed_nonce === %d" % nonce)
+
+
+def _login_in_browser(cdp, base, open_page=True):
+    if open_page:
+        cdp.open_page(base + "/")
+    else:
+        cdp.eval('location.assign("/")')
+    cdp.wait_for(
+        'location.pathname === "/login" && '
+        'document.querySelector("input[name=csrf]") !== null')
+    cdp.eval('''(() => {
+      const form = document.querySelector('form[action="/login"]');
+      form.querySelector('[name="username"]').value = "sergey";
+      form.querySelector('[name="password"]').value = %s;
+      form.submit();
+    })()''' % json.dumps(AUTH_PASSWORD))
+    cdp.wait_for('location.pathname === "/" && (%s)' % BOOTED_JS)
+    assert cdp.eval('document.getElementById("logout-button").hidden') is False
+
+
 def _search_params(cdp):
     return cdp.eval(
         "[...new URLSearchParams(location.search).entries()]")
@@ -266,7 +393,8 @@ def test_restores_valid_url_state_and_survives_reload(dashboard):
     interactive change keeps the new state (FAN-1188 behaviour intact)."""
     cdp, base = dashboard
     cdp.open_page(base + "/?project=P1&project=P2&agent=A2"
-                  "&from=2026-01-01T10:00&to=2026-01-01T12:00&group=agent")
+                  "&from=2026-01-01T10:00&to=2026-01-01T12:00&group=agent",
+                  preload_script=_navigation_probe())
     cdp.wait_for(BOOTED_JS)
     assert _filter_error(cdp) is None
     assert _selected(cdp, "filter-project") == ["P1", "P2"]
@@ -285,10 +413,7 @@ def test_restores_valid_url_state_and_survives_reload(dashboard):
       input.dispatchEvent(new Event("change"));
     })()''')
     cdp.wait_for('location.search.includes("from=2026-01-01T10%3A15")')
-    # The marker dies with the old document, so the booted condition below
-    # can only match the freshly reloaded page.
-    cdp.eval("window.__pre_reload = true; location.reload()")
-    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    _reload_and_wait(cdp)
     assert _element_value(cdp, "filter-from") == "2026-01-01T10:15"
     assert _selected(cdp, "filter-project") == ["P1", "P2"]
 
@@ -440,6 +565,20 @@ def _reset_color_registry(cdp):
     cdp.eval("colorRegistry.byKey.clear()")
 
 
+def _assert_color_keys(cdp, typed_ids):
+    """Fail on missing hydration before entityColor can allocate a fallback."""
+    normalized = [
+        [str(entity_type), str(entity_id).strip()]
+        for entity_type, entity_id in typed_ids
+        if entity_id is not None and str(entity_id).strip()
+    ]
+    missing = cdp.eval(
+        '''(ids => ids.filter(([type, id]) =>
+          !colorRegistry.byKey.has(type + "\\u0000" + id)))('''
+        + json.dumps(normalized) + ")")
+    assert missing == [], "color ledger hydration missing: %r" % missing
+
+
 def _register_colors(cdp, entity_type, ids):
     """Register one complete typed set through the production batch API."""
     return cdp.eval("registerEntityColors(%s, %s)" % (
@@ -455,12 +594,15 @@ def _register_identity_batches(cdp, identities):
         _register_colors(cdp, entity_type, ids)
 
 
-def _color_map(cdp, entity_type, ids):
+def _color_map(cdp, entity_type, ids, require_registered=True):
+    if require_registered:
+        _assert_color_keys(cdp, [[entity_type, entity_id] for entity_id in ids])
     return cdp.eval("Object.fromEntries(%s.map((id) => [id, entityColor(%s, id)]))" % (
         json.dumps(ids), json.dumps(entity_type)))
 
 
 def _registry_map(cdp, typed_ids):
+    _assert_color_keys(cdp, typed_ids)
     return cdp.eval("Object.fromEntries(%s.map(([type, id]) => "
                     "[type + '\\u0000' + id, entityColor(type, id)]))" %
                     json.dumps(typed_ids))
@@ -557,27 +699,8 @@ def test_agent_and_project_batches_have_exact_fifteen_capacity(dashboard):
 def test_meta_boot_registers_canonical_sets_before_chart_render(dashboard):
     """Meta registration completes before the first chart and survives refresh."""
     cdp, base = dashboard
-    trace_script = r'''(() => {
-      window.__aistat_boot_trace = [];
-      const trace = window.__aistat_boot_trace;
-      const fetchImpl = window.fetch;
-      window.fetch = (...args) => {
-        const url = String(args[0] && args[0].url || args[0]);
-        if (!url.includes("/api/meta")) return fetchImpl(...args);
-        trace.push("meta:start");
-        return fetchImpl(...args).then((response) => {
-          trace.push("meta:end");
-          return response;
-        });
-      };
-      const getContext = HTMLCanvasElement.prototype.getContext;
-      HTMLCanvasElement.prototype.getContext = function(...args) {
-        trace.push("chart:canvas");
-        return getContext.apply(this, args);
-      };
-    })();'''
     cdp.open_page(base + "/?model=m-claude&agent=A1&project=P1",
-                  preload_script=trace_script)
+                  preload_script=_navigation_probe(META_BOOT_TRACE_SCRIPT))
     cdp.wait_for(BOOTED_JS)
 
     typed_ids = cdp.eval('''(() => [
@@ -610,12 +733,41 @@ def test_meta_boot_registers_canonical_sets_before_chart_render(dashboard):
     })()''')
     cdp.wait_for('state.models.length === 1 && state.models[0] === "m-claude"')
     assert _registry_map(cdp, typed_ids) == before
-    cdp.eval("refreshMeta().then(refreshAll)")
-    cdp.wait_for(BOOTED_JS)
+    _refresh_and_wait(cdp)
     assert _registry_map(cdp, typed_ids) == before
-    cdp.eval("location.reload()")
-    cdp.wait_for(BOOTED_JS)
+    _reload_and_wait(cdp)
     assert _registry_map(cdp, typed_ids) == before
+
+
+def test_meta_boot_is_cold_isolated_for_three_sequential_launches(dashboard):
+    """A fresh Chrome/profile must hydrate meta before every first chart."""
+    _, base = dashboard
+    for launch in range(3):
+        profile = tempfile.TemporaryDirectory(
+            prefix="aistat-browser-cold-%d-" % launch)
+        cold_cdp = Cdp(CHROME, Path(profile.name) / "chrome-profile")
+        try:
+            cold_cdp.open_page(
+                base + "/?model=m-claude&agent=A1&project=P1",
+                preload_script=_navigation_probe(META_BOOT_TRACE_SCRIPT),
+            )
+            cold_cdp.wait_for(
+                'typeof window.__aistat_document_marker === "string" && '
+                '(%s)' % BOOTED_JS)
+            typed_ids = cold_cdp.eval('''(() => [
+              ...[...document.querySelectorAll("#filter-model option")]
+                .map((o) => ["model", o.value]).filter(([, id]) => id),
+              ...[...document.querySelectorAll("#filter-agent option")]
+                .map((o) => ["agent", o.value]).filter(([, id]) => id),
+              ...[...document.querySelectorAll("#filter-project option")]
+                .map((o) => ["project", o.value]).filter(([, id]) => id),
+            ])()''')
+            _assert_color_keys(cold_cdp, typed_ids)
+            trace = cold_cdp.eval("window.__aistat_boot_trace")
+            assert trace.index("meta:end") < trace.index("chart:canvas")
+        finally:
+            cold_cdp.close()
+            profile.cleanup()
 
 
 def test_color_ledger_survives_live_meta_expansion_and_same_tab_reload(dashboard):
@@ -659,13 +811,16 @@ def test_color_ledger_survives_live_meta_expansion_and_same_tab_reload(dashboard
       }
       window.EventSource = TestEventSource;
     })();'''
-    cdp.open_page(base + "/", preload_script=preload_script)
+    cdp.open_page(base + "/", preload_script=_navigation_probe(preload_script))
     cdp.wait_for(BOOTED_JS)
 
     before = _registry_map(cdp, [["model", "qa-sse-002"]])
     payload = cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
     assert payload["scope"] == "local"
-    assert payload["assignments"]["model"]["qa-sse-002"] == before["model\u0000qa-sse-002"]
+    assert [
+        color for entity_type, raw_id, color in payload["assignments"]
+        if entity_type == "model" and raw_id == "qa-sse-002"
+    ] == [before["model\u0000qa-sse-002"]]
 
     cdp.eval('''(() => {
       sessionStorage.setItem("qa-meta-expanded", "1");
@@ -678,13 +833,12 @@ def test_color_ledger_survives_live_meta_expansion_and_same_tab_reload(dashboard
     assert expanded["model\u0000qa-sse-002"] == before["model\u0000qa-sse-002"]
     assert expanded["model\u0000qa-sse-000"] != expanded["model\u0000qa-sse-002"]
 
-    cdp.eval("window.__pre_reload = true; location.reload()")
-    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    _reload_and_wait(cdp)
     assert _registry_map(cdp, [["model", "qa-sse-000"], ["model", "qa-sse-002"]]) == expanded
 
     cdp.eval('sessionStorage.setItem("qa-meta-reversed", "1"); '
-             'window.__pre_reload = true; location.reload()')
-    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+             'void 0')
+    _reload_and_wait(cdp)
     assert _registry_map(cdp, [["model", "qa-sse-000"], ["model", "qa-sse-002"]]) == expanded
 
 
@@ -705,9 +859,9 @@ def test_color_ledger_clean_history_is_order_independent_and_scope_safe(dashboar
     assert forward == reverse
 
     foreign = {
-        "version": 1,
+        "version": 2,
         "scope": "user:other",
-        "assignments": {"model": {"foreign": "#4f6df5"}},
+        "assignments": [["model", "foreign", "#4f6df5"]],
     }
     cdp.eval("sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s)" % json.dumps(
         json.dumps(foreign)))
@@ -764,9 +918,9 @@ def test_color_ledger_sweeps_stale_namespace_before_hydration(dashboard):
         "assignments": {"model": {"previous-id": "#4f6df5"}},
     }
     valid = {
-        "version": 1,
+        "version": 2,
         "scope": current_scope,
-        "assignments": {"model": {"current-id": "#4f6df5"}},
+        "assignments": [["model", "current-id", "#4f6df5"]],
     }
 
     cdp.eval("clearColorLedger(); sessionStorage.setItem('qa-unrelated', 'keep')")
@@ -810,12 +964,12 @@ def test_color_ledger_rejects_pre_capacity_duplicate_assignments(dashboard):
     cdp.open_page(base + "/")
     cdp.wait_for(BOOTED_JS)
     corrupt = {
-        "version": 1,
+        "version": 2,
         "scope": "local",
-        "assignments": {"model": {
-            "duplicate-first": "#4f6df5",
-            "duplicate-second": "#4f6df5",
-        }},
+        "assignments": [
+            ["model", "duplicate-first", "#4f6df5"],
+            ["model", "duplicate-second", "#4f6df5"],
+        ],
     }
     ids = ["duplicate-first", "duplicate-second"]
 
@@ -827,32 +981,39 @@ def test_color_ledger_rejects_pre_capacity_duplicate_assignments(dashboard):
     assert restored["duplicate-first"] != restored["duplicate-second"]
 
 
-def test_color_ledger_persists_prototype_named_ids_across_reload(dashboard):
-    """FAN-1323: own JSON entries retain __proto__ and constructor safely."""
+def test_color_ledger_persists_numeric_and_prototype_named_ids_across_reload(dashboard):
+    """FAN-1332: ordered tuples retain numeric and prototype-safe IDs."""
     cdp, base = dashboard
-    cdp.open_page(base + "/")
+    cdp.open_page(base + "/", preload_script=_navigation_probe())
     cdp.wait_for(BOOTED_JS)
-    ids = ["__proto__", "constructor"]
+    ids = ["10", "2", "1", "__proto__", "constructor"]
 
     cdp.eval("clearColorLedger(); initializeColorLedger('local')")
     _register_colors(cdp, "model", ids)
     before = _color_map(cdp, "model", ids)
     payload = cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
-    assignments = payload["assignments"]["model"]
+    assignments = {
+        raw_id: color for entity_type, raw_id, color in payload["assignments"]
+        if entity_type == "model"
+    }
+    assert [
+        raw_id for entity_type, raw_id, _ in payload["assignments"]
+        if entity_type == "model"
+    ] == sorted(ids)
     assert assignments["__proto__"] == before["__proto__"]
     assert assignments["constructor"] == before["constructor"]
     assert cdp.eval("Object.getPrototypeOf(Object.prototype) === null && "
                     "({}).polluted === undefined") is True
 
-    cdp.eval("window.__pre_reload = true; location.reload()")
-    cdp.wait_for(f"window.__pre_reload === undefined && ({BOOTED_JS})")
-    assert _color_map(cdp, "model", ids) == before
+    _reload_and_wait(cdp)
+    _assert_color_keys(cdp, [["model", entity_id] for entity_id in ids])
+    assert _color_map(cdp, "model", ids, require_registered=False) == before
 
 
 def test_color_ledger_preserves_exhausted_history_across_reload(dashboard):
     """FAN-1323: C+1 history is valid when every fallback color is present."""
     cdp, base = dashboard
-    cdp.open_page(base + "/")
+    cdp.open_page(base + "/", preload_script=_navigation_probe())
     cdp.wait_for(BOOTED_JS)
     ids = ["exhausted-history-%02d" % index for index in range(15)]
 
@@ -860,14 +1021,79 @@ def test_color_ledger_preserves_exhausted_history_across_reload(dashboard):
     _register_colors(cdp, "model", ids)
     before = _color_map(cdp, "model", ids)
     payload = cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
-    colors = list(payload["assignments"]["model"].values())
+    colors = [
+        color for entity_type, _, color in payload["assignments"]
+        if entity_type == "model"
+    ]
     assert len(colors) == 15
     assert set(colors) == set(cdp.eval(
         'PALETTE.filter((color) => color !== ENTITY_ANCHORS.model["claude-fable-5"])'))
 
-    cdp.eval("window.__pre_reload = true; location.reload()")
-    cdp.wait_for(f"window.__pre_reload === undefined && ({BOOTED_JS})")
-    assert _color_map(cdp, "model", ids) == before
+    _reload_and_wait(cdp)
+    _assert_color_keys(cdp, [["model", entity_id] for entity_id in ids])
+    assert _color_map(cdp, "model", ids, require_registered=False) == before
+
+
+@pytest.mark.parametrize(
+    ("entity_type", "capacity"),
+    (("model", 14), ("agent", 15), ("project", 15)),
+)
+def test_color_ledger_rejects_typed_c_plus_one_prefix_duplicates(
+        dashboard, entity_type, capacity):
+    """FAN-1333: a duplicate before exhaustion invalidates every typed space."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    colors = cdp.eval("PALETTE.filter((color) => color !== "
+                     "ENTITY_ANCHORS.model[\"claude-fable-5\"])") \
+        if entity_type == "model" else cdp.eval("PALETTE")
+    ids = ["typed-corrupt-%s-%02d" % (entity_type, index)
+           for index in range(capacity + 1)]
+    assignments = [
+        [entity_type, entity_id, colors[0] if index < 2 else colors[index - 1]]
+        for index, entity_id in enumerate(ids)
+    ]
+    corrupt = {
+        "version": 2,
+        "scope": "local",
+        "assignments": assignments,
+    }
+
+    cdp.eval("clearColorLedger(); sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s); "
+             "initializeColorLedger('local')" % json.dumps(json.dumps(corrupt)))
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    assert cdp.eval(
+        "colorRegistry.byKey.has(%s)" % json.dumps(
+            entity_type + "\u0000" + ids[0])) is False
+
+    _register_colors(cdp, entity_type, ids)
+    restored = _color_map(cdp, entity_type, ids)
+    assert len(set(restored.values())) == capacity
+
+
+def test_color_ledger_reloads_positive_c_plus_one_history_for_each_typed_space(
+        dashboard):
+    """FAN-1334: production-created exhausted histories survive reload."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/", preload_script=_navigation_probe())
+    cdp.wait_for(BOOTED_JS)
+    for entity_type, capacity in (("model", 14), ("agent", 15), ("project", 15)):
+        ids = ["positive-c-plus-one-%s-%02d" % (entity_type, index)
+               for index in range(capacity + 1)]
+        cdp.eval("clearColorLedger(); initializeColorLedger('local')")
+        _register_colors(cdp, entity_type, ids)
+        before = _color_map(cdp, entity_type, ids)
+        payload = cdp.eval(
+            "JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
+        typed_entries = [
+            entry for entry in payload["assignments"] if entry[0] == entity_type
+        ]
+        assert [entry[1] for entry in typed_entries] == ids
+        assert len(set(entry[2] for entry in typed_entries[:capacity])) == capacity
+
+        _reload_and_wait(cdp)
+        _assert_color_keys(cdp, [[entity_type, entity_id] for entity_id in ids])
+        assert _color_map(cdp, entity_type, ids, require_registered=False) == before
 
 
 def test_color_ledger_storage_operation_failures_use_memory_fallback(dashboard):
@@ -892,9 +1118,9 @@ def test_color_ledger_storage_operation_failures_use_memory_fallback(dashboard):
     assert key_failure == {"memory": True, "warning": True}
 
     valid = {
-        "version": 1,
+        "version": 2,
         "scope": "local",
-        "assignments": {"model": {"must-not-hydrate": "#4f6df5"}},
+        "assignments": [["model", "must-not-hydrate", "#4f6df5"]],
     }
     remove_failure = cdp.eval(r'''(payload => {
       sessionStorage.clear();
@@ -930,6 +1156,142 @@ def test_color_ledger_storage_operation_failures_use_memory_fallback(dashboard):
     assert set_failure["memory"] is True
     assert set_failure["warning"] is True
     assert set_failure["color"] != "#cbd5e1"
+
+
+def test_color_ledger_clear_reacquires_storage_after_recovered_failures(dashboard):
+    """FAN-1334: logout cleanup retries every recovered storage failure."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+
+    results = cdp.eval(r'''(() => {
+      const storage = window.sessionStorage;
+      const originalSessionStorage = Object.getOwnPropertyDescriptor(
+        window, "sessionStorage");
+      const current = {
+        version: COLOR_LEDGER_VERSION,
+        scope: "local",
+        assignments: [],
+      };
+      const adjacent = COLOR_LEDGER_NAMESPACE + "x";
+      const exactNamespace = COLOR_LEDGER_NAMESPACE;
+      const oldKey = COLOR_LEDGER_NAMESPACE + ".v0";
+      const seed = () => {
+        storage.clear();
+        storage.setItem(COLOR_LEDGER_STORAGE_KEY, JSON.stringify(current));
+        storage.setItem(oldKey, "obsolete");
+        storage.setItem(adjacent, "keep-adjacent");
+        storage.setItem(exactNamespace, "keep-exact");
+        storage.setItem("qa-unrelated", "keep-unrelated");
+      };
+      const after = (mode) => ({
+        mode,
+        memory: colorRegistry.byKey.size,
+        reacquired: colorRegistry.storage === storage,
+        current: storage.getItem(COLOR_LEDGER_STORAGE_KEY),
+        old: storage.getItem(oldKey),
+        adjacent: storage.getItem(adjacent),
+        exactNamespace: storage.getItem(exactNamespace),
+        unrelated: storage.getItem("qa-unrelated"),
+      });
+      const results = [];
+      for (const mode of ["normal", "getter", "key", "remove", "set"]) {
+        clearColorLedger();
+        seed();
+        if (mode === "getter") {
+          Object.defineProperty(window, "sessionStorage", {
+            configurable: true,
+            get() { throw new Error("getter denied by QA"); },
+          });
+          initializeColorLedger("local");
+          if (originalSessionStorage) {
+            Object.defineProperty(window, "sessionStorage", originalSessionStorage);
+          } else {
+            delete window.sessionStorage;
+          }
+        } else if (mode === "key") {
+          const original = Storage.prototype.key;
+          Storage.prototype.key = function() { throw new Error("key denied by QA"); };
+          initializeColorLedger("local");
+          Storage.prototype.key = original;
+        } else if (mode === "remove") {
+          const original = Storage.prototype.removeItem;
+          Storage.prototype.removeItem = function() {
+            throw new Error("remove denied by QA");
+          };
+          initializeColorLedger("local");
+          Storage.prototype.removeItem = original;
+        } else if (mode === "set") {
+          initializeColorLedger("local");
+          const original = Storage.prototype.setItem;
+          Storage.prototype.setItem = function() { throw new Error("set denied by QA"); };
+          registerEntityColors("model", ["recovery-set-failure"]);
+          Storage.prototype.setItem = original;
+        }
+        clearColorLedger();
+        results.push(after(mode));
+      }
+      return results;
+    })()''')
+    for result in results:
+        assert result == {
+            "mode": result["mode"],
+            "memory": 0,
+            "reacquired": True,
+            "current": None,
+            "old": None,
+            "adjacent": "keep-adjacent",
+            "exactNamespace": "keep-exact",
+            "unrelated": "keep-unrelated",
+        }
+
+
+def test_authenticated_logout_clears_user_scope_on_normal_and_recovered_paths(
+        authenticated_dashboard):
+    """FAN-1334: successful logout navigates without retaining user colors."""
+    cdp, base = authenticated_dashboard
+    for mode in ("normal", "recovered"):
+        if mode == "normal":
+            _login_in_browser(cdp, base)
+        else:
+            cdp.wait_for('location.pathname === "/" && (%s)' % BOOTED_JS)
+            assert cdp.eval('document.getElementById("logout-button").hidden') is False
+        scope = cdp.eval("colorRegistry.scope")
+        identity = "logout-scope-%s" % mode
+        cdp.eval(
+            "clearColorLedger(); initializeColorLedger(%s); "
+            "registerEntityColors('model', [%s])" % (
+                json.dumps(scope), json.dumps([identity])))
+        assert cdp.eval(
+            "colorRegistry.byKey.has(%s)" % json.dumps(
+                "model\u0000" + identity)) is True
+        assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)")
+
+        if mode == "recovered":
+            assert cdp.eval(r'''(() => {
+              sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + ".v0", "obsolete");
+              const original = Storage.prototype.removeItem;
+              Storage.prototype.removeItem = function() {
+                throw new Error("remove denied before logout");
+              };
+              initializeColorLedger(colorRegistry.scope);
+              Storage.prototype.removeItem = original;
+              return colorRegistry.storage === null;
+            })()''') is True
+
+        cdp.eval('document.getElementById("logout-button").click()')
+        cdp.wait_for(
+            'location.pathname === "/login" && '
+            'document.querySelector("form[action=\\"/login\\"]") !== null')
+        assert cdp.eval(
+            'sessionStorage.getItem("aistat.color-ledger.v2")') is None
+        assert cdp.eval(
+            'sessionStorage.getItem("aistat.color-ledger.v0")') is None
+
+        _login_in_browser(cdp, base, open_page=False)
+        assert cdp.eval(
+            "colorRegistry.byKey.has(%s)" % json.dumps(
+                "model\u0000" + identity)) is False
 
 
 def _probe_entity_colors(cdp, identities):
@@ -1014,7 +1376,7 @@ def test_fallback_mapping_survives_filter_and_reload(dashboard):
     """A filter change keeps cached identity colors, and a reload with the
     filtered URL reconstructs the same mapping in a fresh registry."""
     cdp, base = dashboard
-    cdp.open_page(base + "/?project=P1")
+    cdp.open_page(base + "/?project=P1", preload_script=_navigation_probe())
     cdp.wait_for(BOOTED_JS)
     identities = [["model", "collision-6"], ["model", "collision-9"]]
     before = _probe_entity_colors(cdp, identities)
@@ -1028,8 +1390,7 @@ def test_fallback_mapping_survives_filter_and_reload(dashboard):
     assert _probe_entity_colors(cdp, identities) == before
     assert "project=P2" in cdp.eval("location.search")
 
-    cdp.eval("window.__pre_reload = true; location.reload()")
-    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    _reload_and_wait(cdp)
     assert _probe_entity_colors(cdp, identities) == before
 
 
