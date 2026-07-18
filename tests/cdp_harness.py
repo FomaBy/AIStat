@@ -69,6 +69,11 @@ DEBUG_STATE_JS = """JSON.stringify({
 # Boot finished successfully once the summary card holds a real value.
 BOOTED_JS = 'document.getElementById("card-tokens").textContent !== "—"'
 
+_TARGET_TEARDOWN_EVENTS = frozenset((
+    "Target.detachedFromTarget",
+    "Target.targetDestroyed",
+))
+
 
 class PipeTransport:
     """Raw ``\\0``-framed CDP transport over Chrome's debugging-pipe fds.
@@ -134,6 +139,19 @@ class ChromeProcess:
         self._proc = proc
         self._reaped = False
 
+    def status(self):
+        """A non-blocking, never-raising snapshot of the Chrome process for a
+        stall diagnostic: ``running(pid=N)`` while it is alive, ``exited(rc=N)``
+        once it has gone. ``poll()`` reaps nothing and cannot block, so it is
+        safe on the timeout path where a hung call is being reported."""
+        try:
+            rc = self._proc.poll()
+        except Exception:
+            return "unknown"
+        if rc is None:
+            return "running(pid=%s)" % getattr(self._proc, "pid", "?")
+        return "exited(rc=%s)" % rc
+
     def reap(self):
         if self._reaped:
             return
@@ -165,7 +183,7 @@ class Cdp:
     """
 
     def __init__(self, transport, *, process=None, workdir=None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, context=None):
         self._transport = transport
         self._process = process
         self._workdir = workdir
@@ -176,10 +194,110 @@ class Cdp:
         self._target_id = None
         self._requested_url = None
         self._closed = False
+        self._target_discovery_enabled = False
+        # ``Page.close`` is asynchronous: its reply acknowledges the request,
+        # while target/session teardown arrives as later Target-domain events.
+        # Keep only those bounded lifecycle facts; retaining every Page event
+        # from a long-lived browser would grow without bound.
+        self._target_teardown_events = []
+        # Optional caller-supplied probe (e.g. the dashboard fixture reporting
+        # its Uvicorn thread's liveness). Read only while building a stall
+        # diagnostic, never on the happy path, and never allowed to raise.
+        self._context = context
+        # Per-call stall accounting: the method in flight, its one absolute
+        # deadline, when it started and how many transport bytes have arrived
+        # since. These turn a bare ``CDP read timed out`` into a classifiable
+        # transport-vs-browser-vs-server stall (see ``_diagnostics``).
+        self._call_method = None
+        self._call_deadline = None
+        self._call_start = None
+        self._call_recv_bytes = 0
+
+    def _buffer_state(self):
+        """(complete framed messages waiting, trailing partial-frame bytes) in
+        the receive buffer — the pending-frame state a stall needs."""
+        complete = self._buffer.count(b"\0")
+        partial = len(self._buffer.rsplit(b"\0", 1)[-1]) if self._buffer else 0
+        return complete, partial
+
+    def _process_status(self):
+        """Chrome process state for a diagnostic, or ``None`` when unknown —
+        never raises, tolerant of a stand-in process without ``status()``."""
+        if self._process is None:
+            return None
+        status = getattr(self._process, "status", None)
+        if not callable(status):
+            return "unknown"
+        try:
+            return status()
+        except Exception:
+            return "unknown"
+
+    def _context_snapshot(self):
+        """Read the optional caller probe once, without ever masking a stall."""
+        if self._context is None:
+            return None
+        try:
+            return self._context()
+        except Exception as exc:
+            return "context-probe-failed: %s" % exc
+
+    @staticmethod
+    def _format_context(context):
+        if isinstance(context, dict):
+            return ", ".join("%s=%s" % (key, context[key])
+                             for key in sorted(context))
+        return str(context)
+
+    def _stall_class(self, context=None):
+        """Name the most likely stall owner from the evidence gathered so far.
+
+        * ``browser-dead`` — the Chrome process has exited.
+        * ``transport-recv`` — bytes are still arriving (or sit buffered) yet no
+          matching reply landed: the pipe is live, the browser is streaming, the
+          reply itself is missing/late.
+        * ``server-dead`` — the fixture's server thread has stopped, so a
+          browser waiting on its HTTP/SSE work is not blamed as a pipe stall.
+        * ``browser-silent`` — the process is alive but not a single byte came
+          back within the deadline: the browser (or its pipe) is wedged.
+        * ``idle`` — no call was in flight (diagnostic built off the call path).
+        """
+        proc_status = self._process_status()
+        if proc_status is not None and proc_status.startswith("exited"):
+            return "browser-dead"
+        if (isinstance(context, dict) and
+                context.get("server_thread_alive") is False):
+            return "server-dead"
+        if self._call_start is None:
+            return "idle"
+        complete, partial = self._buffer_state()
+        if self._call_recv_bytes > 0 or complete or partial:
+            return "transport-recv"
+        return "browser-silent"
 
     def _diagnostics(self):
-        return ("requested_url=%r, target_id=%r, session_id=%r" %
+        # The original url/target/session core stays verbatim and first so
+        # existing callers and assertions keep matching on it; the stall
+        # classifier and its evidence are appended.
+        core = ("requested_url=%r, target_id=%r, session_id=%r" %
                 (self._requested_url, self._target_id, self.session_id))
+        context = self._context_snapshot()
+        parts = [core, "stall=%s" % self._stall_class(context)]
+        if self._call_start is not None:
+            elapsed = self._clock() - self._call_start
+            budget = ((self._call_deadline - self._call_start)
+                      if self._call_deadline is not None else float("nan"))
+            parts.append("method=%r, elapsed=%.3fs/deadline=%.3fs" %
+                         (self._call_method, elapsed, budget))
+            complete, partial = self._buffer_state()
+            parts.append("recv_bytes=%d, buffered=%dframes+%dB" %
+                         (self._call_recv_bytes, complete, partial))
+        proc_status = self._process_status()
+        if proc_status is not None:
+            parts.append("chrome=%s" % proc_status)
+        if context:
+            parts.append(self._format_context(context))
+        return ", ".join(parts)
 
     def _read_message(self, deadline):
         """Read one framed message, bounded by an absolute monotonic deadline
@@ -201,13 +319,18 @@ class Cdp:
                 raise TimeoutError("CDP read timed out")
             if chunk == b"":
                 raise ConnectionError("CDP pipe closed")
+            self._call_recv_bytes += len(chunk)
             self._buffer += chunk
         if deadline - self._clock() <= 0:
             raise TimeoutError("CDP read timed out")
         raw, self._buffer = self._buffer.split(b"\0", 1)
-        return json.loads(raw)
+        message = json.loads(raw)
+        if message.get("method") in _TARGET_TEARDOWN_EVENTS:
+            self._target_teardown_events.append(message)
+        return message
 
-    def call(self, method, params=None, session=True, timeout=BOOT_TIMEOUT):
+    def call(self, method, params=None, session=True, timeout=BOOT_TIMEOUT,
+             deadline=None):
         self._next_id += 1
         message = {"id": self._next_id, "method": method,
                    "params": params or {}}
@@ -218,32 +341,115 @@ class Cdp:
         # frame parsing share it. Interleaved events consume the budget instead
         # of resetting it, so an event stream with no matching reply (or a send
         # that blocks on a full pipe) still terminates in bounded time.
-        deadline = self._clock() + timeout
-        self._transport.send(json.dumps(message).encode() + b"\0", deadline)
-        while True:  # events arrive interleaved; wait for our reply
-            try:
+        if deadline is None:
+            deadline = self._clock() + timeout
+        # Arm this call's stall accounting so a timeout can name what stalled.
+        self._call_method = method
+        self._call_deadline = deadline
+        self._call_start = self._clock()
+        self._call_recv_bytes = 0
+        try:
+            self._transport.send(json.dumps(message).encode() + b"\0", deadline)
+            while True:  # events arrive interleaved; wait for our reply
                 reply = self._read_message(deadline)
-            except (ConnectionError, TimeoutError) as exc:
-                raise type(exc)("%s: %s (%s)" %
-                                (method, exc, self._diagnostics())) from exc
-            if reply.get("id") == self._next_id:
-                if expected_session and reply.get("sessionId") != expected_session:
-                    raise RuntimeError(
-                        "%s: reply for unexpected session %r (%s)" %
-                        (method, reply.get("sessionId"), self._diagnostics()))
-                if "error" in reply:
-                    raise RuntimeError("%s: %s (%s)" %
-                                       (method, reply["error"], self._diagnostics()))
-                return reply.get("result", {})
+                if reply.get("id") == self._next_id:
+                    if (expected_session and
+                            reply.get("sessionId") != expected_session):
+                        raise RuntimeError(
+                            "%s: reply for unexpected session %r (%s)" %
+                            (method, reply.get("sessionId"), self._diagnostics()))
+                    if "error" in reply:
+                        raise RuntimeError("%s: %s (%s)" %
+                                           (method, reply["error"], self._diagnostics()))
+                    return reply.get("result", {})
+        except (ConnectionError, TimeoutError) as exc:
+            raise type(exc)("%s: %s (%s)" %
+                            (method, exc, self._diagnostics())) from exc
+        finally:
+            # Every terminal reply path, including send, protocol and
+            # wrong-session failures, is no longer an in-flight call.
+            self._call_start = None
+
+    def _ensure_target_discovery(self):
+        """Enable the two Target events that prove page teardown exactly once."""
+        if not self._target_discovery_enabled:
+            self.call("Target.setDiscoverTargets", {"discover": True},
+                      session=False)
+            self._target_discovery_enabled = True
+
+    def _consume_target_teardown_events(self, target_id, session_id):
+        """Return the exact destruction/detach facts received so far.
+
+        Target events for unrelated browser targets are intentionally dropped:
+        this single-threaded harness owns exactly one page session at a time and
+        must not retain extension/background-target noise across a 20-test run.
+        """
+        destroyed = detached = False
+        events, self._target_teardown_events = self._target_teardown_events, []
+        for event in events:
+            params = event.get("params", {})
+            if (event.get("method") == "Target.targetDestroyed" and
+                    params.get("targetId") == target_id):
+                destroyed = True
+            elif (event.get("method") == "Target.detachedFromTarget" and
+                  params.get("sessionId") == session_id):
+                detached = True
+        return destroyed, detached
+
+    def _wait_for_target_teardown(self, target_id, session_id, deadline,
+                                  started):
+        """Wait under the close operation's one deadline for exact teardown.
+
+        ``Page.close`` only asks Chrome to close the active page.  The old
+        document's SSE/timers are known to be gone only after both the flattened
+        session detaches and Target discovery reports the page destroyed.
+        """
+        destroyed = detached = False
+        self._call_method = "Page.close teardown"
+        self._call_deadline = deadline
+        self._call_start = started
+        self._call_recv_bytes = 0
+        try:
+            while not (destroyed and detached):
+                just_destroyed, just_detached = self._consume_target_teardown_events(
+                    target_id, session_id)
+                destroyed = destroyed or just_destroyed
+                detached = detached or just_detached
+                if destroyed and detached:
+                    return
+                try:
+                    self._read_message(deadline)
+                except (ConnectionError, TimeoutError) as exc:
+                    raise type(exc)(
+                        "Page.close teardown: target_id=%r, session_id=%r, "
+                        "target_destroyed=%s, session_detached=%s (%s)" %
+                        (target_id, session_id, destroyed, detached,
+                         self._diagnostics())) from exc
+        finally:
+            self._call_start = None
+
+    def _close_current_target(self):
+        """Destroy and detach the current page before creating another one.
+
+        Chrome 150 acknowledges ``Target.closeTarget`` before an attached page
+        is gone.  That left prior dashboard tabs (and their EventSource/timers)
+        alive in this module-scoped browser.  ``Page.close`` plus the exact
+        Target events gives a causal teardown barrier without retries or sleeps.
+        """
+        target_id, session_id = self._target_id, self.session_id
+        started = self._clock()
+        deadline = started + BOOT_TIMEOUT
+        self.call("Page.close", deadline=deadline)
+        self._wait_for_target_teardown(target_id, session_id, deadline, started)
+        self.session_id = None
+        self._target_id = None
 
     def open_page(self, url, preload_script=None):
-        # One fresh tab per page: closing the previous target first means a
-        # booted-page condition can never match a stale document.
+        self._ensure_target_discovery()
+        # One fresh tab per page: wait for the previous target's real
+        # destruction/detachment before a new session can be created.
         if self._target_id:
-            self.call("Target.closeTarget", {"targetId": self._target_id},
-                      session=False)
-            self.session_id = None
-            self._target_id = None
+            self._close_current_target()
         self._requested_url = url
         # A target created with a non-blank URL may finish navigation before
         # Target.attachToTarget returns on newer Chrome versions.  Always
@@ -332,10 +538,11 @@ def _place_pipe_fds(cmd_read, resp_write):
     os.set_inheritable(4, True)
 
 
-def launch_chrome(chrome=CHROME, *, clock=time.monotonic):
+def launch_chrome(chrome=CHROME, *, clock=time.monotonic, context=None):
     """Start headless Chrome on a fresh, task-owned HOME/TMPDIR/profile and
     return a :class:`Cdp` bound to it. ``close()`` reaps the process and removes
-    the whole throwaway tree."""
+    the whole throwaway tree. ``context`` is an optional caller probe (e.g. the
+    server thread's liveness) folded into a stall diagnostic."""
     workdir = Path(tempfile.mkdtemp(prefix="aistat-browser-"))
     home = workdir / "home"
     tmp = workdir / "tmp"
@@ -380,7 +587,8 @@ def launch_chrome(chrome=CHROME, *, clock=time.monotonic):
     os.close(cmd_read)
     os.close(resp_write)
     return Cdp(PipeTransport(cmd_write, resp_read, clock=clock),
-               process=ChromeProcess(proc), workdir=workdir, clock=clock)
+               process=ChromeProcess(proc), workdir=workdir, clock=clock,
+               context=context)
 
 
 class DashboardSession:

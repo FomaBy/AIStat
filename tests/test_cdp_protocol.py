@@ -54,7 +54,8 @@ class FakeChrome:
     """
 
     def __init__(self, session_id="S-EXACT", *, stall_methods=(),
-                 stall_events=40, wrong_session_methods=(), clock=None):
+                 stall_events=40, wrong_session_methods=(), clock=None,
+                 close_events=True):
         self.session_id = session_id
         self.commands = []
         self._outbox = []
@@ -63,8 +64,12 @@ class FakeChrome:
         self._stall_events = stall_events
         self._wrong = set(wrong_session_methods)
         self._clock = clock
+        self._close_events = close_events
         self.events_delivered = 0
         self.closed = False
+        self.destroyed_targets = []
+        self.detached_sessions = []
+        self._session_targets = {}
 
     # --- transport interface -------------------------------------------------
     def send(self, data, deadline=None):
@@ -79,6 +84,8 @@ class FakeChrome:
             if self._clock is not None:
                 self._clock.advance()
             return chunk
+        if self._clock is not None:
+            self._clock.advance()
         return b"" if self.closed else None
 
     def close(self):
@@ -94,8 +101,8 @@ class FakeChrome:
             reply["sessionId"] = session
         self._emit(reply)
 
-    def _event(self, method, session=None):
-        event = {"method": method, "params": {}}
+    def _event(self, method, session=None, params=None):
+        event = {"method": method, "params": params or {}}
         if session:
             event["sessionId"] = session
         self._emit(event)
@@ -113,8 +120,19 @@ class FakeChrome:
             self._target_seq += 1
             self._reply(msg, {"targetId": "T-%d" % self._target_seq})
         elif method == "Target.attachToTarget":
+            self._session_targets[self.session_id] = msg["params"]["targetId"]
             self._event("Target.attachedToTarget")  # skipped, matched by id
             self._reply(msg, {"sessionId": self.session_id})
+        elif method == "Page.close":
+            self._reply(msg, {}, session=msg.get("sessionId"))
+            if self._close_events:
+                session = msg.get("sessionId")
+                target = self._session_targets.pop(session)
+                self.detached_sessions.append(session)
+                self.destroyed_targets.append(target)
+                self._event("Target.detachedFromTarget",
+                            params={"sessionId": session, "targetId": target})
+                self._event("Target.targetDestroyed", params={"targetId": target})
         elif method == "Page.navigate":
             self._event("Page.frameStartedNavigating", session=self.session_id)
             self._event("Page.frameStartedLoading", session=self.session_id)
@@ -144,6 +162,7 @@ def test_open_page_lifecycle_order_and_single_session():
     cdp.open_page("http://127.0.0.1:9/dash", preload_script="void 0")
 
     assert fake.commands == [
+        ("Target.setDiscoverTargets", None),
         ("Target.createTarget", None),
         ("Target.attachToTarget", None),
         ("Page.enable", "S-EXACT"),
@@ -158,15 +177,47 @@ def test_open_page_lifecycle_order_and_single_session():
         order.index("Page.navigate")
 
 
-def test_reopen_closes_previous_target_before_relifecycle():
+def test_reopen_waits_for_previous_target_destruction_and_session_detach():
+    """FAN-1352 causal red→green: a close acknowledgement alone is not enough.
+
+    The old harness sent ``Target.closeTarget`` then immediately created another
+    target.  This oracle requires the candidate's ``Page.close`` barrier to
+    receive both the old flattened-session detach and the target-destroyed event
+    before the next target lifecycle begins.
+    """
     fake = FakeChrome(session_id="S-EXACT")
     cdp = Cdp(fake, clock=lambda: 0.0)
     cdp.open_page("http://127.0.0.1:9/one")
+    old_target, old_session = cdp._target_id, cdp.session_id
     fake.commands.clear()
     cdp.open_page("http://127.0.0.1:9/two")
     assert [method for method, _ in fake.commands] == [
-        "Target.closeTarget", "Target.createTarget", "Target.attachToTarget",
+        "Page.close", "Target.createTarget", "Target.attachToTarget",
         "Page.enable", "Page.navigate"]
+    assert fake.destroyed_targets == [old_target]
+    assert fake.detached_sessions == [old_session]
+
+
+def test_reopen_refuses_to_create_a_target_without_teardown_events():
+    """A failed close cannot be masked by creating a second tab or retrying.
+
+    The fake acknowledges ``Page.close`` but never emits the evidence that the
+    prior target/session vanished.  The one monotonic deadline must raise a
+    bounded timeout and leave the browser with only its original created target.
+    """
+    clock = FakeClock(step=1.0)
+    fake = FakeChrome(session_id="S-EXACT", clock=clock, close_events=False)
+    cdp = Cdp(fake, clock=clock)
+    cdp.open_page("http://127.0.0.1:9/one")
+
+    with pytest.raises(TimeoutError) as failure:
+        cdp.open_page("http://127.0.0.1:9/two")
+
+    message = str(failure.value)
+    assert "Page.close teardown" in message
+    assert "target_destroyed=False" in message
+    assert "session_detached=False" in message
+    assert [method for method, _ in fake.commands].count("Target.createTarget") == 1
 
 
 def test_session_scoped_reply_for_wrong_session_is_rejected():
@@ -333,6 +384,194 @@ def test_call_times_out_on_coalesced_events_without_matching_reply():
         cdp.call("Page.navigate", {"url": cdp._requested_url}, timeout=5.0)
     assert "Page.navigate" in str(failure.value)
     assert "requested_url='http://127.0.0.1:9/x'" in str(failure.value)
+
+
+# --- FAN-1352: a long-lived-session stall names what stalled ----------------
+#
+# The observed failure was a bounded `Runtime.evaluate: CDP read timed out`
+# after 60s in one long-lived Chrome/CDP session — Chrome accepting the command
+# and never replying, with the transport, buffer and process otherwise healthy.
+# A bare timeout cannot tell that apart from a wedged pipe, a dead browser or a
+# dead test server, so the timeout now classifies the stall and carries the
+# evidence (monotonic elapsed/deadline, pending method, buffered/pending-frame
+# state, recv activity, Chrome process state, optional server-liveness). These
+# probe the classifier deterministically — no real Chrome, no sleeps.
+
+
+class _FakeProc:
+    """A subprocess stand-in for ``ChromeProcess.status()``: ``poll()`` returns
+    ``None`` while running or an exit code once gone."""
+
+    def __init__(self, rc=None, pid=4321):
+        self._rc = rc
+        self.pid = pid
+
+    def poll(self):
+        return self._rc
+
+
+class _SilentBrowserTransport:
+    """Accepts the command, then never delivers a byte — Chrome taking a
+    ``Runtime.evaluate`` and never answering. Advances the injected clock to the
+    deadline as the read blocks so the single-deadline call ends bounded."""
+
+    def __init__(self, clock, stall_to):
+        self._clock = clock
+        self._stall_to = stall_to
+        self.sent = []
+
+    def send(self, data, deadline=None):
+        self.sent.append(data)
+
+    def recv(self, timeout):
+        self._clock.t = self._stall_to
+        return None
+
+    def close(self):
+        pass
+
+
+class _DeadBrowserTransport:
+    """The pipe EOFs (a Chrome that has exited): recv returns ``b""``."""
+
+    def send(self, data, deadline=None):
+        pass
+
+    def recv(self, timeout):
+        return b""
+
+    def close(self):
+        pass
+
+
+def test_stall_names_a_silent_browser_and_keeps_the_single_deadline():
+    """The exact FAN-1352 signature: the command was sent, the process is alive
+    and the pipe delivered nothing before the one absolute deadline. The bounded
+    timeout classifies it ``browser-silent`` and carries method, monotonic
+    elapsed/deadline, zero recv, empty buffer and the running Chrome — and the
+    clock never runs past the deadline (the single deadline is not weakened)."""
+    clock = _SettableClock(0.0)
+    cdp = Cdp(_SilentBrowserTransport(clock, stall_to=5.0),
+              process=ChromeProcess(_FakeProc(rc=None)), clock=clock)
+    cdp._requested_url = "http://127.0.0.1:9/dash"
+    cdp._target_id = "T-1"
+    cdp.session_id = "S-EXACT"
+
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Runtime.evaluate", {"expression": "1"}, timeout=5.0)
+
+    message = str(failure.value)
+    assert "Runtime.evaluate" in message
+    assert "stall=browser-silent" in message
+    assert "method='Runtime.evaluate'" in message
+    assert "elapsed=5.000s/deadline=5.000s" in message
+    assert "recv_bytes=0, buffered=0frames+0B" in message
+    assert "chrome=running(pid=4321)" in message
+    assert "requested_url='http://127.0.0.1:9/dash'" in message
+    assert clock.t == 5.0  # bounded exactly by the one deadline, no overrun
+
+
+def test_stall_names_a_dead_browser_from_the_process_state():
+    """A pipe EOF while the process has exited is a dead browser, not a mere
+    transport hiccup — the classifier reads the process state and says so."""
+    cdp = Cdp(_DeadBrowserTransport(),
+              process=ChromeProcess(_FakeProc(rc=137)), clock=lambda: 0.0)
+    cdp._requested_url = "http://127.0.0.1:9/dash"
+    with pytest.raises(ConnectionError) as failure:
+        cdp.call("Runtime.evaluate", {"expression": "1"}, timeout=5.0)
+    message = str(failure.value)
+    assert "stall=browser-dead" in message
+    assert "chrome=exited(rc=137)" in message
+
+
+def test_stall_names_a_transport_recv_when_events_arrive_without_a_reply():
+    """Events keep arriving but the matching reply never does: the pipe and
+    browser are live, the reply itself is missing. That is ``transport-recv``,
+    distinct from a browser that went silent."""
+    clock = _SettableClock(0.0)
+    transport = CoalescedTransport(
+        clock, _lifecycle_events("S-EXACT", 8), arrive_at=3.0)
+    cdp = Cdp(transport, process=ChromeProcess(_FakeProc(rc=None)), clock=clock)
+    cdp._requested_url = "http://127.0.0.1:9/dash"
+    cdp.session_id = "S-EXACT"
+
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Runtime.evaluate", {"expression": "1"}, timeout=5.0)
+    message = str(failure.value)
+    assert "stall=transport-recv" in message
+    assert "chrome=running(pid=4321)" in message
+    assert "recv_bytes=0, buffered=0frames+0B" not in message  # bytes did arrive
+
+
+def test_stall_folds_in_the_caller_server_liveness_context():
+    """A server-liveness probe (the dashboard fixture's Uvicorn thread) is
+    folded into the stall message, so a wedged browser is told apart from a
+    dead test server."""
+    clock = _SettableClock(0.0)
+    cdp = Cdp(_SilentBrowserTransport(clock, stall_to=5.0),
+              process=ChromeProcess(_FakeProc(rc=None)), clock=clock,
+              context=lambda: {"server_thread_alive": True,
+                               "server_should_exit": False})
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Runtime.evaluate", {"expression": "1"}, timeout=5.0)
+    message = str(failure.value)
+    assert "server_thread_alive=True" in message
+    assert "server_should_exit=False" in message
+
+
+def test_stall_names_a_dead_server_separately_from_a_silent_browser():
+    """A dead Uvicorn thread is a server stall, not an opaque browser timeout."""
+    clock = _SettableClock(0.0)
+    cdp = Cdp(_SilentBrowserTransport(clock, stall_to=5.0),
+              process=ChromeProcess(_FakeProc(rc=None)), clock=clock,
+              context=lambda: {"server_thread_alive": False,
+                               "server_should_exit": True})
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Runtime.evaluate", {"expression": "1"}, timeout=5.0)
+    message = str(failure.value)
+    assert "stall=server-dead" in message
+    assert "server_thread_alive=False" in message
+
+
+def test_failed_session_reply_disarms_the_next_idle_diagnostic():
+    """A completed error reply cannot be reported later as an in-flight call."""
+    fake = FakeChrome(session_id="S-EXACT", wrong_session_methods={"Page.enable"})
+    cdp = Cdp(fake, clock=lambda: 0.0)
+    cdp.session_id = "S-EXACT"
+    with pytest.raises(RuntimeError):
+        cdp.call("Page.enable", session=True)
+    assert "stall=idle" in cdp._diagnostics()
+
+
+def test_a_context_probe_that_raises_never_masks_the_real_stall():
+    """The optional probe is defensive: if it raises, the stall is still
+    reported, with the probe failure noted rather than swallowing the timeout."""
+    clock = _SettableClock(0.0)
+
+    def _boom():
+        raise RuntimeError("probe blew up")
+
+    cdp = Cdp(_SilentBrowserTransport(clock, stall_to=5.0),
+              process=ChromeProcess(_FakeProc(rc=None)), clock=clock,
+              context=_boom)
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Runtime.evaluate", {"expression": "1"}, timeout=5.0)
+    message = str(failure.value)
+    assert "stall=browser-silent" in message
+    assert "context-probe-failed" in message
+
+
+def test_diagnostics_report_idle_off_the_call_path():
+    """A diagnostic built when no call is in flight (a wait_for whose condition
+    never held, after its probes all returned) reports ``idle`` and omits the
+    per-call fields — it must not attribute a finished call as the stall."""
+    fake = FakeChrome(session_id="S-EXACT")
+    cdp = Cdp(fake, clock=lambda: 0.0)
+    cdp.open_page("http://127.0.0.1:9/dash")  # several calls, all complete
+    diag = cdp._diagnostics()
+    assert "stall=idle" in diag
+    assert "method=" not in diag
+    assert "elapsed=" not in diag
 
 
 # --- AC#5: bounded send + failure-safe, idempotent cleanup ------------------
