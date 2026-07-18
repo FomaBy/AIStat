@@ -1,7 +1,10 @@
 """Per-connection official-CLI profile: isolation, stdin token, host pinning."""
 
+import os
+
 import pytest
 
+import aistat.cli_profile as cli_profile
 from aistat.cli_profile import (
     CliProfileError,
     ConnectionCliProfile,
@@ -220,3 +223,160 @@ def test_context_manager_cleans_up_on_exit(tmp_path):
         (residue / "config.json").write_text('{"token": "live_pat"}')
     assert not residue.exists()
     assert any(c["args"] == ["auth", "logout"] for c in executor.calls)
+
+
+# -- fail-closed storage: reject a symlinked/non-directory profile root -------
+
+def test_login_rejects_symlinked_profile_root_without_touching_target(tmp_path):
+    # A synthetic attacker points the task-owned HOME at a foreign directory.
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "sentinel").write_text("do-not-touch")
+    profiles = tmp_path / "cli_profiles"
+    os.symlink(foreign, profiles)  # cli_profiles_dir is now a symlink
+
+    config = make_config(tmp_path, cli_profiles_dir=profiles)
+    executor = FakeExecutor()
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+    with pytest.raises(CliProfileError) as exc_info:
+        profile.login(TOKEN)
+
+    # fail closed *before* the token is handed to the CLI: no login attempt
+    assert executor.calls == []
+    # the linked/foreign target is left completely unchanged, no fallback write
+    assert (foreign / "sentinel").read_text() == "do-not-touch"
+    assert list(foreign.iterdir()) == [foreign / "sentinel"]
+    # the error carries neither the token nor a path
+    message = str(exc_info.value)
+    assert TOKEN not in message
+    assert str(tmp_path) not in message
+
+
+def test_login_rejects_symlinked_dot_multica(tmp_path):
+    # A nested credential-bearing component (.multica) is the symlink.
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    config = make_config(tmp_path)
+    config.cli_profiles_dir.mkdir(parents=True)
+    os.symlink(foreign, config.cli_profiles_dir / ".multica")
+
+    executor = FakeExecutor()
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+    with pytest.raises(CliProfileError):
+        profile.login(TOKEN)
+    assert executor.calls == []
+
+
+def test_login_rejects_non_directory_profile_root(tmp_path):
+    profiles = tmp_path / "cli_profiles"
+    profiles.write_text("i am a file, not a directory")
+    config = make_config(tmp_path, cli_profiles_dir=profiles)
+    executor = FakeExecutor()
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+    with pytest.raises(CliProfileError):
+        profile.login(TOKEN)
+    assert executor.calls == []
+
+
+def test_discard_residue_rejects_symlinked_root(tmp_path):
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "sentinel").write_text("keep")
+    profiles = tmp_path / "cli_profiles"
+    os.symlink(foreign, profiles)
+    config = make_config(tmp_path, cli_profiles_dir=profiles)
+    profile = ConnectionCliProfile(config, 7, executor=FakeExecutor())
+    with pytest.raises(CliProfileError):
+        profile.discard_residue()
+    assert (foreign / "sentinel").read_text() == "keep"
+
+
+# -- logout re-pins the official host (recorder proof) -----------------------
+
+def test_logout_pins_profile_and_official_host(tmp_path):
+    config = make_config(tmp_path, multica_official_url="https://multica.ai")
+    executor = FakeExecutor()
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+    profile.login(TOKEN)
+    profile.logout()
+    logout_calls = [c for c in executor.calls if c["args"] == ["auth", "logout"]]
+    assert len(logout_calls) == 1
+    prep = logout_calls[0]["prepend"]
+    # every lifecycle call — logout included — pins the isolated profile and host
+    assert prep == [
+        "--profile", "aistat-conn-7", "--server-url", "https://multica.ai",
+    ]
+    assert "https://api.multica.ai" not in prep  # never a poisoned/ambient host
+    # and the child env is still scrubbed of the owner identity
+    assert not any(k.startswith("MULTICA_") for k in logout_calls[0]["env"])
+
+
+# -- cleanup runs even when logout fails -------------------------------------
+
+def test_cleanup_erases_residue_even_when_logout_fails(tmp_path):
+    config = make_config(tmp_path)
+    executor = FakeExecutor(logout_rc=1)  # logout reports failure
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+    profile.login(TOKEN)
+    residue = config.cli_profiles_dir / ".multica" / "profiles" / "aistat-conn-7"
+    residue.mkdir(parents=True, exist_ok=True)
+    (residue / "config.json").write_text('{"token": "live_pat"}')
+    profile.cleanup()  # must not raise; residue removal still runs
+    assert not residue.exists()
+    assert any(c["args"] == ["auth", "logout"] for c in executor.calls)
+
+
+# -- residue removal is never silent -----------------------------------------
+
+def test_unremovable_residue_fails_closed(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    profile = ConnectionCliProfile(config, 7, executor=FakeExecutor())
+
+    def boom(_path):
+        raise OSError(13, "Permission denied", str(_path))
+
+    monkeypatch.setattr(cli_profile.shutil, "rmtree", boom)
+    with pytest.raises(CliProfileError) as exc_info:
+        profile.cleanup()
+    message = str(exc_info.value)
+    assert TOKEN not in message
+    assert str(tmp_path) not in message  # the OS error path never surfaces
+
+
+def test_login_fails_closed_when_stale_residue_cannot_be_removed(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    executor = FakeExecutor()
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+
+    def boom(_path):
+        raise OSError(13, "Permission denied", str(_path))
+
+    monkeypatch.setattr(cli_profile.shutil, "rmtree", boom)
+    # login must fail closed and never hand the token to the CLI when the stale
+    # residue of a revoked/replaced credential cannot be erased first.
+    with pytest.raises(CliProfileError):
+        profile.login(TOKEN)
+    assert executor.calls == []
+
+
+# -- crash/restart: a crashed cycle's residue is erased before the next login -
+
+def test_restart_erases_crashed_residue_before_logging_in(tmp_path):
+    config = make_config(tmp_path)
+    # Simulate a prior cycle that crashed mid-flight, leaving a stale token file.
+    residue = config.cli_profiles_dir / ".multica" / "profiles" / "aistat-conn-7"
+    residue.mkdir(parents=True)
+    (residue / "config.json").write_text('{"token": "revoked_old_pat"}')
+
+    # A fresh profile (worker restart) logs in with the current token.
+    executor = FakeExecutor()
+    profile = ConnectionCliProfile(config, 7, executor=executor)
+    profile.login("mul_new_current_pat")
+
+    # the crashed cycle's stale token config is gone, not resurrected
+    assert not (residue / "config.json").exists()
+    # and the new login used the current token via stdin only
+    login_calls = [c for c in executor.calls if c["args"] == ["login", "--token"]]
+    assert len(login_calls) == 1
+    assert login_calls[0]["stdin"] == "mul_new_current_pat\n"
+    assert "revoked_old_pat" not in all_argv_text(executor)

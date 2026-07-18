@@ -132,45 +132,99 @@ class Collector:
             except WorkerStoreError:
                 return self._fail(user_id, epoch, "the stored token could not be read")
             if not token:
-                # Revoked/erased between listing and reading — nothing to do.
-                return ConnectionOutcome(user_id, "skipped", "connection was revoked")
+                # Revoked/erased between listing and reading. Do a residue-only
+                # local cleanup so a prior crashed cycle's stale token config is
+                # never left behind, but perform no login/poll/publish.
+                return self._discard_revoked(user_id)
             return self._collect_with_token(user_id, epoch, label, token)
         finally:
             lock.release()
 
+    def _discard_revoked(self, user_id: int) -> ConnectionOutcome:
+        try:
+            self.profile_factory(self.config, user_id).discard_residue()
+        except CliProfileError:
+            logger.error(
+                "connection %s: revoked-connection residue could not be removed",
+                user_id,
+            )
+            return ConnectionOutcome(
+                user_id, "failed", "revoked connection residue could not be removed"
+            )
+        return ConnectionOutcome(user_id, "skipped", "connection was revoked")
+
     def _collect_with_token(
         self, user_id: int, epoch: int, label: Optional[str], token: str
     ) -> ConnectionOutcome:
-        with self.profile_factory(self.config, user_id) as profile:
-            try:
-                profile.login(token)
-            except CliProfileError:
-                return self._fail(
-                    user_id, epoch,
-                    "authentication with the connection's token failed",
-                )
-            try:
-                profile.select_workspace(label)
-            except CliProfileError as exc:
-                return self._fail(user_id, epoch, str(exc))
-            db_path = self.config.worker_tenant_db_path(user_id)
-            try:
-                self._poll_into(db_path, profile.runner)
-            except Exception as exc:  # defensive: never leak a token via a trace
-                logger.error(
-                    "polling connection %s failed (%s)", user_id, type(exc).__name__
-                )
-                return self._fail(user_id, epoch, "polling the connection's data failed")
-            try:
-                self.publish_fn(self.config, db_path, user_id)
-            except (PublishError, ValueError):
-                return self._fail(
-                    user_id, epoch, "publishing the connection's snapshot failed"
-                )
-        # Profile logged out and residue erased by the context manager.
-        self._report(user_id, epoch, True, None)
-        logger.info("collected connection %s", user_id)
+        profile = self.profile_factory(self.config, user_id)
+        try:
+            outcome = self._drive_profile(profile, user_id, label, token)
+        finally:
+            # Cleanup always runs, even if driving the profile raised. A
+            # residue that cannot be removed is a safe per-connection failure
+            # that must never be silent and must block reuse of the credential.
+            cleanup_failure = self._safe_cleanup(profile, user_id)
+        if outcome.ok and cleanup_failure is not None:
+            outcome = cleanup_failure
+        if outcome.ok:
+            self._report(user_id, epoch, True, None)
+            logger.info("collected connection %s", user_id)
+        else:
+            self._report(user_id, epoch, False, outcome.detail)
+            logger.error("connection %s: %s", user_id, outcome.detail)
+        return outcome
+
+    def _drive_profile(
+        self,
+        profile: ConnectionCliProfile,
+        user_id: int,
+        label: Optional[str],
+        token: str,
+    ) -> ConnectionOutcome:
+        """Login, select workspace, poll and publish; report handled by caller."""
+        try:
+            profile.login(token)
+        except CliProfileError as exc:
+            # Safe, path-free message (auth, symlinked storage or unremovable
+            # residue) — never the CLI's raw stderr or a token.
+            return ConnectionOutcome(user_id, "failed", str(exc))
+        try:
+            profile.select_workspace(label)
+        except CliProfileError as exc:
+            return ConnectionOutcome(user_id, "failed", str(exc))
+        db_path = self.config.worker_tenant_db_path(user_id)
+        try:
+            self._poll_into(db_path, profile.runner)
+        except Exception as exc:  # defensive: never leak a token via a trace
+            logger.error(
+                "polling connection %s failed (%s)", user_id, type(exc).__name__
+            )
+            return ConnectionOutcome(
+                user_id, "failed", "polling the connection's data failed"
+            )
+        try:
+            self.publish_fn(self.config, db_path, user_id)
+        except (PublishError, ValueError):
+            return ConnectionOutcome(
+                user_id, "failed", "publishing the connection's snapshot failed"
+            )
         return ConnectionOutcome(user_id, "collected", "")
+
+    def _safe_cleanup(
+        self, profile: ConnectionCliProfile, user_id: int
+    ) -> Optional[ConnectionOutcome]:
+        """Log out and erase residue; a removal failure becomes a safe failure."""
+        try:
+            profile.cleanup()
+        except CliProfileError:
+            logger.error(
+                "connection %s: profile residue could not be removed on cleanup",
+                user_id,
+            )
+            return ConnectionOutcome(
+                user_id, "failed", "the connection profile could not be cleaned up"
+            )
+        return None
 
     def _poll_into(self, db_path: Path, runner: Callable[[List[str]], Any]) -> None:
         self.config.ensure_worker_tenants_dir()

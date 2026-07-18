@@ -40,13 +40,25 @@ class FakeProfile:
 
     instances = []
 
-    def __init__(self, config, user_id, *, login_fail=False, ws_fail=False):
+    def __init__(
+        self,
+        config,
+        user_id,
+        *,
+        login_fail=False,
+        ws_fail=False,
+        cleanup_fail=False,
+        discard_fail=False,
+    ):
         self.config = config
         self.user_id = user_id
         self.login_fail = login_fail
         self.ws_fail = ws_fail
+        self.cleanup_fail = cleanup_fail
+        self.discard_fail = discard_fail
         self.logged_in_with = None
         self.cleaned = False
+        self.discarded = False
         self._runner = make_runner()
         FakeProfile.instances.append(self)
 
@@ -65,6 +77,13 @@ class FakeProfile:
 
     def cleanup(self):
         self.cleaned = True
+        if self.cleanup_fail:
+            raise CliProfileError("the connection profile residue could not be removed")
+
+    def discard_residue(self):
+        self.discarded = True
+        if self.discard_fail:
+            raise CliProfileError("the connection profile residue could not be removed")
 
     def __enter__(self):
         return self
@@ -188,7 +207,9 @@ def test_failure_detail_carries_no_token_or_path(tmp_path):
 
 # -- revoked / unreadable token ---------------------------------------------
 
-def test_revoked_connection_is_skipped(tmp_path):
+def test_revoked_connection_does_residue_only_cleanup(tmp_path):
+    # Revoked between listing and reading the token: no login/poll/publish, but
+    # any residue a prior crashed cycle left behind is still erased.
     config = make_config(tmp_path)
     store = FakeStore(
         connections=[{"user_id": 101, "workspace_label": "alpha", "token_epoch": 1}],
@@ -202,7 +223,74 @@ def test_revoked_connection_is_skipped(tmp_path):
     outcome = collector.collect_once()[0]
     assert outcome.status == "skipped"
     assert publisher.calls == []
-    assert FakeProfile.instances == []  # never logs a revoked token in
+    # a profile was constructed only to erase residue — never logged in
+    assert len(FakeProfile.instances) == 1
+    profile = FakeProfile.instances[0]
+    assert profile.discarded is True
+    assert profile.logged_in_with is None  # never logs a revoked token in
+    assert profile.cleaned is False  # no login/logout lifecycle, residue only
+
+
+def test_revoked_residue_removal_failure_is_a_safe_failure(tmp_path):
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[{"user_id": 101, "workspace_label": "alpha", "token_epoch": 1}],
+        tokens={101: None},
+    )
+    collector = Collector(
+        config, store,
+        profile_factory=factory_with({101: {"discard_fail": True}}),
+        publish_fn=RecordingPublisher(), report_fn=None,
+    )
+    outcome = collector.collect_once()[0]
+    assert outcome.status == "failed"  # unremovable revoked residue is not silent
+    assert TOKEN_A not in outcome.detail
+    assert "aistat-conn" not in outcome.detail
+    assert str(tmp_path) not in outcome.detail
+
+
+def test_replaced_token_is_used_not_the_stale_one(tmp_path):
+    # After a token is replaced during a running worker, the next cycle logs in
+    # with the current token from the store — the old value is never revived.
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[{"user_id": 101, "workspace_label": "alpha", "token_epoch": 5}],
+        tokens={101: TOKEN_A},
+    )
+    collector = Collector(
+        config, store, profile_factory=factory_with(),
+        publish_fn=RecordingPublisher(), report_fn=None,
+    )
+    collector.collect_once()
+    store._tokens[101] = TOKEN_B  # replaced while the worker runs
+    collector.collect_once()
+    logins = [p.logged_in_with for p in FakeProfile.instances]
+    assert logins == [TOKEN_A, TOKEN_B]
+    assert TOKEN_A not in logins[1:]  # the stale token is never reused
+
+
+def test_cleanup_residue_failure_downgrades_to_safe_failure(tmp_path):
+    # Data may have been collected, but a residue that cannot be erased must not
+    # be silent: the connection outcome is a safe failure so reuse is blocked.
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[
+            {"user_id": 101, "workspace_label": "alpha", "token_epoch": 1},
+            {"user_id": 202, "workspace_label": "beta", "token_epoch": 1},
+        ],
+        tokens={101: TOKEN_A, 202: TOKEN_B},
+    )
+    collector = Collector(
+        config, store,
+        profile_factory=factory_with({101: {"cleanup_fail": True}}),
+        publish_fn=RecordingPublisher(), report_fn=None,
+    )
+    outcomes = {o.user_id: o for o in collector.collect_once()}
+    assert outcomes[101].status == "failed"
+    assert TOKEN_A not in outcomes[101].detail
+    assert str(tmp_path) not in outcomes[101].detail
+    # one connection's cleanup failure does not stop the other
+    assert outcomes[202].status == "collected"
 
 
 def test_unreadable_token_fails_safely(tmp_path):

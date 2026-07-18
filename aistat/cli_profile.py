@@ -26,6 +26,7 @@ on-disk residue, so a revoked/replaced token leaves nothing behind.
 import logging
 import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,30 @@ logger = logging.getLogger("aistat.cli_profile")
 
 class CliProfileError(RuntimeError):
     """A profile lifecycle step failed. Never carries a token or a path."""
+
+
+def _assert_safe_component(path: Path) -> None:
+    """Fail closed if an existing storage component is a symlink or a
+    non-directory.
+
+    An absent component is fine: it is created fresh under a parent that has
+    already been validated. A symlink is rejected outright so a linked/foreign
+    target can never receive the token or be deleted as residue, and there is
+    no fallback to another location. ``os.lstat`` never follows the link and
+    the raised error mentions neither the path nor any token.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise CliProfileError(
+            "connection profile storage is unsafe: a symlink is not permitted"
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise CliProfileError(
+            "connection profile storage is unsafe: not a directory"
+        )
 
 
 @dataclass
@@ -184,20 +209,55 @@ class ConnectionCliProfile:
     def _profile_dir(self) -> Path:
         return self.home / ".multica" / "profiles" / self.profile
 
+    def _assert_safe_storage(self) -> None:
+        """Reject a symlinked/non-directory storage chain before any token use.
+
+        Validates the whole credential-bearing chain — the task-owned HOME
+        (``AISTAT_CLI_PROFILES_DIR``), ``.multica``, ``profiles`` and this
+        connection's own profile directory — so a linked or foreign target can
+        never receive the PAT or be deleted as residue. Fails closed with no
+        fallback to another location.
+        """
+        multica = self.home / ".multica"
+        profiles = multica / "profiles"
+        for component in (self.home, multica, profiles, self._profile_dir()):
+            _assert_safe_component(component)
+
     def _prepare_home(self) -> None:
+        # Fail closed before the PAT ever touches disk: a symlinked or
+        # non-directory storage component is rejected with no fallback, so the
+        # token can never be redirected to a linked/foreign target.
+        self._assert_safe_storage()
         self.config.ensure_cli_profiles_dir()
         # A crashed prior cycle may have left a stale token file; start clean so
-        # a revoked/replaced credential is never resurrected on restart.
+        # a revoked/replaced credential is never resurrected on restart. If the
+        # residue cannot be removed, fail closed rather than reuse it.
         self._remove_residue()
 
     def _remove_residue(self) -> None:
         try:
             shutil.rmtree(self._profile_dir())
         except FileNotFoundError:
-            pass
-        except OSError as exc:
-            logger.warning("could not clear profile residue for user %s: %s",
-                           self.user_id, exc.__class__.__name__)
+            return
+        except OSError:
+            # Never silent: a residue we cannot erase could resurrect a revoked
+            # or replaced token, so fail closed and let the caller record a safe
+            # per-connection failure. The message carries no path (``from None``
+            # drops the OS error so its filename never surfaces in a trace).
+            raise CliProfileError(
+                "the connection profile residue could not be removed"
+            ) from None
+
+    def discard_residue(self) -> None:
+        """Erase on-disk profile residue without login/logout or any network call.
+
+        Used when a connection was revoked between listing and reading its
+        token: a prior crashed cycle may have left a stale token config that
+        must not survive revocation. Fails closed if the storage is unsafe or
+        the residue cannot be removed, and never logs in or contacts the host.
+        """
+        self._assert_safe_storage()
+        self._remove_residue()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -245,15 +305,23 @@ class ConnectionCliProfile:
         return self._executor.json(args, prepend=prepend, env=self._env())
 
     def logout(self) -> None:
+        # Pin the isolated profile *and* the official host on logout too, so
+        # every lifecycle invocation — not just data calls — is bound to the
+        # deterministic per-user profile and the trusted host.
         result = self._executor.raw(
-            ["auth", "logout"], prepend=["--profile", self.profile],
-            env=self._env(),
+            ["auth", "logout"], prepend=self._base(), env=self._env(),
         )
         if result.returncode != 0:
             logger.warning("auth logout returned non-zero for user %s", self.user_id)
 
     def cleanup(self) -> None:
-        """Log out and erase the profile's on-disk residue (token included)."""
+        """Log out and erase the profile's on-disk residue (token included).
+
+        A logout failure must still trigger local residue removal, so the
+        removal runs in a ``finally``. A residue that cannot be erased is never
+        silent: ``_remove_residue`` raises so the caller records a safe
+        per-connection failure instead of treating the credential as gone.
+        """
         try:
             self.logout()
         finally:
