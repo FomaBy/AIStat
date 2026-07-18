@@ -68,7 +68,17 @@ def dashboard():
                 raise RuntimeError("uvicorn did not start")
             time.sleep(0.05)
 
-        session.cdp = launch_chrome(CHROME)
+        # Fold the Uvicorn thread's liveness into any CDP stall diagnostic, so
+        # a long-lived-session timeout can tell a wedged browser apart from a
+        # dead test server (FAN-1352).
+        def _server_context(session=session):
+            thread = session.thread
+            return {
+                "server_thread_alive": thread.is_alive() if thread else None,
+                "server_should_exit": getattr(session.server, "should_exit", None),
+            }
+
+        session.cdp = launch_chrome(CHROME, context=_server_context)
         yield session.cdp, f"http://127.0.0.1:{port}"
     finally:
         session.close()
