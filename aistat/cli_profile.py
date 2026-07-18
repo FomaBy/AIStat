@@ -57,6 +57,10 @@ def _assert_safe_component(path: Path) -> None:
         st = os.lstat(path)
     except FileNotFoundError:
         return
+    except OSError:
+        raise CliProfileError(
+            "connection profile storage could not be verified"
+        ) from None
     if stat.S_ISLNK(st.st_mode):
         raise CliProfileError(
             "connection profile storage is unsafe: a symlink is not permitted"
@@ -77,6 +81,21 @@ class ExecResult:
 def _profile_name(user_id: int) -> str:
     """Deterministic, path-safe profile name from a trusted internal id."""
     return "aistat-conn-{}".format(canonical_tenant_id(user_id))
+
+
+def assert_safe_profile_storage(root: Path, user_id: int) -> None:
+    """Validate one connection's complete credential-bearing path chain.
+
+    This pure preflight is shared with ``Collector`` so unsafe storage can be
+    rejected before it creates a tenant lock, reads the token, constructs a
+    profile or enters any CLI lifecycle operation.
+    """
+    home = Path(root)
+    multica = home / ".multica"
+    profiles = multica / "profiles"
+    profile_dir = profiles / _profile_name(user_id)
+    for component in (home, multica, profiles, profile_dir):
+        _assert_safe_component(component)
 
 
 def scrubbed_env(home: Path) -> Dict[str, str]:
@@ -218,10 +237,7 @@ class ConnectionCliProfile:
         never receive the PAT or be deleted as residue. Fails closed with no
         fallback to another location.
         """
-        multica = self.home / ".multica"
-        profiles = multica / "profiles"
-        for component in (self.home, multica, profiles, self._profile_dir()):
-            _assert_safe_component(component)
+        assert_safe_profile_storage(self.home, self.user_id)
 
     def _prepare_home(self) -> None:
         # Fail closed before the PAT ever touches disk: a symlinked or
@@ -235,6 +251,10 @@ class ConnectionCliProfile:
         self._remove_residue()
 
     def _remove_residue(self) -> None:
+        # Validate immediately before deletion too. Cleanup may run after an
+        # executor call, so the earlier login/collector preflight is not a safe
+        # reason to traverse the path again without checking it.
+        self._assert_safe_storage()
         try:
             shutil.rmtree(self._profile_dir())
         except FileNotFoundError:
@@ -305,6 +325,9 @@ class ConnectionCliProfile:
         return self._executor.json(args, prepend=prepend, env=self._env())
 
     def logout(self) -> None:
+        # A cleanup reached independently of login must not invoke the CLI with
+        # an unsafe HOME/profile chain.
+        self._assert_safe_storage()
         # Pin the isolated profile *and* the official host on logout too, so
         # every lifecycle invocation — not just data calls — is bound to the
         # deterministic per-user profile and the trusted host.
