@@ -54,7 +54,9 @@ def mode_of(path):
 
 def test_store_encrypts_at_rest_with_private_files(tmp_path):
     store = make_store(tmp_path)
-    store.store_token(USER_ID, "https://multica.example", "Team", TOKEN, 1)
+    store.store_token(
+        USER_ID, handoff.OFFICIAL_MULTICA_URL, "Team", TOKEN, 1
+    )
     raw = (tmp_path / "data" / "worker_connections.db").read_bytes()
     assert TOKEN.encode() not in raw
     assert store.get_token(USER_ID) == TOKEN
@@ -68,9 +70,9 @@ def test_store_encrypts_at_rest_with_private_files(tmp_path):
 
 def test_store_replace_delete_and_reopen(tmp_path):
     store = make_store(tmp_path)
-    store.store_token(USER_ID, "https://multica.example", None, TOKEN, 1)
+    store.store_token(USER_ID, handoff.OFFICIAL_MULTICA_URL, None, TOKEN, 1)
     store.store_token(
-        USER_ID, "https://multica.example", None, TOKEN + "v2", 2
+        USER_ID, handoff.OFFICIAL_MULTICA_URL, None, TOKEN + "v2", 2
     )
     # Same key file, fresh instance: data survives, old epoch is replaced.
     reopened = make_store(tmp_path)
@@ -99,11 +101,33 @@ def test_store_refuses_invalid_key_file(tmp_path):
 
 def test_wrong_key_cannot_decrypt(tmp_path):
     store = make_store(tmp_path)
-    store.store_token(USER_ID, "https://multica.example", None, TOKEN, 1)
+    store.store_token(USER_ID, handoff.OFFICIAL_MULTICA_URL, None, TOKEN, 1)
     (tmp_path / "keys" / "worker.key").unlink()
     rotated = make_store(tmp_path)  # generates a fresh key
     with pytest.raises(WorkerStoreError):
         rotated.get_token(USER_ID)
+
+
+@pytest.mark.parametrize(
+    "server_url",
+    ["", handoff.OFFICIAL_MULTICA_URL],
+)
+def test_store_normalizes_empty_or_exact_legacy_host(tmp_path, server_url):
+    store = make_store(tmp_path)
+    store.store_token(USER_ID, server_url, None, TOKEN, 1)
+    assert store.list_connections()[0]["server_url"] == handoff.OFFICIAL_MULTICA_URL
+
+
+def test_store_rejects_poisoned_host_before_encrypting_token(tmp_path):
+    store = make_store(tmp_path)
+    with pytest.raises(ValueError, match="unsupported Multica server"):
+        store.store_token(
+            USER_ID, "https://attacker.example", None, TOKEN, 1
+        )
+    assert store.list_connections() == []
+    assert TOKEN.encode() not in (
+        tmp_path / "data" / "worker_connections.db"
+    ).read_bytes()
 
 
 # --- pull client against the real Flask host ---------------------------

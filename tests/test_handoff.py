@@ -34,7 +34,7 @@ def user_id(store):
 
 def submit(store, user_id, token=TOKEN, now=NOW):
     return store.submit_connection(
-        user_id, "https://multica.example", "My workspace", token, now=now
+        user_id, handoff.OFFICIAL_MULTICA_URL, "My workspace", token, now=now
     )
 
 
@@ -167,7 +167,7 @@ def test_workspace_label_validator():
 def test_submit_and_status_projection(store, user_id):
     view = submit(store, user_id)
     assert view["status"] == "pending"
-    assert view["server_url"] == "https://multica.example"
+    assert "server_url" not in view
     assert view["workspace_label"] == "My workspace"
     assert "token" not in view and "lease_id" not in view
     assert store.connection_status(user_id)["status"] == "pending"
@@ -384,15 +384,12 @@ def test_apply_worker_acks_batch(store, user_id):
 
 
 def test_official_server_url_is_pinned():
-    official = "https://multica.ai"
+    official = handoff.OFFICIAL_MULTICA_URL
     assert handoff.normalize_official_server_url("", official) == official
     assert handoff.normalize_official_server_url(None, official) == official
-    assert (
-        handoff.normalize_official_server_url("https://multica.ai/", official)
-        == official
-    )
-    # No alternate host, subdomain suffix, IP, port, credentials or scheme
-    # downgrade can point a stored connection anywhere but the official host.
+    assert handoff.normalize_official_server_url(official, official) == official
+    # Backward compatibility is intentionally byte-exact: only absent/empty or
+    # the canonical legacy value is accepted. Structural aliases are rejected.
     for bad in (
         "https://evil.example",
         "https://multica.ai.evil.example",
@@ -400,15 +397,26 @@ def test_official_server_url_is_pinned():
         "https://multica.ai:8443",
         "https://user@multica.ai",
         "https://127.0.0.1",
+        "https://multica.ai/",
+        "https://multica.ai/path",
+        "https://multica.ai?query=1",
+        "https://multica.ai#fragment",
+        "HTTPS://multica.ai",
+        " https://multica.ai ",
         "ftp://multica.ai",
         7,
     ):
         with pytest.raises(ValueError):
             handoff.normalize_official_server_url(bad, official)
-    # A misconfigured official URL is rejected outright (fail closed).
+    # An environment/config value is an assertion of the one official host,
+    # never an override that can select another otherwise-valid HTTPS host.
     for bad_official in (
+        "https://multica.example",
         "http://multica.ai",
+        "https://multica.ai/",
         "https://multica.ai/path",
+        "https://multica.ai?query=1",
+        "https://multica.ai#fragment",
         "https://multica.ai:8443",
         "https://user@multica.ai",
         "",
@@ -416,6 +424,60 @@ def test_official_server_url_is_pinned():
     ):
         with pytest.raises(ValueError):
             handoff.canonical_official_server_url(bad_official)
+
+
+def test_direct_submit_rejects_wrong_host_before_token_storage(
+    store, user_id, tmp_path
+):
+    with pytest.raises(ValueError, match="unsupported Multica server"):
+        store.submit_connection(
+            user_id, "https://attacker.example", "alpha", TOKEN, now=NOW
+        )
+    assert store.connection_status(user_id) is None
+    assert TOKEN.encode() not in (tmp_path / "security.db").read_bytes()
+
+
+@pytest.mark.parametrize("legacy_url", ["", handoff.OFFICIAL_MULTICA_URL])
+def test_pending_legacy_url_is_normalized_before_token_handoff(
+    store, user_id, legacy_url
+):
+    submit(store, user_id)
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE connections SET server_url = ? WHERE user_id = ?",
+            (legacy_url, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    state = store.lease_pending_connections(now=NOW)
+    (entry,) = state["pending"]
+    assert entry["server_url"] == handoff.OFFICIAL_MULTICA_URL
+
+
+def test_poisoned_persisted_url_is_erased_before_token_handoff(
+    store, user_id, tmp_path
+):
+    submit(store, user_id)
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE connections SET server_url = ? WHERE user_id = ?",
+            ("https://attacker.example", user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    state = store.lease_pending_connections(now=NOW)
+    assert state["pending"] == []
+    assert state["revoked"] == [{"user_id": user_id, "token_epoch": 2}]
+    view = store.connection_status(user_id)
+    assert view["status"] == "revocation_pending"
+    assert view["last_sync_error"] == "unsupported Multica server"
+    assert TOKEN.encode() not in (tmp_path / "security.db").read_bytes()
 
 
 def test_pending_token_expires_into_revocation_pending(store, user_id, tmp_path):

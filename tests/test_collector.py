@@ -401,6 +401,49 @@ def test_failure_detail_carries_no_token_or_path(tmp_path):
 
 # -- collector storage preflight: no lock/token/profile/lifecycle side effect -
 
+def test_poisoned_persisted_host_fails_before_token_or_profile_lifecycle(tmp_path):
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[
+            {
+                "user_id": 101,
+                "server_url": "https://attacker.example",
+                "workspace_label": "alpha",
+                "token_epoch": 12,
+            }
+        ],
+        tokens={101: TOKEN_A},
+    )
+    factory = RealProfileFactory()
+    publisher = RecordingPublisher()
+    reports = []
+    collector = Collector(
+        config,
+        store,
+        profile_factory=factory,
+        publish_fn=publisher,
+        report_fn=lambda cfg, user, epoch, ok, error: reports.append(
+            (user, epoch, ok, error)
+        ),
+    )
+
+    outcome = collector.collect_once()[0]
+
+    assert (outcome.user_id, outcome.status, outcome.detail) == (
+        101,
+        "failed",
+        "unsupported Multica server",
+    )
+    assert reports == [(101, 12, False, "unsupported Multica server")]
+    assert store.get_token_calls == []
+    assert factory.instances == []
+    assert factory.lifecycle_events == []
+    assert factory.executors == {}
+    assert publisher.calls == []
+    assert not os.path.lexists(str(config.cli_profiles_dir / "conn-101.lock"))
+    assert not config.worker_tenant_db_path(101).exists()
+
+
 @pytest.mark.parametrize(
     "component",
     ["home", "dot_multica", "profiles", "tenant_profile"],

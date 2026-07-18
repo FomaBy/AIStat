@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from . import handoff
 from .cli_profile import (
     CliProfileError,
     ConnectionCliProfile,
@@ -124,6 +125,17 @@ class Collector:
         user_id = canonical_tenant_id(meta["user_id"])
         epoch = int(meta.get("token_epoch") or 0)
         label = meta.get("workspace_label")
+        try:
+            # Validate both config and encrypted-store metadata before lock,
+            # token decryption, profile construction or any CLI lifecycle.
+            # Missing/empty metadata is the only supported legacy shape.
+            handoff.normalize_official_server_url(
+                meta.get("server_url"), self.config.multica_official_url
+            )
+        except ValueError:
+            return self._fail(
+                user_id, epoch, handoff.UNSUPPORTED_MULTICA_SERVER
+            )
         try:
             # This must precede even the per-tenant lock: its pathname lives in
             # the same root and would otherwise follow a symlink or fail on a

@@ -26,7 +26,6 @@ import hmac
 import secrets
 import sqlite3
 import time
-from urllib.parse import urlsplit
 
 from .tenant import canonical_tenant_id
 
@@ -73,6 +72,7 @@ WORKER_READINESS_TTL_DEFAULT_SECONDS = 15 * 60
 # published: every stored connection is pinned to this exact host so a poisoned
 # ``server_url`` can never point the worker's use of the PAT at an attacker.
 OFFICIAL_MULTICA_URL = "https://multica.ai"
+UNSUPPORTED_MULTICA_SERVER = "unsupported Multica server"
 
 # Reason surfaced in the cabinet when a pending token was never collected.
 PENDING_EXPIRED_REASON = (
@@ -125,7 +125,6 @@ _NONCE_ALPHABET = frozenset(
 # HTTP response, so status projections whitelist these columns only.
 _STATUS_COLUMNS = (
     "user_id",
-    "server_url",
     "workspace_label",
     "status",
     "token_epoch",
@@ -300,30 +299,16 @@ def validate_server_url(value, default=None):
 
 
 def canonical_official_server_url(official_url):
-    """Validate the operator's official Multica URL and reduce it to scheme+host.
+    """Accept only the one byte-exact official Multica endpoint.
 
-    The result is the only server URL the host will ever store. It must be a
-    bare ``https://<host>`` with no credentials, port or path, so there is a
-    single, unambiguous canonical form to pin every connection to.
+    ``AISTAT_MULTICA_OFFICIAL_URL`` is retained solely as a compatibility
+    assertion for existing deployments. It is never an override: whitespace,
+    case changes, a trailing slash, path, query, fragment, credentials, port,
+    IP or another otherwise-valid HTTPS host all fail closed.
     """
-    if not isinstance(official_url, str) or not official_url.strip():
-        raise ValueError("official Multica server URL is required")
-    structural = validate_server_url(official_url.strip())
-    parts = urlsplit(structural)
-    host = (parts.hostname or "").lower()
-    if (
-        parts.scheme != "https"
-        or not host
-        or parts.username
-        or parts.password
-        or "@" in parts.netloc
-        or parts.port is not None
-        or parts.path not in ("", "/")
-    ):
-        raise ValueError(
-            "official Multica server URL must be a bare https host"
-        )
-    return "https://" + host
+    if official_url != OFFICIAL_MULTICA_URL:
+        raise ValueError(UNSUPPORTED_MULTICA_SERVER)
+    return OFFICIAL_MULTICA_URL
 
 
 def normalize_official_server_url(value, official_url):
@@ -336,24 +321,10 @@ def normalize_official_server_url(value, official_url):
     redirecting the worker's later use of the PAT away from Multica.
     """
     official = canonical_official_server_url(official_url)
-    if value is not None and not isinstance(value, str):
-        raise ValueError("unsupported Multica server")
-    candidate = (value or "").strip()
-    if not candidate:
+    if value is None or value == "":
         return official
-    parts = urlsplit(validate_server_url(candidate))
-    host = (parts.hostname or "").lower()
-    if (
-        parts.scheme != "https"
-        or not host
-        or parts.username
-        or parts.password
-        or "@" in parts.netloc
-        or parts.port is not None
-        or parts.path not in ("", "/")
-        or host != urlsplit(official).hostname
-    ):
-        raise ValueError("unsupported Multica server")
+    if not isinstance(value, str) or value != official:
+        raise ValueError(UNSUPPORTED_MULTICA_SERVER)
     return official
 
 
@@ -419,6 +390,12 @@ def submit_connection(
     and the worker's ``INSERT OR REPLACE`` overwrites the old ciphertext when it
     stores the new token.
     """
+    # Defense in depth for callers that bypass the HTTP validators: a config,
+    # request or migration cannot persist a PAT beside any host except the one
+    # exact official endpoint. Validation happens before opening the database.
+    server_url = normalize_official_server_url(
+        server_url, OFFICIAL_MULTICA_URL
+    )
     user_id = canonical_tenant_id(user_id)
     now = _now(now)
     conn = connect()
@@ -607,6 +584,34 @@ def lease_pending_connections(
             "WHERE status IN ('pending', 'replacement_pending') "
             "AND token IS NOT NULL ORDER BY user_id"
         ).fetchall():
+            try:
+                server_url = normalize_official_server_url(
+                    row["server_url"], OFFICIAL_MULTICA_URL
+                )
+            except ValueError:
+                # A poisoned persisted host never leaves the public host with
+                # its PAT. Erase it and request deletion of any older worker
+                # copy (replacement case) before exposing a terminal state.
+                conn.execute(
+                    "UPDATE connections SET token = NULL, "
+                    "status = 'revocation_pending', token_epoch = ?, "
+                    "updated_at = ?, lease_id = NULL, lease_expires_at = 0, "
+                    "revoke_acked_at = NULL, last_sync_error = ? "
+                    "WHERE user_id = ?",
+                    (
+                        int(row["token_epoch"]) + 1,
+                        now,
+                        UNSUPPORTED_MULTICA_SERVER,
+                        int(row["user_id"]),
+                    ),
+                )
+                continue
+            if row["server_url"] != server_url:
+                # Normalize an empty legacy value before the token handoff.
+                conn.execute(
+                    "UPDATE connections SET server_url = ? WHERE user_id = ?",
+                    (server_url, int(row["user_id"])),
+                )
             lease_id = secrets.token_urlsafe(24)
             lease_expires_at = now + WORKER_LEASE_SECONDS
             conn.execute(
@@ -617,7 +622,7 @@ def lease_pending_connections(
             pending.append(
                 {
                     "user_id": int(row["user_id"]),
-                    "server_url": row["server_url"],
+                    "server_url": server_url,
                     "workspace_label": row["workspace_label"],
                     "token": row["token"],
                     "token_epoch": int(row["token_epoch"]),

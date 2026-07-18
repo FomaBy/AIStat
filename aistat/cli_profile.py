@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from . import handoff
 from .cli import CliError, run_cli
 from .config import Config
 from .tenant import canonical_tenant_id
@@ -210,7 +211,14 @@ class ConnectionCliProfile:
         self.user_id = canonical_tenant_id(user_id)
         self.profile = _profile_name(self.user_id)
         self.home = Path(config.cli_profiles_dir)
-        self.official_url = config.multica_official_url
+        try:
+            self.official_url = handoff.canonical_official_server_url(
+                config.multica_official_url
+            )
+        except ValueError:
+            # Never echo a poisoned config value into an error or construct a
+            # profile capable of reaching its host.
+            raise CliProfileError(handoff.UNSUPPORTED_MULTICA_SERVER) from None
         self._executor = executor or _SubprocessExecutor(
             config.cli_bin, config.cli_timeout_seconds
         )
@@ -287,6 +295,9 @@ class ConnectionCliProfile:
         The token is written to the CLI's stdin only; it is never placed in
         argv, the environment or any message this function raises or logs.
         """
+        # A profile object may be reused after a completed cycle. Never carry a
+        # prior tenant selection into a fresh login/discovery lifecycle.
+        self._workspace_id = None
         self._prepare_home()
         if not token:
             raise CliProfileError("no token available for the connection")
@@ -305,8 +316,12 @@ class ConnectionCliProfile:
             data = self._executor.json(
                 ["workspace", "list"], prepend=self._base(), env=self._env()
             )
-        except CliError as exc:
-            raise CliProfileError("could not list the connection's workspaces") from exc
+        except CliError:
+            # Raw CLI detail can contain request context and must not survive in
+            # a traceback, sync error or diagnostic surface.
+            raise CliProfileError(
+                "could not list the connection's workspaces"
+            ) from None
         workspaces = data if isinstance(data, list) else (data.get("workspaces") or [])
         chosen = resolve_workspace(workspaces, label)
         self._workspace_id = str(chosen["id"])
@@ -322,7 +337,12 @@ class ConnectionCliProfile:
         if self._workspace_id is None:
             raise CliProfileError("workspace was not selected before polling")
         prepend = self._base() + ["--workspace-id", self._workspace_id]
-        return self._executor.json(args, prepend=prepend, env=self._env())
+        try:
+            return self._executor.json(args, prepend=prepend, env=self._env())
+        except CliError:
+            raise CliProfileError(
+                "could not read the connection's workspace data"
+            ) from None
 
     def logout(self) -> None:
         # A cleanup reached independently of login must not invoke the CLI with
@@ -331,8 +351,11 @@ class ConnectionCliProfile:
         # Pin the isolated profile *and* the official host on logout too, so
         # every lifecycle invocation — not just data calls — is bound to the
         # deterministic per-user profile and the trusted host.
+        prepend = self._base()
+        if self._workspace_id is not None:
+            prepend += ["--workspace-id", self._workspace_id]
         result = self._executor.raw(
-            ["auth", "logout"], prepend=self._base(), env=self._env(),
+            ["auth", "logout"], prepend=prepend, env=self._env(),
         )
         if result.returncode != 0:
             logger.warning("auth logout returned non-zero for user %s", self.user_id)
@@ -348,7 +371,10 @@ class ConnectionCliProfile:
         try:
             self.logout()
         finally:
-            self._remove_residue()
+            try:
+                self._remove_residue()
+            finally:
+                self._workspace_id = None
 
     def __enter__(self) -> "ConnectionCliProfile":
         return self

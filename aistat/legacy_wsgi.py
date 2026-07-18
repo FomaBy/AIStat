@@ -152,7 +152,7 @@ def _validate_config():
         handoff.canonical_official_server_url(MULTICA_OFFICIAL_URL)
     except ValueError as exc:
         raise RuntimeError(
-            "AISTAT_MULTICA_OFFICIAL_URL must be a bare https host: "
+            "AISTAT_MULTICA_OFFICIAL_URL must be exactly https://multica.ai: "
             + str(exc)
         )
     if not ADMIN_USERNAME or not PASSWORD_HASH:
