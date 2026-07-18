@@ -77,9 +77,8 @@ def validate_public_config(config: Config) -> None:
         handoff.canonical_official_server_url(config.multica_official_url)
     except ValueError as exc:
         raise SecurityConfigError(
-            "AISTAT_MULTICA_OFFICIAL_URL must be a bare https host: {}".format(
-                exc
-            )
+            "AISTAT_MULTICA_OFFICIAL_URL must be exactly https://multica.ai: "
+            "{}".format(exc)
         )
     if not config.allowed_hosts:
         raise SecurityConfigError("AISTAT_ALLOWED_HOSTS must not be empty")

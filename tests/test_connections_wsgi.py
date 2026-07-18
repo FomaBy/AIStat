@@ -14,6 +14,7 @@ from werkzeug.security import generate_password_hash
 
 from aistat import handoff
 from aistat.config import Config
+from aistat.security import SecurityConfigError
 from aistat.wsgi import create_app
 
 PASSWORD = "correct horse battery staple"
@@ -36,9 +37,7 @@ def make_config(tmp_path, worker_secret=WORKER_SECRET, connect_enabled=True):
     config.ingest_secret = INGEST_SECRET
     config.worker_secret = worker_secret
     config.multica_connect_enabled = connect_enabled
-    # A staging official host keeps these fixtures independent of the real
-    # multica.ai default while exercising the exact-host pinning.
-    config.multica_official_url = "https://multica.example"
+    config.multica_official_url = handoff.OFFICIAL_MULTICA_URL
     config.allowed_hosts = ("localhost", "testserver", "aistat.app")
     config.force_https = False
     config.session_cookie_secure = True
@@ -193,7 +192,7 @@ def test_intake_pending_and_status_never_expose_token(conn_app, caplog):
         assert response.status_code == 200
         body = response.get_json()
         assert body["status"] == "pending"
-        assert body["server_url"] == "https://multica.example"
+        assert "server_url" not in body
         assert body["workspace_label"] == "My space"
         assert "token" not in body and "token_epoch" not in body
         status = client.get(
@@ -470,31 +469,60 @@ def test_feature_flag_off_makes_everything_fail_closed(tmp_path):
     ).status_code == 404
 
 
-def test_intake_pins_connection_to_official_host(conn_app):
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://evil.example",
+        "https://multica.ai.evil.com",
+        "http://multica.ai",
+        "https://multica.ai:8443",
+        "https://127.0.0.1",
+        "https://user@multica.ai",
+        "https://multica.ai/",
+        "https://multica.ai/path",
+        "https://multica.ai?query=1",
+        "https://multica.ai#fragment",
+        "HTTPS://multica.ai",
+        " https://multica.ai ",
+    ],
+)
+def test_intake_rejects_every_noncanonical_host_without_storage(conn_app, bad):
     app, config = conn_app
     client = app.test_client()
     csrf = login(client)
     warm_worker(client)
-    # An alternate host, subdomain suffix, IP literal, port or downgraded
-    # scheme is refused without echoing the submitted value.
-    for bad in (
-        "https://evil.example",
-        "https://multica.example.evil.com",
-        "http://multica.example",
-        "https://multica.example:8443",
-        "https://127.0.0.1",
-        "https://user@multica.example",
-    ):
-        response = submit(client, csrf, server_url=bad)
-        assert response.status_code == 422, bad
-        assert bad not in response.get_data(as_text=True)
-    # The official host (explicitly named or omitted) is what gets stored.
-    named = submit(client, csrf, server_url="https://multica.example/")
+    response = submit(client, csrf, server_url=bad)
+    assert response.status_code == 422
+    assert bad not in response.get_data(as_text=True)
+    assert TOKEN.encode() not in config.security_db_path.read_bytes()
+
+
+@pytest.mark.parametrize("legacy_url", [None, "", handoff.OFFICIAL_MULTICA_URL])
+def test_intake_accepts_only_empty_or_exact_official_legacy_value(
+    conn_app, legacy_url
+):
+    app, config = conn_app
+    client = app.test_client()
+    csrf = login(client)
+    warm_worker(client)
+    kwargs = {} if legacy_url is None else {"server_url": legacy_url}
+    named = submit(client, csrf, **kwargs)
     assert named.status_code == 200
-    assert named.get_json()["server_url"] == "https://multica.example"
-    omitted = submit(client, csrf)
-    assert omitted.status_code == 200
-    assert omitted.get_json()["server_url"] == "https://multica.example"
+    assert "server_url" not in named.get_json()
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        stored = conn.execute("SELECT server_url FROM connections").fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == handoff.OFFICIAL_MULTICA_URL
+
+
+def test_public_config_cannot_override_the_official_multica_host(tmp_path):
+    config = make_config(tmp_path)
+    config.multica_official_url = "https://attacker.example"
+    with pytest.raises(SecurityConfigError, match="exactly https://multica.ai"):
+        create_app(config)
+    assert not config.security_db_path.exists()
 
 
 def test_intake_requires_a_ready_worker(tmp_path):

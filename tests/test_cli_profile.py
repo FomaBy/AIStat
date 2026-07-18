@@ -155,6 +155,40 @@ def test_host_is_always_the_configured_official_url(tmp_path):
         assert "https://api.multica.ai" not in prep
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://attacker.example",
+        "https://multica.ai/",
+        "https://multica.ai/path",
+        "https://multica.ai?query=1",
+        "https://multica.ai#fragment",
+    ],
+)
+def test_profile_rejects_poisoned_config_before_storage_or_executor(tmp_path, bad):
+    config = make_config(tmp_path, multica_official_url=bad)
+    executor = FakeExecutor()
+    with pytest.raises(CliProfileError, match="unsupported Multica server"):
+        ConnectionCliProfile(config, 7, executor=executor)
+    assert executor.calls == []
+    assert not config.cli_profiles_dir.exists()
+
+
+def test_profile_rejects_poisoned_official_url_environment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "AISTAT_MULTICA_OFFICIAL_URL", "https://attacker.example"
+    )
+    config = Config()
+    config.cli_profiles_dir = tmp_path / "cli_profiles"
+    executor = FakeExecutor()
+    with pytest.raises(CliProfileError, match="unsupported Multica server"):
+        ConnectionCliProfile(config, 7, executor=executor)
+    assert executor.calls == []
+    assert not config.cli_profiles_dir.exists()
+
+
 # -- workspace selection -----------------------------------------------------
 
 def test_resolve_workspace_matches_and_refuses_ambiguity():
@@ -196,6 +230,74 @@ def test_runner_requires_workspace_selection_first(tmp_path):
     profile.login(TOKEN)
     with pytest.raises(CliProfileError):
         profile.runner(["agent", "list"])
+
+
+def test_workspace_discovery_error_drops_raw_cli_detail(tmp_path):
+    executor = FakeExecutor(ws_error=True)
+    profile = ConnectionCliProfile(make_config(tmp_path), 7, executor=executor)
+    profile.login(TOKEN)
+    with pytest.raises(CliProfileError) as exc_info:
+        profile.select_workspace("alpha")
+    assert exc_info.value.__cause__ is None
+    assert "boom" not in str(exc_info.value)
+
+
+def test_two_tenant_lifecycle_recorder_scopes_every_call(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MULTICA_TOKEN", "owner-secret-token")
+    monkeypatch.setenv("MULTICA_WORKSPACE_ID", "owner-workspace")
+    monkeypatch.setenv("MULTICA_SERVER_URL", "https://attacker.example")
+    config = make_config(tmp_path)
+    cases = (
+        (101, "alpha", "ws-alpha", "mul_tenant_alpha_secret"),
+        (202, "beta", "ws-beta", "mul_tenant_beta_secret"),
+    )
+    recordings = []
+    for user_id, label, workspace_id, token in cases:
+        executor = FakeExecutor(
+            workspaces=[
+                {"id": "ws-alpha", "name": "Alpha", "slug": "alpha"},
+                {"id": "ws-beta", "name": "Beta", "slug": "beta"},
+            ]
+        )
+        profile = ConnectionCliProfile(config, user_id, executor=executor)
+        profile.login(token)
+        profile.select_workspace(label)
+        profile.runner(["agent", "list"])
+        profile.logout()
+        recordings.append((user_id, workspace_id, token, executor))
+
+    for user_id, workspace_id, token, executor in recordings:
+        assert len(executor.calls) == 4
+        for call in executor.calls:
+            prepend = call["prepend"]
+            assert prepend[:4] == [
+                "--profile",
+                "aistat-conn-{}".format(user_id),
+                "--server-url",
+                "https://multica.ai",
+            ]
+            assert call["env"]["HOME"] == str(config.cli_profiles_dir)
+            assert not any(key.startswith("MULTICA_") for key in call["env"])
+            assert token not in " ".join(call["args"] + prepend)
+            assert token not in " ".join(call["env"].values())
+        login_call, discovery_call, data_call, logout_call = executor.calls
+        assert login_call["args"] == ["login", "--token"]
+        assert login_call["stdin"] == token + "\n"
+        assert discovery_call["args"] == ["workspace", "list"]
+        assert "--workspace-id" not in login_call["prepend"]
+        assert "--workspace-id" not in discovery_call["prepend"]
+        for scoped_call in (data_call, logout_call):
+            prepend = scoped_call["prepend"]
+            assert prepend[prepend.index("--workspace-id") + 1] == workspace_id
+
+    all_text = " ".join(
+        " ".join(call["args"] + call["prepend"])
+        for _, _, _, executor in recordings
+        for call in executor.calls
+    )
+    assert cases[0][3] not in all_text and cases[1][3] not in all_text
 
 
 # -- cleanup: logout + residue erased ----------------------------------------
@@ -306,6 +408,7 @@ def test_logout_pins_profile_and_official_host(tmp_path):
     assert prep == [
         "--profile", "aistat-conn-7", "--server-url", "https://multica.ai",
     ]
+    assert "--workspace-id" not in prep
     assert "https://api.multica.ai" not in prep  # never a poisoned/ambient host
     # and the child env is still scrubbed of the owner identity
     assert not any(k.startswith("MULTICA_") for k in logout_calls[0]["env"])

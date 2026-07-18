@@ -35,9 +35,9 @@ def load_legacy(
     monkeypatch.setenv(
         "AISTAT_MULTICA_CONNECT_ENABLED", "1" if connect_enabled else "0"
     )
-    # A staging official host keeps these fixtures independent of the real
-    # multica.ai default while exercising the exact-host pinning.
-    monkeypatch.setenv("AISTAT_MULTICA_OFFICIAL_URL", "https://multica.example")
+    monkeypatch.setenv(
+        "AISTAT_MULTICA_OFFICIAL_URL", handoff.OFFICIAL_MULTICA_URL
+    )
     import aistat.legacy_wsgi as module
 
     return importlib.reload(module)
@@ -127,7 +127,7 @@ def test_intake_status_and_throttle(legacy_conn):
     assert status == "200 OK"
     view = json.loads(body.decode("utf-8"))
     assert view["status"] == "pending"
-    assert view["server_url"] == "https://multica.example"
+    assert "server_url" not in view
     assert view["workspace_label"] == "Мой воркспейс"
     assert "token" not in view and "token_epoch" not in view
     assert TOKEN.encode() not in body
@@ -383,21 +383,37 @@ def test_intake_pins_connection_to_official_host(legacy_conn):
     warm_worker(module)
     for bad in (
         "https://evil.example",
-        "https://multica.example.evil.com",
-        "http://multica.example",
-        "https://multica.example:8443",
+        "https://multica.ai.evil.com",
+        "http://multica.ai",
+        "https://multica.ai:8443",
         "https://127.0.0.1",
-        "https://user@multica.example",
+        "https://user@multica.ai",
+        "https://multica.ai/",
+        "https://multica.ai?query=1",
+        "https://multica.ai#fragment",
     ):
         status, _, body = submit(module, cookies, csrf, server_url=bad)
         assert status == "422 Unprocessable Entity", bad
         assert bad.encode() not in body
     status, _, body = submit(
-        module, cookies, csrf, server_url="https://multica.example/"
+        module, cookies, csrf, server_url=handoff.OFFICIAL_MULTICA_URL
     )
     assert status == "200 OK"
     view = json.loads(body.decode("utf-8"))
-    assert view["server_url"] == "https://multica.example"
+    assert "server_url" not in view
+    conn = module._security_connection()
+    try:
+        stored = conn.execute("SELECT server_url FROM connections").fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == handoff.OFFICIAL_MULTICA_URL
+
+
+def test_legacy_config_cannot_override_the_official_multica_host(legacy_conn):
+    module, _ = legacy_conn
+    module.MULTICA_OFFICIAL_URL = "https://attacker.example"
+    with pytest.raises(RuntimeError, match="exactly https://multica.ai"):
+        module._validate_config()
 
 
 def test_intake_requires_a_ready_worker(tmp_path, monkeypatch):

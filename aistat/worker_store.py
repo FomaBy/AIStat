@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from . import handoff
+
 
 class WorkerStoreError(RuntimeError):
     """Raised when the encrypted worker store cannot be used safely."""
@@ -112,6 +114,12 @@ class WorkerTokenStore:
         token_epoch: int,
         now: Optional[int] = None,
     ) -> None:
+        # Validate before encryption or a write transaction. A compromised
+        # response/migration cannot pair a PAT with another endpoint in the
+        # worker store; empty legacy rows normalize to the exact official URL.
+        server_url = handoff.normalize_official_server_url(
+            server_url, handoff.OFFICIAL_MULTICA_URL
+        )
         now = int(time.time()) if now is None else int(now)
         ciphertext = self._fernet.encrypt(token.encode("utf-8"))
         conn = self._connect()
