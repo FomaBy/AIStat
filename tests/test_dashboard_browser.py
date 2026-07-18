@@ -115,19 +115,27 @@ class Cdp:
                     raise RuntimeError(f"{method}: {reply['error']}")
                 return reply.get("result", {})
 
-    def open_page(self, url):
+    def open_page(self, url, preload_script=None):
         # One fresh tab per page: closing the previous target first means a
         # booted-page condition can never match a stale document.
         if self._target_id:
             self.call("Target.closeTarget", {"targetId": self._target_id},
                       session=False)
             self.session_id = None
-        target = self.call("Target.createTarget", {"url": url}, session=False)
+        target = self.call(
+            "Target.createTarget",
+            {"url": "about:blank" if preload_script else url},
+            session=False)
         self._target_id = target["targetId"]
         attached = self.call(
             "Target.attachToTarget",
             {"targetId": target["targetId"], "flatten": True}, session=False)
         self.session_id = attached["sessionId"]
+        if preload_script:
+            self.call("Page.enable")
+            self.call("Page.addScriptToEvaluateOnNewDocument",
+                      {"source": preload_script})
+            self.call("Page.navigate", {"url": url})
 
     def eval(self, expression):
         """Evaluate JS in the page; returns the JSON-serialized value."""
@@ -419,6 +427,197 @@ def _chart_colors(cdp, canvas_id):
         ' return o; })()' % canvas_id)
 
 
+def _reset_color_registry(cdp):
+    """Make the shipped registry a fresh browser-session registry.
+
+    The dashboard fixture already boots with its own entities. Clearing the
+    live map lets capacity tests exercise the finite canonical universe
+    without accidentally counting fixture identities as prior allocations.
+    """
+    assert cdp.eval(
+        'typeof colorRegistry === "object" && '
+        'typeof registerEntityColors === "function"') is True
+    cdp.eval("colorRegistry.byKey.clear()")
+
+
+def _register_colors(cdp, entity_type, ids):
+    """Register one complete typed set through the production batch API."""
+    return cdp.eval("registerEntityColors(%s, %s)" % (
+        json.dumps(entity_type), json.dumps(ids)))
+
+
+def _register_identity_batches(cdp, identities):
+    by_type = {}
+    for entity_type, entity_id in identities:
+        if entity_id is not None and str(entity_id).strip():
+            by_type.setdefault(entity_type, []).append(entity_id)
+    for entity_type, ids in by_type.items():
+        _register_colors(cdp, entity_type, ids)
+
+
+def _color_map(cdp, entity_type, ids):
+    return cdp.eval("Object.fromEntries(%s.map((id) => [id, entityColor(%s, id)]))" % (
+        json.dumps(ids), json.dumps(entity_type)))
+
+
+def _registry_map(cdp, typed_ids):
+    return cdp.eval("Object.fromEntries(%s.map(([type, id]) => "
+                    "[type + '\\u0000' + id, entityColor(type, id)]))" %
+                    json.dumps(typed_ids))
+
+
+def test_fallback_batch_has_exact_model_capacity_and_late_repeat(dashboard):
+    """FAN-1318: canonical model batches fill 14 non-Fable slots exactly.
+
+    A 15th identity may repeat deterministically, but never before the
+    Fable-adjusted capacity. Forward and reverse input order must produce the
+    same mapping, including the collision regression identities.
+    """
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    _reset_color_registry(cdp)
+
+    model_ids = ["collision-6", "collision-9"] + [
+        "model-capacity-%02d" % i for i in range(12)]
+    _register_colors(cdp, "model", model_ids)
+    at_capacity = _color_map(cdp, "model", model_ids)
+    fallback_palette = cdp.eval(
+        'PALETTE.filter((color) => color !== '
+        'ENTITY_ANCHORS.model["claude-fable-5"])')
+    assert len(fallback_palette) == 14
+    assert len(set(at_capacity.values())) == 14
+    assert set(at_capacity.values()) == set(fallback_palette)
+    assert at_capacity["collision-6"] != at_capacity["collision-9"]
+    assert cdp.eval('entityColor("model", "claude-fable-5")') == "#ef4444"
+
+    fifteenth = model_ids + ["model-after-capacity"]
+    _register_colors(cdp, "model", fifteenth)
+    after_capacity = _color_map(cdp, "model", fifteenth)
+    assert {key: after_capacity[key] for key in model_ids} == at_capacity
+    assert len(set(after_capacity.values())) == 14
+    assert after_capacity["model-after-capacity"] in set(fallback_palette)
+
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    _reset_color_registry(cdp)
+    _register_colors(cdp, "model", list(reversed(fifteenth)))
+    fresh_reverse = _color_map(cdp, "model", fifteenth)
+
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    _reset_color_registry(cdp)
+    _register_colors(cdp, "model", fifteenth)
+    assert _color_map(cdp, "model", fifteenth) == fresh_reverse
+
+
+def test_agent_and_project_batches_have_exact_fifteen_capacity(dashboard):
+    """Agent/project spaces have 15 fallback colors and repeat on identity 16."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    _reset_color_registry(cdp)
+
+    _register_colors(cdp, "agent", ["typed-space-shared"])
+    _register_colors(cdp, "project", ["typed-space-shared"])
+    assert cdp.eval('colorRegistry.byKey.has("model\\u0000typed-space-shared")') is False
+    assert cdp.eval('colorRegistry.byKey.has("agent\\u0000typed-space-shared")') is True
+    assert cdp.eval('colorRegistry.byKey.has("project\\u0000typed-space-shared")') is True
+    assert cdp.eval('entityColor("agent", null)') == "#cbd5e1"
+    assert cdp.eval('entityColor("project", "")') == "#cbd5e1"
+
+    for entity_type in ("agent", "project"):
+        _reset_color_registry(cdp)
+        ids = ["typed-space-shared"] + [
+            "%s-capacity-%02d" % (entity_type, i) for i in range(14)]
+        _register_colors(cdp, entity_type, ids)
+        at_capacity = _color_map(cdp, entity_type, ids)
+        assert len(set(at_capacity.values())) == 15
+        assert set(at_capacity.values()) == set(cdp.eval("PALETTE"))
+
+        all_ids = ids + ["%s-after-capacity" % entity_type]
+        _register_colors(cdp, entity_type, all_ids)
+        after_capacity = _color_map(cdp, entity_type, all_ids)
+        assert {key: after_capacity[key] for key in ids} == at_capacity
+        assert len(set(after_capacity.values())) == 15
+
+        cdp.open_page(base + "/")
+        cdp.wait_for(BOOTED_JS)
+        _reset_color_registry(cdp)
+        _register_colors(cdp, entity_type, list(reversed(all_ids)))
+        fresh_reverse = _color_map(cdp, entity_type, all_ids)
+
+        cdp.open_page(base + "/")
+        cdp.wait_for(BOOTED_JS)
+        _reset_color_registry(cdp)
+        _register_colors(cdp, entity_type, all_ids)
+        assert _color_map(cdp, entity_type, all_ids) == fresh_reverse
+
+
+def test_meta_boot_registers_canonical_sets_before_chart_render(dashboard):
+    """Meta registration completes before the first chart and survives refresh."""
+    cdp, base = dashboard
+    trace_script = r'''(() => {
+      window.__aistat_boot_trace = [];
+      const trace = window.__aistat_boot_trace;
+      const fetchImpl = window.fetch;
+      window.fetch = (...args) => {
+        const url = String(args[0] && args[0].url || args[0]);
+        if (!url.includes("/api/meta")) return fetchImpl(...args);
+        trace.push("meta:start");
+        return fetchImpl(...args).then((response) => {
+          trace.push("meta:end");
+          return response;
+        });
+      };
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function(...args) {
+        trace.push("chart:canvas");
+        return getContext.apply(this, args);
+      };
+    })();'''
+    cdp.open_page(base + "/?model=m-claude&agent=A1&project=P1",
+                  preload_script=trace_script)
+    cdp.wait_for(BOOTED_JS)
+
+    typed_ids = cdp.eval('''(() => [
+      ...[...document.querySelectorAll("#filter-model option")]
+        .map((o) => ["model", o.value]).filter(([, id]) => id),
+      ...[...document.querySelectorAll("#filter-agent option")]
+        .map((o) => ["agent", o.value]).filter(([, id]) => id),
+      ...[...document.querySelectorAll("#filter-project option")]
+        .map((o) => ["project", o.value]).filter(([, id]) => id),
+    ])()''')
+    registered = cdp.eval('''(%s).map(([type, id]) => ({
+      type, id, registered: colorRegistry.byKey.has(type + "\\u0000" + id),
+    }))''' % json.dumps(typed_ids))
+    assert registered and all(item["registered"] for item in registered)
+
+    trace = cdp.eval("window.__aistat_boot_trace")
+    assert trace.index("meta:end") < trace.index("chart:canvas")
+
+    before = _registry_map(cdp, typed_ids)
+    cdp.eval('''(() => {
+      const select = document.getElementById("filter-model");
+      for (const option of select.options) option.selected = option.value === "m-shared";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('state.models.length === 1 && state.models[0] === "m-shared"')
+    cdp.eval('''(() => {
+      const select = document.getElementById("filter-model");
+      for (const option of select.options) option.selected = option.value === "m-claude";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('state.models.length === 1 && state.models[0] === "m-claude"')
+    assert _registry_map(cdp, typed_ids) == before
+    cdp.eval("refreshMeta().then(refreshAll)")
+    cdp.wait_for(BOOTED_JS)
+    assert _registry_map(cdp, typed_ids) == before
+    cdp.eval("location.reload()")
+    cdp.wait_for(BOOTED_JS)
+    assert _registry_map(cdp, typed_ids) == before
+
+
 def _probe_entity_colors(cdp, identities):
     """Return ``type:id -> color`` from the live page registry."""
     return cdp.eval(
@@ -432,6 +631,8 @@ def _fresh_entity_colors(cdp, base, identities):
     and the explicit probe identities can claim fallback slots."""
     cdp.open_page(base + "/?from=2030-01-01T00:00&to=2030-01-02T00:00")
     cdp.wait_for(BOOTED_JS)
+    _reset_color_registry(cdp)
+    _register_identity_batches(cdp, identities)
     return _probe_entity_colors(cdp, identities)
 
 
@@ -439,6 +640,8 @@ def _fresh_entity_color_snapshot(cdp, base, identities):
     """Return colors plus palette cardinality after probing a fresh registry."""
     cdp.open_page(base + "/?from=2030-01-01T00:00&to=2030-01-02T00:00")
     cdp.wait_for(BOOTED_JS)
+    _reset_color_registry(cdp)
+    _register_identity_batches(cdp, identities)
     return cdp.eval(
         '(ids => { const colors = Object.fromEntries(ids.map(([type, id]) => ['
         'type + ":" + (id === null ? "<null>" : id), '

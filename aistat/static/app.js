@@ -33,12 +33,10 @@ const ENTITY_ANCHORS = {
 const SINGLE_SERIES_COLOR = "#4f6df5";
 
 // typed key ("type\0id") -> color, assigned once and cached for the session.
-// Fallback colors are derived only from the typed key. Keeping a mutable set of
-// colors already seen makes the result depend on which colliding identity was
-// rendered first, so collision handling must not consult encounter order.
-// Anchor colors are skipped by a deterministic probe; caching by id — never by
-// position — keeps a color fixed across reorder, live refresh and group
-// switches. Repeated colors are allowed once the fixed palette is exhausted.
+// A canonical batch is registered before charts render. That lets colliding
+// identities claim distinct free slots without making the mapping depend on
+// the order in which a chart happens to encounter them. Existing assignments
+// are deliberately retained when meta refreshes add new identities.
 const colorRegistry = { byKey: new Map() };
 
 // FNV-1a over the typed key: a stable, well-spread starting index into the
@@ -52,31 +50,75 @@ function hashKey(key) {
   return h >>> 0;
 }
 
-function entityColor(type, id) {
-  if (id == null || id === "") return UNATTRIBUTED_COLOR;
-  const key = type + "\u0000" + id;
-  const cached = colorRegistry.byKey.get(key);
-  if (cached) return cached;
-  const anchors = ENTITY_ANCHORS[type];
-  let color = anchors && Object.prototype.hasOwnProperty.call(anchors, id)
-    ? anchors[id] : null;
-  if (!color) {
-    // Re-seed the palette lookup separately from the legacy FNV start hash.
-    // This keeps identities that share a start slot (for example collision-6
-    // and collision-9) independent of the order in which they are encountered.
-    const start = hashKey(key + "\u0000palette") % PALETTE.length;
-    const reserved = new Set(anchors ? Object.values(anchors) : []);
-    color = PALETTE[start];
-    for (let i = 0; i < PALETTE.length; i++) {
-      const candidate = PALETTE[(start + i) % PALETTE.length];
-      if (!reserved.has(candidate)) {
-        color = candidate;
-        break;
-      }
+function normalizeEntityId(id) {
+  if (id == null) return "";
+  return String(id).trim();
+}
+
+function entityKey(type, id) {
+  return String(type || "").trim() + "\u0000" + normalizeEntityId(id);
+}
+
+function fallbackColorForKey(key, reserved, used) {
+  const start = hashKey(key + "\u0000palette") % PALETTE.length;
+
+  // Prefer an unused color, skipping anchors. The first loop is what gives a
+  // finite batch exact uniqueness up to its effective capacity.
+  for (let i = 0; i < PALETTE.length; i++) {
+    const candidate = PALETTE[(start + i) % PALETTE.length];
+    if (!reserved.has(candidate) && !used.has(candidate)) return candidate;
+  }
+
+  // The palette is finite. After exhaustion, keep the same deterministic
+  // probe, but allow a repeat while still protecting anchor colors.
+  for (let i = 0; i < PALETTE.length; i++) {
+    const candidate = PALETTE[(start + i) % PALETTE.length];
+    if (!reserved.has(candidate)) return candidate;
+  }
+  return UNATTRIBUTED_COLOR;
+}
+
+function registerEntityColors(type, ids) {
+  const normalizedType = String(type || "").trim();
+  if (!normalizedType) return;
+
+  const anchors = ENTITY_ANCHORS[normalizedType] || {};
+  const reserved = new Set(Object.values(anchors));
+  for (const [id, color] of Object.entries(anchors)) {
+    colorRegistry.byKey.set(entityKey(normalizedType, id), color);
+  }
+
+  const canonicalIds = [...new Set((Array.isArray(ids) ? ids : [])
+    .map(normalizeEntityId).filter(Boolean))].sort();
+  const used = new Set();
+  for (const [key, color] of colorRegistry.byKey) {
+    if (key.startsWith(normalizedType + "\u0000") && !reserved.has(color)) {
+      used.add(color);
     }
   }
-  colorRegistry.byKey.set(key, color);
-  return color;
+
+  for (const id of canonicalIds) {
+    const key = entityKey(normalizedType, id);
+    if (colorRegistry.byKey.has(key)) continue;
+    const color = Object.prototype.hasOwnProperty.call(anchors, id)
+      ? anchors[id] : fallbackColorForKey(key, reserved, used);
+    colorRegistry.byKey.set(key, color);
+    if (!reserved.has(color)) used.add(color);
+  }
+}
+
+function entityColor(type, id) {
+  const normalizedType = String(type || "").trim();
+  const normalizedId = normalizeEntityId(id);
+  if (!normalizedId) return UNATTRIBUTED_COLOR;
+  const key = entityKey(normalizedType, normalizedId);
+  const cached = colorRegistry.byKey.get(key);
+  if (cached) return cached;
+  // Production paths register their complete meta batch first. This small
+  // compatibility fallback also keeps direct probes safe without assigning a
+  // sentinel or bypassing anchor handling.
+  registerEntityColors(normalizedType, [normalizedId]);
+  return colorRegistry.byKey.get(key) || UNATTRIBUTED_COLOR;
 }
 
 // Every value the period/group selects can hold; URL parameters outside these
@@ -690,6 +732,9 @@ async function setupSession() {
 
 async function refreshMeta() {
   const meta = await fetchJSON("/api/meta");
+  registerEntityColors("project", meta.projects.map((project) => project.id));
+  registerEntityColors("agent", meta.agents.map((agent) => agent.id));
+  registerEntityColors("model", meta.models);
   state.lastDate = meta.date_span.last;
   populateMultiSelect("filter-project", meta.projects, (p) => p.id, (p) => p.title, state.projects);
   populateMultiSelect("filter-agent", meta.agents, (a) => a.id, (a) => a.name, state.agents);
