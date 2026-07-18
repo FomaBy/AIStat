@@ -247,6 +247,30 @@ class Config:
             handoff.WORKER_READINESS_TTL_DEFAULT_SECONDS,
         )
     )
+    # Task-owned HOME root for the per-connection official CLI. Every
+    # connection logs in under its own ``--profile aistat-conn-<id>`` inside
+    # this directory, so no per-user token ever touches the owner's real
+    # ``~/.multica`` and the ambient MULTICA_* identity is scrubbed away.
+    cli_profiles_dir: Path = field(
+        default_factory=lambda: _env_path(
+            "AISTAT_CLI_PROFILES_DIR", PROJECT_ROOT / "data" / "cli_profiles"
+        )
+    )
+    # Where the per-connection worker stages each user's freshly polled tenant
+    # database before it is published. Distinct from ``tenants_dir`` (the
+    # public host's install target) so a worker and host on one machine in
+    # tests never collide.
+    worker_tenants_dir: Path = field(
+        default_factory=lambda: _env_path(
+            "AISTAT_WORKER_TENANTS_DIR", PROJECT_ROOT / "data" / "worker_tenants"
+        )
+    )
+    # Start-to-start cadence of the per-connection collection loop.
+    worker_collect_interval_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "AISTAT_WORKER_COLLECT_INTERVAL_SECONDS", 300
+        )
+    )
 
     def ensure_db_dir(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,8 +285,28 @@ class Config:
         except OSError:
             pass
 
+    def ensure_cli_profiles_dir(self) -> None:
+        self.cli_profiles_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cli_profiles_dir.chmod(0o700)
+        except OSError:
+            pass
+
+    def ensure_worker_tenants_dir(self) -> None:
+        self.worker_tenants_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.worker_tenants_dir.chmod(0o700)
+        except OSError:
+            pass
+
     def tenant_db_path(self, user_id: int) -> Path:
         """Resolve a tenant path only from a trusted internal numeric user id."""
         if not isinstance(user_id, int) or isinstance(user_id, bool):
             raise ValueError("tenant path requires an internal integer user id")
         return Path(tenant_db_path(self.tenants_dir, user_id))
+
+    def worker_tenant_db_path(self, user_id: int) -> Path:
+        """Worker-local staging path for one tenant's freshly polled data."""
+        if not isinstance(user_id, int) or isinstance(user_id, bool):
+            raise ValueError("tenant path requires an internal integer user id")
+        return Path(tenant_db_path(self.worker_tenants_dir, user_id))

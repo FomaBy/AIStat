@@ -8,7 +8,7 @@ replaced with empty data.
 
 import json
 import subprocess
-from typing import Any, List, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 
 class CliError(Exception):
@@ -19,12 +19,29 @@ class CliError(Exception):
         super().__init__(f"multica {' '.join(args)}: {message}")
 
 
-def run_cli(args: List[str], *, binary: str = "multica", timeout: int = 120) -> Any:
-    """Run `multica <args> --output json` and return the parsed JSON."""
-    cmd = [binary, *args, "--output", "json"]
+def run_cli(
+    args: List[str],
+    *,
+    binary: str = "multica",
+    timeout: int = 120,
+    env: Optional[Mapping[str, str]] = None,
+    prepend: Sequence[str] = (),
+) -> Any:
+    """Run `multica [prepend...] <args> --output json` and return parsed JSON.
+
+    ``prepend`` carries pinned global flags that must precede the subcommand
+    (``--profile``, ``--server-url``, ``--workspace-id``) — the per-connection
+    worker uses it to bind every call to one isolated identity. ``env``, when
+    given, fully replaces the child environment; the per-connection worker
+    passes a scrubbed copy so an ambient ``MULTICA_TOKEN`` cannot leak in.
+    Only ``args`` (never ``prepend``) is echoed in errors, so a profile name
+    never lands in a health message.
+    """
+    cmd = [binary, *prepend, *args, "--output", "json"]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True, timeout=timeout,
+            env=None if env is None else dict(env),
         )
     except FileNotFoundError:
         raise CliError(args, f"binary not found: {binary}")

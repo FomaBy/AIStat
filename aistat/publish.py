@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 from .config import Config
 from .security import snapshot_signature
 from .snapshot import SnapshotError, create_compressed_snapshot
+from .tenant import canonical_tenant_id
 
 logger = logging.getLogger("aistat.publish")
 Opener = Callable[..., Any]
@@ -30,7 +31,13 @@ class PublishError(RuntimeError):
     """Raised when a snapshot cannot be built or accepted by the host."""
 
 
-def _validate_publish_config(config: Config) -> None:
+def _validate_publish_endpoint(config: Config) -> None:
+    """Validate everything a publish needs except the tenant selector.
+
+    The per-connection worker supplies the tenant per snapshot, so tenant is
+    checked by the caller, not here; single-tenant callers add the tenant
+    check via ``_validate_publish_config``.
+    """
     if not config.publish_url:
         raise PublishError("AISTAT_PUBLISH_URL is not configured")
     parsed = urlsplit(config.publish_url)
@@ -41,10 +48,14 @@ def _validate_publish_config(config: Config) -> None:
         )
     if not config.ingest_secret or len(config.ingest_secret.encode("utf-8")) < 32:
         raise PublishError("AISTAT_INGEST_SECRET must contain at least 32 bytes")
-    if config.publish_tenant_id is None:
-        raise PublishError("AISTAT_TENANT_ID is not configured")
     if config.publish_interval_seconds < 60:
         raise PublishError("AISTAT_PUBLISH_INTERVAL_SECONDS must be at least 60")
+
+
+def _validate_publish_config(config: Config) -> None:
+    _validate_publish_endpoint(config)
+    if config.publish_tenant_id is None:
+        raise PublishError("AISTAT_TENANT_ID is not configured")
 
 
 def current_marker(db_path: Path) -> Optional[str]:
@@ -69,14 +80,24 @@ def current_marker(db_path: Path) -> Optional[str]:
         return None
 
 
-def publish_once(
+def publish_snapshot(
     config: Config,
+    db_path: Path,
+    tenant_id: int,
     opener: Opener = urllib.request.urlopen,
     now: Optional[int] = None,
 ) -> Dict[str, Any]:
-    _validate_publish_config(config)
+    """Sign and upload one tenant's snapshot to the shared ingest endpoint.
+
+    The tenant id is bound into the HMAC signature and echoed in the header,
+    so the host installs the payload into exactly that tenant's database and
+    rejects a wrong-tenant, replayed or stale upload. One ingest secret signs
+    every tenant because the tenant lives inside the signed material.
+    """
+    _validate_publish_endpoint(config)
+    tenant_id = canonical_tenant_id(tenant_id)
     try:
-        payload = create_compressed_snapshot(config.db_path)
+        payload = create_compressed_snapshot(db_path)
     except SnapshotError as exc:
         raise PublishError(str(exc)) from exc
     if len(payload) > config.max_snapshot_bytes:
@@ -89,7 +110,7 @@ def publish_once(
 
     timestamp = int(time.time()) if now is None else int(now)
     signature = snapshot_signature(
-        config.ingest_secret, config.publish_tenant_id, timestamp, payload
+        config.ingest_secret, tenant_id, timestamp, payload
     )
     request = urllib.request.Request(
         config.publish_url,
@@ -97,7 +118,7 @@ def publish_once(
         method="POST",
         headers={
             "Content-Type": "application/vnd.aistat.snapshot+gzip",
-            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Tenant": str(tenant_id),
             "X-AIStat-Timestamp": str(timestamp),
             "X-AIStat-Signature": signature,
             "User-Agent": "AIStat-Publisher/1",
@@ -120,12 +141,25 @@ def publish_once(
     if result.get("status") != "ok":
         raise PublishError("host did not confirm snapshot installation")
     if (
-        result.get("tenant_id") != config.publish_tenant_id
+        result.get("tenant_id") != tenant_id
         or result.get("sha256") != expected_sha256
         or result.get("size_bytes") != expected_size
     ):
         raise PublishError("host confirmation does not match the sent snapshot")
     return result
+
+
+def publish_once(
+    config: Config,
+    opener: Opener = urllib.request.urlopen,
+    now: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Single-tenant publish of the owner database (config-driven tenant)."""
+    if config.publish_tenant_id is None:
+        raise PublishError("AISTAT_TENANT_ID is not configured")
+    return publish_snapshot(
+        config, config.db_path, config.publish_tenant_id, opener, now
+    )
 
 
 def watch(config: Config) -> int:
