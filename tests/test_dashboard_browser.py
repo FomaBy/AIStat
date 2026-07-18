@@ -752,6 +752,186 @@ def test_color_ledger_storage_denial_uses_memory_fallback(dashboard):
     assert cdp.eval('entityColor("model", "storage-denied")') != "#cbd5e1"
 
 
+def test_color_ledger_sweeps_stale_namespace_before_hydration(dashboard):
+    """FAN-1323: one scope never retains another scope's ledger namespace."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    current_scope = "user:qa-current"
+    stale = {
+        "version": 0,
+        "scope": "user:previous",
+        "assignments": {"model": {"previous-id": "#4f6df5"}},
+    }
+    valid = {
+        "version": 1,
+        "scope": current_scope,
+        "assignments": {"model": {"current-id": "#4f6df5"}},
+    }
+
+    cdp.eval("clearColorLedger(); sessionStorage.setItem('qa-unrelated', 'keep')")
+    cdp.eval("sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + '.v0', %s); "
+             "initializeColorLedger(%s)" % (
+                 json.dumps(json.dumps(stale)), json.dumps(current_scope)))
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_NAMESPACE + '.v0')") is None
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    assert cdp.eval("sessionStorage.getItem('qa-unrelated')") == "keep"
+    assert cdp.eval('colorRegistry.byKey.has("model\\u0000previous-id")') is False
+
+    cdp.eval("sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s); "
+             "sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + '.v0', %s); "
+             "initializeColorLedger(%s)" % (
+                 json.dumps(json.dumps(valid)), json.dumps(json.dumps(stale)),
+                 json.dumps(current_scope)))
+    assert cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))") == valid
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_NAMESPACE + '.v0')") is None
+    assert cdp.eval('entityColor("model", "current-id")') == "#4f6df5"
+
+    wrong_scope = dict(valid, scope="user:previous")
+    cdp.eval("sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s); "
+             "sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + '.v0', %s); "
+             "initializeColorLedger(%s)" % (
+                 json.dumps(json.dumps(wrong_scope)), json.dumps(json.dumps(stale)),
+                 json.dumps(current_scope)))
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_NAMESPACE + '.v0')") is None
+
+    cdp.eval("sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, '{bad json'); "
+             "sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + '.v0', 'obsolete'); "
+             "initializeColorLedger(%s)" % json.dumps(current_scope))
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_NAMESPACE + '.v0')") is None
+    assert cdp.eval("sessionStorage.getItem('qa-unrelated')") == "keep"
+
+
+def test_color_ledger_rejects_pre_capacity_duplicate_assignments(dashboard):
+    """FAN-1323: a duplicate fallback cannot exist before exhaustion."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    corrupt = {
+        "version": 1,
+        "scope": "local",
+        "assignments": {"model": {
+            "duplicate-first": "#4f6df5",
+            "duplicate-second": "#4f6df5",
+        }},
+    }
+    ids = ["duplicate-first", "duplicate-second"]
+
+    cdp.eval("clearColorLedger(); sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s); "
+             "initializeColorLedger('local')" % json.dumps(json.dumps(corrupt)))
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    _register_colors(cdp, "model", ids)
+    restored = _color_map(cdp, "model", ids)
+    assert restored["duplicate-first"] != restored["duplicate-second"]
+
+
+def test_color_ledger_persists_prototype_named_ids_across_reload(dashboard):
+    """FAN-1323: own JSON entries retain __proto__ and constructor safely."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    ids = ["__proto__", "constructor"]
+
+    cdp.eval("clearColorLedger(); initializeColorLedger('local')")
+    _register_colors(cdp, "model", ids)
+    before = _color_map(cdp, "model", ids)
+    payload = cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
+    assignments = payload["assignments"]["model"]
+    assert assignments["__proto__"] == before["__proto__"]
+    assert assignments["constructor"] == before["constructor"]
+    assert cdp.eval("Object.getPrototypeOf(Object.prototype) === null && "
+                    "({}).polluted === undefined") is True
+
+    cdp.eval("window.__pre_reload = true; location.reload()")
+    cdp.wait_for(f"window.__pre_reload === undefined && ({BOOTED_JS})")
+    assert _color_map(cdp, "model", ids) == before
+
+
+def test_color_ledger_preserves_exhausted_history_across_reload(dashboard):
+    """FAN-1323: C+1 history is valid when every fallback color is present."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    ids = ["exhausted-history-%02d" % index for index in range(15)]
+
+    cdp.eval("clearColorLedger(); initializeColorLedger('local')")
+    _register_colors(cdp, "model", ids)
+    before = _color_map(cdp, "model", ids)
+    payload = cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
+    colors = list(payload["assignments"]["model"].values())
+    assert len(colors) == 15
+    assert set(colors) == set(cdp.eval(
+        'PALETTE.filter((color) => color !== ENTITY_ANCHORS.model["claude-fable-5"])'))
+
+    cdp.eval("window.__pre_reload = true; location.reload()")
+    cdp.wait_for(f"window.__pre_reload === undefined && ({BOOTED_JS})")
+    assert _color_map(cdp, "model", ids) == before
+
+
+def test_color_ledger_storage_operation_failures_use_memory_fallback(dashboard):
+    """Enumeration, removal and persistence errors never hydrate stale state."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+
+    key_failure = cdp.eval(r'''(() => {
+      clearColorLedger();
+      sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + ".v0", "obsolete");
+      const original = Storage.prototype.key;
+      Storage.prototype.key = function() { throw new Error("key denied by QA"); };
+      initializeColorLedger("local");
+      const result = {
+        memory: colorRegistry.storage === null,
+        warning: colorRegistry.storageWarningShown,
+      };
+      Storage.prototype.key = original;
+      return result;
+    })()''')
+    assert key_failure == {"memory": True, "warning": True}
+
+    valid = {
+        "version": 1,
+        "scope": "local",
+        "assignments": {"model": {"must-not-hydrate": "#4f6df5"}},
+    }
+    remove_failure = cdp.eval(r'''(payload => {
+      sessionStorage.clear();
+      sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, JSON.stringify(payload));
+      sessionStorage.setItem(COLOR_LEDGER_NAMESPACE + ".v0", "obsolete");
+      const original = Storage.prototype.removeItem;
+      Storage.prototype.removeItem = function() { throw new Error("remove denied by QA"); };
+      initializeColorLedger("local");
+      const result = {
+        memory: colorRegistry.storage === null,
+        warning: colorRegistry.storageWarningShown,
+        hydrated: colorRegistry.byKey.has("model\\u0000must-not-hydrate"),
+      };
+      Storage.prototype.removeItem = original;
+      return result;
+    })(%s)''' % json.dumps(valid))
+    assert remove_failure == {"memory": True, "warning": True, "hydrated": False}
+
+    set_failure = cdp.eval(r'''(() => {
+      sessionStorage.clear();
+      initializeColorLedger("local");
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = function() { throw new Error("set denied by QA"); };
+      registerEntityColors("model", ["persist-denied"]);
+      const result = {
+        memory: colorRegistry.storage === null,
+        warning: colorRegistry.storageWarningShown,
+        color: entityColor("model", "persist-denied"),
+      };
+      Storage.prototype.setItem = original;
+      return result;
+    })()''')
+    assert set_failure["memory"] is True
+    assert set_failure["warning"] is True
+    assert set_failure["color"] != "#cbd5e1"
+
+
 def _probe_entity_colors(cdp, identities):
     """Return ``type:id -> color`` from the live page registry."""
     return cdp.eval(
