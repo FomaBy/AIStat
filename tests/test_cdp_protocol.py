@@ -15,14 +15,17 @@ run cannot prove:
 * failure-safe, idempotent cleanup across the three teardown failure paths.
 """
 
+import os
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from cdp_harness import (
-    BOOT_TIMEOUT, Cdp, ChromeProcess, DashboardSession)
+    BOOT_TIMEOUT, Cdp, ChromeProcess, DashboardSession, PipeTransport)
 
 
 class FakeClock:
@@ -64,7 +67,7 @@ class FakeChrome:
         self.closed = False
 
     # --- transport interface -------------------------------------------------
-    def send(self, data):
+    def send(self, data, deadline=None):
         for raw in data.split(b"\0"):
             if raw:
                 self._handle(_loads(raw))
@@ -215,7 +218,7 @@ def test_pipe_close_midcall_raises_bounded_connection_error():
         def __init__(self):
             self.sent = []
 
-        def send(self, data):
+        def send(self, data, deadline=None):
             self.sent.append(data)
 
         def recv(self, timeout):
@@ -232,6 +235,141 @@ def test_pipe_close_midcall_raises_bounded_connection_error():
     assert "requested_url='http://127.0.0.1:9/x'" in str(failure.value)
 
 
+class _SettableClock:
+    """A monotonic clock whose value is set explicitly, so a transport can model
+    a packet becoming readable at a precise instant."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class CoalescedTransport:
+    """Delivers several frames — interleaved events then (optionally) the
+    matching reply — in ONE buffered packet on a single ``recv``, and advances
+    the injected clock to ``arrive_at`` as that packet becomes readable. Models
+    Chrome coalescing an event burst and the reply into one pipe read.
+    """
+
+    def __init__(self, clock, frames, arrive_at):
+        self._clock = clock
+        self._packet = b"".join(_dumps(frame) for frame in frames)
+        self._arrive_at = arrive_at
+        self._delivered = False
+        self.sent = []
+
+    def send(self, data, deadline=None):
+        self.sent.append(data)
+
+    def recv(self, timeout):
+        if self._delivered:
+            return None  # poll expiry — nothing more arrives
+        self._delivered = True
+        self._clock.t = self._arrive_at
+        return self._packet
+
+    def close(self):
+        pass
+
+
+def _lifecycle_events(session, count):
+    return [{"method": "Page.lifecycleEvent", "params": {}, "sessionId": session}
+            for _ in range(count)]
+
+
+def test_call_rejects_coalesced_reply_that_arrives_after_deadline():
+    """FAN-1347 negative probe: eight interleaved events and the matching reply
+    delivered in one buffered packet that only becomes readable after the
+    injected monotonic deadline. The buffered frames must not be parsed past the
+    deadline, so the call ends in a bounded TimeoutError with method/URL/target/
+    session diagnostics — never accepting the late reply."""
+    clock = _SettableClock(0.0)
+    reply = {"id": 1, "result": {"frameId": "F"}, "sessionId": "S-EXACT"}
+    transport = CoalescedTransport(
+        clock, _lifecycle_events("S-EXACT", 8) + [reply], arrive_at=6.0)
+    cdp = Cdp(transport, clock=clock)
+    cdp._requested_url = "http://127.0.0.1:9/dash"
+    cdp._target_id = "T-1"
+    cdp.session_id = "S-EXACT"
+
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Page.navigate", {"url": cdp._requested_url}, timeout=5.0)
+
+    message = str(failure.value)
+    assert "Page.navigate" in message
+    assert "requested_url='http://127.0.0.1:9/dash'" in message
+    assert "target_id='T-1'" in message
+    assert "session_id='S-EXACT'" in message
+
+
+def test_call_accepts_coalesced_reply_that_arrives_before_deadline():
+    """The mirror case: the same coalesced packet, readable before the deadline,
+    is parsed frame by frame and the matching reply is accepted."""
+    clock = _SettableClock(0.0)
+    reply = {"id": 1, "result": {"frameId": "F"}, "sessionId": "S-EXACT"}
+    transport = CoalescedTransport(
+        clock, _lifecycle_events("S-EXACT", 8) + [reply], arrive_at=3.0)
+    cdp = Cdp(transport, clock=clock)
+    cdp.session_id = "S-EXACT"
+
+    result = cdp.call("Page.navigate", {"url": "http://127.0.0.1:9/dash"},
+                      timeout=5.0)
+    assert result == {"frameId": "F"}
+
+
+def test_call_times_out_on_coalesced_events_without_matching_reply():
+    """A coalesced burst of events with no matching reply still terminates in
+    bounded time: the frames are consumed, then the next poll expires."""
+    clock = _SettableClock(0.0)
+    transport = CoalescedTransport(
+        clock, _lifecycle_events("S-EXACT", 8), arrive_at=3.0)
+    cdp = Cdp(transport, clock=clock)
+    cdp._requested_url = "http://127.0.0.1:9/x"
+    cdp.session_id = "S-EXACT"
+
+    with pytest.raises(TimeoutError) as failure:
+        cdp.call("Page.navigate", {"url": cdp._requested_url}, timeout=5.0)
+    assert "Page.navigate" in str(failure.value)
+    assert "requested_url='http://127.0.0.1:9/x'" in str(failure.value)
+
+
+# --- AC#5: bounded send + failure-safe, idempotent cleanup ------------------
+
+
+def test_send_is_bounded_when_the_command_pipe_is_full():
+    """A Chrome that has stopped reading fills the command pipe. The send must
+    fail with a bounded TimeoutError instead of blocking forever on the write."""
+    read_fd, write_fd = os.pipe()
+    transport = PipeTransport(write_fd, read_fd)
+    try:
+        payload = b"x" * (8 * 1024 * 1024)  # far exceeds the pipe buffer
+        deadline = time.monotonic() + 0.3
+        started = time.monotonic()
+        with pytest.raises(TimeoutError) as failure:
+            transport.send(payload, deadline)
+        assert "send timed out" in str(failure.value)
+        assert time.monotonic() - started < 5  # returned promptly, not a hang
+    finally:
+        transport.close()
+
+
+def test_send_on_a_dead_pipe_fails_fast_rather_than_hanging():
+    """When the read end is gone (a dead Chrome) the write fails immediately;
+    the error is surfaced, bounded, not swallowed into a hang."""
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    transport = PipeTransport(write_fd, read_fd)
+    try:
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            transport.send(b"probe\0", deadline=time.monotonic() + 5)
+        assert time.monotonic() - started < 5
+    finally:
+        transport.close()
+
+
 # --- AC#5: failure-safe, idempotent cleanup ---------------------------------
 
 class _Server:
@@ -240,11 +378,15 @@ class _Server:
 
 
 class _Thread:
-    def __init__(self):
+    def __init__(self, alive_after_join=False):
         self.joined = 0
+        self._alive_after_join = alive_after_join
 
     def join(self, timeout=None):
         self.joined += 1
+
+    def is_alive(self):
+        return self._alive_after_join
 
 
 def test_cleanup_setup_failure_before_yield_releases_partial_resources():
@@ -287,6 +429,41 @@ def test_cleanup_survives_exception_in_cdp_close():
     assert thread.joined == 1
 
 
+def test_cleanup_joins_a_real_server_thread_to_completion():
+    """The Uvicorn stand-in really runs and really stops: after close() the
+    thread is provably gone (``is_alive() is False``), not just asked to exit."""
+    class _StoppableServer:
+        def __init__(self):
+            self.should_exit = False
+
+        def run(self):
+            while not self.should_exit:
+                time.sleep(0.005)
+
+    server = _StoppableServer()
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    session = DashboardSession(server=server, thread=thread)
+
+    session.close()
+    assert session.thread_alive_after_join is False
+    assert thread.is_alive() is False
+    assert session.cleanup_errors == []
+
+
+def test_cleanup_surfaces_a_hung_server_thread_after_bounded_join():
+    """A thread that outlives its bounded join (a hung Uvicorn) is recorded and
+    surfaced as a cleanup error instead of leaking silently."""
+    server, thread = _Server(), _Thread(alive_after_join=True)
+    session = DashboardSession(server=server, thread=thread)
+
+    session.close()
+    assert thread.joined == 1
+    assert session.thread_alive_after_join is True
+    assert any(isinstance(e, RuntimeError) and "still alive" in str(e)
+               for e in session.cleanup_errors)
+
+
 def test_cdp_close_bounded_on_graceful_timeout_then_reaps_and_cleans():
     """Failure path (b): the graceful Browser.close never replies (a hang the
     deadline turns into a bounded timeout); Chrome is still force-reaped, the
@@ -295,7 +472,7 @@ def test_cdp_close_bounded_on_graceful_timeout_then_reaps_and_cleans():
         def __init__(self):
             self.closed = 0
 
-        def send(self, data):
+        def send(self, data, deadline=None):
             pass
 
         def recv(self, timeout):
@@ -358,4 +535,7 @@ def test_chrome_process_reap_force_kills_unresponsive_chrome_idempotently():
 
 
 def test_boot_timeout_is_the_documented_default():
-    assert BOOT_TIMEOUT == 15.0
+    # Provisioned for a cold Chrome's first command and an awaitPromise compound
+    # refresh under CI contention, not a warm round-trip (FAN-1348); still finite
+    # so a genuine hang is bounded.
+    assert BOOT_TIMEOUT == 60.0

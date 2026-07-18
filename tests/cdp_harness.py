@@ -30,9 +30,21 @@ import tempfile
 import time
 from pathlib import Path
 
-# Chrome takes a beat to answer the first command in a cold profile; every CDP
-# call is bounded by this single absolute deadline (see ``Cdp.call``).
-BOOT_TIMEOUT = 15.0
+# Every CDP call is bounded by this single absolute deadline (see ``Cdp.call``),
+# which covers send, receive and buffered-frame parsing alike.
+#
+# The deadline exists to catch a genuinely hung transport (a lost reply, a dead
+# Chrome), not to enforce a latency budget. It therefore has to clear the
+# slowest *legitimate* operation, and two of those are far slower than a warm
+# protocol round-trip: a cold Chrome answering its first command on a throwaway
+# profile, and a ``Runtime.evaluate`` that awaits a compound page refresh
+# (``refreshMeta().then(refreshAll)`` — a meta fetch plus eight parallel API
+# fetches plus a full Chart.js render). On an idle machine both finish in a few
+# seconds, but on a cold, contended CI runner their tail crosses 15s and the
+# read fired a false ``CDP read timed out`` (the FAN-1347 preload flake). 60s
+# gives an order of magnitude of headroom over the observed warm cost while
+# still bounding a real hang.
+BOOT_TIMEOUT = 60.0
 
 CHROME_CANDIDATES = (
     os.environ.get("AISTAT_CHROME"),
@@ -62,16 +74,41 @@ class PipeTransport:
     """Raw ``\\0``-framed CDP transport over Chrome's debugging-pipe fds.
 
     ``recv`` returns the next chunk of bytes, ``b""`` at end-of-pipe, or ``None``
-    when the poll times out — the three outcomes ``Cdp`` distinguishes.
+    when the poll times out — the three outcomes ``Cdp`` distinguishes. ``send``
+    is bounded by the same absolute deadline: the command fd is non-blocking and
+    each write waits for writability only until the deadline, so a full pipe (a
+    Chrome that has stopped reading) raises a bounded ``TimeoutError`` instead of
+    blocking forever.
     """
 
-    def __init__(self, cmd_write, resp_read):
+    def __init__(self, cmd_write, resp_read, *, clock=time.monotonic):
         self._cmd_write = cmd_write
         self._resp_read = resp_read
+        self._clock = clock
         self._closed = False
+        # A blocked send must be bounded by the deadline, not hang on a full
+        # pipe; select on the fd only reports writability, os.write on a
+        # blocking fd could still stall on a partial write. Non-blocking + a
+        # select/deadline loop bounds the whole send. This is our write end of
+        # the command pipe; Chrome reads the other end, unaffected.
+        os.set_blocking(cmd_write, False)
 
-    def send(self, data):
-        os.write(self._cmd_write, data)
+    def send(self, data, deadline=None):
+        view = memoryview(data)
+        while view:
+            if deadline is not None:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise TimeoutError("CDP send timed out")
+                _, writable, _ = select.select([], [self._cmd_write], [],
+                                               remaining)
+                if not writable:
+                    raise TimeoutError("CDP send timed out")
+            try:
+                written = os.write(self._cmd_write, view)
+            except BlockingIOError:
+                continue
+            view = view[written:]
 
     def recv(self, timeout):
         ready, _, _ = select.select([self._resp_read], [], [], max(0.0, timeout))
@@ -146,7 +183,15 @@ class Cdp:
 
     def _read_message(self, deadline):
         """Read one framed message, bounded by an absolute monotonic deadline
-        supplied by the caller — never a fresh per-message window."""
+        supplied by the caller — never a fresh per-message window.
+
+        The deadline is authoritative for buffered/coalesced frames too: when a
+        single packet carries several events and then the reply, time spent
+        consuming the earlier frames still counts, so a matching reply that only
+        becomes readable after the deadline must not slip through. Without the
+        re-check below the ``while`` loop is skipped entirely for an
+        already-buffered frame and an expired call could accept a late reply.
+        """
         while b"\0" not in self._buffer:
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -157,6 +202,8 @@ class Cdp:
             if chunk == b"":
                 raise ConnectionError("CDP pipe closed")
             self._buffer += chunk
+        if deadline - self._clock() <= 0:
+            raise TimeoutError("CDP read timed out")
         raw, self._buffer = self._buffer.split(b"\0", 1)
         return json.loads(raw)
 
@@ -167,11 +214,12 @@ class Cdp:
         expected_session = self.session_id if session and self.session_id else None
         if expected_session:
             message["sessionId"] = expected_session
-        # One absolute deadline for the whole call: interleaved events consume
-        # the budget instead of resetting it, so an event stream with no
-        # matching reply still terminates in bounded time.
+        # One absolute deadline for the whole call — send, receive and buffered
+        # frame parsing share it. Interleaved events consume the budget instead
+        # of resetting it, so an event stream with no matching reply (or a send
+        # that blocks on a full pipe) still terminates in bounded time.
         deadline = self._clock() + timeout
-        self._transport.send(json.dumps(message).encode() + b"\0")
+        self._transport.send(json.dumps(message).encode() + b"\0", deadline)
         while True:  # events arrive interleaved; wait for our reply
             try:
                 reply = self._read_message(deadline)
@@ -331,7 +379,7 @@ def launch_chrome(chrome=CHROME, *, clock=time.monotonic):
         raise
     os.close(cmd_read)
     os.close(resp_write)
-    return Cdp(PipeTransport(cmd_write, resp_read),
+    return Cdp(PipeTransport(cmd_write, resp_read, clock=clock),
                process=ChromeProcess(proc), workdir=workdir, clock=clock)
 
 
@@ -344,6 +392,11 @@ class DashboardSession:
     ``cdp.close()`` never leaks Chrome, the server thread or the temp DB. It is
     idempotent — a second call is a no-op — and records swallowed teardown
     errors on ``cleanup_errors`` for assertions.
+
+    After the bounded join the server thread must be provably gone, not merely
+    asked to stop: ``thread_alive_after_join`` records ``thread.is_alive()`` so
+    a thread that outlived its join (a hung Uvicorn) is surfaced instead of
+    silently leaking.
     """
 
     def __init__(self, cdp=None, server=None, thread=None, tmp=None):
@@ -353,6 +406,7 @@ class DashboardSession:
         self.tmp = tmp
         self._closed = False
         self.cleanup_errors = []
+        self.thread_alive_after_join = None
 
     def close(self):
         if self._closed:
@@ -372,6 +426,10 @@ class DashboardSession:
         if self.thread is not None:
             try:
                 self.thread.join(timeout=10)
+                self.thread_alive_after_join = self.thread.is_alive()
+                if self.thread_alive_after_join:
+                    errors.append(RuntimeError(
+                        "server thread still alive after join"))
             except Exception as exc:
                 errors.append(exc)
         if self.tmp is not None:
