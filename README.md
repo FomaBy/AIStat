@@ -238,8 +238,11 @@ metadata задачи, а не по проекту).
 | `AISTAT_PRICING_OVERRIDES` | — | необязательный второй JSON, переопределяющий/дополняющий тарифы |
 | `AISTAT_CREDITS_PER_USD` | `1.0` | курс: сколько кредитов в 1 USD стоимости |
 | `AISTAT_PORT` | `8787` | порт дашборда/API (используется `run.sh`) |
+| `AISTAT_MULTICA_CONNECT_ENABLED` | `0` | fail-closed выключатель «подключения своего Мультика»; без `1` приём и worker-эндпоинты недоступны |
 | `AISTAT_WORKER_SECRET` | — | третий независимый HMAC-секрет (≥32 байт) канала «подключение своего Мультика»; без него приём токенов выключен |
-| `AISTAT_DEFAULT_SERVER_URL` | — | сервер Multica по умолчанию для подключений без явного `server_url` |
+| `AISTAT_MULTICA_OFFICIAL_URL` | `https://multica.ai` | единственный официальный хост, к которому пиннится любое подключение; пользовательский `server_url` не публикуется |
+| `AISTAT_CONNECTION_PENDING_TTL_SECONDS` | `600` | время жизни открытого pending-токена на хосте (жёсткий потолок 900) |
+| `AISTAT_WORKER_READINESS_TTL_SECONDS` | `900` | требуемая свежесть последнего pull worker'а для приёма токена |
 | `AISTAT_WORKER_SYNC_URL` | — | (worker) базовый URL публичного хоста для pull-канала |
 | `AISTAT_WORKER_KEY_PATH` | `~/.config/aistat/worker.key` | (worker) ключ шифрования токенов; хранится отдельно от хранилища |
 | `AISTAT_WORKER_STORE_PATH` | `./data/worker_connections.db` | (worker) зашифрованное хранилище токенов, права `0600` |
@@ -247,11 +250,18 @@ metadata задачи, а не по проекту).
 
 ## Подключение своего Мультика
 
-Пользователь вводит API-токен своего Multica в кабинете; хост держит его
-только до подтверждённого handoff доверенному локальному worker'у, который
-хранит токены зашифрованными. Протокол (HMAC pull-канал, lease/ack,
-replay-защита), state machine, деплой и residual risk описаны в
-[docs/secure-token-handoff.md](docs/secure-token-handoff.md).
+Регистрация/вход — через Google; свой Multica API-токен (PAT) пользователь вводит
+вручную в кабинете, и PAT никогда не выступает паролем AIStat. Хост держит токен
+только до подтверждённого handoff доверенному локальному worker'у, который хранит
+токены зашифрованными. Функция ship'ится **выключенной**
+(`AISTAT_MULTICA_CONNECT_ENABLED`), пиннит подключение к официальному хосту, даёт
+pending-токену короткий TTL и требует готовый worker перед записью токена.
+
+⚠️ PAT представляет пользователя, видит все его доступные workspaces и обычно не
+истекает: заведите отдельный PAT для AIStat (по возможности с ручным сроком) и
+обязательно отзовите его в Multica после отключения. Протокол (HMAC pull-канал,
+lease/ack, replay-защита), state machine, fail-closed контроли, деплой и residual
+risk описаны в [docs/secure-token-handoff.md](docs/secure-token-handoff.md).
 
 ## Как работает ингест
 

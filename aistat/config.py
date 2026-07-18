@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, FrozenSet, Optional, Tuple
 
-from . import oauth
+from . import handoff, oauth
 from .tenant import canonical_tenant_id, tenant_db_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -184,12 +184,6 @@ class Config:
     worker_secret: Optional[str] = field(
         default_factory=lambda: os.environ.get("AISTAT_WORKER_SECRET") or None
     )
-    # Server URL stored for a connection when the user does not name one
-    # (the owner's default Multica server).
-    default_server_url: Optional[str] = field(
-        default_factory=lambda: os.environ.get("AISTAT_DEFAULT_SERVER_URL")
-        or None
-    )
     # Trusted local worker only: base URL of the public host whose worker
     # endpoints this machine pulls (e.g. https://aistat.app).
     worker_sync_url: Optional[str] = field(
@@ -212,6 +206,45 @@ class Config:
         default_factory=lambda: _env_path(
             "AISTAT_WORKER_KEY_PATH",
             Path.home() / ".config" / "aistat" / "worker.key",
+        )
+    )
+    # Fail-closed master switch for the whole "connect your Multica" feature.
+    # Without an explicit truthy value both the token intake and the worker
+    # pull/ack channel are unavailable, so the feature ships dormant.
+    multica_connect_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "AISTAT_MULTICA_CONNECT_ENABLED", False
+        )
+    )
+    # The single official Multica host every connection is pinned to. A
+    # user-supplied server URL is never published; only this exact host is
+    # ever stored, so a poisoned server_url cannot redirect the PAT.
+    multica_official_url: str = field(
+        default_factory=lambda: (
+            os.environ.get("AISTAT_MULTICA_OFFICIAL_URL")
+            or handoff.OFFICIAL_MULTICA_URL
+        )
+    )
+    # Plaintext pending-token lifetime on the host (default 10 min, hard cap
+    # 15 min). After it the host physically erases the token.
+    connection_pending_ttl_seconds: int = field(
+        default_factory=lambda: max(
+            1,
+            min(
+                _env_int(
+                    "AISTAT_CONNECTION_PENDING_TTL_SECONDS",
+                    handoff.PENDING_TTL_DEFAULT_SECONDS,
+                ),
+                handoff.PENDING_TTL_MAX_SECONDS,
+            ),
+        )
+    )
+    # How fresh the worker's last authenticated pull must be for intake to save
+    # a token; otherwise intake fails closed with 503 and stores nothing.
+    worker_readiness_ttl_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "AISTAT_WORKER_READINESS_TTL_SECONDS",
+            handoff.WORKER_READINESS_TTL_DEFAULT_SECONDS,
         )
     )
 

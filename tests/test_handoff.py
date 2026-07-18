@@ -322,3 +322,122 @@ def test_apply_worker_acks_batch(store, user_id):
         store.apply_worker_acks({"not": "a list"})
     with pytest.raises(ValueError):
         store.apply_worker_acks([{}] * (handoff.MAX_ACK_ITEMS + 1))
+
+
+# --- hardening: official host, pending TTL, readiness, ack-gated revoke -
+
+
+def test_official_server_url_is_pinned():
+    official = "https://multica.ai"
+    assert handoff.normalize_official_server_url("", official) == official
+    assert handoff.normalize_official_server_url(None, official) == official
+    assert (
+        handoff.normalize_official_server_url("https://multica.ai/", official)
+        == official
+    )
+    # No alternate host, subdomain suffix, IP, port, credentials or scheme
+    # downgrade can point a stored connection anywhere but the official host.
+    for bad in (
+        "https://evil.example",
+        "https://multica.ai.evil.example",
+        "http://multica.ai",
+        "https://multica.ai:8443",
+        "https://user@multica.ai",
+        "https://127.0.0.1",
+        "ftp://multica.ai",
+        7,
+    ):
+        with pytest.raises(ValueError):
+            handoff.normalize_official_server_url(bad, official)
+    # A misconfigured official URL is rejected outright (fail closed).
+    for bad_official in (
+        "http://multica.ai",
+        "https://multica.ai/path",
+        "https://multica.ai:8443",
+        "https://user@multica.ai",
+        "",
+        "not a url",
+    ):
+        with pytest.raises(ValueError):
+            handoff.canonical_official_server_url(bad_official)
+
+
+def test_pending_token_expires_into_revocation_pending(store, user_id, tmp_path):
+    submit(store, user_id)  # pending at NOW
+    security_db = tmp_path / "security.db"
+    assert TOKEN.encode() in security_db.read_bytes()
+    ttl = handoff.PENDING_TTL_DEFAULT_SECONDS
+    later = NOW + ttl + 1
+    # A pull past the TTL erases the plaintext and hands it to the worker as a
+    # revocation to confirm, instead of leasing a stale token.
+    state = store.lease_pending_connections(ttl, now=later)
+    assert state["pending"] == []
+    assert state["revoked"] == [{"user_id": user_id, "token_epoch": 2}]
+    assert TOKEN.encode() not in security_db.read_bytes()
+    view = store.connection_status(user_id, ttl, now=later)
+    assert view["status"] == "revocation_pending"
+    assert view["last_sync_error"] == handoff.PENDING_EXPIRED_REASON
+
+
+def test_status_read_alone_purges_expired_pending(store, user_id, tmp_path):
+    submit(store, user_id)
+    ttl = handoff.PENDING_TTL_DEFAULT_SECONDS
+    assert (
+        store.connection_status(user_id, ttl, now=NOW + 5)["status"] == "pending"
+    )
+    view = store.connection_status(user_id, ttl, now=NOW + ttl + 1)
+    assert view["status"] == "revocation_pending"
+    assert TOKEN.encode() not in (tmp_path / "security.db").read_bytes()
+
+
+def test_worker_readiness_tracks_last_pull(store):
+    ttl = handoff.WORKER_READINESS_TTL_DEFAULT_SECONDS
+    assert not store.worker_ready(ttl, now=NOW)  # no pull has landed yet
+    store.lease_pending_connections(now=NOW)  # a pull records the heartbeat
+    assert store.worker_ready(ttl, now=NOW + ttl)
+    assert not store.worker_ready(ttl, now=NOW + ttl + 1)  # gone stale
+
+
+def test_replacement_pending_is_distinct_from_first_connect(store, user_id):
+    assert submit(store, user_id)["status"] == "pending"
+    assert submit(store, user_id, now=NOW + 1)["status"] == "replacement_pending"
+
+
+def test_revoked_only_after_worker_delete_ack(store, user_id):
+    submit(store, user_id)
+    assert store.revoke_connection(user_id, now=NOW)
+    # Still pending on the worker side until it confirms the delete.
+    assert store.connection_status(user_id)["status"] == "revocation_pending"
+    ok, status = handoff.ack_connection_revoked(
+        store._connect, user_id, 2, now=NOW
+    )
+    assert (ok, status) == (True, "revoked")
+    assert store.connection_status(user_id)["status"] == "revoked"
+    # A stale epoch cannot complete a revocation opened for a newer lifecycle.
+    submit(store, user_id, now=NOW + 1)  # reconnect -> epoch 3
+    assert handoff.ack_connection_revoked(
+        store._connect, user_id, 2, now=NOW + 2
+    ) == (False, "stale-epoch")
+
+
+def test_account_cleanup_leaves_no_active_worker_credential(
+    store, user_id, tmp_path
+):
+    # Model account deletion / credential cleanup: it erases the host token and
+    # cannot read `revoked` until the worker acknowledges deleting its copy.
+    submit(store, user_id)
+    lease = store.lease_pending_connections(now=NOW)["pending"][0]
+    handoff.ack_connection_stored(
+        store._connect, user_id, lease["lease_id"], 1, now=NOW
+    )
+    assert store.connection_status(user_id)["status"] == "active"
+    assert store.revoke_connection(user_id, now=NOW + 1)  # cleanup primitive
+    # Visible fail-closed intermediate state, never left as an active credential.
+    assert store.connection_status(user_id)["status"] == "revocation_pending"
+    (revoked,) = store.lease_pending_connections(now=NOW + 2)["revoked"]
+    ok, status = handoff.ack_connection_revoked(
+        store._connect, user_id, revoked["token_epoch"], now=NOW + 3
+    )
+    assert (ok, status) == (True, "revoked")
+    assert store.connection_status(user_id)["status"] == "revoked"
+    assert TOKEN.encode() not in (tmp_path / "security.db").read_bytes()

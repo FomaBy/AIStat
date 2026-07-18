@@ -678,7 +678,11 @@ def create_app(config: Optional[Config] = None) -> Flask:
         user_id = current_user_id()
         if user_id is None:
             return jsonify({"detail": "authentication required"}), 401
-        status = security_store.connection_status(user_id)
+        if not config.multica_connect_enabled:
+            return jsonify({"status": "disabled"})
+        status = security_store.connection_status(
+            user_id, config.connection_pending_ttl_seconds
+        )
         if status is None:
             return jsonify({"status": "none"})
         del status["token_epoch"]
@@ -686,8 +690,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.post("/api/connection")
     def api_connection_submit():
-        # The token would wait on the host forever without a configured
-        # worker channel, so intake fails closed instead of accepting it.
+        # Fail closed unless the whole feature is switched on and a worker
+        # channel exists — otherwise a stored token could never be collected.
+        if not config.multica_connect_enabled:
+            return jsonify({"detail": "connection intake is disabled"}), 503
         if not config.worker_secret:
             return jsonify(
                 {"detail": "connection intake is not configured"}
@@ -707,8 +713,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
             token = handoff.validate_connection_token(
                 request.form.get("token")
             )
-            server_url = handoff.validate_server_url(
-                request.form.get("server_url"), config.default_server_url
+            # The user's server URL is never published: the connection is
+            # pinned to the single official Multica host.
+            server_url = handoff.normalize_official_server_url(
+                request.form.get("server_url"), config.multica_official_url
             )
             workspace_label = handoff.validate_workspace_label(
                 request.form.get("workspace_label")
@@ -716,6 +724,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
         except ValueError as exc:
             # Validator messages never contain the submitted values.
             return jsonify({"detail": str(exc)}), 422
+        # No token is written unless the trusted worker has pulled recently;
+        # otherwise a stored token could linger uncollected.
+        if not security_store.worker_ready(config.worker_readiness_ttl_seconds):
+            return jsonify({"detail": "connection worker is not ready"}), 503
         try:
             status = security_store.submit_connection(
                 user_id, server_url, workspace_label, token
@@ -727,6 +739,8 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.post("/api/connection/revoke")
     def api_connection_revoke():
+        if not config.multica_connect_enabled:
+            return jsonify({"detail": "connection intake is disabled"}), 503
         if not valid_request_csrf():
             return jsonify({"detail": "invalid CSRF token"}), 400
         user_id = current_user_id()
@@ -734,7 +748,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return jsonify({"detail": "authentication required"}), 401
         if not security_store.revoke_connection(user_id):
             return jsonify({"detail": "no connection"}), 404
-        return jsonify({"status": "revoked"})
+        # `revoked` is only reported once the worker has acked the delete; a
+        # fresh revoke reports the intermediate `revocation_pending`.
+        status = security_store.connection_status(
+            user_id, config.connection_pending_ttl_seconds
+        )
+        return jsonify({"status": status["status"] if status else "revoked"})
 
     class ReplayedWorkerNonce(Exception):
         pass
@@ -758,7 +777,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.post(handoff.WORKER_PULL_PATH)
     def worker_connection_pull():
-        if not config.worker_secret:
+        if not (config.multica_connect_enabled and config.worker_secret):
             return jsonify({"detail": "not found"}), 404
         try:
             verified_worker_body(handoff.WORKER_PULL_PATH)
@@ -766,11 +785,15 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return jsonify({"detail": "worker authentication failed"}), 401
         except ReplayedWorkerNonce:
             return jsonify({"detail": "worker replay rejected"}), 409
-        return jsonify(security_store.lease_pending_connections())
+        return jsonify(
+            security_store.lease_pending_connections(
+                config.connection_pending_ttl_seconds
+            )
+        )
 
     @app.post(handoff.WORKER_ACK_PATH)
     def worker_connection_ack():
-        if not config.worker_secret:
+        if not (config.multica_connect_enabled and config.worker_secret):
             return jsonify({"detail": "not found"}), 404
         try:
             payload = verified_worker_body(handoff.WORKER_ACK_PATH)

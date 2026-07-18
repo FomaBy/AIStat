@@ -93,7 +93,28 @@ PASSWORD_HASH = os.environ.get("AISTAT_PASSWORD_HASH", "")
 SESSION_SECRET = os.environ.get("AISTAT_SESSION_SECRET", "")
 INGEST_SECRET = os.environ.get("AISTAT_INGEST_SECRET", "")
 WORKER_SECRET = os.environ.get("AISTAT_WORKER_SECRET", "")
-DEFAULT_SERVER_URL = os.environ.get("AISTAT_DEFAULT_SERVER_URL") or None
+# Fail-closed master switch for the "connect your Multica" feature.
+MULTICA_CONNECT_ENABLED = _env_bool("AISTAT_MULTICA_CONNECT_ENABLED", False)
+# The single official Multica host every connection is pinned to.
+MULTICA_OFFICIAL_URL = (
+    os.environ.get("AISTAT_MULTICA_OFFICIAL_URL") or handoff.OFFICIAL_MULTICA_URL
+)
+# Plaintext pending-token lifetime (default 10 min, hard cap 15 min).
+CONNECTION_PENDING_TTL = max(
+    1,
+    min(
+        int(
+            os.environ.get("AISTAT_CONNECTION_PENDING_TTL_SECONDS")
+            or handoff.PENDING_TTL_DEFAULT_SECONDS
+        ),
+        handoff.PENDING_TTL_MAX_SECONDS,
+    ),
+)
+# Required freshness of the worker's last authenticated pull for intake.
+WORKER_READINESS_TTL = int(
+    os.environ.get("AISTAT_WORKER_READINESS_TTL_SECONDS")
+    or handoff.WORKER_READINESS_TTL_DEFAULT_SECONDS
+)
 SESSION_SECONDS = int(os.environ.get("AISTAT_SESSION_HOURS", "12")) * 3600
 INGEST_MAX_AGE = int(os.environ.get("AISTAT_INGEST_MAX_AGE_SECONDS", "300"))
 MAX_SNAPSHOT_BYTES = int(
@@ -127,6 +148,13 @@ def _validate_config():
             raise RuntimeError(
                 "the worker secret must be independent from other secrets"
             )
+    try:
+        handoff.canonical_official_server_url(MULTICA_OFFICIAL_URL)
+    except ValueError as exc:
+        raise RuntimeError(
+            "AISTAT_MULTICA_OFFICIAL_URL must be a bare https host: "
+            + str(exc)
+        )
     if not ADMIN_USERNAME or not PASSWORD_HASH:
         raise RuntimeError("dashboard credentials are not configured")
     if os.path.abspath(DB_PATH) == os.path.abspath(SECURITY_DB_PATH):
@@ -1413,7 +1441,7 @@ def _worker_channel_body(environ, path):
 def _worker_pull(environ, start_response):
     if environ.get("REQUEST_METHOD") != "POST":
         return _respond(environ, start_response, "405 Method Not Allowed")
-    if not WORKER_SECRET:
+    if not (MULTICA_CONNECT_ENABLED and WORKER_SECRET):
         return _json_response(
             environ, start_response, "404 Not Found", {"detail": "not found"}
         )
@@ -1439,14 +1467,16 @@ def _worker_pull(environ, start_response):
         environ,
         start_response,
         "200 OK",
-        handoff.lease_pending_connections(_security_connection),
+        handoff.lease_pending_connections(
+            _security_connection, CONNECTION_PENDING_TTL
+        ),
     )
 
 
 def _worker_ack(environ, start_response):
     if environ.get("REQUEST_METHOD") != "POST":
         return _respond(environ, start_response, "405 Method Not Allowed")
-    if not WORKER_SECRET:
+    if not (MULTICA_CONNECT_ENABLED and WORKER_SECRET):
         return _json_response(
             environ, start_response, "404 Not Found", {"detail": "not found"}
         )
@@ -1497,7 +1527,13 @@ def _connection_api(environ, start_response, session, path):
             {"detail": "authentication required"},
         )
     if path == "/api/connection" and method == "GET":
-        status = handoff.connection_status(_security_connection, user_id)
+        if not MULTICA_CONNECT_ENABLED:
+            return _json_response(
+                environ, start_response, "200 OK", {"status": "disabled"}
+            )
+        status = handoff.connection_status(
+            _security_connection, user_id, CONNECTION_PENDING_TTL
+        )
         if status is None:
             return _json_response(
                 environ, start_response, "200 OK", {"status": "none"}
@@ -1518,6 +1554,14 @@ def _connection_api(environ, start_response, session, path):
             "400 Bad Request",
             {"detail": "invalid CSRF token"},
         )
+    # Fail closed unless the whole feature is switched on.
+    if not MULTICA_CONNECT_ENABLED:
+        return _json_response(
+            environ,
+            start_response,
+            "503 Service Unavailable",
+            {"detail": "connection intake is disabled"},
+        )
     if path == "/api/connection/revoke":
         if not handoff.revoke_connection(_security_connection, user_id):
             return _json_response(
@@ -1526,8 +1570,16 @@ def _connection_api(environ, start_response, session, path):
                 "404 Not Found",
                 {"detail": "no connection"},
             )
+        # `revoked` only after the worker acks the delete; a fresh revoke
+        # reports the intermediate `revocation_pending`.
+        status = handoff.connection_status(
+            _security_connection, user_id, CONNECTION_PENDING_TTL
+        )
         return _json_response(
-            environ, start_response, "200 OK", {"status": "revoked"}
+            environ,
+            start_response,
+            "200 OK",
+            {"status": status["status"] if status else "revoked"},
         )
     # Intake fails closed while no worker channel can ever collect the token.
     if not WORKER_SECRET:
@@ -1549,8 +1601,9 @@ def _connection_api(environ, start_response, session, path):
     handoff.record_connection_submission(_security_connection, user_id)
     try:
         token = handoff.validate_connection_token(_first(form, "token"))
-        server_url = handoff.validate_server_url(
-            _first(form, "server_url"), DEFAULT_SERVER_URL
+        # The user's server URL is never published: pin to the official host.
+        server_url = handoff.normalize_official_server_url(
+            _first(form, "server_url"), MULTICA_OFFICIAL_URL
         )
         workspace_label = handoff.validate_workspace_label(
             _first(form, "workspace_label")
@@ -1562,6 +1615,14 @@ def _connection_api(environ, start_response, session, path):
             start_response,
             "422 Unprocessable Entity",
             {"detail": str(exc)},
+        )
+    # No token is written unless the trusted worker pulled recently.
+    if not handoff.worker_ready(_security_connection, WORKER_READINESS_TTL):
+        return _json_response(
+            environ,
+            start_response,
+            "503 Service Unavailable",
+            {"detail": "connection worker is not ready"},
         )
     try:
         status = handoff.submit_connection(

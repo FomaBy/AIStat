@@ -73,6 +73,14 @@ def validate_public_config(config: Config) -> None:
             raise SecurityConfigError(
                 "the worker secret must be independent from other secrets"
             )
+    try:
+        handoff.canonical_official_server_url(config.multica_official_url)
+    except ValueError as exc:
+        raise SecurityConfigError(
+            "AISTAT_MULTICA_OFFICIAL_URL must be a bare https host: {}".format(
+                exc
+            )
+        )
     if not config.allowed_hosts:
         raise SecurityConfigError("AISTAT_ALLOWED_HOSTS must not be empty")
     if config.db_path.resolve() == config.security_db_path.resolve():
@@ -741,8 +749,24 @@ class SecurityStore:
     # --- "connect your Multica" token handoff (shared logic in handoff.py,
     # --- so the legacy contour applies byte-identical state transitions).
 
-    def connection_status(self, user_id: int) -> Optional[dict]:
-        return handoff.connection_status(self._connect, user_id)
+    def connection_status(
+        self,
+        user_id: int,
+        pending_ttl_seconds: int = handoff.PENDING_TTL_MAX_SECONDS,
+        now: Optional[int] = None,
+    ) -> Optional[dict]:
+        return handoff.connection_status(
+            self._connect, user_id, pending_ttl_seconds, now
+        )
+
+    def worker_ready(
+        self,
+        readiness_ttl_seconds: int = handoff.WORKER_READINESS_TTL_DEFAULT_SECONDS,
+        now: Optional[int] = None,
+    ) -> bool:
+        return handoff.worker_ready(
+            self._connect, readiness_ttl_seconds, now
+        )
 
     def submit_connection(
         self,
@@ -778,8 +802,14 @@ class SecurityStore:
             self._connect, nonce, max_age_seconds, now
         )
 
-    def lease_pending_connections(self, now: Optional[int] = None) -> dict:
-        return handoff.lease_pending_connections(self._connect, now)
+    def lease_pending_connections(
+        self,
+        pending_ttl_seconds: int = handoff.PENDING_TTL_MAX_SECONDS,
+        now: Optional[int] = None,
+    ) -> dict:
+        return handoff.lease_pending_connections(
+            self._connect, pending_ttl_seconds, now
+        )
 
     def apply_worker_acks(
         self, acks, now: Optional[int] = None

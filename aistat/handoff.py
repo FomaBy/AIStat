@@ -26,6 +26,7 @@ import hmac
 import secrets
 import sqlite3
 import time
+from urllib.parse import urlsplit
 
 from .tenant import canonical_tenant_id
 
@@ -39,9 +40,44 @@ WORKER_LEASE_SECONDS = 10 * 60
 # purged nonce could be replayed while its timestamp is still fresh.
 WORKER_NONCE_TTL_FACTOR = 3
 
-CONNECTION_STATUSES = ("pending", "active", "error", "revoked")
+# Lifecycle. A submitted token waits in ``pending`` (first time) or
+# ``replacement_pending`` (replacing an existing connection) until the worker
+# stores it and acks, which flips it to ``active``. Disconnect / expiry /
+# account cleanup erase the host token and enter ``revocation_pending``; only a
+# worker delete-ack advances that to the terminal ``revoked`` — so ``revoked``
+# always means "no worker copy remains", never merely "requested".
+CONNECTION_STATUSES = (
+    "pending",
+    "replacement_pending",
+    "active",
+    "error",
+    "revocation_pending",
+    "revoked",
+)
+# Statuses the worker may lease and collect a plaintext token for.
+LEASABLE_STATUSES = ("pending", "replacement_pending")
 CONNECTION_WINDOW_SECONDS = 15 * 60
 CONNECTION_MAX_SUBMISSIONS = 10
+
+# Plaintext pending-token lifetime on the host. The worker must collect a token
+# within this window; afterwards the host physically erases it and treats it as
+# a revocation the worker must still confirm. Default 10 minutes, hard-capped
+# at 15 so no configuration can leave plaintext sitting longer.
+PENDING_TTL_DEFAULT_SECONDS = 10 * 60
+PENDING_TTL_MAX_SECONDS = 15 * 60
+# How fresh the worker's last authenticated pull must be for the host to accept
+# a new token. Default 15 minutes (three default pull cycles).
+WORKER_READINESS_TTL_DEFAULT_SECONDS = 15 * 60
+
+# The single official Multica host. The user-supplied server URL is never
+# published: every stored connection is pinned to this exact host so a poisoned
+# ``server_url`` can never point the worker's use of the PAT at an attacker.
+OFFICIAL_MULTICA_URL = "https://multica.ai"
+
+# Reason surfaced in the cabinet when a pending token was never collected.
+PENDING_EXPIRED_REASON = (
+    "pending token expired before the worker collected it; reconnect to retry"
+)
 
 MIN_TOKEN_LENGTH = 8
 MAX_TOKEN_LENGTH = 512
@@ -75,6 +111,10 @@ CREATE TABLE IF NOT EXISTS worker_nonces (
     nonce   TEXT PRIMARY KEY,
     seen_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS worker_status (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    last_seen_at INTEGER NOT NULL
+);
 """
 
 _NONCE_ALPHABET = frozenset(
@@ -105,6 +145,60 @@ def _erase_deleted_pages(conn):
     # post-ack erase, so deleted content is zeroed regardless of how the
     # caller's connection factory is configured.
     conn.execute("PRAGMA secure_delete = ON")
+
+
+def _record_worker_heartbeat_locked(conn, now):
+    # A successful authenticated pull is the worker's liveness signal; the host
+    # refuses to accept new tokens unless one landed recently (worker_ready).
+    conn.execute(
+        "INSERT OR REPLACE INTO worker_status (id, last_seen_at) VALUES (1, ?)",
+        (now,),
+    )
+
+
+def _purge_expired_pending_locked(conn, pending_ttl_seconds, now):
+    """Physically erase pending tokens the worker never collected in time.
+
+    An expired token is treated as a revocation the worker must still confirm:
+    the plaintext is erased now, the epoch bumped so any in-flight lease/ack is
+    void, and the connection parked in ``revocation_pending`` so the worker
+    deletes any copy it may already hold and acks before it reads ``revoked``.
+    """
+    cutoff = now - int(pending_ttl_seconds)
+    expired = conn.execute(
+        "SELECT user_id, token_epoch FROM connections "
+        "WHERE status IN ('pending', 'replacement_pending') "
+        "AND updated_at <= ?",
+        (cutoff,),
+    ).fetchall()
+    for row in expired:
+        conn.execute(
+            "UPDATE connections SET token = NULL, "
+            "status = 'revocation_pending', token_epoch = ?, updated_at = ?, "
+            "lease_id = NULL, lease_expires_at = 0, revoke_acked_at = NULL, "
+            "last_sync_error = ? WHERE user_id = ?",
+            (
+                int(row["token_epoch"]) + 1,
+                now,
+                PENDING_EXPIRED_REASON,
+                int(row["user_id"]),
+            ),
+        )
+
+
+def worker_ready(connect, readiness_ttl_seconds, now=None):
+    """True while the worker's last authenticated pull is within the window."""
+    now = _now(now)
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT last_seen_at FROM worker_status WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return False
+    return (now - int(row["last_seen_at"])) <= int(readiness_ttl_seconds)
 
 
 def worker_signature(secret, path, timestamp, nonce, body):
@@ -205,6 +299,64 @@ def validate_server_url(value, default=None):
     return candidate.rstrip("/")
 
 
+def canonical_official_server_url(official_url):
+    """Validate the operator's official Multica URL and reduce it to scheme+host.
+
+    The result is the only server URL the host will ever store. It must be a
+    bare ``https://<host>`` with no credentials, port or path, so there is a
+    single, unambiguous canonical form to pin every connection to.
+    """
+    if not isinstance(official_url, str) or not official_url.strip():
+        raise ValueError("official Multica server URL is required")
+    structural = validate_server_url(official_url.strip())
+    parts = urlsplit(structural)
+    host = (parts.hostname or "").lower()
+    if (
+        parts.scheme != "https"
+        or not host
+        or parts.username
+        or parts.password
+        or "@" in parts.netloc
+        or parts.port is not None
+        or parts.path not in ("", "/")
+    ):
+        raise ValueError(
+            "official Multica server URL must be a bare https host"
+        )
+    return "https://" + host
+
+
+def normalize_official_server_url(value, official_url):
+    """Pin a submitted server URL to the single official Multica host.
+
+    The user value is never published: an empty value adopts the official host,
+    and any non-empty value must resolve to exactly that host over HTTPS — no
+    alternate host, IP literal, port, credentials or path. This is what keeps a
+    poisoned ``server_url`` (or a redirect/DNS trick riding on one) from ever
+    redirecting the worker's later use of the PAT away from Multica.
+    """
+    official = canonical_official_server_url(official_url)
+    if value is not None and not isinstance(value, str):
+        raise ValueError("unsupported Multica server")
+    candidate = (value or "").strip()
+    if not candidate:
+        return official
+    parts = urlsplit(validate_server_url(candidate))
+    host = (parts.hostname or "").lower()
+    if (
+        parts.scheme != "https"
+        or not host
+        or parts.username
+        or parts.password
+        or "@" in parts.netloc
+        or parts.port is not None
+        or parts.path not in ("", "/")
+        or host != urlsplit(official).hostname
+    ):
+        raise ValueError("unsupported Multica server")
+    return official
+
+
 def validate_workspace_label(value):
     if value is None:
         return None
@@ -227,18 +379,31 @@ def _status_view(row):
     return view
 
 
-def connection_status(connect, user_id):
-    """Cabinet projection of one connection; never includes the token."""
+def connection_status(
+    connect, user_id, pending_ttl_seconds=PENDING_TTL_MAX_SECONDS, now=None
+):
+    """Cabinet projection of one connection; never includes the token.
+
+    Reading status also purges any pending token that outlived its TTL, so an
+    expired plaintext can never survive merely because nobody polled the
+    worker channel.
+    """
     user_id = canonical_tenant_id(user_id)
+    now = _now(now)
     conn = connect()
     try:
+        _erase_deleted_pages(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        _purge_expired_pending_locked(conn, pending_ttl_seconds, now)
         row = conn.execute(
             "SELECT {} FROM connections WHERE user_id = ?".format(
                 ", ".join(_STATUS_COLUMNS)
             ),
             (user_id,),
         ).fetchone()
-        return _status_view(row) if row else None
+        result = _status_view(row) if row else None
+        conn.commit()
+        return result
     finally:
         conn.close()
 
@@ -246,10 +411,13 @@ def connection_status(connect, user_id):
 def submit_connection(
     connect, user_id, server_url, workspace_label, token, now=None
 ):
-    """Create or replace the user's connection; new epoch, ``pending`` state.
+    """Create or replace the user's connection; new epoch, pending state.
 
-    Replacing bumps ``token_epoch`` so an in-flight ack for the previous
-    token can no longer erase or activate the new one.
+    A brand-new connection starts ``pending``; replacing an existing one starts
+    ``replacement_pending`` so the cabinet can tell the two apart. Either way a
+    fresh ``token_epoch`` voids any in-flight lease/ack for the previous token,
+    and the worker's ``INSERT OR REPLACE`` overwrites the old ciphertext when it
+    stores the new token.
     """
     user_id = canonical_tenant_id(user_id)
     now = _now(now)
@@ -271,7 +439,7 @@ def submit_connection(
             epoch = int(row["token_epoch"]) + 1
             conn.execute(
                 "UPDATE connections SET server_url = ?, workspace_label = ?, "
-                "token = ?, token_epoch = ?, status = 'pending', "
+                "token = ?, token_epoch = ?, status = 'replacement_pending', "
                 "updated_at = ?, lease_id = NULL, lease_expires_at = 0, "
                 "revoke_acked_at = NULL, last_sync_error = NULL "
                 "WHERE user_id = ?",
@@ -300,10 +468,14 @@ def submit_connection(
 
 
 def revoke_connection(connect, user_id, now=None):
-    """Disconnect: erase any host-side token now, flag the worker to purge.
+    """Disconnect / account cleanup: erase the host token, await worker purge.
 
-    Returns ``False`` when the user has no connection. Idempotent for an
-    already revoked one.
+    The plaintext (if any still sits on the host) is erased at once and the
+    connection enters ``revocation_pending``. It only reaches the terminal
+    ``revoked`` after the worker acknowledges deleting its own copy, so a
+    ``revoked`` connection provably leaves no active worker credential behind.
+    Returns ``False`` when the user has no connection; idempotent once the
+    revocation is already pending or acknowledged.
     """
     user_id = canonical_tenant_id(user_id)
     now = _now(now)
@@ -318,12 +490,12 @@ def revoke_connection(connect, user_id, now=None):
         if row is None:
             conn.rollback()
             return False
-        if row["status"] != "revoked":
+        if row["status"] not in ("revocation_pending", "revoked"):
             conn.execute(
-                "UPDATE connections SET token = NULL, status = 'revoked', "
-                "token_epoch = ?, updated_at = ?, lease_id = NULL, "
-                "lease_expires_at = 0, revoke_acked_at = NULL "
-                "WHERE user_id = ?",
+                "UPDATE connections SET token = NULL, "
+                "status = 'revocation_pending', token_epoch = ?, "
+                "updated_at = ?, lease_id = NULL, lease_expires_at = 0, "
+                "revoke_acked_at = NULL WHERE user_id = ?",
                 (int(row["token_epoch"]) + 1, now, user_id),
             )
         conn.commit()
@@ -411,22 +583,33 @@ def consume_worker_nonce(connect, nonce, max_age_seconds, now=None):
         conn.close()
 
 
-def lease_pending_connections(connect, now=None):
-    """Atomically lease every pending token and list unacked revocations.
+def lease_pending_connections(
+    connect, pending_ttl_seconds=PENDING_TTL_MAX_SECONDS, now=None
+):
+    """Record the worker heartbeat, then lease pending tokens + list purges.
 
-    Each pull invalidates previous leases for the returned rows, so exactly
-    one lease can ever acknowledge a given epoch. This response is the only
-    place a stored token legitimately leaves security.db.
+    Every authenticated pull is the worker's liveness signal (worker_ready) and
+    the periodic TTL sweep: expired plaintext is erased before anything is
+    leased. Each pull invalidates previous leases for the returned rows, so
+    exactly one lease can ever acknowledge a given epoch. The ``pending`` list
+    is the only place a stored token legitimately leaves security.db; the
+    ``revoked`` list names connections whose worker copy must be deleted
+    (disconnect, expiry or account cleanup) and confirmed before they read
+    ``revoked``.
     """
     now = _now(now)
     conn = connect()
     try:
+        _erase_deleted_pages(conn)
         conn.execute("BEGIN IMMEDIATE")
+        _record_worker_heartbeat_locked(conn, now)
+        _purge_expired_pending_locked(conn, pending_ttl_seconds, now)
         pending = []
         for row in conn.execute(
             "SELECT user_id, server_url, workspace_label, token, token_epoch "
-            "FROM connections WHERE status = 'pending' AND token IS NOT NULL "
-            "ORDER BY user_id"
+            "FROM connections "
+            "WHERE status IN ('pending', 'replacement_pending') "
+            "AND token IS NOT NULL ORDER BY user_id"
         ).fetchall():
             lease_id = secrets.token_urlsafe(24)
             lease_expires_at = now + WORKER_LEASE_SECONDS
@@ -453,8 +636,8 @@ def lease_pending_connections(connect, now=None):
             }
             for row in conn.execute(
                 "SELECT user_id, token_epoch FROM connections "
-                "WHERE status = 'revoked' AND revoke_acked_at IS NULL "
-                "ORDER BY user_id"
+                "WHERE status = 'revocation_pending' "
+                "AND revoke_acked_at IS NULL ORDER BY user_id"
             ).fetchall()
         ]
         conn.commit()
@@ -490,7 +673,10 @@ def ack_connection_stored(connect, user_id, lease_id, token_epoch, now=None):
         if row is None:
             conn.rollback()
             return False, "unknown-connection"
-        if row["status"] != "pending" or int(row["token_epoch"]) != token_epoch:
+        if (
+            row["status"] not in LEASABLE_STATUSES
+            or int(row["token_epoch"]) != token_epoch
+        ):
             conn.rollback()
             return False, "stale-epoch"
         if not row["lease_id"] or not hmac.compare_digest(
@@ -514,7 +700,12 @@ def ack_connection_stored(connect, user_id, lease_id, token_epoch, now=None):
 
 
 def ack_connection_revoked(connect, user_id, token_epoch, now=None):
-    """Worker confirmed it purged the local token for a revoked connection."""
+    """Worker confirmed it deleted its copy: advance to the terminal ``revoked``.
+
+    Only a matching ``revocation_pending`` epoch advances, and it does so
+    exactly once; a later ack for the same acknowledged epoch is idempotent.
+    A stale epoch cannot complete a revocation started for a newer lifecycle.
+    """
     try:
         user_id = canonical_tenant_id(user_id)
         token_epoch = int(token_epoch)
@@ -532,15 +723,20 @@ def ack_connection_revoked(connect, user_id, token_epoch, now=None):
         if row is None:
             conn.rollback()
             return False, "unknown-connection"
-        if row["status"] != "revoked" or int(row["token_epoch"]) != token_epoch:
+        if int(row["token_epoch"]) != token_epoch:
             conn.rollback()
             return False, "stale-epoch"
-        if row["revoke_acked_at"] is None:
-            conn.execute(
-                "UPDATE connections SET revoke_acked_at = ?, updated_at = ? "
-                "WHERE user_id = ?",
-                (now, now, user_id),
-            )
+        if row["status"] == "revoked":
+            conn.rollback()
+            return True, "revoked"
+        if row["status"] != "revocation_pending":
+            conn.rollback()
+            return False, "stale-epoch"
+        conn.execute(
+            "UPDATE connections SET status = 'revoked', revoke_acked_at = ?, "
+            "updated_at = ? WHERE user_id = ?",
+            (now, now, user_id),
+        )
         conn.commit()
         return True, "revoked"
     finally:

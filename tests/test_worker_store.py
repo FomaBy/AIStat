@@ -19,6 +19,7 @@ from test_connections_wsgi import (
     login,
     make_config,
     submit,
+    warm_worker,
 )
 from aistat.wsgi import create_app
 
@@ -159,6 +160,7 @@ def host(tmp_path):
 
 def test_end_to_end_handoff_via_real_host(host, tmp_path, caplog):
     client, host_config, csrf = host
+    warm_worker(client)
     assert submit(client, csrf).status_code == 200
     config = worker_config(tmp_path)
     with caplog.at_level(logging.DEBUG):
@@ -197,6 +199,7 @@ def test_end_to_end_handoff_via_real_host(host, tmp_path, caplog):
 
 def test_sync_error_report_reaches_cabinet(host, tmp_path):
     client, _, csrf = host
+    warm_worker(client)
     assert submit(client, csrf).status_code == 200
     config = worker_config(tmp_path)
     pull_once(config, opener=FlaskOpener(client))
