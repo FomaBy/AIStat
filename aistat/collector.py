@@ -31,7 +31,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .cli_profile import CliProfileError, ConnectionCliProfile
+from .cli_profile import (
+    CliProfileError,
+    ConnectionCliProfile,
+    assert_safe_profile_storage,
+)
 from .config import Config
 from .db import connect, init_db
 from .poller import Poller
@@ -120,8 +124,21 @@ class Collector:
         user_id = canonical_tenant_id(meta["user_id"])
         epoch = int(meta.get("token_epoch") or 0)
         label = meta.get("workspace_label")
+        try:
+            # This must precede even the per-tenant lock: its pathname lives in
+            # the same root and would otherwise follow a symlink or fail on a
+            # non-directory before the profile's login guard can run.
+            assert_safe_profile_storage(self.config.cli_profiles_dir, user_id)
+        except CliProfileError as exc:
+            return self._fail(user_id, epoch, str(exc))
         lock = _TenantLock(self.config.cli_profiles_dir, user_id)
-        if not lock.acquire():
+        try:
+            acquired = lock.acquire()
+        except OSError:
+            return self._fail(
+                user_id, epoch, "the connection profile lock could not be acquired"
+            )
+        if not acquired:
             return ConnectionOutcome(
                 user_id, "skipped",
                 "another poll of this tenant is already in progress",
