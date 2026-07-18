@@ -4,6 +4,9 @@ Covers the worker-channel signature, request validators and the atomic
 connection state machine both WSGI contours share via ``aistat.handoff``.
 """
 
+import concurrent.futures
+import sqlite3
+import threading
 import time
 
 import pytest
@@ -283,17 +286,70 @@ def test_sync_reports_flip_between_active_and_error(store, user_id):
     ) == (False, "invalid-state")
 
 
-def test_submission_throttle_mirrors_login_throttle(store, user_id):
-    for step in range(handoff.CONNECTION_MAX_SUBMISSIONS):
-        assert store.connection_retry_after(user_id, now=NOW + step) == 0
-        store.record_connection_submission(user_id, now=NOW + step)
-    retry = store.connection_retry_after(
-        user_id, now=NOW + handoff.CONNECTION_MAX_SUBMISSIONS
+def test_submission_throttle_reserves_atomically(store, user_id):
+    barrier = threading.Barrier(12)
+
+    def reserve(_):
+        barrier.wait()
+        return store.reserve_connection_submission(user_id, now=NOW)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        results = list(executor.map(reserve, range(12)))
+
+    assert results.count(0) == handoff.CONNECTION_MAX_SUBMISSIONS
+    assert sum(result > 0 for result in results) == 2
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT window_started, submissions FROM connection_throttle "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["window_started"] == NOW
+    assert row["submissions"] == handoff.CONNECTION_MAX_SUBMISSIONS
+    assert store.reserve_connection_submission(user_id, now=NOW + 899) == 1
+    assert (
+        store.reserve_connection_submission(
+            user_id, now=NOW + handoff.CONNECTION_WINDOW_SECONDS
+        )
+        == 0
     )
-    assert retry > 0
-    # A fresh window clears the counter.
-    reset = NOW + handoff.CONNECTION_WINDOW_SECONDS + 1
-    assert store.connection_retry_after(user_id, now=reset) == 0
+
+
+def test_submission_throttle_is_tenant_scoped(store, user_id):
+    other_user_id = store.find_or_create_user_by_identity(
+        "google", "subject-2", email="other@example.com"
+    )
+    for _ in range(handoff.CONNECTION_MAX_SUBMISSIONS):
+        assert store.reserve_connection_submission(user_id, now=NOW) == 0
+    assert store.reserve_connection_submission(user_id, now=NOW) > 0
+    assert store.reserve_connection_submission(other_user_id, now=NOW) == 0
+
+
+def test_submission_throttle_rolls_back_on_sqlite_error(user_id):
+    class FailingConnection:
+        def __init__(self):
+            self.rollback_count = 0
+            self.close_count = 0
+
+        def execute(self, _sql, _parameters=()):
+            raise sqlite3.OperationalError("synthetic throttle failure")
+
+        def rollback(self):
+            self.rollback_count += 1
+
+        def close(self):
+            self.close_count += 1
+
+    connection = FailingConnection()
+    with pytest.raises(sqlite3.OperationalError, match="synthetic throttle"):
+        handoff.reserve_connection_submission(
+            lambda: connection, user_id, now=NOW
+        )
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
 
 
 def test_apply_worker_acks_batch(store, user_id):

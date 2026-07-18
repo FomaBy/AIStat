@@ -1589,7 +1589,15 @@ def _connection_api(environ, start_response, session, path):
             "503 Service Unavailable",
             {"detail": "connection intake is not configured"},
         )
-    retry = handoff.connection_retry_after(_security_connection, user_id)
+    try:
+        retry = handoff.reserve_connection_submission(_security_connection, user_id)
+    except sqlite3.Error:
+        return _json_response(
+            environ,
+            start_response,
+            "503 Service Unavailable",
+            {"detail": "connection intake unavailable"},
+        )
     if retry:
         return _json_response(
             environ,
@@ -1598,7 +1606,6 @@ def _connection_api(environ, start_response, session, path):
             {"detail": "too many submissions"},
             [("Retry-After", str(retry))],
         )
-    handoff.record_connection_submission(_security_connection, user_id)
     try:
         token = handoff.validate_connection_token(_first(form, "token"))
         # The user's server URL is never published: pin to the official host.

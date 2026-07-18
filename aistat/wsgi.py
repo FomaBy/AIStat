@@ -703,12 +703,14 @@ def create_app(config: Optional[Config] = None) -> Flask:
         user_id = current_user_id()
         if user_id is None:
             return jsonify({"detail": "authentication required"}), 401
-        retry_after = security_store.connection_retry_after(user_id)
+        try:
+            retry_after = security_store.reserve_connection_submission(user_id)
+        except sqlite3.Error:
+            return jsonify({"detail": "connection intake unavailable"}), 503
         if retry_after:
             response = jsonify({"detail": "too many submissions"})
             response.headers["Retry-After"] = str(retry_after)
             return response, 429
-        security_store.record_connection_submission(user_id)
         try:
             token = handoff.validate_connection_token(
                 request.form.get("token")
