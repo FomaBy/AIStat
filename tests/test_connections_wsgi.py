@@ -1,9 +1,12 @@
 """Flask-contour route tests for "connect your Multica" (FAN-1220)."""
 
+import concurrent.futures
 import json
 import logging
 import re
 import secrets
+import sqlite3
+import threading
 import time
 
 import pytest
@@ -174,6 +177,10 @@ def test_intake_validates_input_without_echoing_it(conn_app):
         assert response.status_code == 422
         text = response.get_data(as_text=True)
         assert TOKEN not in text and "evil.example" not in text
+    warm_worker(client)
+    for _ in range(handoff.CONNECTION_MAX_SUBMISSIONS - 3):
+        assert submit(client, csrf).status_code == 200
+    assert submit(client, csrf).status_code == 429
 
 
 def test_intake_pending_and_status_never_expose_token(conn_app, caplog):
@@ -209,6 +216,59 @@ def test_intake_rate_limited_like_login_throttle(conn_app):
     blocked = submit(client, csrf)
     assert blocked.status_code == 429
     assert int(blocked.headers["Retry-After"]) > 0
+
+
+def test_intake_rate_limit_is_atomic_under_concurrency(conn_app):
+    app, config = conn_app
+    warm_worker(app.test_client())
+    barrier = threading.Barrier(12)
+
+    def attempt(index):
+        with app.test_client() as client:
+            csrf = login(client)
+            barrier.wait()
+            response = submit(client, csrf, token=TOKEN + str(index))
+            return response.status_code, response.headers.get("Retry-After")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        outcomes = list(executor.map(attempt, range(12)))
+
+    assert [status for status, _ in outcomes].count(200) == 10
+    rejected = [retry for status, retry in outcomes if status == 429]
+    assert len(rejected) == 2
+    assert all(int(retry) > 0 for retry in rejected)
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        row = conn.execute(
+            "SELECT submissions FROM connection_throttle"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (handoff.CONNECTION_MAX_SUBMISSIONS,)
+
+
+def test_intake_throttle_storage_error_fails_closed(conn_app, monkeypatch):
+    app, config = conn_app
+    client = app.test_client()
+    csrf = login(client)
+    warm_worker(client)
+
+    def fail_reservation(*_args, **_kwargs):
+        raise sqlite3.OperationalError("synthetic throttle failure")
+
+    def unexpected_validation(*_args, **_kwargs):
+        pytest.fail("PAT validation must not run after throttle storage failure")
+
+    monkeypatch.setattr(
+        handoff, "reserve_connection_submission", fail_reservation
+    )
+    monkeypatch.setattr(
+        handoff, "validate_connection_token", unexpected_validation
+    )
+    response = submit(client, csrf)
+    assert response.status_code == 503
+    assert TOKEN not in response.get_data(as_text=True)
+    assert TOKEN.encode() not in config.security_db_path.read_bytes()
 
 
 def test_worker_pull_requires_valid_signature(conn_app):

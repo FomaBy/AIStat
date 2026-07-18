@@ -1,8 +1,11 @@
 """Legacy cPanel contour route tests for "connect your Multica" (FAN-1220)."""
 
+import concurrent.futures
 import importlib
 import json
 import secrets
+import sqlite3
+import threading
 import time
 from urllib.parse import urlencode
 
@@ -144,6 +147,64 @@ def test_intake_status_and_throttle(legacy_conn):
     status, headers, _ = submit(module, cookies, csrf)
     assert status == "429 Too Many Requests"
     assert int(header_values(headers, "Retry-After")[0]) > 0
+
+
+def test_intake_rate_limit_is_atomic_under_concurrency(legacy_conn):
+    module, tmp_path = legacy_conn
+    cookies = login(module)
+    csrf = session_csrf(module, cookies)
+    warm_worker(module)
+    barrier = threading.Barrier(12)
+
+    def attempt(index):
+        barrier.wait()
+        status, headers, _ = submit(
+            module, cookies, csrf, token=TOKEN + str(index)
+        )
+        retry = header_values(headers, "Retry-After")
+        return status, retry[0] if retry else None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        outcomes = list(executor.map(attempt, range(12)))
+
+    assert [status for status, _ in outcomes].count("200 OK") == 10
+    rejected = [
+        retry for status, retry in outcomes if status == "429 Too Many Requests"
+    ]
+    assert len(rejected) == 2
+    assert all(int(retry) > 0 for retry in rejected)
+    conn = sqlite3.connect(str(tmp_path / "security.db"))
+    try:
+        row = conn.execute(
+            "SELECT submissions FROM connection_throttle"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (handoff.CONNECTION_MAX_SUBMISSIONS,)
+
+
+def test_intake_throttle_storage_error_fails_closed(legacy_conn, monkeypatch):
+    module, tmp_path = legacy_conn
+    cookies = login(module)
+    csrf = session_csrf(module, cookies)
+    warm_worker(module)
+
+    def fail_reservation(*_args, **_kwargs):
+        raise sqlite3.OperationalError("synthetic throttle failure")
+
+    def unexpected_validation(*_args, **_kwargs):
+        pytest.fail("PAT validation must not run after throttle storage failure")
+
+    monkeypatch.setattr(
+        module.handoff, "reserve_connection_submission", fail_reservation
+    )
+    monkeypatch.setattr(
+        module.handoff, "validate_connection_token", unexpected_validation
+    )
+    status, _, body = submit(module, cookies, csrf)
+    assert status == "503 Service Unavailable"
+    assert TOKEN.encode() not in body
+    assert TOKEN.encode() not in (tmp_path / "security.db").read_bytes()
 
 
 def test_worker_channel_auth_and_replay(legacy_conn):

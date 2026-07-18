@@ -785,15 +785,10 @@ class SecurityStore:
     ) -> bool:
         return handoff.revoke_connection(self._connect, user_id, now)
 
-    def connection_retry_after(
+    def reserve_connection_submission(
         self, user_id: int, now: Optional[int] = None
     ) -> int:
-        return handoff.connection_retry_after(self._connect, user_id, now)
-
-    def record_connection_submission(
-        self, user_id: int, now: Optional[int] = None
-    ) -> None:
-        handoff.record_connection_submission(self._connect, user_id, now)
+        return handoff.reserve_connection_submission(self._connect, user_id, now)
 
     def consume_worker_nonce(
         self, nonce: str, max_age_seconds: int, now: Optional[int] = None

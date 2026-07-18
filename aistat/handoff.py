@@ -504,59 +504,55 @@ def revoke_connection(connect, user_id, now=None):
         conn.close()
 
 
-def connection_retry_after(connect, user_id, now=None):
-    """Seconds until the next submission is allowed (0 = allowed now)."""
+def reserve_connection_submission(connect, user_id, now=None):
+    """Atomically reserve one intake attempt or return its retry delay.
+
+    The availability check and counter increment must share one write
+    transaction.  Otherwise concurrent intake requests can all observe the
+    same available slot before any of them records it.  A return value of zero
+    means the caller owns one slot; a positive value is the canonical number
+    of seconds until the current window ends and the caller must reject the
+    request.
+    """
     user_id = canonical_tenant_id(user_id)
     now = _now(now)
-    conn = connect()
+    conn = None
     try:
-        row = conn.execute(
-            "SELECT window_started, submissions FROM connection_throttle "
-            "WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if not row:
-            return 0
-        window_end = int(row["window_started"]) + CONNECTION_WINDOW_SECONDS
-        if window_end <= now:
-            conn.execute(
-                "DELETE FROM connection_throttle WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.commit()
-            return 0
-        if int(row["submissions"]) >= CONNECTION_MAX_SUBMISSIONS:
-            return window_end - now
-        return 0
-    finally:
-        conn.close()
-
-
-def record_connection_submission(connect, user_id, now=None):
-    """Count one intake attempt; mirror of the login throttle shape."""
-    user_id = canonical_tenant_id(user_id)
-    now = _now(now)
-    conn = connect()
-    try:
+        conn = connect()
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT window_started, submissions FROM connection_throttle "
             "WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        if not row or int(row["window_started"]) + CONNECTION_WINDOW_SECONDS <= now:
-            window_started, submissions = now, 1
-        else:
+
+        if row and int(row["window_started"]) + CONNECTION_WINDOW_SECONDS > now:
             window_started = int(row["window_started"])
-            submissions = int(row["submissions"]) + 1
+            submissions = int(row["submissions"])
+            if submissions >= CONNECTION_MAX_SUBMISSIONS:
+                retry_after = window_started + CONNECTION_WINDOW_SECONDS - now
+                conn.rollback()
+                return retry_after
+            submissions += 1
+        else:
+            window_started, submissions = now, 1
         conn.execute(
             "INSERT OR REPLACE INTO connection_throttle "
             "(user_id, window_started, submissions) VALUES (?, ?, ?)",
             (user_id, window_started, submissions),
         )
         conn.commit()
+        return 0
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def consume_worker_nonce(connect, nonce, max_age_seconds, now=None):
