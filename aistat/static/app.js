@@ -37,7 +37,18 @@ const SINGLE_SERIES_COLOR = "#4f6df5";
 // identities claim distinct free slots without making the mapping depend on
 // the order in which a chart happens to encounter them. Existing assignments
 // are deliberately retained when meta refreshes add new identities.
-const colorRegistry = { byKey: new Map() };
+const COLOR_LEDGER_VERSION = 1;
+const COLOR_LEDGER_NAMESPACE = "aistat.color-ledger";
+const COLOR_LEDGER_STORAGE_KEY = COLOR_LEDGER_NAMESPACE + ".v1";
+const COLOR_ENTITY_TYPES = new Set(["model", "agent", "project"]);
+
+const colorRegistry = {
+  byKey: new Map(),
+  scope: null,
+  storage: null,
+  storageChecked: false,
+  storageWarningShown: false,
+};
 
 // FNV-1a over the typed key: a stable, well-spread starting index into the
 // palette that depends only on the entity's identity.
@@ -57,6 +68,143 @@ function normalizeEntityId(id) {
 
 function entityKey(type, id) {
   return String(type || "").trim() + "\u0000" + normalizeEntityId(id);
+}
+
+function colorLedgerWarning(detail) {
+  if (colorRegistry.storageWarningShown) return;
+  colorRegistry.storageWarningShown = true;
+  console.warn(
+    "AIStat: sessionStorage unavailable for color history; using in-memory color assignments.",
+    detail || "storage access failed"
+  );
+}
+
+function colorLedgerStorage() {
+  if (colorRegistry.storageChecked) return colorRegistry.storage;
+  colorRegistry.storageChecked = true;
+  try {
+    const storage = window.sessionStorage;
+    if (!storage) throw new Error("sessionStorage is unavailable");
+    colorRegistry.storage = storage;
+    return storage;
+  } catch (error) {
+    colorLedgerWarning(error);
+    colorRegistry.storage = null;
+    return null;
+  }
+}
+
+function clearColorLedgerStorage(storage) {
+  if (!storage) return;
+  try {
+    const keys = [];
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (key && key.startsWith(COLOR_LEDGER_NAMESPACE)) keys.push(key);
+    }
+    for (const key of keys) storage.removeItem(key);
+  } catch (error) {
+    colorLedgerWarning(error);
+  }
+}
+
+function allowedFallbackColors(type) {
+  const reserved = new Set(Object.values(ENTITY_ANCHORS[type] || {}));
+  return new Set(PALETTE.filter((color) => !reserved.has(color)));
+}
+
+function validateColorLedger(payload, scope) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+      payload.version !== COLOR_LEDGER_VERSION || payload.scope !== scope ||
+      !payload.assignments || typeof payload.assignments !== "object" ||
+      Array.isArray(payload.assignments)) return null;
+
+  const restored = [];
+  for (const [type, assignments] of Object.entries(payload.assignments)) {
+    if (!COLOR_ENTITY_TYPES.has(type) || !assignments ||
+        typeof assignments !== "object" || Array.isArray(assignments)) return null;
+    const anchors = ENTITY_ANCHORS[type] || {};
+    const allowed = allowedFallbackColors(type);
+    for (const [rawId, color] of Object.entries(assignments)) {
+      const id = normalizeEntityId(rawId);
+      // Anchors are always restored from code. Ignore any stored value for an
+      // anchor instead of allowing a stale or corrupted payload to override it.
+      if (Object.prototype.hasOwnProperty.call(anchors, id)) continue;
+      if (!id || id !== rawId || typeof color !== "string" || !allowed.has(color)) {
+        return null;
+      }
+      restored.push([type, id, color]);
+    }
+  }
+  return restored;
+}
+
+function persistColorLedger() {
+  const storage = colorLedgerStorage();
+  if (!storage || !colorRegistry.scope) return;
+  const assignments = {};
+  for (const [key, color] of colorRegistry.byKey) {
+    const separator = key.indexOf("\u0000");
+    const type = separator < 0 ? "" : key.slice(0, separator);
+    const id = separator < 0 ? "" : key.slice(separator + 1);
+    if (!COLOR_ENTITY_TYPES.has(type) || !id ||
+        !allowedFallbackColors(type).has(color) ||
+        Object.prototype.hasOwnProperty.call(ENTITY_ANCHORS[type] || {}, id)) continue;
+    if (!assignments[type]) assignments[type] = {};
+    assignments[type][id] = color;
+  }
+  try {
+    storage.setItem(COLOR_LEDGER_STORAGE_KEY, JSON.stringify({
+      version: COLOR_LEDGER_VERSION,
+      scope: colorRegistry.scope,
+      assignments,
+    }));
+  } catch (error) {
+    colorRegistry.storage = null;
+    colorLedgerWarning(error);
+  }
+}
+
+function initializeColorLedger(scope) {
+  colorRegistry.byKey.clear();
+  colorRegistry.scope = scope || null;
+  colorRegistry.storage = null;
+  colorRegistry.storageChecked = false;
+  colorRegistry.storageWarningShown = false;
+  if (!colorRegistry.scope) {
+    colorLedgerWarning("no authenticated user scope");
+    colorRegistry.storageChecked = true;
+    return;
+  }
+
+  const storage = colorLedgerStorage();
+  if (!storage) return;
+  try {
+    const raw = storage.getItem(COLOR_LEDGER_STORAGE_KEY);
+    if (raw == null) return;
+    const restored = validateColorLedger(JSON.parse(raw), colorRegistry.scope);
+    if (restored == null) {
+      clearColorLedgerStorage(storage);
+      return;
+    }
+    for (const [type, id, color] of restored) {
+      colorRegistry.byKey.set(entityKey(type, id), color);
+    }
+  } catch (error) {
+    // Corrupt JSON is disposable state; storage access failures use the
+    // in-memory fallback and must never prevent dashboard boot.
+    if (error instanceof SyntaxError) {
+      clearColorLedgerStorage(storage);
+    } else {
+      colorRegistry.storage = null;
+      colorLedgerWarning(error);
+    }
+  }
+}
+
+function clearColorLedger() {
+  colorRegistry.byKey.clear();
+  clearColorLedgerStorage(colorLedgerStorage());
 }
 
 function fallbackColorForKey(key, reserved, used) {
@@ -80,7 +228,7 @@ function fallbackColorForKey(key, reserved, used) {
 
 function registerEntityColors(type, ids) {
   const normalizedType = String(type || "").trim();
-  if (!normalizedType) return;
+  if (!COLOR_ENTITY_TYPES.has(normalizedType)) return;
 
   const anchors = ENTITY_ANCHORS[normalizedType] || {};
   const reserved = new Set(Object.values(anchors));
@@ -105,12 +253,15 @@ function registerEntityColors(type, ids) {
     colorRegistry.byKey.set(key, color);
     if (!reserved.has(color)) used.add(color);
   }
+  persistColorLedger();
 }
 
 function entityColor(type, id) {
   const normalizedType = String(type || "").trim();
   const normalizedId = normalizeEntityId(id);
-  if (!normalizedId) return UNATTRIBUTED_COLOR;
+  if (!COLOR_ENTITY_TYPES.has(normalizedType) || !normalizedId) return UNATTRIBUTED_COLOR;
+  const anchors = ENTITY_ANCHORS[normalizedType] || {};
+  if (Object.prototype.hasOwnProperty.call(anchors, normalizedId)) return anchors[normalizedId];
   const key = entityKey(normalizedType, normalizedId);
   const cached = colorRegistry.byKey.get(key);
   if (cached) return cached;
@@ -711,6 +862,8 @@ function connectEvents() {
 async function setupSession() {
   try {
     const auth = await fetchJSON("/api/session");
+    const userId = normalizeEntityId(auth.user_id);
+    initializeColorLedger(userId ? "user:" + userId : null);
     state.csrf = auth.csrf;
     const button = $("logout-button");
     button.hidden = false;
@@ -721,20 +874,22 @@ async function setupSession() {
         body: new URLSearchParams({ csrf: state.csrf }),
       });
       if (!response.ok) throw new Error(`logout → HTTP ${response.status}`);
+      clearColorLedger();
       location.assign("/login");
     });
   } catch (error) {
     // The local FastAPI app intentionally has no login endpoint. A 404 here
     // means local-only mode, not a dashboard failure.
     if (!String(error.message).includes("HTTP 404")) throw error;
+    initializeColorLedger("local");
   }
 }
 
 async function refreshMeta() {
   const meta = await fetchJSON("/api/meta");
-  registerEntityColors("project", meta.projects.map((project) => project.id));
-  registerEntityColors("agent", meta.agents.map((agent) => agent.id));
-  registerEntityColors("model", meta.models);
+  registerEntityColors("project", (meta.projects || []).map((project) => project.id));
+  registerEntityColors("agent", (meta.agents || []).map((agent) => agent.id));
+  registerEntityColors("model", meta.models || []);
   state.lastDate = meta.date_span.last;
   populateMultiSelect("filter-project", meta.projects, (p) => p.id, (p) => p.title, state.projects);
   populateMultiSelect("filter-agent", meta.agents, (a) => a.id, (a) => a.name, state.agents);

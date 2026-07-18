@@ -618,6 +618,140 @@ def test_meta_boot_registers_canonical_sets_before_chart_render(dashboard):
     assert _registry_map(cdp, typed_ids) == before
 
 
+def test_color_ledger_survives_live_meta_expansion_and_same_tab_reload(dashboard):
+    """FAN-1320: append-only meta expansion keeps colors through reloads.
+
+    The preload keeps the production ``refreshMeta().then(refreshAll)`` path
+    intact while supplying the QA reproduction's first-seen and expanded meta
+    sets. The fake EventSource only provides a deterministic real-browser
+    ``update`` event; allocation, persistence and reload are production code.
+    """
+    cdp, base = dashboard
+    preload_script = r'''(() => {
+      const realFetch = window.fetch;
+      window.fetch = (...args) => {
+        const url = String(args[0] && args[0].url || args[0]);
+        if (!url.includes("/api/meta")) return realFetch(...args);
+        return realFetch(...args).then(async (response) => {
+          const meta = await response.json();
+          const expanded = sessionStorage.getItem("qa-meta-expanded") === "1";
+          const reversed = sessionStorage.getItem("qa-meta-reversed") === "1";
+          if (!expanded) meta.models = ["qa-sse-002"];
+          else meta.models = reversed
+            ? ["qa-sse-002", "qa-sse-000"]
+            : ["qa-sse-000", "qa-sse-002"];
+          return new Response(JSON.stringify(meta), {
+            status: 200, headers: {"Content-Type": "application/json"},
+          });
+        });
+      };
+      class TestEventSource {
+        constructor() {
+          this.listeners = {};
+          window.__qa_event_source = this;
+        }
+        addEventListener(name, callback) {
+          (this.listeners[name] ||= []).push(callback);
+        }
+        emit(name, data) {
+          for (const callback of this.listeners[name] || []) callback({data});
+        }
+      }
+      window.EventSource = TestEventSource;
+    })();'''
+    cdp.open_page(base + "/", preload_script=preload_script)
+    cdp.wait_for(BOOTED_JS)
+
+    before = _registry_map(cdp, [["model", "qa-sse-002"]])
+    payload = cdp.eval("JSON.parse(sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY))")
+    assert payload["scope"] == "local"
+    assert payload["assignments"]["model"]["qa-sse-002"] == before["model\u0000qa-sse-002"]
+
+    cdp.eval('''(() => {
+      sessionStorage.setItem("qa-meta-expanded", "1");
+      window.__qa_event_source.emit("update", JSON.stringify({
+        beat: {seq: 1, at: "2026-01-02T00:00:00Z"}, cycle: {id: "qa"},
+      }));
+    })()''')
+    cdp.wait_for('colorRegistry.byKey.has("model\\u0000qa-sse-000")')
+    expanded = _registry_map(cdp, [["model", "qa-sse-000"], ["model", "qa-sse-002"]])
+    assert expanded["model\u0000qa-sse-002"] == before["model\u0000qa-sse-002"]
+    assert expanded["model\u0000qa-sse-000"] != expanded["model\u0000qa-sse-002"]
+
+    cdp.eval("window.__pre_reload = true; location.reload()")
+    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    assert _registry_map(cdp, [["model", "qa-sse-000"], ["model", "qa-sse-002"]]) == expanded
+
+    cdp.eval('sessionStorage.setItem("qa-meta-reversed", "1"); '
+             'window.__pre_reload = true; location.reload()')
+    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    assert _registry_map(cdp, [["model", "qa-sse-000"], ["model", "qa-sse-002"]]) == expanded
+
+
+def test_color_ledger_clean_history_is_order_independent_and_scope_safe(dashboard):
+    """A cleared ledger is deterministic, while wrong-scope data is dropped."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    ids = ["collision-6", "collision-9", "clean-history"]
+
+    cdp.eval("clearColorLedger(); initializeColorLedger('local')")
+    _register_colors(cdp, "model", ids)
+    forward = _color_map(cdp, "model", ids)
+
+    cdp.eval("clearColorLedger(); initializeColorLedger('local')")
+    _register_colors(cdp, "model", list(reversed(ids)))
+    reverse = _color_map(cdp, "model", ids)
+    assert forward == reverse
+
+    foreign = {
+        "version": 1,
+        "scope": "user:other",
+        "assignments": {"model": {"foreign": "#4f6df5"}},
+    }
+    cdp.eval("sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s)" % json.dumps(
+        json.dumps(foreign)))
+    cdp.eval("initializeColorLedger('local')")
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    assert cdp.eval('colorRegistry.byKey.has("model\\u0000foreign")') is False
+
+
+def test_color_ledger_rejects_corrupt_payload_without_trusting_anchors(dashboard):
+    """Corrupt state cannot restore sentinel/reserved colors or Fable drift."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    corrupt = {
+        "version": 99,
+        "scope": "local",
+        "assignments": {"model": {
+            "claude-fable-5": "#0ea5e9",
+            "bad-sentinel": "#cbd5e1",
+        }},
+    }
+    cdp.eval("sessionStorage.setItem(COLOR_LEDGER_STORAGE_KEY, %s)" % json.dumps(
+        json.dumps(corrupt)))
+    cdp.eval("initializeColorLedger('local')")
+    assert cdp.eval("sessionStorage.getItem(COLOR_LEDGER_STORAGE_KEY)") is None
+    assert cdp.eval('entityColor("model", "claude-fable-5")') == "#ef4444"
+    assert cdp.eval('entityColor("agent", null)') == "#cbd5e1"
+    assert cdp.eval('colorRegistry.byKey.has("model\\u0000bad-sentinel")') is False
+
+
+def test_color_ledger_storage_denial_uses_memory_fallback(dashboard):
+    """A denied sessionStorage must warn but never prevent dashboard boot."""
+    cdp, base = dashboard
+    preload_script = r'''Object.defineProperty(window, "sessionStorage", {
+      configurable: true,
+      get() { throw new Error("storage denied by QA"); },
+    });'''
+    cdp.open_page(base + "/", preload_script=preload_script)
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("colorRegistry.storage === null && colorRegistry.storageWarningShown") is True
+    _register_colors(cdp, "model", ["storage-denied"])
+    assert cdp.eval('entityColor("model", "storage-denied")') != "#cbd5e1"
+
+
 def _probe_entity_colors(cdp, identities):
     """Return ``type:id -> color`` from the live page registry."""
     return cdp.eval(
