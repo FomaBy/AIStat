@@ -84,6 +84,11 @@ class Cdp:
         self._next_id = 0
         self.session_id = None
         self._target_id = None
+        self._requested_url = None
+
+    def _diagnostics(self):
+        return ("requested_url=%r, target_id=%r, session_id=%r" %
+                (self._requested_url, self._target_id, self.session_id))
 
     def _read_message(self, timeout=BOOT_TIMEOUT):
         deadline = time.monotonic() + timeout
@@ -105,14 +110,24 @@ class Cdp:
         self._next_id += 1
         message = {"id": self._next_id, "method": method,
                    "params": params or {}}
-        if session and self.session_id:
-            message["sessionId"] = self.session_id
+        expected_session = self.session_id if session and self.session_id else None
+        if expected_session:
+            message["sessionId"] = expected_session
         os.write(self._cmd_write, json.dumps(message).encode() + b"\0")
         while True:  # events arrive interleaved; wait for our reply
-            reply = self._read_message()
+            try:
+                reply = self._read_message()
+            except (ConnectionError, TimeoutError) as exc:
+                raise type(exc)("%s: %s (%s)" %
+                                (method, exc, self._diagnostics())) from exc
             if reply.get("id") == self._next_id:
+                if expected_session and reply.get("sessionId") != expected_session:
+                    raise RuntimeError(
+                        "%s: reply for unexpected session %r (%s)" %
+                        (method, reply.get("sessionId"), self._diagnostics()))
                 if "error" in reply:
-                    raise RuntimeError(f"{method}: {reply['error']}")
+                    raise RuntimeError("%s: %s (%s)" %
+                                       (method, reply["error"], self._diagnostics()))
                 return reply.get("result", {})
 
     def open_page(self, url, preload_script=None):
@@ -122,20 +137,27 @@ class Cdp:
             self.call("Target.closeTarget", {"targetId": self._target_id},
                       session=False)
             self.session_id = None
+            self._target_id = None
+        self._requested_url = url
+        # A target created with a non-blank URL may finish navigation before
+        # Target.attachToTarget returns on newer Chrome versions.  Always
+        # attach to a blank target first, then navigate through that exact
+        # flattened session so Page/Runtime commands cannot land on a stale
+        # or launch-created about:blank target.
         target = self.call(
             "Target.createTarget",
-            {"url": "about:blank" if preload_script else url},
+            {"url": "about:blank"},
             session=False)
         self._target_id = target["targetId"]
         attached = self.call(
             "Target.attachToTarget",
             {"targetId": target["targetId"], "flatten": True}, session=False)
         self.session_id = attached["sessionId"]
+        self.call("Page.enable")
         if preload_script:
-            self.call("Page.enable")
             self.call("Page.addScriptToEvaluateOnNewDocument",
                       {"source": preload_script})
-            self.call("Page.navigate", {"url": url})
+        self.call("Page.navigate", {"url": url})
 
     def eval(self, expression):
         """Evaluate JS in the page; returns the JSON-serialized value."""
@@ -166,7 +188,8 @@ class Cdp:
             page_state = f"unavailable: {exc}"
         raise TimeoutError(f"condition never held: {condition_js}\n"
                            f"last eval error: {last_error}\n"
-                           f"page state: {page_state}")
+                           f"page state: {page_state}\n"
+                           f"{self._diagnostics()}")
 
     def close(self):
         try:
@@ -258,6 +281,32 @@ def _filter_error(cdp):
 def _search_params(cdp):
     return cdp.eval(
         "[...new URLSearchParams(location.search).entries()]")
+
+
+def test_open_page_navigates_the_attached_target(dashboard):
+    """A fresh target must reach the requested page after its flat session
+    is attached; creating a target alone is not sufficient evidence."""
+    cdp, base = dashboard
+    requested_url = base + "/?project=P1&agent=A1"
+    cdp.open_page(requested_url)
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("location.href") == requested_url
+    assert cdp.eval('document.getElementById("card-tokens") !== null') is True
+
+
+def test_navigation_timeout_includes_target_diagnostics(dashboard):
+    """A bounded adapter failure identifies the page and flat session that
+    failed instead of only reporting a generic CDP timeout."""
+    cdp, base = dashboard
+    requested_url = base + "/?project=P1"
+    cdp.open_page(requested_url)
+    cdp.wait_for(BOOTED_JS)
+    with pytest.raises(TimeoutError) as failure:
+        cdp.wait_for("false", timeout=0)
+    message = str(failure.value)
+    assert "requested_url=%r" % requested_url in message
+    assert "target_id=%r" % cdp._target_id in message
+    assert "session_id=%r" % cdp.session_id in message
 
 
 def test_restores_valid_url_state_and_survives_reload(dashboard):
@@ -576,9 +625,11 @@ def test_meta_boot_registers_canonical_sets_before_chart_render(dashboard):
         return getContext.apply(this, args);
       };
     })();'''
-    cdp.open_page(base + "/?model=m-claude&agent=A1&project=P1",
-                  preload_script=trace_script)
+    requested_url = base + "/?model=m-claude&agent=A1&project=P1"
+    cdp.open_page(requested_url, preload_script=trace_script)
     cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("location.href") == requested_url
+    assert cdp.eval('document.getElementById("card-tokens") !== null') is True
 
     typed_ids = cdp.eval('''(() => [
       ...[...document.querySelectorAll("#filter-model option")]
@@ -613,8 +664,8 @@ def test_meta_boot_registers_canonical_sets_before_chart_render(dashboard):
     cdp.eval("refreshMeta().then(refreshAll)")
     cdp.wait_for(BOOTED_JS)
     assert _registry_map(cdp, typed_ids) == before
-    cdp.eval("location.reload()")
-    cdp.wait_for(BOOTED_JS)
+    cdp.eval("window.__aistat_pre_reload = true; location.reload()")
+    cdp.wait_for(f"window.__aistat_pre_reload === undefined && ({BOOTED_JS})")
     assert _registry_map(cdp, typed_ids) == before
 
 
