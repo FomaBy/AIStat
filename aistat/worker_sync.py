@@ -117,7 +117,7 @@ def pull_once(
     for item in state.get("pending") or []:
         try:
             user_id = int(item["user_id"])
-            store.store_token(
+            accepted = store.store_token(
                 user_id,
                 str(item["server_url"]),
                 item.get("workspace_label"),
@@ -126,6 +126,11 @@ def pull_once(
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkerSyncError("host sent an invalid pending entry") from exc
+        if not accepted:
+            logger.warning(
+                "ignored stale encrypted-token update for user %s", user_id
+            )
+            continue
         acks.append(
             {
                 "user_id": user_id,
@@ -143,7 +148,12 @@ def pull_once(
             epoch = int(item["token_epoch"])
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkerSyncError("host sent an invalid revoked entry") from exc
-        store.delete_connection(user_id)
+        accepted = store.delete_connection(user_id, epoch)
+        if not accepted:
+            logger.warning(
+                "ignored stale encrypted-token revoke for user %s", user_id
+            )
+            continue
         acks.append(
             {"user_id": user_id, "token_epoch": epoch, "result": "revoked"}
         )
