@@ -152,6 +152,20 @@ def test_connection_routes_require_session(conn_app):
     ).status_code == 401
 
 
+def test_authenticated_dashboard_serves_shared_connection_cabinet(conn_app):
+    app, _ = conn_app
+    client = app.test_client()
+    login(client)
+    page = client.get("/", base_url="https://localhost")
+    assert page.status_code == 200
+    html = page.get_data(as_text=True)
+    assert 'id="connection-cabinet"' in html
+    assert 'id="connection-token"' in html
+    assert 'type="password"' in html
+    assert "https://multica.ai" in html
+    assert "server_url" not in html
+
+
 def test_intake_requires_csrf(conn_app):
     app, _ = conn_app
     client = app.test_client()

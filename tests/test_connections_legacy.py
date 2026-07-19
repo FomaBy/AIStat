@@ -112,6 +112,19 @@ def test_connection_routes_require_session_and_csrf(legacy_conn):
     assert b"invalid CSRF token" in body
 
 
+def test_authenticated_dashboard_serves_shared_connection_cabinet(legacy_conn):
+    module, _ = legacy_conn
+    cookies = login(module)
+    status, _, body = request(module.application, "/", cookie=cookies)
+    assert status == "200 OK"
+    html = body.decode("utf-8")
+    assert 'id="connection-cabinet"' in html
+    assert 'id="connection-token"' in html
+    assert 'type="password"' in html
+    assert "https://multica.ai" in html
+    assert "server_url" not in html
+
+
 def test_intake_status_and_throttle(legacy_conn):
     module, tmp_path = legacy_conn
     cookies = login(module)
