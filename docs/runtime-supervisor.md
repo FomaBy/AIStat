@@ -1,0 +1,144 @@
+# Автономный локальный рантайм AIStat (supervisor)
+
+Доверенная локальная машина держит постоянно поднятыми ровно **четыре**
+долгоживущих контура:
+
+| Контур | Команда | Что делает |
+|---|---|---|
+| owner poller | `python -m aistat.poller` | синхронизирует Multica владельца в локальную БД |
+| owner publisher | `python -m aistat.publish --watch` | подписанный snapshot владельца → публичный хост |
+| PAT worker | `python -m aistat.worker_sync --watch` | тянет пользовательские токены в зашифрованный store |
+| per-user collector | `python -m aistat.collector` | собирает статистику по подключениям и публикует per-tenant |
+
+Всеми четырьмя управляет один **fail-fast supervisor**
+(`aistat/supervisor.py`), которого поднимает один launchd-агент
+`com.aistat.runtime`. Supervisor:
+
+- держит по одному экземпляру каждого контура (одиночность гарантирует
+  `flock` — второй supervisor не запустится);
+- перезапускает упавший контур с экспоненциальным backoff;
+- при crash-loop (слишком частые перезапуски) завершается с ненулевым кодом,
+  launchd поднимает рантайм заново, а проблема остаётся видимой, а не «тихо
+  умирает»;
+- по SIGTERM/SIGINT (и при `launchctl bootout` во время reinstall/uninstall)
+  гасит каждый контур **вместе с его группой процессов**, не оставляя
+  осиротевших дочерних процессов (`multica` CLI, per-connection профиль).
+
+## Раскладка рантайма
+
+Рантайм-рут по умолчанию — `$HOME/Library/Application Support/AIStat`
+(переопределяется `AISTAT_RUNTIME_ROOT`). Пути в plist и логах генерируются из
+реального `$HOME`; захардкоженного имени пользователя нигде нет.
+
+```
+<runtime-root>/
+  code/        активная копия кода (пакет aistat + манифесты)
+  code.prev/   предыдущая копия — для rollback
+  data/        постоянное состояние: БД, зашифрованный store, tenants, логи
+  .venv/       виртуальное окружение рантайма
+```
+
+`data/` лежит **вне** `code/`, поэтому обновление кода никогда не трогает БД
+владельца, зашифрованный store, tenant-снимки и логи. Ключ шифрования по
+умолчанию `~/.config/aistat/worker.key` — вообще вне рантайм-рута.
+
+## Контракт приватной активации (без значений секретов)
+
+Секреты **никогда** не попадают в plist, argv, stdout/stderr, Git или
+тестовые артефакты. Единственный источник секретов — приватный env-файл
+`AISTAT_ENV_FILE` (по умолчанию `~/.config/aistat/production.env`), права
+`0600`, каталог `0700`. Supervisor загружает его на старте и проверяет права;
+небезопасный файл — отказ старта.
+
+Минимальный набор для рантайма (значения задаёт владелец, здесь только имена):
+
+```
+AISTAT_TENANT_ID=            # внутренний users.id владельца (из aistat.migrate)
+AISTAT_PUBLISH_URL=          # https://… — куда publisher шлёт snapshot
+AISTAT_INGEST_SECRET=        # ≥32 байта, независимый HMAC для snapshot
+AISTAT_WORKER_SYNC_URL=      # https://… — откуда worker тянет токены
+AISTAT_WORKER_SECRET=        # ≥32 байта, независимый HMAC для worker-канала
+# AISTAT_SESSION_SECRET=     # если задан — тоже обязан отличаться от прочих
+```
+
+Требования, которые проверяет preflight (`python -m aistat.preflight`):
+
+- задан `AISTAT_TENANT_ID`;
+- `AISTAT_PUBLISH_URL` и `AISTAT_WORKER_SYNC_URL` — HTTPS;
+- `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET` присутствуют, ≥32 байт и
+  **взаимно независимы** (и с `AISTAT_SESSION_SECRET`, если он задан);
+- интервалы publish/worker-pull/worker-collect ≥ 60 секунд;
+- ключ шифрования лежит **не** в каталоге store; ключ/store — owner-only
+  (`0600`), каталоги — `0700`;
+- все контуры и зависимость `cryptography` импортируются.
+
+> **Fail-closed intake.** Хост не сохраняет новый PAT, пока не увидит свежий
+> подписанный heartbeat worker'а: до первого успешного `worker_sync` intake
+> отвечает `503`. Инсталлятор **не** включает `AISTAT_MULTICA_CONNECT_ENABLED`
+> — это отдельный хостовый флаг и отдельный этап активации.
+
+## Команды
+
+Всё через один скрипт `deploy/aistat_runtime.sh` (рантайм-рут и пути берутся
+из `$HOME`):
+
+```bash
+deploy/aistat_runtime.sh preflight    # проверить конфиг до установки
+deploy/aistat_runtime.sh install      # поставить/обновить рантайм (транзакционно)
+deploy/aistat_runtime.sh status       # статус launchd-задания и контуров
+deploy/aistat_runtime.sh restart      # перезапустить рантайм
+deploy/aistat_runtime.sh rollback     # откатиться на предыдущую копию кода
+deploy/aistat_runtime.sh uninstall            # снять рантайм, данные сохранить
+deploy/aistat_runtime.sh uninstall --purge    # снять рантайм и удалить данные
+```
+
+### Установка / обновление (транзакционно)
+
+`install` сначала стейджит свежую копию кода, поднимает/обновляет venv,
+линтит plist (`plutil -lint`) и прогоняет **полный preflight** — и только
+после этого останавливает старый рантайм. Порядок:
+
+1. staging кода → `code.incoming/`, обновление `.venv`;
+2. рендер + `plutil -lint` манифеста, полный preflight по новой копии;
+3. атомарный swap: `code/ → code.prev/`, `code.incoming/ → code/`;
+4. `launchctl bootout` старого + `bootstrap` нового задания, postflight.
+
+Если что-то падает после swap — предыдущая копия автоматически
+восстанавливается из `code.prev/` и снова bootstrap'ится. Неудачная установка
+никогда не оставляет машину без рабочего рантайма и не удаляет `data/`.
+Повторный `install` идемпотентен.
+
+### Откат
+
+```bash
+deploy/aistat_runtime.sh rollback     # code.prev/ → code/, повторный bootstrap
+```
+
+### Удаление
+
+`uninstall` делает `bootout` (гасит supervisor и все контуры вместе с их
+группами), удаляет plist и копии кода, но **сохраняет** `data/` и ключ.
+`--purge` дополнительно удаляет `data/`. Ключ `~/.config/aistat/worker.key`
+удаляется только вручную.
+
+## Логи и статус
+
+- `data/runtime.stdout.log`, `data/runtime.stderr.log` — вывод supervisor;
+- `data/<contour>.log` — вывод каждого контура (poller/publisher/…);
+- `run/supervisor.status.json` — текущие PID/перезапуски по контурам (без
+  секретов), права `0600`.
+
+## Проверка
+
+Поведение доказано автоматическими тестами:
+
+- `tests/test_supervisor.py` — одиночность, перезапуск, crash-loop fail-fast,
+  чистое завершение по SIGTERM без осиротевших процессов (в т.ч. реальные
+  подпроцессы);
+- `tests/test_preflight.py` — все проверки конфигурации и прав;
+- `tests/test_runtime_install.py` — рендер plist (без захардкоженного
+  пользователя), транзакционный install/rollback/uninstall, сохранность
+  данных;
+- `tests/test_runtime_e2e.py` — синтетический lifecycle submit → pull →
+  зашифрованный store → ack/erase → collector → per-tenant publish → sync
+  report, включая replace, revoke, restart и credential epoch.

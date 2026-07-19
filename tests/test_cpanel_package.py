@@ -30,6 +30,10 @@ def test_cpanel_package_keeps_worker_side_out(tmp_path):
     # key/store material never reach the shared host.
     assert not (package / "aistat" / "worker_store.py").exists()
     assert not (package / "aistat" / "worker_sync.py").exists()
+    # The trusted-local runtime supervisor/installer/preflight never ship.
+    assert not (package / "aistat" / "supervisor.py").exists()
+    assert not (package / "aistat" / "runtime_install.py").exists()
+    assert not (package / "aistat" / "preflight.py").exists()
     requirements = (package / "requirements.txt").read_text(encoding="utf-8")
     assert "cryptography" not in requirements
     leftovers = [
