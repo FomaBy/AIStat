@@ -242,6 +242,46 @@ def test_workspace_discovery_error_drops_raw_cli_detail(tmp_path):
     assert "boom" not in str(exc_info.value)
 
 
+def test_unexpected_executor_errors_are_redacted(tmp_path):
+    class ExplodingExecutor(FakeExecutor):
+        def raw(self, *args, **kwargs):
+            raise RuntimeError("PAT=synthetic-secret raw stderr")
+
+        def json(self, *args, **kwargs):
+            raise RuntimeError("profile=/tmp/private raw stdout")
+
+    profile = ConnectionCliProfile(
+        make_config(tmp_path), 7, executor=ExplodingExecutor()
+    )
+    with pytest.raises(CliProfileError) as login_error:
+        profile.login(TOKEN)
+    assert str(login_error.value) == "official CLI login failed for the connection"
+    assert "PAT=" not in str(login_error.value)
+
+    profile.login = lambda _token: None
+    with pytest.raises(CliProfileError) as workspace_error:
+        profile.select_workspace("alpha")
+    assert str(workspace_error.value) == "could not list the connection's workspaces"
+    assert "/tmp/private" not in str(workspace_error.value)
+
+
+def test_unexpected_logout_error_still_erases_residue(tmp_path):
+    class LogoutExploder(FakeExecutor):
+        def raw(self, args, **kwargs):
+            if list(args)[:2] == ["auth", "logout"]:
+                raise RuntimeError("logout PAT sentinel")
+            return super().raw(args, **kwargs)
+
+    config = make_config(tmp_path)
+    profile = ConnectionCliProfile(config, 7, executor=LogoutExploder())
+    profile.login(TOKEN)
+    residue = config.cli_profiles_dir / ".multica" / "profiles" / "aistat-conn-7"
+    residue.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(CliProfileError):
+        profile.cleanup()
+    assert not residue.exists()
+
+
 def test_two_tenant_lifecycle_recorder_scopes_every_call(
     tmp_path, monkeypatch
 ):

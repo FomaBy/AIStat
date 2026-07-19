@@ -29,4 +29,4 @@ def test_snapshot_surfaces_failures(conn):
     snap = snapshot(conn)
     assert snap["status"] == "degraded"
     assert len(snap["failing_sources"]) == 5  # one per agent
-    assert all("stubbed failure" in s["last_error"] for s in snap["failing_sources"])
+    assert all(s["last_error"] == "poll source failed" for s in snap["failing_sources"])

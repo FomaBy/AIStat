@@ -286,6 +286,21 @@ def test_sync_reports_flip_between_active_and_error(store, user_id):
     ) == (False, "invalid-state")
 
 
+def test_sync_error_allowlist_drops_exception_and_secret_text(store, user_id):
+    submit(store, user_id)
+    entry = store.lease_pending_connections(now=NOW)["pending"][0]
+    handoff.ack_connection_stored(
+        store._connect, user_id, entry["lease_id"], 1, now=NOW
+    )
+    sentinel = "PAT=synthetic-secret /tmp/private-profile raw stderr"
+    assert handoff.record_connection_sync(
+        store._connect, user_id, 1, False, error=sentinel, now=NOW + 1
+    ) == (True, "error")
+    view = store.connection_status(user_id)
+    assert view["last_sync_error"] == handoff.DEFAULT_SYNC_ERROR
+    assert sentinel not in repr(view)
+
+
 def test_submission_throttle_reserves_atomically(store, user_id):
     barrier = threading.Barrier(12)
 

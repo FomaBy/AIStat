@@ -163,7 +163,7 @@ def test_failed_source_recorded_without_breaking_cycle(conn):
         "SELECT source, last_error FROM sync_state WHERE ok = 0"
     ).fetchall()
     assert len(failing) == 3
-    assert all("connection refused" in row["last_error"] for row in failing)
+    assert all(row["last_error"] == "poll source failed" for row in failing)
 
     # recovery: next healthy cycle clears the error state
     poller_ok = Poller(Config(), conn, runner=make_runner())
@@ -178,14 +178,14 @@ def test_detail_sync_failure_leaves_issue_pending(conn):
     poller = Poller(Config(), conn, runner=runner)
     result = poller.run_cycle()
     assert result.detail_failed == 3
-    assert "issue_details" in " ".join(result.errors)
+    assert "issue details synchronization failed" in result.errors
     # issues remain pending for retry
     assert len(poller.pending_detail_issues(budget=10)) == 3
     row = conn.execute(
         "SELECT ok, last_error FROM sync_state WHERE source = 'issue_details'"
     ).fetchone()
     assert row["ok"] == 0
-    assert "3 of 3" in row["last_error"]
+    assert row["last_error"] == "issue details synchronization failed"
 
 
 def test_live_beat_lands_before_slow_phase(conn):

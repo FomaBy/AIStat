@@ -121,8 +121,8 @@ tenant_id/sha256/size отправленного.
 Worker-процесс (только доверенная машина), рядом с `worker_sync`:
 
 ```
-python -m aistat.collector --watch      # цикл по всем подключениям
-python -m aistat.collector --once       # один цикл, JSON-сводка (без токенов/путей)
+python -m aistat.collector               # непрерывный цикл по всем подключениям
+python -m aistat.collector --once        # один цикл, JSON-сводка (без токенов/путей)
 ```
 
 Требует настроенных `AISTAT_PUBLISH_URL` + `AISTAT_INGEST_SECRET` (для публикации) и

@@ -40,11 +40,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import normalize, pricing, store
-from .cli import CliError, run_cli
+from .cli import run_cli
 from .config import Config
 from .db import connect, init_db, utcnow_iso
 
 logger = logging.getLogger("aistat.poller")
+
+POLL_SOURCE_FAILURE = "poll source failed"
+ISSUE_DETAILS_FAILURE = "issue details synchronization failed"
+PRICING_FAILURE = "pricing data could not be loaded"
 
 # runner(args: List[str]) -> parsed JSON. Injectable for tests.
 Runner = Callable[[List[str]], Any]
@@ -108,13 +112,16 @@ class Poller:
         """Run one source, record its outcome, keep the cycle going on error."""
         try:
             value = fn()
-        except (CliError, normalize.NormalizationError) as exc:
-            message = str(exc)
-            logger.error("source %s failed: %s", name, message)
-            store.record_source_attempt(self.conn, name, ok=False, error=message)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.error("source %s failed", str(name).split(":", 1)[0])
+            store.record_source_attempt(
+                self.conn, name, ok=False, error=POLL_SOURCE_FAILURE
+            )
             self.conn.commit()
             result.sources_failed += 1
-            result.errors.append(f"{name}: {message}")
+            result.errors.append(POLL_SOURCE_FAILURE)
             return False, None
         store.record_source_attempt(self.conn, name, ok=True)
         self.conn.commit()
@@ -226,16 +233,19 @@ class Poller:
                 store.mark_issue_details_synced(self.conn, issue_id, detail_key)
                 self.conn.commit()
                 result.detail_synced += 1
-            except (CliError, normalize.NormalizationError) as exc:
-                errors.append(f"{issue['identifier'] or issue_id}: {exc}")
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                errors.append(ISSUE_DETAILS_FAILURE)
                 result.detail_failed += 1
-                logger.error("issue details failed for %s: %s", issue_id, exc)
+                logger.error("issue details failed")
 
         if errors:
-            summary = f"{len(errors)} of {attempted} issues failed: " + "; ".join(errors[:3])
-            store.record_source_attempt(self.conn, "issue_details", ok=False, error=summary)
+            store.record_source_attempt(
+                self.conn, "issue_details", ok=False, error=ISSUE_DETAILS_FAILURE
+            )
             result.sources_failed += 1
-            result.errors.append(f"issue_details: {summary}")
+            result.errors.append(ISSUE_DETAILS_FAILURE)
         else:
             store.record_source_attempt(self.conn, "issue_details", ok=True)
             result.sources_ok += 1
@@ -264,13 +274,16 @@ class Poller:
             )
             unpriced = pricing.unpriced_models_in_usage(self.conn, rates)
             self.conn.commit()
-        except pricing.PricingError as exc:
-            message = str(exc)
-            logger.error("source pricing failed: %s", message)
-            store.record_source_attempt(self.conn, "pricing", ok=False, error=message)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.error("source pricing failed")
+            store.record_source_attempt(
+                self.conn, "pricing", ok=False, error=PRICING_FAILURE
+            )
             self.conn.commit()
             result.sources_failed += 1
-            result.errors.append(f"pricing: {message}")
+            result.errors.append(PRICING_FAILURE)
             return
         store.record_source_attempt(self.conn, "pricing", ok=True)
         self.conn.commit()
