@@ -48,6 +48,8 @@ class FakeStore:
         self.states = {}
         self.identities = {}
         self.owner_links = {}
+        self.tenants = set()
+        self.raise_on_register = False
         self._next_id = 0
 
     def put_oauth_state(
@@ -82,6 +84,31 @@ class FakeStore:
             return linked
         self.owner_links[key] = int(owner_user_id)
         return int(owner_user_id)
+
+    def register_or_link_identity(
+        self, provider, subject, email=None, display_name=None,
+        admin_email=None, allowed_emails=None, owner_user_id=None, now=None,
+    ):
+        """In-memory mirror of SecurityStore.register_or_link_identity."""
+        if self.raise_on_register:
+            raise RuntimeError("injected store anomaly")
+        key = (provider, subject)
+        if key in self.identities:
+            return {"user_id": self.identities[key], "outcome": "existing"}
+        normalized = email.strip().lower() if email else None
+        owner_email = (admin_email or "").strip().lower()
+        if owner_email and owner_user_id and normalized == owner_email:
+            self.identities[key] = int(owner_user_id)
+            self.owner_links[key] = int(owner_user_id)
+            return {"user_id": int(owner_user_id), "outcome": "linked_owner"}
+        if allowed_emails and (
+            normalized is None or normalized not in allowed_emails
+        ):
+            return {"user_id": None, "outcome": "denied"}
+        self._next_id += 1
+        self.identities[key] = self._next_id
+        self.tenants.add(self._next_id)
+        return {"user_id": self._next_id, "outcome": "created"}
 
 
 def fake_http(monkeypatch, token=None, identity=None, captured=None):
@@ -415,67 +442,247 @@ def test_build_authorize_url_requires_https_redirect():
 OWNER_ALLOWED = frozenset({"owner@example.com"})
 
 
-def test_owner_only_identity_links_verified_owner():
+def _register(store, subject, email, email_verified=True, display_name="N",
+              allowed_emails=frozenset(), admin_email="owner@example.com",
+              owner_user_id=7):
+    return oauth.open_registration_identity(
+        store, "google", subject, email, email_verified, display_name,
+        allowed_emails=allowed_emails, admin_email=admin_email,
+        owner_user_id=owner_user_id,
+    )
+
+
+def test_open_registration_creates_ordinary_user_on_empty_allowlist():
+    # an empty allow list admits any verified user as a fresh ordinary account
     store = FakeStore()
-    uid = oauth.owner_only_identity(
-        store, "google", "sub-1", "Owner@Example.com", True, "Owner",
-        allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
-        owner_user_id=7,
+    uid = _register(store, "sub-1", "new@example.com")
+    assert isinstance(uid, int)
+    assert uid != 7  # not the owner
+    # the new user got its own tenant registry row
+    assert uid in store.tenants
+
+
+def test_open_registration_is_subject_first_across_email_and_allowlist():
+    # the same subject always maps back to the same user, whatever the email
+    # or allow list later become
+    store = FakeStore()
+    first = _register(store, "sub-1", "a@example.com")
+    # email changed at the provider -> still the same account, no second user
+    again = _register(store, "sub-1", "b@example.com")
+    assert again == first
+    # and even once an allow list is configured that would exclude them, an
+    # already-registered subject still signs in
+    still = _register(
+        store, "sub-1", "a@example.com",
+        allowed_emails=frozenset({"someone@else.com"}),
+    )
+    assert still == first
+
+
+def test_open_registration_distinct_subjects_same_email_are_distinct_users():
+    store = FakeStore()
+    one = _register(store, "sub-1", "shared@example.com")
+    two = _register(store, "sub-2", "shared@example.com")
+    assert one != two
+
+
+def test_open_registration_links_owner_by_admin_email():
+    # a new subject whose verified email is the admin email links to the owner
+    store = FakeStore()
+    uid = _register(
+        store, "owner-sub", "Owner@Example.com",
+        admin_email="owner@example.com", owner_user_id=7,
     )
     assert uid == 7
-    assert store.owner_links == {("google", "sub-1"): 7}
-    # a second sign-in with the same identity maps back to the owner
-    again = oauth.owner_only_identity(
-        store, "google", "sub-1", "owner@example.com", True, "Owner",
-        allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
-        owner_user_id=7,
-    )
-    assert again == 7
+    assert store.owner_links == {("google", "owner-sub"): 7}
+    # no fresh tenant is minted for the owner-linked identity
+    assert store.tenants == set()
 
 
-def test_owner_only_identity_allows_empty_allowlist_for_owner():
-    # the admin email is the gate; an unset allow-list still admits the owner
-    store = FakeStore()
-    uid = oauth.owner_only_identity(
-        store, "google", "s", "owner@example.com", True, None,
-        allowed_emails=frozenset(), admin_email="owner@example.com",
-        owner_user_id=3,
+def test_open_registration_allowlist_admits_listed_and_denies_outsider():
+    listed = FakeStore()
+    uid = _register(
+        listed, "sub-in", "Owner@Example.com", allowed_emails=OWNER_ALLOWED,
     )
-    assert uid == 3
+    assert isinstance(uid, int)
+
+    outsider = FakeStore()
+    with pytest.raises(oauth.RegistrationClosedError):
+        _register(
+            outsider, "sub-out", "stranger@example.com",
+            allowed_emails=OWNER_ALLOWED,
+        )
+    # a denied new subject writes no identity or tenant row
+    assert outsider.identities == {}
+    assert outsider.tenants == set()
 
 
 @pytest.mark.parametrize(
-    ("email", "email_verified", "admin_email", "allowed", "owner_user_id"),
+    ("email", "email_verified"),
     [
-        ("owner@example.com", False, "owner@example.com", OWNER_ALLOWED, 7),   # unverified
-        (None, True, "owner@example.com", OWNER_ALLOWED, 7),                   # no email
-        ("stranger@example.com", True, "owner@example.com", OWNER_ALLOWED, 7), # not owner
-        ("owner@example.com", True, None, OWNER_ALLOWED, 7),                   # no admin email
-        ("owner@example.com", True, "owner@example.com",
-         frozenset({"someone@else.com"}), 7),                                  # excluded by allow-list
-        ("owner@example.com", True, "owner@example.com", OWNER_ALLOWED, None), # owner not init
+        (None, True),                  # missing email
+        ("u@example.com", False),      # unverified email
+        ("", True),                    # empty email
     ],
 )
-def test_owner_only_identity_rejects_before_creating_account(
-    email, email_verified, admin_email, allowed, owner_user_id
+def test_open_registration_rejects_missing_or_unverified_email(
+    email, email_verified
 ):
     store = FakeStore()
-    with pytest.raises(oauth.OAuthError):
-        oauth.owner_only_identity(
-            store, "google", "sub-x", email, email_verified, "N",
-            allowed_emails=allowed, admin_email=admin_email,
-            owner_user_id=owner_user_id,
-        )
-    # a rejected login never writes an identity row
+    with pytest.raises(oauth.OAuthError) as excinfo:
+        _register(store, "sub-x", email, email_verified=email_verified)
+    # a plain OAuthError (generic), not the closed-registration variant
+    assert not isinstance(excinfo.value, oauth.RegistrationClosedError)
+    assert store.identities == {}
+
+
+def test_open_registration_wraps_store_anomaly_as_oauth_error():
+    store = FakeStore()
+    store.raise_on_register = True
+    with pytest.raises(oauth.OAuthError) as excinfo:
+        _register(store, "sub-x", "owner@example.com")
+    # a store anomaly fails closed as a generic error, never a 500
+    assert not isinstance(excinfo.value, oauth.RegistrationClosedError)
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "a@b.co",
+        "  a@b.co  ",                       # only outer U+0020 SPACE is trimmed
+        "  User.Name+tag@Example.COM  ",    # case preserved, allowed local dots/+
+        "x@sub.example.com",
+        # every RFC unquoted ``atext`` punctuation is an allowed local char
+        "user!#$%&'*+/=?^_`{|}~-@example.com",
+        "a@b-c.example.com",                # interior hyphen in a label is fine
+        "1@2.co",                           # single-char digit labels
+        "a@" + "b" * 63 + ".com",           # 63-char label boundary (allowed)
+        "a" * 64 + "@example.com",          # 64-char local boundary (allowed)
+        "a@" + "x" * 60 + "." + "y" * 60 + ".example.com",  # long but <= 254
+    ],
+)
+def test_normalize_email_returns_canonical_trimmed_form(email):
+    # only U+0020 SPACE is trimmed; case is preserved for storage
+    assert oauth.normalize_email(email) == email.strip(" ")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,                 # missing
+        "",                   # empty
+        "   ",                # spaces only
+        "\t\n ",              # tabs/newlines (only the space trims off)
+        "\tUser.Name+tag@Example.COM\n",  # outer tab/newline is NOT stripped
+        12345,                # non-string
+        True,                 # non-string
+        b"a@b.co",            # bytes, not str
+        "\x01\x02",           # control characters only
+        "a\x00b@example.com", # embedded NUL
+        "a\nb@example.com",   # embedded newline (survives an outer strip)
+        "plainaddress",       # no @
+        "a@b",                # domain has no dot
+        "@example.com",       # empty local part
+        "a b@example.com",    # interior whitespace
+        "a@@example.com",     # doubled @
+        "a@.com",             # empty domain label before dot
+        # dotted-domain / dot-structure false accepts from the QA report
+        "a@b..example",       # consecutive domain dots
+        "a@.b.example",       # leading domain dot
+        "a@b.example.",       # trailing domain dot
+        "a..b@example.com",   # consecutive local dots
+        ".a@example.com",     # leading local dot
+        "a.@example.com",     # trailing local dot
+        # non-ASCII: IDN/EAI is out of scope and fails closed
+        "user@exämple.com",   # ä in the domain (IDN)
+        "пол@example.com",  # Cyrillic local (EAI)
+        # C1 / Unicode format / bidi controls embedded as literal code points
+        "a@b\u0081.example.com",   # C1 control U+0081
+        "a@b\u200bexample.com",    # zero-width space U+200B
+        "a@ex\u202eample.com",     # right-to-left override U+202E
+        # LDH domain-label hyphen violations
+        "a@-bad.example.com",      # leading hyphen
+        "a@bad-.example.com",      # trailing hyphen
+        # quoted / comment local-part forms are not accepted
+        '"a"@example.com',
+        "a(comment)@example.com",
+        # length overflow
+        "a" * 65 + "@example.com",          # local part 65 > 64
+        "a@" + "b" * 64 + ".com",           # domain label 64 > 63
+        "a@" + ("x" * 63 + ".") * 4 + "example.com",  # whole address > 254
+    ],
+)
+def test_normalize_email_rejects_unusable_values(value):
+    assert oauth.normalize_email(value) is None
+
+
+def test_normalize_email_control_probes_are_literal_code_points():
+    # guard the reject cases above: a ``\u`` escape in a normal string is the
+    # single real code point at runtime, not six characters of backslash text,
+    # so the probes genuinely exercise the control characters they name.
+    assert ord("\u0081") == 0x81
+    assert ord("\u200b") == 0x200B
+    assert ord("\u202e") == 0x202E
+    assert oauth.normalize_email("a@b\u0081.example.com") is None
+    assert oauth.normalize_email("a@b\u200bexample.com") is None
+    assert oauth.normalize_email("a@ex\u202eample.com") is None
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        None,
+        "",
+        "   ",
+        "\t\n",
+        12345,
+        "a\x00b@example.com",
+        "plainaddress",
+        "a@b",
+        "a b@example.com",
+        # QA-reported dotted-domain / dot-structure false accepts
+        "a@b..example",
+        "a@.b.example",
+        "a@b.example.",
+        "a..b@example.com",
+        # non-ASCII / IDN / EAI fails closed
+        "user@exämple.com",
+        # literal C1 / format / bidi control code points
+        "a@b\u0081.example.com",   # U+0081
+        "a@b\u200bexample.com",    # U+200B
+        "a@ex\u202eample.com",     # U+202E
+        # LDH hyphen violation and length overflow
+        "a@-bad.example.com",
+        "a" * 65 + "@example.com",
+    ],
+)
+def test_open_registration_rejects_malformed_email_even_when_verified(email):
+    # every unusable email fails closed as a generic OAuthError (the same safe
+    # login failure), never the closed-registration variant, and writes nothing
+    store = FakeStore()
+    with pytest.raises(oauth.OAuthError) as excinfo:
+        _register(store, "sub-x", email, email_verified=True)
+    assert not isinstance(excinfo.value, oauth.RegistrationClosedError)
+    assert store.identities == {}
+    assert store.tenants == set()
     assert store.owner_links == {}
 
 
-def test_owner_only_identity_wraps_store_anomaly_as_oauth_error():
-    store = FakeStore()
-    store.owner_links[("google", "sub-x")] = 999  # linked to a different user
-    with pytest.raises(oauth.OAuthError):
-        oauth.owner_only_identity(
-            store, "google", "sub-x", "owner@example.com", True, "N",
-            allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
-            owner_user_id=7,
-        )
+def test_open_registration_trims_before_owner_and_allowlist_match():
+    # a valid verified email wrapped in whitespace still matches the owner email
+    # (owner link) and the allow list (admission) after canonical trimming
+    owner_store = FakeStore()
+    uid = _register(
+        owner_store, "owner-sub", "  Owner@Example.com  ",
+        admin_email="owner@example.com", owner_user_id=7,
+    )
+    assert uid == 7
+    assert owner_store.owner_links == {("google", "owner-sub"): 7}
+
+    listed = FakeStore()
+    admitted = _register(
+        listed, "sub-in", "  Allowed@Example.com  ",
+        allowed_emails=frozenset({"allowed@example.com"}),
+        admin_email="owner@example.com",
+    )
+    assert isinstance(admitted, int) and admitted != 7

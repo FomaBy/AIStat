@@ -538,11 +538,15 @@ def _place_pipe_fds(cmd_read, resp_write):
     os.set_inheritable(4, True)
 
 
-def launch_chrome(chrome=CHROME, *, clock=time.monotonic, context=None):
+def launch_chrome(chrome=CHROME, *, clock=time.monotonic, context=None,
+                  extra_args=()):
     """Start headless Chrome on a fresh, task-owned HOME/TMPDIR/profile and
     return a :class:`Cdp` bound to it. ``close()`` reaps the process and removes
     the whole throwaway tree. ``context`` is an optional caller probe (e.g. the
-    server thread's liveness) folded into a stall diagnostic."""
+    server thread's liveness) folded into a stall diagnostic. ``extra_args`` are
+    appended to Chrome's command line (e.g. ``--ignore-certificate-errors`` for
+    a loopback HTTPS fixture); the default of no extra flags keeps every
+    existing caller byte-for-byte unchanged."""
     workdir = Path(tempfile.mkdtemp(prefix="aistat-browser-"))
     home = workdir / "home"
     tmp = workdir / "tmp"
@@ -567,7 +571,7 @@ def launch_chrome(chrome=CHROME, *, clock=time.monotonic, context=None):
              # Page.navigate stall (FAN-1346).
              "--use-mock-keychain", "--password-store=basic",
              "--remote-debugging-pipe",
-             "--user-data-dir=" + str(profile), "about:blank"],
+             "--user-data-dir=" + str(profile), *extra_args, "about:blank"],
             # close_fds must stay off: the default close pass runs after
             # preexec_fn and would destroy the freshly placed fds 3/4;
             # CLOEXEC already keeps every other Python fd out of Chrome.

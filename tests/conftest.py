@@ -1,4 +1,6 @@
+import base64
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +16,36 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def load_fixture(name):
     with open(FIXTURES / name, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def assert_opaque_session_cookie(value, forbidden):
+    """Prove an ``aistat_session`` value is a bare opaque token (FAN-1392).
+
+    The value must be a single URL-safe token — no ``.`` separator, so no
+    signed/serialized envelope — and neither the raw value nor any base64
+    decoding of it may parse into a claims object or contain any of the
+    ``forbidden`` identity/CSRF strings. This is the client-visible half of the
+    "no client-authoritative auth claims" property.
+    """
+    assert value, "no session cookie value"
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", value), value
+    haystacks = [value]
+    padded = value + "=" * (-len(value) % 4)
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            haystacks.append(decoder(padded.encode("ascii")).decode("latin-1"))
+        except Exception:
+            pass
+    for candidate in haystacks:
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            parsed = None
+        assert not isinstance(parsed, (dict, list)), candidate
+    blob = "\n".join(haystacks)
+    for needle in forbidden:
+        if needle:
+            assert str(needle) not in blob, needle
 
 
 @pytest.fixture

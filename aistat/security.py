@@ -101,21 +101,54 @@ def validate_public_config(config: Config) -> None:
         )
 
 
-def csrf_token(session) -> str:
-    token = session.get("_csrf")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        session["_csrf"] = token
-    return token
+LOGIN_CSRF_TTL_SECONDS = 10 * 60
 
 
-def validate_csrf(session, candidate: Optional[str]) -> bool:
-    expected = session.get("_csrf")
-    return bool(
-        expected
-        and candidate
-        and hmac.compare_digest(str(expected), str(candidate))
-    )
+def _login_csrf_signature(secret: str, value: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        ("login:" + value).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def make_login_csrf(secret: str, now: Optional[int] = None) -> str:
+    """Mint a pre-authentication login-form CSRF token.
+
+    The login POST happens before any server-side session exists, so its CSRF
+    defence is a short-lived double-submit cookie carrying only this random,
+    signed, timestamped value — never identity. The same token is echoed in the
+    form and set as the ``aistat_login_csrf`` cookie; :func:`valid_login_csrf`
+    requires the two to match, so a cross-site form cannot forge it.
+    """
+    now = int(time.time()) if now is None else int(now)
+    value = "{}.{}".format(now, secrets.token_urlsafe(24))
+    return value + "." + _login_csrf_signature(secret, value)
+
+
+def valid_login_csrf(
+    secret: str,
+    cookie_value: Optional[str],
+    candidate: Optional[str],
+    now: Optional[int] = None,
+    max_age_seconds: int = LOGIN_CSRF_TTL_SECONDS,
+) -> bool:
+    if (
+        not candidate
+        or not cookie_value
+        or not hmac.compare_digest(str(candidate), str(cookie_value))
+    ):
+        return False
+    try:
+        timestamp, token, signature = candidate.split(".", 2)
+        timestamp_int = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    now = int(time.time()) if now is None else int(now)
+    if abs(now - timestamp_int) > max_age_seconds:
+        return False
+    expected = _login_csrf_signature(secret, timestamp + "." + token)
+    return hmac.compare_digest(expected, signature)
 
 
 def safe_next_url(candidate: Optional[str], default: str = "/") -> str:
@@ -261,7 +294,8 @@ class SecurityStore:
                     sid_hash    TEXT PRIMARY KEY,
                     user_id     INTEGER NOT NULL,
                     created_at  INTEGER NOT NULL,
-                    expires_at  INTEGER NOT NULL
+                    expires_at  INTEGER NOT NULL,
+                    csrf        TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
@@ -279,6 +313,23 @@ class SecurityStore:
             if "client_hash" not in columns:
                 conn.execute(
                     "ALTER TABLE oauth_state ADD COLUMN client_hash TEXT"
+                )
+            session_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(sessions)")
+            }
+            if "csrf" not in session_columns:
+                # Opaque server-side sessions (FAN-1392): the browser cookie is
+                # now a bare random token and the per-session CSRF secret lives
+                # in this column, never in the cookie. Any row that predates the
+                # column belongs to an old signed/structured cookie, so drop
+                # them all in the same one-time migration: those cookies must
+                # fail closed and force a fresh sign-in, not resolve through a
+                # lingering row.
+                conn.execute("DELETE FROM sessions")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN csrf TEXT NOT NULL "
+                    "DEFAULT ''"
                 )
             conn.commit()
         finally:
@@ -362,13 +413,17 @@ class SecurityStore:
     def create_session(
         self, user_id: int, ttl_seconds: int, now: Optional[int] = None
     ) -> str:
-        """Register a new server-side session and return its secret id.
+        """Register a new server-side session and return its opaque secret id.
 
+        The returned id is a fresh CSPRNG token that becomes the entire browser
+        cookie; only its hash is stored here, alongside a per-session CSRF
+        secret, so the cookie carries no identity, expiry or CSRF of its own.
         Expired rows are purged in the same transaction so the table stays
         bounded by the number of live sessions.
         """
         now = int(time.time()) if now is None else int(now)
         sid = secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(32)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -377,19 +432,52 @@ class SecurityStore:
             )
             conn.execute(
                 "INSERT INTO sessions "
-                "(sid_hash, user_id, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "(sid_hash, user_id, created_at, expires_at, csrf) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
                     session_id_hash(sid),
                     int(user_id),
                     now,
                     now + int(ttl_seconds),
+                    csrf,
                 ),
             )
             conn.commit()
         finally:
             conn.close()
         return sid
+
+    def resolve_session(
+        self, sid: Optional[str], now: Optional[int] = None
+    ) -> Optional[dict]:
+        """Resolve the authoritative server-side state behind an opaque cookie.
+
+        Returns ``{"user_id", "csrf", "expires_at"}`` for a live session, or
+        ``None`` for a missing, expired, revoked or superseded token. Only the
+        hash of the presented value is looked up, so a signed/structured cookie
+        minted before opaque sessions hashes to something that is not a stored
+        id and fails closed here — even while an old row for its inner id still
+        exists.
+        """
+        if not sid or not isinstance(sid, str):
+            return None
+        now = int(time.time()) if now is None else int(now)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT user_id, expires_at, csrf FROM sessions "
+                "WHERE sid_hash = ? AND expires_at > ?",
+                (session_id_hash(sid), now),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            "user_id": int(row["user_id"]),
+            "csrf": row["csrf"],
+            "expires_at": int(row["expires_at"]),
+        }
 
     def session_is_active(
         self, sid: Optional[str], now: Optional[int] = None
@@ -736,6 +824,102 @@ class SecurityStore:
             )
             conn.commit()
             return owner_user_id
+        finally:
+            conn.close()
+
+    def register_or_link_identity(
+        self,
+        provider: str,
+        subject: str,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        admin_email: Optional[str] = None,
+        allowed_emails=None,
+        owner_user_id: Optional[int] = None,
+        now: Optional[int] = None,
+    ) -> dict:
+        """Subject-first identity resolution with atomic first registration.
+
+        Returns ``{"user_id", "outcome"}`` where ``outcome`` is one of
+        ``"existing"`` (the subject was already registered), ``"linked_owner"``
+        (a new subject whose email is the admin email, attached to the owner),
+        ``"created"`` (a new ordinary user + identity + empty tenant), or
+        ``"denied"`` (a new subject barred by a non-empty allow list — nothing
+        is written and ``user_id`` is ``None``).
+
+        Everything a single new registration touches — the ``users`` row, its
+        ``oauth_identities`` row and its ``tenants`` registry row — is committed
+        in one ``BEGIN IMMEDIATE`` transaction, so concurrent or replayed
+        callbacks for one new subject converge on a single account/tenant and an
+        injected failure rolls the whole registration back with no partial rows.
+        The allow list gates only new subjects: an already-registered subject
+        always resolves, and an ordinary user is never merged into or elevated
+        to the owner even if its email later equals the admin email.
+        """
+        now = int(time.time()) if now is None else int(now)
+        normalized = email.strip().lower() if email else None
+        owner_email = (admin_email or "").strip().lower()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row is not None:
+                conn.commit()
+                return {"user_id": int(row["user_id"]), "outcome": "existing"}
+            # A brand-new subject. The admin email links to the pre-existing
+            # owner; the owner stays the single admin and keeps its own tenant.
+            if owner_email and owner_user_id and normalized == owner_email:
+                owner = conn.execute(
+                    "SELECT is_admin FROM users WHERE id = ?",
+                    (int(owner_user_id),),
+                ).fetchone()
+                if owner is None or int(owner["is_admin"]) != 1:
+                    conn.rollback()
+                    raise SecurityConfigError(
+                        "owner user is missing or not an admin"
+                    )
+                conn.execute(
+                    "INSERT INTO oauth_identities "
+                    "(provider, subject, user_id, email, linked_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (provider, subject, int(owner_user_id), email, now),
+                )
+                conn.commit()
+                return {
+                    "user_id": int(owner_user_id),
+                    "outcome": "linked_owner",
+                }
+            # Ordinary registration. A non-empty allow list is the only gate,
+            # and only for this first sight of the subject.
+            if allowed_emails and (
+                normalized is None or normalized not in allowed_emails
+            ):
+                conn.rollback()
+                return {"user_id": None, "outcome": "denied"}
+            cursor = conn.execute(
+                "INSERT INTO users (created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 0)",
+                (now, display_name, email),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, now),
+            )
+            conn.execute(
+                "INSERT INTO tenants "
+                "(user_id, created_at, last_ingest_timestamp) "
+                "VALUES (?, ?, 0)",
+                (user_id, now),
+            )
+            conn.commit()
+            return {"user_id": user_id, "outcome": "created"}
         finally:
             conn.close()
 

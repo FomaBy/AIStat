@@ -46,6 +46,7 @@ from urllib.request import Request, urlopen
 __all__ = [
     "OAuthProvider",
     "OAuthError",
+    "RegistrationClosedError",
     "generate_state",
     "generate_client_token",
     "is_valid_client_token",
@@ -53,9 +54,10 @@ __all__ = [
     "build_authorize_url",
     "exchange_code",
     "fetch_identity",
+    "normalize_email",
     "begin",
     "finish",
-    "owner_only_identity",
+    "open_registration_identity",
     "providers_from_env",
     "allowed_emails_from_env",
     "is_email_authorized",
@@ -67,6 +69,27 @@ HTTP_TIMEOUT_SECONDS = 10
 MAX_RESPONSE_BYTES = 256 * 1024
 USER_AGENT = "AIStat-OAuth/1.0"
 _CLIENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+# A deliberately strict, provider-agnostic ASCII address grammar used as the
+# single fail-closed boundary before any account row is written. It gates open
+# registration, so an exotic, non-ASCII or forged address fails closed rather
+# than creating a half-identified account. IDN/EAI is explicitly out of scope
+# and fails closed with everything else non-ASCII.
+#
+# ``RFC 5321/5322`` unquoted ``atext``: ASCII letters, digits and a fixed set of
+# punctuation. The quoted-string and comment local-part forms are deliberately
+# excluded, so only a plain dot-atom local part is accepted.
+_LOCAL_ATEXT = r"A-Za-z0-9!#$%&'*+/=?^_`{|}~-"
+# A dot-atom local part: one or more ``atext`` atoms joined by single dots, with
+# no empty, leading, trailing or consecutive dots.
+_LOCAL_RE = re.compile(
+    r"[" + _LOCAL_ATEXT + r"]+(?:\.[" + _LOCAL_ATEXT + r"]+)*"
+)
+# A single LDH domain label: 1–63 ASCII letters/digits/hyphens with no leading
+# or trailing hyphen.
+_DOMAIN_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# RFC 5321 length ceilings: the whole stored address and the local part.
+MAX_EMAIL_LENGTH = 254
+MAX_LOCAL_LENGTH = 64
 
 
 class OAuthError(Exception):
@@ -74,6 +97,18 @@ class OAuthError(Exception):
 
     The message is intentionally coarse; callers surface a generic error to the
     user and never echo provider responses or secrets.
+    """
+
+
+class RegistrationClosedError(OAuthError):
+    """Raised when a *new* verified identity is not permitted to register.
+
+    Distinct from the generic :class:`OAuthError` so a contour can show the
+    dedicated, non-secret "registration is closed" page for a rejected new user
+    instead of the generic provider-error page. It is only ever raised for an
+    unseen ``(provider, subject)``: an already-registered subject always signs
+    in, whatever the current allow list. The message never reveals whether an
+    email is on any list.
     """
 
 
@@ -307,6 +342,65 @@ def fetch_identity(
     return str(subject), email, email_verified, display_name
 
 
+def normalize_email(email) -> Optional[str]:
+    """Return the canonical provider email, or ``None`` if unusable.
+
+    This is the single, shared fail-closed boundary for a provider-supplied
+    email, applied identically by both WSGI contours before any account-store
+    call. It enforces one deterministic, conservative ASCII policy:
+
+    * the value must be a ``str``; only outer ``U+0020`` SPACE is trimmed (tabs,
+      newlines and every other control are structural rejects, never silently
+      stripped);
+    * the whole stored address is capped at 254 characters and must be pure
+      ASCII — this rejects IDN/EAI, C1 controls (``U+0080``–``U+009F``) and
+      Unicode format/bidi controls such as ``U+200B``/``U+202E`` in one step;
+    * any remaining C0 control or ``DEL`` is rejected;
+    * there must be exactly one ``@``; the local part is a 1–64 character RFC
+      unquoted dot-atom (``atext`` atoms joined by single dots, with no empty,
+      leading, trailing or consecutive dots); the domain is two or more LDH
+      labels, each 1–63 characters with no leading or trailing hyphen.
+
+    ``None``, a non-``str``, an empty, whitespace-only, control-bearing,
+    non-ASCII or otherwise structurally malformed value all yield ``None`` so
+    the caller can reject the login before any user/identity/tenant/session row
+    is written — even when the provider marked the email verified.
+
+    A usable value is returned with only outer ``U+0020`` trimmed and its case
+    preserved for storage, while allow-list and owner comparison stay
+    case-insensitive, so the canonical form is stable across logins.
+    """
+    if not isinstance(email, str):
+        return None
+    # Trim only outer U+0020 SPACE. Tab/newline/other whitespace is not a
+    # harmless pad here — it fails closed below as a control character.
+    trimmed = email.strip(" ")
+    if not trimmed or len(trimmed) > MAX_EMAIL_LENGTH:
+        return None
+    # ASCII-only in a single check: this rejects all non-ASCII at once —
+    # IDN/EAI, C1 controls (U+0080–U+009F, e.g. U+0081) and Unicode
+    # format/bidi controls (e.g. U+200B, U+202E) — none of which are usable.
+    try:
+        trimmed.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    # Reject any remaining C0 control or DEL (an interior tab/newline, or a
+    # leading/trailing control that survived the space-only trim).
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed):
+        return None
+    if trimmed.count("@") != 1:
+        return None
+    local, domain = trimmed.split("@", 1)
+    if not local or len(local) > MAX_LOCAL_LENGTH or not _LOCAL_RE.fullmatch(local):
+        return None
+    labels = domain.split(".")
+    if len(labels) < 2 or not all(
+        _DOMAIN_LABEL_RE.fullmatch(label) for label in labels
+    ):
+        return None
+    return trimmed
+
+
 def begin(store, provider: "OAuthProvider", next_url, client_token, now=None) -> str:
     """Start a login: mint a one-time ``state``, persist it, return the URL.
 
@@ -358,9 +452,10 @@ def finish(
     ``resolve_identity(subject, email, email_verified, display_name) -> int`` is
     the account policy. It runs *after* the identity is known and may raise
     :class:`OAuthError` to reject the login before any account row is written
-    (for example, the owner-only policy in :func:`owner_only_identity`). When it
-    is ``None`` the identity is linked or created unconditionally via the
-    store's ``find_or_create_user_by_identity`` (legacy open behaviour).
+    (for example, the open-registration policy in
+    :func:`open_registration_identity`). When it is ``None`` the identity is
+    linked or created unconditionally via the store's
+    ``find_or_create_user_by_identity`` (legacy open behaviour).
 
     Returns ``{"user_id", "email", "display_name", "next_url"}``. Raises
     :class:`OAuthError` on any failure. Establishing a session and deciding
@@ -403,13 +498,17 @@ def finish(
         user_id = resolve_identity(subject, email, email_verified, display_name)
     return {
         "user_id": user_id,
-        "email": email,
+        # Surface the canonical trimmed email (when the address is usable) so the
+        # session a contour establishes carries the same form that was stored,
+        # never provider whitespace. A ``None``/absent email (legacy open path)
+        # is preserved as-is.
+        "email": normalize_email(email) or email,
         "display_name": display_name,
         "next_url": record.get("next_url") or "/",
     }
 
 
-def owner_only_identity(
+def open_registration_identity(
     store,
     provider_name,
     subject,
@@ -420,41 +519,59 @@ def owner_only_identity(
     admin_email,
     owner_user_id,
 ):
-    """Owner-only sign-in policy, applied identically by both WSGI contours.
+    """Open-registration sign-in policy, applied identically by both contours.
 
-    A provider callback is accepted only when it carries a *verified* email that
-    equals the configured owner email (``AISTAT_ADMIN_EMAIL``); when an allow
-    list is configured, the email must also appear on it. The identity is linked
-    to the pre-existing owner account and never creates a new user, so open
-    registration stays off and the owner always lands on the owner tenant. Any
-    failed check raises :class:`OAuthError` *before* an account row could be
-    written, so a non-owner login leaves no trace.
+    Identity resolution is *subject-first*: an already-registered
+    ``(provider, subject)`` always maps back to the same AIStat user, regardless
+    of a later email change or any allow-list change, and is never merged or
+    elevated. Only a brand-new subject is subjected to policy:
+
+    * a verified email equal to the configured admin email
+      (``AISTAT_ADMIN_EMAIL``) links to the pre-existing owner account — the
+      owner stays the single admin and keeps its password login and tenant;
+    * any other new subject registers a fresh ordinary user (``is_admin=0``)
+      together with its own identity and empty tenant, in one atomic
+      transaction. When an allow list is configured the email must match it
+      (case-insensitive); an empty allow list admits any verified user.
+
+    Every callback must carry a structurally valid, provider-*verified* email.
+    The address is normalized once here (:func:`normalize_email`) before any
+    account-store call, so ``None``, empty, whitespace-only, control-character
+    and malformed values fail closed — even when ``email_verified`` is true —
+    and the store only ever sees the canonical trimmed form. A new subject that
+    is neither the owner nor allow-listed is rejected with
+    :class:`RegistrationClosedError` and writes no user, identity, tenant or
+    session row. Any store-level anomaly fails the login closed rather than
+    surfacing a 500 on the public callback.
     """
-    if not email:
-        raise OAuthError("provider returned no email")
+    normalized_email = normalize_email(email)
+    if normalized_email is None:
+        # None, empty, whitespace-only, control-character-only, non-string or
+        # structurally malformed: fail closed before any row is written.
+        raise OAuthError("provider returned no usable email")
     if email_verified is not True:
         raise OAuthError("provider email is not verified")
-    normalized = email.strip().lower()
-    owner_email = (admin_email or "").strip().lower()
-    if not owner_email:
-        raise OAuthError("owner email is not configured")
-    if normalized != owner_email:
-        raise OAuthError("email is not permitted to sign in")
-    if allowed_emails and normalized not in allowed_emails:
-        raise OAuthError("email is not on the allow list")
-    if not owner_user_id:
-        raise OAuthError("owner account is not initialised")
     try:
-        return store.link_identity_to_owner(
-            provider_name, subject, int(owner_user_id), email=email
+        result = store.register_or_link_identity(
+            provider_name,
+            subject,
+            email=normalized_email,
+            display_name=display_name,
+            admin_email=admin_email,
+            allowed_emails=allowed_emails,
+            owner_user_id=owner_user_id,
         )
     except OAuthError:
         raise
     except Exception:
-        # A store-level anomaly (identity already linked to a different user, or
-        # a missing owner row) must fail the login closed, never 500 the public
-        # callback.
-        raise OAuthError("owner identity linking failed")
+        # A store-level anomaly (identity already linked elsewhere, a missing
+        # owner row, a write failure) must fail the login closed.
+        raise OAuthError("account registration failed")
+    user_id = result.get("user_id") if result else None
+    if user_id is None:
+        # A new subject that is neither the owner nor permitted to register.
+        raise RegistrationClosedError("registration is closed")
+    return int(user_id)
 
 
 _PROVIDER_FIELDS = (
@@ -501,11 +618,14 @@ def providers_from_env(environ) -> dict:
 
 
 def allowed_emails_from_env(environ) -> frozenset:
-    """Return the lower-cased set of emails allowed to access private data.
+    """Return the lower-cased registration allow list.
 
-    Fail-closed: an unset or empty ``AISTAT_OAUTH_ALLOWED_EMAILS`` yields an
-    empty set, so a successful OAuth login authenticates an identity but grants
-    no access to private statistics until an operator lists it.
+    This gates only the *first* registration of a new provider subject (see
+    :func:`open_registration_identity`): an unset or empty
+    ``AISTAT_OAUTH_ALLOWED_EMAILS`` yields an empty set, which means **open**
+    registration — any verified user may register — while a non-empty set
+    restricts new registrations to the listed emails. It never blocks an
+    already-registered account.
     """
     raw = environ.get("AISTAT_OAUTH_ALLOWED_EMAILS") or ""
     return frozenset(

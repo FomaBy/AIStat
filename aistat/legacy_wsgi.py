@@ -5,13 +5,12 @@ with a package index capped at Flask 2.0.3. This entry point deliberately uses
 only the Python 3.6 standard library, while preserving the security contract of
 the modern Flask WSGI app:
 
-* signed HttpOnly/Secure/SameSite sessions;
+* opaque HttpOnly/Secure/SameSite sessions resolved server-side;
 * CSRF-protected login/logout and persistent login throttling;
 * strict Host/HTTPS checks and browser security headers;
 * HMAC-authenticated, replay-protected, atomic SQLite snapshot ingestion.
 """
 
-import base64
 import fcntl
 import gzip
 import hashlib
@@ -231,7 +230,8 @@ def _bootstrap():
                 sid_hash    TEXT PRIMARY KEY,
                 user_id     INTEGER NOT NULL,
                 created_at  INTEGER NOT NULL,
-                expires_at  INTEGER NOT NULL
+                expires_at  INTEGER NOT NULL,
+                csrf        TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -244,6 +244,19 @@ def _bootstrap():
         }
         if "client_hash" not in columns:
             conn.execute("ALTER TABLE oauth_state ADD COLUMN client_hash TEXT")
+        session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        if "csrf" not in session_columns:
+            # Opaque server-side sessions (FAN-1392): the cookie is now a bare
+            # random token and the per-session CSRF secret lives in this column.
+            # Any pre-migration row belongs to an old signed/structured cookie,
+            # so drop them all here (one time) — those cookies fail closed and
+            # force a fresh sign-in instead of resolving through a stale row.
+            conn.execute("DELETE FROM sessions")
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN csrf TEXT NOT NULL DEFAULT ''"
+            )
         admins = conn.execute(
             "SELECT id FROM users WHERE is_admin = 1 ORDER BY id"
         ).fetchall()
@@ -318,15 +331,6 @@ _validate_config()
 OWNER_USER_ID = _bootstrap()
 
 
-def _b64encode(data):
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _b64decode(value):
-    value += "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value.encode("ascii"))
-
-
 def _sign(data, secret):
     return hmac.new(
         secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
@@ -362,16 +366,24 @@ def _session_id_hash(sid):
 
 
 def _create_session_record(user_id, expires_at, now=None):
+    """Insert one opaque session and return its secret id.
+
+    The id becomes the whole browser cookie; only its hash is stored, next to a
+    fresh per-session CSRF secret, so the cookie carries no identity, expiry or
+    CSRF of its own.
+    """
     now = int(time.time()) if now is None else int(now)
     sid = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32)
     conn = _security_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
         conn.execute(
-            "INSERT INTO sessions (sid_hash, user_id, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?)",
-            (_session_id_hash(sid), int(user_id), now, int(expires_at)),
+            "INSERT INTO sessions "
+            "(sid_hash, user_id, created_at, expires_at, csrf) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (_session_id_hash(sid), int(user_id), now, int(expires_at), csrf),
         )
         conn.commit()
     finally:
@@ -379,19 +391,29 @@ def _create_session_record(user_id, expires_at, now=None):
     return sid
 
 
-def _session_is_active(sid, now=None):
+def _resolve_session_record(sid, now=None):
+    """Authoritative server-side state behind an opaque cookie, or ``None``.
+
+    Returns ``{"uid", "csrf"}`` for a live session; ``None`` for a missing,
+    expired, revoked or superseded token. Only the hash of the presented value
+    is looked up, so an old signed/structured cookie hashes to a non-id and
+    fails closed here even while a row for its inner id still lives.
+    """
     if not sid or not isinstance(sid, str):
-        return False
+        return None
     now = int(time.time()) if now is None else int(now)
     conn = _security_connection()
     try:
         row = conn.execute(
-            "SELECT 1 FROM sessions WHERE sid_hash = ? AND expires_at > ?",
+            "SELECT user_id, csrf FROM sessions "
+            "WHERE sid_hash = ? AND expires_at > ?",
             (_session_id_hash(sid), now),
         ).fetchone()
     finally:
         conn.close()
-    return row is not None
+    if row is None:
+        return None
+    return {"uid": int(row[0]), "csrf": row[1]}
 
 
 def _revoke_session(sid):
@@ -409,78 +431,47 @@ def _revoke_session(sid):
 
 
 def _make_session():
+    """Create the owner password session; return its opaque cookie value."""
     now = int(time.time())
-    expires_at = now + SESSION_SECONDS
-    payload = {
-        "u": ADMIN_USERNAME,
-        "uid": OWNER_USER_ID,
-        "sid": _create_session_record(OWNER_USER_ID, expires_at, now),
-        "exp": expires_at,
-        "csrf": secrets.token_urlsafe(32),
-    }
-    encoded = _b64encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
-    return encoded + "." + _sign(encoded, SESSION_SECRET), payload
+    return _create_session_record(OWNER_USER_ID, now + SESSION_SECONDS, now)
 
 
 def _make_oauth_session(user_id, email, provider):
+    """Create an OAuth login session; return its opaque cookie value.
+
+    ``email``/``provider`` are accepted for call-site symmetry but never enter
+    the cookie or a session row: identity is resolved from ``user_id`` alone.
+    """
     now = int(time.time())
-    expires_at = now + SESSION_SECONDS
-    payload = {
-        "uid": int(user_id),
-        "email": email,
-        "provider": provider,
-        "sid": _create_session_record(user_id, expires_at, now),
-        "exp": expires_at,
-        "csrf": secrets.token_urlsafe(32),
-    }
-    encoded = _b64encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
-    return encoded + "." + _sign(encoded, SESSION_SECRET), payload
+    return _create_session_record(int(user_id), now + SESSION_SECONDS, now)
 
 
 def _read_session(environ):
+    """Resolve this request's opaque cookie to server-side session state.
+
+    The cookie value is the whole token; an old signed/structured cookie hashes
+    to a non-id and returns ``None`` here (fail closed), even while a row for
+    its inner id still exists.
+    """
     value = _cookies(environ).get("aistat_session")
-    if not value or "." not in value:
+    if not value:
         return None
-    encoded, signature = value.rsplit(".", 1)
-    if not hmac.compare_digest(_sign(encoded, SESSION_SECRET), signature):
+    record = _resolve_session_record(value)
+    if record is None:
         return None
-    try:
-        payload = json.loads(_b64decode(encoded).decode("utf-8"))
-    except Exception:
-        return None
-    if int(payload.get("exp", 0)) < time.time():
-        return None
-    # Pre-revocation cookies carry no server-side id and fail closed here.
-    if not _session_is_active(payload.get("sid")):
-        return None
-    return payload
-
-
-def _email_authorized(email):
-    return oauth.is_email_authorized(OAUTH_ALLOWED_EMAILS, email)
+    return {"sid": value, "uid": record["uid"], "csrf": record["csrf"]}
 
 
 def _session_grants_access(payload):
     """Whether a valid session may reach private data (fail-closed for OAuth).
 
-    The admin password session is unchanged. An OAuth session is honoured only
-    while its email stays on the allow-list, so de-listing revokes access on the
-    next request.
+    Registration is the gate now: an OAuth subject reaches a session only after
+    it was admitted at the callback, and the owner password session is created
+    directly, so any live session carrying a user id is honoured. The allow
+    list is not re-checked per request, so de-listing an email cannot revoke an
+    already registered user before its server-side session expires.
     """
-    if not payload:
-        return False
-    if payload.get("u") == ADMIN_USERNAME:
-        return True
-    uid = payload.get("uid")
-    if uid and OWNER_USER_ID is not None and int(uid) == OWNER_USER_ID:
-        return True
-    if uid and _email_authorized(payload.get("email")):
-        return True
-    return False
+    return bool(payload and payload.get("uid") is not None)
 
 
 def _make_login_csrf():
@@ -809,6 +800,86 @@ class _LegacyOAuthStore(object):
         finally:
             conn.close()
 
+    def register_or_link_identity(
+        self,
+        provider,
+        subject,
+        email=None,
+        display_name=None,
+        admin_email=None,
+        allowed_emails=None,
+        owner_user_id=None,
+        now=None,
+    ):
+        """Subject-first resolution + atomic first registration.
+
+        Mirrors ``SecurityStore.register_or_link_identity`` byte-for-byte in
+        behaviour so the Python 3.6 cPanel contour registers, links and gates
+        identically. Returns ``{"user_id", "outcome"}`` with ``outcome`` in
+        ``existing`` / ``linked_owner`` / ``created`` / ``denied``; a denied new
+        subject writes nothing and yields ``user_id`` ``None``.
+        """
+        now = int(time.time()) if now is None else int(now)
+        normalized = email.strip().lower() if email else None
+        owner_email = (admin_email or "").strip().lower()
+        conn = _security_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row is not None:
+                conn.commit()
+                return {"user_id": int(row["user_id"]), "outcome": "existing"}
+            if owner_email and owner_user_id and normalized == owner_email:
+                owner = conn.execute(
+                    "SELECT is_admin FROM users WHERE id = ?",
+                    (int(owner_user_id),),
+                ).fetchone()
+                if owner is None or int(owner["is_admin"]) != 1:
+                    conn.rollback()
+                    raise RuntimeError("owner user is missing or not an admin")
+                conn.execute(
+                    "INSERT INTO oauth_identities "
+                    "(provider, subject, user_id, email, linked_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (provider, subject, int(owner_user_id), email, now),
+                )
+                conn.commit()
+                return {
+                    "user_id": int(owner_user_id),
+                    "outcome": "linked_owner",
+                }
+            if allowed_emails and (
+                normalized is None or normalized not in allowed_emails
+            ):
+                conn.rollback()
+                return {"user_id": None, "outcome": "denied"}
+            cursor = conn.execute(
+                "INSERT INTO users (created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 0)",
+                (now, display_name, email),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, now),
+            )
+            conn.execute(
+                "INSERT INTO tenants "
+                "(user_id, created_at, last_ingest_timestamp) "
+                "VALUES (?, ?, 0)",
+                (user_id, now),
+            )
+            conn.commit()
+            return {"user_id": user_id, "outcome": "created"}
+        finally:
+            conn.close()
+
 
 def _secure_headers(environ):
     headers = [
@@ -994,7 +1065,7 @@ def _render_login(csrf, next_url, error=None):
             '<div class="oauth-divider">или</div>'
             '<a class="oauth-button" href="{url}">'
             '<span class="g-mark" aria-hidden="true">G</span>'
-            "Войти через Google</a>"
+            "Войти / зарегистрироваться через Google</a>"
         ).format(url=html.escape(google_url, quote=True))
     return """<!DOCTYPE html>
 <html lang="ru">
@@ -1039,27 +1110,30 @@ def _render_login(csrf, next_url, error=None):
     )
 
 
-def _render_oauth_pending(email):
+def _render_registration_closed():
+    """Non-secret page for a new user who may not register.
+
+    Reveals no email or allow-list detail; a rejected new subject never reaches
+    a session.
+    """
     return """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <title>Нет доступа — AIStat</title>
+  <title>Регистрация закрыта — AIStat</title>
   <link rel="stylesheet" href="/login.css">
 </head>
 <body>
   <main class="login-shell">
     <section class="login-card">
       <h1>AIStat</h1>
-      <p class="subtitle">Вход выполнен как {email}, но у аккаунта пока нет
-      доступа к статистике. Обратитесь к администратору.</p>
-      <p><a href="/login">Войти как администратор</a></p>
+      <p class="subtitle">Регистрация сейчас закрыта. Чтобы получить доступ,
+      обратитесь к администратору.</p>
+      <p><a href="/login">Вернуться ко входу</a></p>
     </section>
   </main>
 </body>
-</html>""".format(
-        email=html.escape(email or "—")
-    )
+</html>"""
 
 
 def _oauth(environ, start_response, path):
@@ -1104,7 +1178,7 @@ def _oauth(environ, start_response, path):
     }
 
     def resolve_identity(subject, email, email_verified, display_name):
-        return oauth.owner_only_identity(
+        return oauth.open_registration_identity(
             store,
             parts[1],
             subject,
@@ -1119,6 +1193,16 @@ def _oauth(environ, start_response, path):
     try:
         result = oauth.finish(
             store, provider, params, client_token, resolve_identity
+        )
+    except oauth.RegistrationClosedError:
+        # A new subject that is not the owner and not allow-listed: no session
+        # is created, and the page reveals no allow-list detail.
+        return _respond(
+            environ,
+            start_response,
+            "403 Forbidden",
+            _render_registration_closed(),
+            "text/html; charset=utf-8",
         )
     except oauth.OAuthError:
         csrf = _make_login_csrf()
@@ -1137,27 +1221,17 @@ def _oauth(environ, start_response, path):
             "text/html; charset=utf-8",
             headers,
         )
-    session_value, _payload = _make_oauth_session(
+    # Registration/link succeeded, so access is granted by the active session
+    # alone — there is no second, request-time allow-list gate.
+    # Rotate the incoming session so a re-auth invalidates the old token.
+    _revoke_session(_cookies(environ).get("aistat_session"))
+    session_value = _make_oauth_session(
         result["user_id"], result["email"], parts[1]
     )
     set_cookie = (
         "Set-Cookie",
         _cookie_header("aistat_session", session_value, SESSION_SECONDS),
     )
-    # The owner's linked login always reaches data; other identities are gated
-    # by the allow-list. Mirrors _session_grants_access and the Flask contour.
-    owner_linked = (
-        OWNER_USER_ID is not None and int(result["user_id"]) == OWNER_USER_ID
-    )
-    if not owner_linked and not _email_authorized(result["email"]):
-        return _respond(
-            environ,
-            start_response,
-            "403 Forbidden",
-            _render_oauth_pending(result["email"]),
-            "text/html; charset=utf-8",
-            [set_cookie],
-        )
     next_url = _safe_next(result["next_url"])
     return _respond(
         environ,
@@ -1362,7 +1436,11 @@ def _login(environ, start_response):
             headers,
         )
     _clear_login_failures(key)
-    session_value, _payload = _make_session()
+    # Rotate: a re-auth from this browser invalidates its own previous token
+    # server-side (captured pre-rotation cookies replay dead), while a parallel
+    # session for the same user in another browser stays live.
+    _revoke_session(_cookies(environ).get("aistat_session"))
+    session_value = _make_session()
     headers = [
         ("Location", next_url),
         (

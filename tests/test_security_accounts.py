@@ -138,6 +138,49 @@ def test_old_oauth_state_schema_is_migrated_fail_closed(tmp_path):
     }
 
 
+def test_old_sessions_schema_migrates_and_purges_pre_opaque_rows(tmp_path):
+    # FAN-1392: an old sessions table (no csrf column) with a live row. The
+    # one-time migration adds the column and drops every pre-opaque row, so a
+    # cookie carrying that old inner id can never resolve after the upgrade —
+    # while fresh opaque sessions then persist across restarts unpurged.
+    path = tmp_path / "security.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "sid_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, "
+            "created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (sid_hash, user_id, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id_hash("legacy-sid"), 7, 100, 10 ** 12),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = SecurityStore(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "csrf" in columns
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert store.resolve_session("legacy-sid") is None
+
+    sid = store.create_session(7, ttl_seconds=3600, now=1000)
+    assert store.resolve_session(sid, now=1001)["user_id"] == 7
+    # A second worker start must not re-purge live sessions.
+    restarted = SecurityStore(path)
+    resolved = restarted.resolve_session(sid, now=1002)
+    assert resolved["user_id"] == 7
+    assert resolved["csrf"]
+
+
 def test_old_schema_migration_is_safe_under_concurrent_startup(tmp_path):
     path = tmp_path / "security.db"
     conn = sqlite3.connect(str(path))
@@ -199,6 +242,212 @@ def test_session_lifecycle_revocation_and_expiry(tmp_path):
     assert not store.session_is_active(12345, now=1050)
     store.revoke_session(None)
     store.revoke_session(12345)
+
+
+def _counts(store):
+    conn = store._connect()
+    try:
+        return {
+            "users": conn.execute(
+                "SELECT COUNT(*) AS n FROM users"
+            ).fetchone()["n"],
+            "identities": conn.execute(
+                "SELECT COUNT(*) AS n FROM oauth_identities"
+            ).fetchone()["n"],
+            "tenants": conn.execute(
+                "SELECT COUNT(*) AS n FROM tenants"
+            ).fetchone()["n"],
+        }
+    finally:
+        conn.close()
+
+
+def test_register_creates_user_identity_and_tenant_atomically(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    result = store.register_or_link_identity(
+        "google", "sub-1", email="new@example.com", display_name="New",
+        admin_email="owner@example.com", allowed_emails=frozenset(),
+        owner_user_id=None, now=100,
+    )
+    assert result["outcome"] == "created"
+    user_id = result["user_id"]
+    # exactly one user (ordinary), one identity and one tenant row exist
+    assert _counts(store) == {"users": 1, "identities": 1, "tenants": 1}
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        tenant = conn.execute(
+            "SELECT user_id FROM tenants WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert int(row["is_admin"]) == 0
+    assert tenant is not None
+
+
+def test_register_is_subject_first_and_ignores_email_and_allowlist(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    first = store.register_or_link_identity(
+        "google", "sub-1", email="a@example.com", allowed_emails=frozenset(),
+        now=100,
+    )
+    assert first["outcome"] == "created"
+    # a later login with a changed email keeps the same account, no new rows
+    again = store.register_or_link_identity(
+        "google", "sub-1", email="b@example.com",
+        allowed_emails=frozenset({"only@else.com"}), now=200,
+    )
+    assert again == {"user_id": first["user_id"], "outcome": "existing"}
+    assert _counts(store) == {"users": 1, "identities": 1, "tenants": 1}
+
+
+def test_register_ordinary_subject_is_never_elevated_to_owner(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    owner = store.ensure_owner_user("sergey", email="owner@example.com", now=10)
+    ordinary = store.register_or_link_identity(
+        "google", "sub-1", email="person@example.com",
+        admin_email="owner@example.com", allowed_emails=frozenset(),
+        owner_user_id=owner, now=100,
+    )
+    assert ordinary["user_id"] != owner
+    # the same subject later presents the admin email: subject-first means it
+    # stays its own ordinary account, never merged into or elevated to the owner
+    again = store.register_or_link_identity(
+        "google", "sub-1", email="owner@example.com",
+        admin_email="owner@example.com", allowed_emails=frozenset(),
+        owner_user_id=owner, now=200,
+    )
+    assert again == {"user_id": ordinary["user_id"], "outcome": "existing"}
+    conn = store._connect()
+    try:
+        is_admin = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (ordinary["user_id"],)
+        ).fetchone()["is_admin"]
+        admins = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE is_admin = 1"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert int(is_admin) == 0
+    assert int(admins) == 1
+
+
+def test_register_links_new_admin_subject_to_owner_without_new_tenant(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    owner = store.ensure_owner_user("sergey", email="owner@example.com", now=10)
+    linked = store.register_or_link_identity(
+        "google", "owner-sub", email="Owner@Example.com",
+        admin_email="owner@example.com", allowed_emails=frozenset(),
+        owner_user_id=owner, now=100,
+    )
+    assert linked == {"user_id": owner, "outcome": "linked_owner"}
+    # no ordinary user was created, and no tenant row was minted for the owner
+    # by the link (the owner keeps whatever tenant it already had — none here)
+    assert _counts(store) == {"users": 1, "identities": 1, "tenants": 0}
+
+
+def test_register_denies_new_outsider_under_nonempty_allowlist(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    denied = store.register_or_link_identity(
+        "google", "sub-out", email="stranger@example.com",
+        admin_email="owner@example.com",
+        allowed_emails=frozenset({"allowed@example.com"}), now=100,
+    )
+    assert denied == {"user_id": None, "outcome": "denied"}
+    # nothing at all was written for the rejected subject
+    assert _counts(store) == {"users": 0, "identities": 0, "tenants": 0}
+    # a normalized, allow-listed email does register
+    ok = store.register_or_link_identity(
+        "google", "sub-in", email="Allowed@Example.com",
+        admin_email="owner@example.com",
+        allowed_emails=frozenset({"allowed@example.com"}), now=100,
+    )
+    assert ok["outcome"] == "created"
+
+
+def test_register_stores_canonical_email_and_matches_allowlist_case_insensitively(
+    tmp_path,
+):
+    store = SecurityStore(tmp_path / "security.db")
+    # the policy hands the store an already-canonical (trimmed) address; the
+    # store persists it verbatim and its allow-list match is case-insensitive
+    result = store.register_or_link_identity(
+        "google", "sub-pad", email="New@Example.com",
+        admin_email="owner@example.com",
+        allowed_emails=frozenset({"new@example.com"}), now=100,
+    )
+    assert result["outcome"] == "created"
+    conn = store._connect()
+    try:
+        user_email = conn.execute(
+            "SELECT email FROM users WHERE id = ?", (result["user_id"],)
+        ).fetchone()["email"]
+        id_email = conn.execute(
+            "SELECT email FROM oauth_identities WHERE subject = ?", ("sub-pad",)
+        ).fetchone()["email"]
+    finally:
+        conn.close()
+    assert user_email == "New@Example.com"
+    assert id_email == "New@Example.com"
+
+
+def test_register_concurrent_new_subject_yields_one_account(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+
+    def register(_index):
+        return store.register_or_link_identity(
+            "google", "race-sub", email="race@example.com",
+            allowed_emails=frozenset(), now=100,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(register, range(8)))
+
+    user_ids = {r["user_id"] for r in results}
+    assert len(user_ids) == 1
+    # exactly one callback created the account; every other one saw it existing
+    outcomes = sorted(r["outcome"] for r in results)
+    assert outcomes.count("created") == 1
+    assert set(outcomes) <= {"created", "existing"}
+    # exactly one user, identity and tenant survived the concurrent callbacks
+    assert _counts(store) == {"users": 1, "identities": 1, "tenants": 1}
+
+
+class _FailingConnection:
+    """Wraps a real connection and raises on a chosen statement."""
+
+    def __init__(self, real, fail_fragment):
+        self._real = real
+        self._fail_fragment = fail_fragment
+
+    def execute(self, sql, *args):
+        if self._fail_fragment in sql:
+            raise sqlite3.OperationalError("injected failure")
+        return self._real.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_register_injected_failure_rolls_back_completely(tmp_path):
+    store = SecurityStore(tmp_path / "security.db")
+    real = store._connect()
+    failing = _FailingConnection(real, "INSERT INTO tenants")
+    # the user and identity inserts run, then the tenant insert fails mid
+    # transaction; the whole registration must roll back with no partial rows
+    original_connect = store._connect
+    store._connect = lambda: failing
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.register_or_link_identity(
+                "google", "sub-x", email="x@example.com",
+                allowed_emails=frozenset(), now=100,
+            )
+    finally:
+        store._connect = original_connect
+    assert _counts(store) == {"users": 0, "identities": 0, "tenants": 0}
 
 
 def test_sessions_store_only_hashes_and_purge_expired_rows(tmp_path):

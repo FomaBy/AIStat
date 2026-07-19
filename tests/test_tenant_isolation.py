@@ -88,21 +88,18 @@ def _flask_make_tenant_b(config):
 def _flask_authorize_session(client, config, user_id, email):
     """Attach an authorised server-side session for ``user_id`` to ``client``.
 
-    Mirrors what a real OAuth callback establishes (user_id + allow-listed
-    email + a live server-side session id) so a *second* tenant identity can be
-    exercised even though the production OAuth policy is owner-only.
+    Mirrors what a real OAuth callback establishes: a live server-side session
+    row keyed by the hash of one opaque token, and that token as the whole
+    ``aistat_session`` cookie. No identity is placed in the cookie itself, so a
+    *second* tenant identity is exercised exactly as production resolves it —
+    from the server-side record alone.
     """
     store = SecurityStore(config.security_db_path)
     sid = store.create_session(user_id, 3600)
     config.oauth_allowed_emails = frozenset(
         set(config.oauth_allowed_emails) | {email}
     )
-    with client.session_transaction(base_url="https://localhost") as sess:
-        sess["user_id"] = user_id
-        sess["email"] = email
-        sess["provider"] = "google"
-        sess["sid"] = sid
-        sess.permanent = True
+    client.set_cookie("aistat_session", sid)
 
 
 def test_flask_fuzz_params_never_change_owner_tenant(public_app):
