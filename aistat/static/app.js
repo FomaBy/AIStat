@@ -140,6 +140,13 @@ const state = {
   lastSyncMarker: null,
   syncPollTimer: null,
   focusSyncTimer: null,
+  connection: null,
+  connectionSupported: true,
+  connectionBusy: false,
+  connectionReplacing: false,
+  connectionPollTimer: null,
+  connectionPollGeneration: 0,
+  connectionPollDeadline: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -194,6 +201,364 @@ async function fetchJSON(url) {
   }
   if (!resp.ok) throw new Error(`${url} → HTTP ${resp.status}`);
   return resp.json();
+}
+
+// ---------- personal Multica connection cabinet ----------
+
+const CONNECTION_POLL_INTERVAL_MS = 1500;
+const CONNECTION_POLL_TIMEOUT_MS = 60000;
+const CONNECTION_PENDING_STATES = new Set([
+  "pending", "replacement_pending", "revocation_pending",
+]);
+const CONNECTION_STATES = new Set([
+  "none", "disabled", "pending", "replacement_pending", "active",
+  "error", "revocation_pending", "revoked",
+]);
+const CONNECTION_STATE_LABELS = {
+  none: "не подключён",
+  disabled: "недоступно",
+  pending: "ожидает синхронизации",
+  replacement_pending: "замена ожидает синхронизации",
+  active: "подключено",
+  error: "ошибка синхронизации",
+  revocation_pending: "отключение выполняется",
+  revoked: "отозвано",
+};
+const CONNECTION_STATE_TITLES = {
+  none: "Multica не подключён",
+  disabled: "Подключение Multica недоступно",
+  pending: "Подключение ожидает синхронизации",
+  replacement_pending: "Замена PAT ожидает синхронизации",
+  active: "Multica подключён",
+  error: "Не удалось синхронизировать Multica",
+  revocation_pending: "Отключение Multica выполняется",
+  revoked: "Подключение Multica отозвано",
+};
+const SAFE_CONNECTION_ERRORS = new Set([
+  "worker collection failed",
+  "authentication with the connection's token failed",
+  "official CLI login failed for the connection",
+  "could not list the connection's workspaces",
+  "the connection's token has no accessible workspace",
+  "the connection's token has multiple workspaces but none was selected",
+  "the connection's workspace label is ambiguous",
+  "the connection's workspace could not be resolved",
+  "workspace was not selected before polling",
+  "could not read the connection's workspace data",
+  "connection collection failed",
+  "polling the connection's data failed",
+  "publishing the connection's snapshot failed",
+  "connection was revoked",
+  "poll source failed",
+  "issue details synchronization failed",
+]);
+
+function connectionSupportedSurface() {
+  const cabinet = $("connection-cabinet");
+  return cabinet && !cabinet.hidden && state.connectionSupported;
+}
+
+function clearConnectionToken() {
+  const input = $("connection-token");
+  if (!input) return;
+  // Clear before waiting for the response. The value is never put in a URL,
+  // history entry, storage area, log message or rendered error.
+  input.value = "";
+  input.defaultValue = "";
+  input.removeAttribute("value");
+}
+
+function safeConnectionError(value) {
+  const candidate = typeof value === "string" ? value.trim() : "";
+  return SAFE_CONNECTION_ERRORS.has(candidate)
+    ? candidate
+    : "Синхронизация Multica завершилась с ошибкой. Попробуйте подключить PAT ещё раз.";
+}
+
+function connectionRequestError(status) {
+  const error = new Error("connection request failed");
+  error.status = status;
+  return error;
+}
+
+async function readConnectionResponse(response) {
+  const raw = await response.text();
+  let payload = {};
+  if (raw) {
+    try { payload = JSON.parse(raw); } catch (_) { payload = {}; }
+  }
+  if (response.status === 401) {
+    const next = encodeURIComponent(location.pathname + location.search);
+    location.assign(`/login?next=${next}`);
+    throw connectionRequestError(401);
+  }
+  if (!response.ok) throw connectionRequestError(response.status);
+  return payload;
+}
+
+async function connectionRequest(path, options) {
+  const response = await fetch(path, Object.assign({
+    credentials: "same-origin",
+    headers: { "Accept": "application/json" },
+  }, options || {}));
+  return readConnectionResponse(response);
+}
+
+function showConnectionOperationError(error) {
+  const note = $("connection-form-error");
+  if (!note) return;
+  const messages = {
+    400: "Сессия устарела или запрос не прошёл проверку. Обновите страницу.",
+    401: "Сессия истекла. Войдите снова.",
+    404: "Подключение не найдено. Обновите страницу.",
+    422: "Проверьте PAT и метку workspace.",
+    429: "Слишком много попыток. Повторите позже.",
+    503: "Подключение сейчас недоступно. Попробуйте позже.",
+  };
+  note.textContent = messages[error && error.status]
+    || "Не удалось изменить подключение. Попробуйте позже.";
+  note.hidden = false;
+}
+
+function clearConnectionOperationError() {
+  const note = $("connection-form-error");
+  if (!note) return;
+  note.textContent = "";
+  note.hidden = true;
+}
+
+function setConnectionBusy(busy) {
+  state.connectionBusy = busy;
+  const form = $("connection-form");
+  const submit = $("connection-submit");
+  const token = $("connection-token");
+  const label = $("connection-workspace-label");
+  if (form) form.setAttribute("aria-busy", busy ? "true" : "false");
+  if (submit) {
+    submit.disabled = busy || (state.connection && state.connection.status === "disabled");
+    submit.setAttribute("aria-busy", busy ? "true" : "false");
+  }
+  if (token) token.disabled = busy;
+  if (label) label.disabled = busy;
+  for (const id of ["connection-replace", "connection-disconnect", "connection-confirm-yes", "connection-confirm-no"]) {
+    const button = $(id);
+    if (button) button.disabled = busy;
+  }
+}
+
+function connectionStatusMessage(status, data) {
+  if (status === "error") return safeConnectionError(data && data.last_sync_error);
+  const messages = {
+    none: "Подключите Multica, чтобы загрузить вашу статистику.",
+    disabled: "Администратор временно отключил ручное подключение.",
+    pending: "PAT принят. Ожидаем подтверждение защищённого worker-канала.",
+    replacement_pending: "Новая PAT принята. Ожидаем подтверждение замены.",
+    active: "Статистика будет обновляться автоматически.",
+    revocation_pending: "Запрос на отключение принят. Ожидаем удаления доступа worker-каналом.",
+    revoked: "Доступ удалён. Отзовите PAT в настройках Multica.",
+  };
+  return messages[status] || messages.none;
+}
+
+function stopConnectionPolling() {
+  if (state.connectionPollTimer) {
+    clearTimeout(state.connectionPollTimer);
+    state.connectionPollTimer = null;
+  }
+  state.connectionPollGeneration += 1;
+  state.connectionPollDeadline = 0;
+}
+
+function renderConnection(data) {
+  const rawStatus = data && typeof data.status === "string" ? data.status : "none";
+  const status = CONNECTION_STATES.has(rawStatus) ? rawStatus : "none";
+  const normalized = Object.assign({}, data || {}, { status });
+  state.connection = normalized;
+
+  const badge = $("connection-status-badge");
+  const title = $("connection-status-title");
+  const message = $("connection-status-message");
+  if (badge) {
+    badge.dataset.state = status;
+    badge.textContent = CONNECTION_STATE_LABELS[status];
+  }
+  if (title) title.textContent = CONNECTION_STATE_TITLES[status];
+  if (message) message.textContent = connectionStatusMessage(status, normalized);
+
+  const details = $("connection-details");
+  if (details) details.hidden = false;
+  const workspaceDetail = $("connection-workspace-detail");
+  const workspace = $("connection-workspace");
+  const workspaceLabel = typeof normalized.workspace_label === "string"
+    ? normalized.workspace_label : "";
+  if (workspace) workspace.textContent = workspaceLabel;
+  if (workspaceDetail) workspaceDetail.hidden = !workspaceLabel;
+  const syncedDetail = $("connection-synced-detail");
+  const synced = $("connection-synced-at");
+  if (synced) synced.textContent = normalized.last_synced_at
+    ? fmtDateTime(new Date(Number(normalized.last_synced_at) * 1000).toISOString()) : "";
+  if (syncedDetail) syncedDetail.hidden = !normalized.last_synced_at;
+
+  const empty = $("connection-empty");
+  if (empty) {
+    empty.textContent = status === "revoked"
+      ? "Подключение отозвано. Подключите новый PAT, если хотите продолжить синхронизацию."
+      : "У вас пока нет подключения. Нажмите «Подключить» и вставьте PAT из Multica.";
+    empty.hidden = !["none", "revoked"].includes(status);
+  }
+  const error = $("connection-error");
+  if (error) {
+    error.textContent = status === "error" ? safeConnectionError(normalized.last_sync_error) : "";
+    error.hidden = status !== "error";
+  }
+  const advice = $("connection-advice");
+  if (advice) advice.hidden = !["revoked", "revocation_pending"].includes(status);
+
+  const form = $("connection-form");
+  const actions = $("connection-actions");
+  const showForm = status === "none" || status === "disabled" || status === "revoked"
+    || ((status === "active" || status === "error") && state.connectionReplacing);
+  if (form) form.hidden = !showForm;
+  if (actions) actions.hidden = !((status === "active" || status === "error") && !state.connectionReplacing);
+  const submit = $("connection-submit");
+  if (submit) {
+    submit.textContent = (status === "active" || status === "error" || state.connectionReplacing)
+      ? "Заменить PAT" : "Подключить";
+    submit.disabled = state.connectionBusy || status === "disabled";
+  }
+  const confirm = $("connection-confirm");
+  if (confirm && status !== "active" && status !== "error") confirm.hidden = true;
+  if (!CONNECTION_PENDING_STATES.has(status)) stopConnectionPolling();
+}
+
+async function refreshConnection() {
+  if (!connectionSupportedSurface()) return null;
+  try {
+    const data = await connectionRequest("/api/connection");
+    renderConnection(data);
+    return state.connection;
+  } catch (error) {
+    if (error && error.status === 404) {
+      state.connectionSupported = false;
+      const cabinet = $("connection-cabinet");
+      if (cabinet) cabinet.hidden = true;
+      stopConnectionPolling();
+      return null;
+    }
+    const message = $("connection-status-message");
+    if (message) message.textContent = "Статус подключения временно недоступен.";
+    return null;
+  }
+}
+
+function startConnectionPolling(status) {
+  stopConnectionPolling();
+  if (!CONNECTION_PENDING_STATES.has(status)) return;
+  const generation = state.connectionPollGeneration;
+  state.connectionPollDeadline = Date.now() + CONNECTION_POLL_TIMEOUT_MS;
+  const tick = async () => {
+    if (generation !== state.connectionPollGeneration) return;
+    if (Date.now() >= state.connectionPollDeadline) {
+      const error = $("connection-error");
+      if (error) {
+        error.textContent = "Синхронизация ещё не завершена. Обновите статус позже.";
+        error.hidden = false;
+      }
+      state.connectionPollTimer = null;
+      return;
+    }
+    const current = await refreshConnection();
+    if (generation !== state.connectionPollGeneration || !current
+        || !CONNECTION_PENDING_STATES.has(current.status)) return;
+    state.connectionPollTimer = setTimeout(tick, CONNECTION_POLL_INTERVAL_MS);
+  };
+  state.connectionPollTimer = setTimeout(tick, 0);
+}
+
+async function postConnection(path, body) {
+  const headers = {
+    "Accept": "application/json",
+    "X-CSRF-Token": state.csrf || "",
+    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+  };
+  const request = connectionRequest(path, {
+    method: "POST",
+    headers,
+    body: new URLSearchParams(body || {}),
+  });
+  return request;
+}
+
+async function submitConnection(event) {
+  event.preventDefault();
+  if (state.connectionBusy || !connectionSupportedSurface()) return;
+  const tokenInput = $("connection-token");
+  const labelInput = $("connection-workspace-label");
+  const token = tokenInput ? tokenInput.value : "";
+  const workspaceLabel = labelInput ? labelInput.value : "";
+  if (!token.trim()) {
+    const error = $("connection-form-error");
+    if (error) {
+      error.textContent = "Введите PAT для подключения.";
+      error.hidden = false;
+    }
+    return;
+  }
+  clearConnectionOperationError();
+  setConnectionBusy(true);
+  const body = { token };
+  if (workspaceLabel.trim()) body.workspace_label = workspaceLabel;
+  // The input is cleared immediately after fetch receives its body, before
+  // any response or error can be rendered.
+  const request = postConnection("/api/connection", body);
+  clearConnectionToken();
+  try {
+    const data = await request;
+    state.connectionReplacing = false;
+    renderConnection(data);
+    startConnectionPolling(state.connection.status);
+  } catch (error) {
+    showConnectionOperationError(error);
+  } finally {
+    setConnectionBusy(false);
+  }
+}
+
+async function revokeConnection() {
+  if (state.connectionBusy || !connectionSupportedSurface()) return;
+  clearConnectionOperationError();
+  setConnectionBusy(true);
+  const confirm = $("connection-confirm");
+  if (confirm) confirm.hidden = true;
+  try {
+    const data = await postConnection("/api/connection/revoke", {});
+    state.connectionReplacing = false;
+    renderConnection(data);
+    startConnectionPolling(state.connection.status);
+  } catch (error) {
+    showConnectionOperationError(error);
+  } finally {
+    setConnectionBusy(false);
+  }
+}
+
+function setupConnection() {
+  const cabinet = $("connection-cabinet");
+  if (!cabinet) return;
+  $("connection-form").addEventListener("submit", submitConnection);
+  $("connection-replace").addEventListener("click", () => {
+    state.connectionReplacing = true;
+    clearConnectionOperationError();
+    renderConnection(state.connection || { status: "none" });
+    $("connection-token").focus();
+  });
+  $("connection-disconnect").addEventListener("click", () => {
+    if (!state.connectionBusy) $("connection-confirm").hidden = false;
+  });
+  $("connection-confirm-no").addEventListener("click", () => {
+    $("connection-confirm").hidden = true;
+  });
+  $("connection-confirm-yes").addEventListener("click", revokeConnection);
 }
 
 function periodRange() {
@@ -872,6 +1237,9 @@ function resetFilters() {
 
 async function boot() {
   await setupSession();
+  setupConnection();
+  const connection = await refreshConnection();
+  if (connection) startConnectionPolling(connection.status);
   await refreshMeta();
   readFiltersFromUrl();
   $("filter-project").addEventListener("change", () => {

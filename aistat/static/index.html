@@ -66,6 +66,49 @@
     <span id="estimate-note" class="note" hidden>≈ значения по агентам/моделям/проектам и неполным дням распределены по фактическим интервалам запусков задач.</span>
   </section>
 
+  <section class="connection-panel" id="connection-cabinet" aria-labelledby="connection-title">
+    <div class="connection-heading">
+      <div>
+        <h2 id="connection-title">Подключить свой Multica</h2>
+        <p class="connection-intro">AIStat получает статистику из вашего Multica через защищённый worker-канал. PAT нужен только для подключения и не показывается после отправки.</p>
+      </div>
+      <span id="connection-status-badge" class="connection-badge" data-state="none">не подключён</span>
+    </div>
+    <div id="connection-status" class="connection-status" role="status" aria-live="polite">
+      <strong id="connection-status-title">Multica не подключён</strong>
+      <span id="connection-status-message">Подключите Multica, чтобы загрузить вашу статистику.</span>
+    </div>
+    <dl id="connection-details" class="connection-details" hidden>
+      <div><dt>Хост Multica</dt><dd><a href="https://multica.ai" target="_blank" rel="noopener noreferrer">https://multica.ai</a></dd></div>
+      <div id="connection-workspace-detail" hidden><dt>Workspace</dt><dd id="connection-workspace"></dd></div>
+      <div id="connection-synced-detail" hidden><dt>Последняя синхронизация</dt><dd id="connection-synced-at"></dd></div>
+    </dl>
+    <p id="connection-error" class="connection-error" role="alert" hidden></p>
+    <p id="connection-empty" class="connection-empty">У вас пока нет подключения. Нажмите «Подключить» и вставьте PAT из Multica.</p>
+
+    <form id="connection-form" class="connection-form" autocomplete="off" novalidate>
+      <label for="connection-token">Multica PAT <span class="required-mark" aria-hidden="true">*</span></label>
+      <input id="connection-token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+      <label for="connection-workspace-label">Метка workspace <span class="optional-mark">необязательно</span></label>
+      <input id="connection-workspace-label" name="workspace_label" type="text" autocomplete="off" maxlength="128">
+      <p class="connection-host">Официальный хост: <a href="https://multica.ai" target="_blank" rel="noopener noreferrer">https://multica.ai</a></p>
+      <p id="connection-form-error" class="connection-error" role="alert" hidden></p>
+      <button id="connection-submit" class="connection-button connection-button-primary" type="submit">Подключить</button>
+    </form>
+
+    <div id="connection-actions" class="connection-actions" hidden>
+      <button id="connection-replace" class="connection-button connection-button-primary" type="button">Заменить PAT</button>
+      <button id="connection-disconnect" class="connection-button connection-button-secondary" type="button">Отключить</button>
+    </div>
+    <div id="connection-confirm" class="connection-confirm" role="alertdialog" aria-labelledby="connection-confirm-title" hidden>
+      <strong id="connection-confirm-title">Отключить Multica?</strong>
+      <p>AIStat удалит доступ к этому подключению. После подтверждения отзовите PAT в Multica.</p>
+      <button id="connection-confirm-yes" class="connection-button connection-button-danger" type="button">Да, отключить</button>
+      <button id="connection-confirm-no" class="connection-button connection-button-secondary" type="button">Отмена</button>
+    </div>
+    <p id="connection-advice" class="connection-advice" hidden>После отключения отзовите этот PAT в настройках Multica.</p>
+  </section>
+
   <section class="cards" id="cards">
     <div class="card"><div class="card-label">Всего токенов</div><div class="card-value" id="card-tokens">—</div><div class="card-sub" id="card-tokens-sub"></div></div>
     <div class="card"><div class="card-label">Стоимость</div><div class="card-value" id="card-cost">—</div><div class="card-sub" id="card-cost-sub"></div></div>
