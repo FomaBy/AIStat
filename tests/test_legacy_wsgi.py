@@ -10,6 +10,7 @@ import os
 import re
 import runpy
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlencode, urlsplit
 from wsgiref.util import setup_testing_defaults
@@ -29,7 +30,7 @@ SESSION_SECRET = "legacy-session-" + "s" * 48
 INGEST_SECRET = "legacy-ingest-" + "i" * 48
 
 
-def configure_legacy_env(tmp_path, monkeypatch):
+def configure_legacy_env(tmp_path, monkeypatch, allowed_emails="allowed@example.com"):
     monkeypatch.setenv("AISTAT_DB_PATH", str(tmp_path / "public.db"))
     monkeypatch.setenv("AISTAT_SECURITY_DB_PATH", str(tmp_path / "security.db"))
     monkeypatch.setenv("AISTAT_TENANTS_DIR", str(tmp_path / "tenants"))
@@ -57,13 +58,11 @@ def configure_legacy_env(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "AISTAT_OAUTH_GOOGLE_REDIRECT_URI", "https://localhost/auth/google/callback"
     )
-    monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", "allowed@example.com")
+    monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", allowed_emails)
     monkeypatch.setenv("AISTAT_ADMIN_EMAIL", "allowed@example.com")
 
 
-@pytest.fixture
-def legacy(tmp_path, monkeypatch):
-    configure_legacy_env(tmp_path, monkeypatch)
+def _boot_legacy(tmp_path):
     import aistat.legacy_wsgi as module
 
     module = importlib.reload(module)
@@ -73,6 +72,19 @@ def legacy(tmp_path, monkeypatch):
     conn.close()
     migrate_owner_database(Config(), now=1000)
     return module
+
+
+@pytest.fixture
+def legacy(tmp_path, monkeypatch):
+    configure_legacy_env(tmp_path, monkeypatch)
+    return _boot_legacy(tmp_path)
+
+
+@pytest.fixture
+def legacy_open(tmp_path, monkeypatch):
+    # empty allow list => open registration for any verified Google user
+    configure_legacy_env(tmp_path, monkeypatch, allowed_emails="")
+    return _boot_legacy(tmp_path)
 
 
 def request(app, path, method="GET", body=b"", headers=None, cookie=None):
@@ -204,6 +216,75 @@ def install_fake_http(monkeypatch, identity):
 def state_from(headers):
     location = header_values(headers, "Location")[0]
     return parse_qs(urlsplit(location).query)["state"][0]
+
+
+def oauth_login(module, monkeypatch, identity, next_url="/", cookie=None):
+    """Drive a full mock-provider Google login through the real legacy app.
+
+    Only the provider's HTTPS egress is stubbed; the whole redirect loop, the
+    browser-binding cookie and every policy/store write run for real. Returns
+    ``(status, headers, body, cookies)``.
+    """
+    install_fake_http(monkeypatch, identity)
+    status, headers, _ = request(
+        module.application,
+        "/auth/google/start?" + urlencode({"next": next_url}),
+        cookie=cookie,
+    )
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers, cookie or "")
+    status, headers, body = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    return status, headers, body, cookie_jar(headers, start_cookies)
+
+
+def meta_projects(module, cookies):
+    status, _, body = request(module.application, "/api/meta", cookie=cookies)
+    assert status == "200 OK"
+    return {p["id"] for p in module.json.loads(body.decode("utf-8"))["projects"]}
+
+
+def user_id_for_subject(module, subject):
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT user_id FROM oauth_identities WHERE subject = ?", (subject,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def account_counts_for(module, subject, email):
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        return {
+            "users": conn.execute(
+                "SELECT COUNT(*) FROM users WHERE email = ?", (email,)
+            ).fetchone()[0],
+            "identities": conn.execute(
+                "SELECT COUNT(*) FROM oauth_identities WHERE subject = ?",
+                (subject,),
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
+def seed_legacy_tenant(module, user_id, project_id, title):
+    path = os.path.join(module.TENANTS_DIR, "%d.db" % int(user_id))
+    conn = connect(path)
+    init_db(conn)
+    conn.execute(
+        "INSERT INTO projects (id, title, status, synced_at) "
+        "VALUES (?, ?, 'in_progress', '2026-01-02T00:00:00Z')",
+        (project_id, title),
+    )
+    conn.commit()
+    conn.close()
 
 
 def test_cgi_loads_only_aistat_private_environment(tmp_path, monkeypatch):
@@ -794,7 +875,7 @@ def test_login_page_shows_google_button(legacy):
     status, _, body = request(legacy.application, "/login")
     assert status == "200 OK"
     page = body.decode("utf-8")
-    assert "Войти через Google" in page
+    assert "Войти / зарегистрироваться через Google" in page
     assert "/auth/google/start?next=" in page
 
 
@@ -902,8 +983,11 @@ def test_oauth_callback_sanitizes_next_url_for_browser(
     assert header_values(headers, "Location") == [expected_location]
 
 
-def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
-    # owner-only: a verified but non-owner email is refused before any account
+def test_oauth_login_denies_outsider_under_nonempty_allowlist(
+    legacy, monkeypatch
+):
+    # the legacy env configures a non-empty allow list, so a verified new
+    # subject that is neither the owner nor allow-listed is refused registration
     install_fake_http(
         monkeypatch,
         {
@@ -916,15 +1000,317 @@ def test_oauth_login_is_fail_closed_for_stranger(legacy, monkeypatch):
     status, headers, _ = request(legacy.application, "/auth/google/start")
     state = state_from(headers)
     start_cookies = cookie_jar(headers)
-    status, headers, _ = request(
+    status, headers, body = request(
         legacy.application,
         "/auth/google/callback?state=%s&code=abc" % state,
         cookie=start_cookies,
     )
-    assert status == "400 Bad Request"
+    assert status == "403 Forbidden"
+    page = body.decode("utf-8")
+    assert "Регистрация сейчас закрыта" in page
+    assert "stranger@example.com" not in page
+    assert "allowed@example.com" not in page
     cookies = cookie_jar(headers, start_cookies)
     status, _, _ = request(legacy.application, "/api/meta", cookie=cookies)
     assert status == "401 Unauthorized"
+
+
+def test_open_registration_first_login_creates_own_empty_tenant(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    identity = {"sub": "new-1", "email": "new@example.com", "email_verified": True}
+    status, _, _, cookies = oauth_login(module, monkeypatch, identity, "/api/meta")
+    assert status == "303 See Other"
+    # a fresh ordinary account sees only its own empty tenant, not owner data
+    assert meta_projects(module, cookies) == set()
+    new_id = user_id_for_subject(module, "new-1")
+
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        is_admin = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (new_id,)
+        ).fetchone()[0]
+        has_tenant = conn.execute(
+            "SELECT 1 FROM tenants WHERE user_id = ?", (new_id,)
+        ).fetchone()
+        admins = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_admin = 1"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert int(is_admin) == 0
+    assert has_tenant is not None
+    assert int(admins) == 1
+
+    # a repeat login with the same subject returns the same account
+    status, _, _, _ = oauth_login(module, monkeypatch, identity, "/api/meta")
+    assert status == "303 See Other"
+    assert account_counts_for(module, "new-1", "new@example.com") == {
+        "users": 1, "identities": 1
+    }
+
+
+def test_open_registration_email_change_keeps_single_account(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    status, _, _, _ = oauth_login(
+        module, monkeypatch,
+        {"sub": "chg", "email": "old@example.com", "email_verified": True},
+    )
+    assert status == "303 See Other"
+    first_id = user_id_for_subject(module, "chg")
+    # the provider later reports a different verified email for the same subject
+    status, _, _, _ = oauth_login(
+        module, monkeypatch,
+        {"sub": "chg", "email": "fresh@example.com", "email_verified": True},
+    )
+    assert status == "303 See Other"
+    assert user_id_for_subject(module, "chg") == first_id
+    assert account_counts_for(module, "chg", "old@example.com")["identities"] == 1
+
+
+def test_open_registration_ab_tenant_isolation(legacy_open, monkeypatch):
+    module = legacy_open
+    _, _, _, a_cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "sub-a", "email": "shared@example.com", "email_verified": True},
+    )
+    _, _, _, b_cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "sub-b", "email": "shared@example.com", "email_verified": True},
+    )
+    a_id = user_id_for_subject(module, "sub-a")
+    b_id = user_id_for_subject(module, "sub-b")
+    assert a_id != b_id
+    seed_legacy_tenant(module, a_id, "PA", "A private project")
+    # A sees only A's data; B sees neither A's project nor the owner's P1/P2
+    assert meta_projects(module, a_cookies) == {"PA"}
+    assert meta_projects(module, b_cookies) == set()
+
+
+def test_open_registration_admin_email_links_owner(legacy_open, monkeypatch):
+    module = legacy_open
+    status, _, _, cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "owner-sub", "email": "Allowed@Example.com",
+         "email_verified": True},
+        "/api/meta",
+    )
+    assert status == "303 See Other"
+    # the admin email links to the pre-existing owner: owner tenant, owner data
+    assert user_id_for_subject(module, "owner-sub") == module.OWNER_USER_ID
+    assert meta_projects(module, cookies) == {"P1", "P2"}
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        admins = [
+            row[0]
+            for row in conn.execute("SELECT id FROM users WHERE is_admin = 1")
+        ]
+    finally:
+        conn.close()
+    assert admins == [module.OWNER_USER_ID]
+
+
+def test_open_registration_ordinary_subject_not_elevated_by_admin_email(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    _, _, _, _ = oauth_login(
+        module, monkeypatch,
+        {"sub": "not-owner", "email": "person@example.com",
+         "email_verified": True},
+    )
+    ordinary_id = user_id_for_subject(module, "not-owner")
+    assert ordinary_id != module.OWNER_USER_ID
+    # the same subject later presents the admin email: it stays ordinary and
+    # never merges into or is elevated to the owner
+    _, _, _, cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "not-owner", "email": "allowed@example.com",
+         "email_verified": True},
+        "/api/meta",
+    )
+    assert user_id_for_subject(module, "not-owner") == ordinary_id
+    assert meta_projects(module, cookies) == set()  # not the owner's P1/P2
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        is_admin = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (ordinary_id,)
+        ).fetchone()[0]
+        admins = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_admin = 1"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert int(is_admin) == 0
+    assert int(admins) == 1
+
+
+def test_open_registration_simultaneous_callbacks_one_account(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    identity = {"sub": "sim", "email": "sim@example.com", "email_verified": True}
+    install_fake_http(monkeypatch, identity)
+    # two overlapping flows for the same brand-new subject (shared binding)
+    status, headers, _ = request(module.application, "/auth/google/start")
+    first_state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, headers, _ = request(module.application, "/auth/google/start",
+                                 cookie=start_cookies)
+    second_state = state_from(headers)
+    start_cookies = cookie_jar(headers, start_cookies)
+    first = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=a" % first_state,
+        cookie=start_cookies,
+    )
+    second = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=b" % second_state,
+        cookie=start_cookies,
+    )
+    assert first[0] == "303 See Other"
+    assert second[0] == "303 See Other"
+    assert account_counts_for(module, "sim", "sim@example.com") == {
+        "users": 1, "identities": 1
+    }
+
+
+def test_open_registration_logout_to_other_user_no_leak(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    _, _, _, a_cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "user-a", "email": "a@example.com", "email_verified": True},
+    )
+    a_id = user_id_for_subject(module, "user-a")
+    seed_legacy_tenant(module, a_id, "PA", "A private project")
+    assert meta_projects(module, a_cookies) == {"PA"}
+
+    # logout revokes the server-side session (CSRF-protected POST)
+    status, headers, _ = request(
+        module.application,
+        "/logout",
+        method="POST",
+        headers={"X-CSRF-Token": session_csrf(module, a_cookies)},
+        cookie=a_cookies,
+    )
+    assert status == "303 See Other"
+    after_logout = cookie_jar(headers, a_cookies)
+    status, _, _ = request(module.application, "/api/meta", cookie=after_logout)
+    assert status == "401 Unauthorized"
+
+    # a different user then logging in never inherits A's data
+    _, _, _, b_cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "user-b", "email": "b@example.com", "email_verified": True},
+    )
+    assert user_id_for_subject(module, "user-b") != a_id
+    assert meta_projects(module, b_cookies) == set()
+
+
+def test_open_registration_registered_user_keeps_access_after_delisting(
+    legacy_open, monkeypatch, tmp_path
+):
+    module = legacy_open
+    _, _, _, cookies = oauth_login(
+        module, monkeypatch,
+        {"sub": "keeper", "email": "keeper@example.com", "email_verified": True},
+    )
+    assert meta_projects(module, cookies) == set()  # registered, has access
+
+    # an operator reconfigures a non-empty allow list that excludes them and
+    # the worker restarts (module reload) over the same security.db
+    monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", "someone@else.com")
+    reloaded = importlib.reload(module)
+    # the already-registered user keeps access — no request-time allow-list gate
+    status, _, _ = request(reloaded.application, "/api/meta", cookie=cookies)
+    assert status == "200 OK"
+    # but a brand-new outsider can no longer register
+    status, _, _, outsider = oauth_login(
+        reloaded, monkeypatch,
+        {"sub": "late", "email": "late@example.com", "email_verified": True},
+    )
+    assert status == "403 Forbidden"
+    status, _, _ = request(reloaded.application, "/api/meta", cookie=outsider)
+    assert status == "401 Unauthorized"
+
+
+def _legacy_counts(module):
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        return {
+            "users": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "identities": conn.execute(
+                "SELECT COUNT(*) FROM oauth_identities"
+            ).fetchone()[0],
+            "tenants": conn.execute(
+                "SELECT COUNT(*) FROM tenants"
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
+def test_legacy_register_concurrent_new_subject_yields_one_account(legacy_open):
+    module = legacy_open
+    store = module._LegacyOAuthStore()
+    before = _legacy_counts(module)
+
+    def register(_index):
+        return store.register_or_link_identity(
+            "google", "race-sub", email="race@example.com",
+            allowed_emails=frozenset(), now=100,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(register, range(8)))
+
+    assert len({r["user_id"] for r in results}) == 1
+    assert sorted(r["outcome"] for r in results).count("created") == 1
+    after = _legacy_counts(module)
+    # exactly one user, identity and tenant were added by the race
+    assert after["users"] == before["users"] + 1
+    assert after["identities"] == before["identities"] + 1
+    assert after["tenants"] == before["tenants"] + 1
+
+
+class _FailingConnection:
+    def __init__(self, real, fail_fragment):
+        self._real = real
+        self._fail_fragment = fail_fragment
+
+    def execute(self, sql, *args):
+        if self._fail_fragment in sql:
+            raise sqlite3.OperationalError("injected failure")
+        return self._real.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_legacy_register_injected_failure_rolls_back(legacy_open, monkeypatch):
+    module = legacy_open
+    store = module._LegacyOAuthStore()
+    before = _legacy_counts(module)
+    original = module._security_connection
+
+    def failing_connection():
+        return _FailingConnection(original(), "INSERT INTO tenants")
+
+    monkeypatch.setattr(module, "_security_connection", failing_connection)
+    with pytest.raises(sqlite3.OperationalError):
+        store.register_or_link_identity(
+            "google", "sub-x", email="x@example.com",
+            allowed_emails=frozenset(), now=100,
+        )
+    monkeypatch.setattr(module, "_security_connection", original)
+    # the whole registration rolled back — no partial user/identity/tenant rows
+    assert _legacy_counts(module) == before
 
 
 def test_oauth_login_is_fail_closed_for_unverified_owner(legacy, monkeypatch):

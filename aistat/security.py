@@ -739,6 +739,102 @@ class SecurityStore:
         finally:
             conn.close()
 
+    def register_or_link_identity(
+        self,
+        provider: str,
+        subject: str,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        admin_email: Optional[str] = None,
+        allowed_emails=None,
+        owner_user_id: Optional[int] = None,
+        now: Optional[int] = None,
+    ) -> dict:
+        """Subject-first identity resolution with atomic first registration.
+
+        Returns ``{"user_id", "outcome"}`` where ``outcome`` is one of
+        ``"existing"`` (the subject was already registered), ``"linked_owner"``
+        (a new subject whose email is the admin email, attached to the owner),
+        ``"created"`` (a new ordinary user + identity + empty tenant), or
+        ``"denied"`` (a new subject barred by a non-empty allow list — nothing
+        is written and ``user_id`` is ``None``).
+
+        Everything a single new registration touches — the ``users`` row, its
+        ``oauth_identities`` row and its ``tenants`` registry row — is committed
+        in one ``BEGIN IMMEDIATE`` transaction, so concurrent or replayed
+        callbacks for one new subject converge on a single account/tenant and an
+        injected failure rolls the whole registration back with no partial rows.
+        The allow list gates only new subjects: an already-registered subject
+        always resolves, and an ordinary user is never merged into or elevated
+        to the owner even if its email later equals the admin email.
+        """
+        now = int(time.time()) if now is None else int(now)
+        normalized = email.strip().lower() if email else None
+        owner_email = (admin_email or "").strip().lower()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row is not None:
+                conn.commit()
+                return {"user_id": int(row["user_id"]), "outcome": "existing"}
+            # A brand-new subject. The admin email links to the pre-existing
+            # owner; the owner stays the single admin and keeps its own tenant.
+            if owner_email and owner_user_id and normalized == owner_email:
+                owner = conn.execute(
+                    "SELECT is_admin FROM users WHERE id = ?",
+                    (int(owner_user_id),),
+                ).fetchone()
+                if owner is None or int(owner["is_admin"]) != 1:
+                    conn.rollback()
+                    raise SecurityConfigError(
+                        "owner user is missing or not an admin"
+                    )
+                conn.execute(
+                    "INSERT INTO oauth_identities "
+                    "(provider, subject, user_id, email, linked_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (provider, subject, int(owner_user_id), email, now),
+                )
+                conn.commit()
+                return {
+                    "user_id": int(owner_user_id),
+                    "outcome": "linked_owner",
+                }
+            # Ordinary registration. A non-empty allow list is the only gate,
+            # and only for this first sight of the subject.
+            if allowed_emails and (
+                normalized is None or normalized not in allowed_emails
+            ):
+                conn.rollback()
+                return {"user_id": None, "outcome": "denied"}
+            cursor = conn.execute(
+                "INSERT INTO users (created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 0)",
+                (now, display_name, email),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, now),
+            )
+            conn.execute(
+                "INSERT INTO tenants "
+                "(user_id, created_at, last_ingest_timestamp) "
+                "VALUES (?, ?, 0)",
+                (user_id, now),
+            )
+            conn.commit()
+            return {"user_id": user_id, "outcome": "created"}
+        finally:
+            conn.close()
+
     def put_oauth_state(
         self,
         state: str,

@@ -34,8 +34,6 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from markupsafe import escape
-
 from . import __version__, aggregates, handoff, oauth
 from .config import Config
 from .db import connect_readonly, init_db
@@ -116,21 +114,16 @@ def create_app(config: Optional[Config] = None) -> Flask:
         return security_store.session_is_active(session.get("sid"))
 
     def oauth_session_authorized() -> bool:
-        """True when the current session is an authorised OAuth login.
+        """True when the current session is a registered OAuth login.
 
-        The owner's own OAuth login (linked to the admin user id) always counts.
-        Any other identity is re-checked against the allow-list on every request
-        so removing an email revokes access immediately. Fail-closed: no
-        allow-list and not the owner => no access.
+        Registration is the gate now: a subject reaches an active session only
+        after ``open_registration_identity`` admitted it, so any live session
+        that carries a ``user_id`` is authorised. The allow list is no longer
+        re-checked per request, so de-listing an email cannot revoke an already
+        registered user (their access ends only when the server-side session
+        does). Fail-closed: no ``user_id`` => no access.
         """
-        uid = session.get("user_id")
-        if not uid:
-            return False
-        if owner_user_id is not None and uid == owner_user_id:
-            return True
-        return oauth.is_email_authorized(
-            config.oauth_allowed_emails, session.get("email")
-        )
+        return session.get("user_id") is not None
 
     def normalized_host() -> str:
         host = request.host.rsplit("@", 1)[-1]
@@ -355,18 +348,22 @@ def create_app(config: Optional[Config] = None) -> Flask:
     def login_css():
         return send_from_directory(STATIC_DIR, "login.css")
 
-    def oauth_pending(email):
-        shown = escape(email or "—")
+    def registration_closed():
+        """Non-secret page shown when a new user may not register.
+
+        Carries no email or allow-list detail, so it never reveals who is or
+        is not permitted; a rejected new subject never reaches a session.
+        """
         body = (
             "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
-            "<title>Нет доступа — AIStat</title>"
+            "<title>Регистрация закрыта — AIStat</title>"
             "<link rel=\"stylesheet\" href=\"/login.css\"></head><body>"
             "<main class=\"login-shell\"><section class=\"login-card\">"
-            "<h1>AIStat</h1><p class=\"subtitle\">Вход выполнен как {email}, "
-            "но у аккаунта пока нет доступа к статистике. Обратитесь к "
-            "администратору.</p><p><a href=\"/login\">Войти как администратор</a>"
-            "</p></section></main></body></html>"
-        ).format(email=shown)
+            "<h1>AIStat</h1><p class=\"subtitle\">Регистрация сейчас закрыта. "
+            "Чтобы получить доступ, обратитесь к администратору.</p>"
+            "<p><a href=\"/login\">Вернуться ко входу</a></p>"
+            "</section></main></body></html>"
+        )
         return body, 403
 
     @app.get("/auth/<provider>/start")
@@ -403,7 +400,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
         client_token = request.cookies.get(OAUTH_CLIENT_COOKIE)
 
         def resolve_identity(subject, email, email_verified, display_name):
-            return oauth.owner_only_identity(
+            return oauth.open_registration_identity(
                 security_store,
                 provider,
                 subject,
@@ -423,12 +420,18 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 client_token,
                 resolve_identity,
             )
+        except oauth.RegistrationClosedError:
+            # A new subject that is not the owner and not allow-listed: no
+            # session is created, and the page reveals no allow-list detail.
+            return registration_closed()
         except oauth.OAuthError:
             body, status = render_login(
                 "Не удалось выполнить вход через провайдера. Попробуйте снова.",
                 400,
             )
             return body, status
+        # Registration/link succeeded, so access is granted by the active
+        # session alone — there is no second, request-time allow-list gate.
         session.clear()
         session["user_id"] = result["user_id"]
         session["email"] = result["email"]
@@ -438,14 +441,6 @@ def create_app(config: Optional[Config] = None) -> Flask:
         )
         session.permanent = True
         csrf_token(session)
-        owner_linked = (
-            owner_user_id is not None
-            and int(result["user_id"]) == owner_user_id
-        )
-        if not owner_linked and not oauth.is_email_authorized(
-            config.oauth_allowed_emails, result["email"]
-        ):
-            return oauth_pending(result["email"])
         return redirect(safe_next_url(result["next_url"]), code=303)
 
     @app.get("/healthz")

@@ -460,27 +460,20 @@ def _read_session(environ):
     return payload
 
 
-def _email_authorized(email):
-    return oauth.is_email_authorized(OAUTH_ALLOWED_EMAILS, email)
-
-
 def _session_grants_access(payload):
     """Whether a valid session may reach private data (fail-closed for OAuth).
 
-    The admin password session is unchanged. An OAuth session is honoured only
-    while its email stays on the allow-list, so de-listing revokes access on the
-    next request.
+    The admin password session is unchanged. Registration is the gate now: an
+    OAuth subject reaches a session only after it was admitted at the callback,
+    so any live session carrying a user id is honoured. The allow list is not
+    re-checked per request, so de-listing an email cannot revoke an already
+    registered user before its server-side session expires.
     """
     if not payload:
         return False
     if payload.get("u") == ADMIN_USERNAME:
         return True
-    uid = payload.get("uid")
-    if uid and OWNER_USER_ID is not None and int(uid) == OWNER_USER_ID:
-        return True
-    if uid and _email_authorized(payload.get("email")):
-        return True
-    return False
+    return payload.get("uid") is not None
 
 
 def _make_login_csrf():
@@ -809,6 +802,86 @@ class _LegacyOAuthStore(object):
         finally:
             conn.close()
 
+    def register_or_link_identity(
+        self,
+        provider,
+        subject,
+        email=None,
+        display_name=None,
+        admin_email=None,
+        allowed_emails=None,
+        owner_user_id=None,
+        now=None,
+    ):
+        """Subject-first resolution + atomic first registration.
+
+        Mirrors ``SecurityStore.register_or_link_identity`` byte-for-byte in
+        behaviour so the Python 3.6 cPanel contour registers, links and gates
+        identically. Returns ``{"user_id", "outcome"}`` with ``outcome`` in
+        ``existing`` / ``linked_owner`` / ``created`` / ``denied``; a denied new
+        subject writes nothing and yields ``user_id`` ``None``.
+        """
+        now = int(time.time()) if now is None else int(now)
+        normalized = email.strip().lower() if email else None
+        owner_email = (admin_email or "").strip().lower()
+        conn = _security_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM oauth_identities "
+                "WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+            if row is not None:
+                conn.commit()
+                return {"user_id": int(row["user_id"]), "outcome": "existing"}
+            if owner_email and owner_user_id and normalized == owner_email:
+                owner = conn.execute(
+                    "SELECT is_admin FROM users WHERE id = ?",
+                    (int(owner_user_id),),
+                ).fetchone()
+                if owner is None or int(owner["is_admin"]) != 1:
+                    conn.rollback()
+                    raise RuntimeError("owner user is missing or not an admin")
+                conn.execute(
+                    "INSERT INTO oauth_identities "
+                    "(provider, subject, user_id, email, linked_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (provider, subject, int(owner_user_id), email, now),
+                )
+                conn.commit()
+                return {
+                    "user_id": int(owner_user_id),
+                    "outcome": "linked_owner",
+                }
+            if allowed_emails and (
+                normalized is None or normalized not in allowed_emails
+            ):
+                conn.rollback()
+                return {"user_id": None, "outcome": "denied"}
+            cursor = conn.execute(
+                "INSERT INTO users (created_at, display_name, email, is_admin) "
+                "VALUES (?, ?, ?, 0)",
+                (now, display_name, email),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO oauth_identities "
+                "(provider, subject, user_id, email, linked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, now),
+            )
+            conn.execute(
+                "INSERT INTO tenants "
+                "(user_id, created_at, last_ingest_timestamp) "
+                "VALUES (?, ?, 0)",
+                (user_id, now),
+            )
+            conn.commit()
+            return {"user_id": user_id, "outcome": "created"}
+        finally:
+            conn.close()
+
 
 def _secure_headers(environ):
     headers = [
@@ -994,7 +1067,7 @@ def _render_login(csrf, next_url, error=None):
             '<div class="oauth-divider">или</div>'
             '<a class="oauth-button" href="{url}">'
             '<span class="g-mark" aria-hidden="true">G</span>'
-            "Войти через Google</a>"
+            "Войти / зарегистрироваться через Google</a>"
         ).format(url=html.escape(google_url, quote=True))
     return """<!DOCTYPE html>
 <html lang="ru">
@@ -1039,27 +1112,30 @@ def _render_login(csrf, next_url, error=None):
     )
 
 
-def _render_oauth_pending(email):
+def _render_registration_closed():
+    """Non-secret page for a new user who may not register.
+
+    Reveals no email or allow-list detail; a rejected new subject never reaches
+    a session.
+    """
     return """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <title>Нет доступа — AIStat</title>
+  <title>Регистрация закрыта — AIStat</title>
   <link rel="stylesheet" href="/login.css">
 </head>
 <body>
   <main class="login-shell">
     <section class="login-card">
       <h1>AIStat</h1>
-      <p class="subtitle">Вход выполнен как {email}, но у аккаунта пока нет
-      доступа к статистике. Обратитесь к администратору.</p>
-      <p><a href="/login">Войти как администратор</a></p>
+      <p class="subtitle">Регистрация сейчас закрыта. Чтобы получить доступ,
+      обратитесь к администратору.</p>
+      <p><a href="/login">Вернуться ко входу</a></p>
     </section>
   </main>
 </body>
-</html>""".format(
-        email=html.escape(email or "—")
-    )
+</html>"""
 
 
 def _oauth(environ, start_response, path):
@@ -1104,7 +1180,7 @@ def _oauth(environ, start_response, path):
     }
 
     def resolve_identity(subject, email, email_verified, display_name):
-        return oauth.owner_only_identity(
+        return oauth.open_registration_identity(
             store,
             parts[1],
             subject,
@@ -1119,6 +1195,16 @@ def _oauth(environ, start_response, path):
     try:
         result = oauth.finish(
             store, provider, params, client_token, resolve_identity
+        )
+    except oauth.RegistrationClosedError:
+        # A new subject that is not the owner and not allow-listed: no session
+        # is created, and the page reveals no allow-list detail.
+        return _respond(
+            environ,
+            start_response,
+            "403 Forbidden",
+            _render_registration_closed(),
+            "text/html; charset=utf-8",
         )
     except oauth.OAuthError:
         csrf = _make_login_csrf()
@@ -1137,6 +1223,8 @@ def _oauth(environ, start_response, path):
             "text/html; charset=utf-8",
             headers,
         )
+    # Registration/link succeeded, so access is granted by the active session
+    # alone — there is no second, request-time allow-list gate.
     session_value, _payload = _make_oauth_session(
         result["user_id"], result["email"], parts[1]
     )
@@ -1144,20 +1232,6 @@ def _oauth(environ, start_response, path):
         "Set-Cookie",
         _cookie_header("aistat_session", session_value, SESSION_SECONDS),
     )
-    # The owner's linked login always reaches data; other identities are gated
-    # by the allow-list. Mirrors _session_grants_access and the Flask contour.
-    owner_linked = (
-        OWNER_USER_ID is not None and int(result["user_id"]) == OWNER_USER_ID
-    )
-    if not owner_linked and not _email_authorized(result["email"]):
-        return _respond(
-            environ,
-            start_response,
-            "403 Forbidden",
-            _render_oauth_pending(result["email"]),
-            "text/html; charset=utf-8",
-            [set_cookie],
-        )
     next_url = _safe_next(result["next_url"])
     return _respond(
         environ,

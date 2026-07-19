@@ -46,6 +46,7 @@ from urllib.request import Request, urlopen
 __all__ = [
     "OAuthProvider",
     "OAuthError",
+    "RegistrationClosedError",
     "generate_state",
     "generate_client_token",
     "is_valid_client_token",
@@ -55,7 +56,7 @@ __all__ = [
     "fetch_identity",
     "begin",
     "finish",
-    "owner_only_identity",
+    "open_registration_identity",
     "providers_from_env",
     "allowed_emails_from_env",
     "is_email_authorized",
@@ -74,6 +75,18 @@ class OAuthError(Exception):
 
     The message is intentionally coarse; callers surface a generic error to the
     user and never echo provider responses or secrets.
+    """
+
+
+class RegistrationClosedError(OAuthError):
+    """Raised when a *new* verified identity is not permitted to register.
+
+    Distinct from the generic :class:`OAuthError` so a contour can show the
+    dedicated, non-secret "registration is closed" page for a rejected new user
+    instead of the generic provider-error page. It is only ever raised for an
+    unseen ``(provider, subject)``: an already-registered subject always signs
+    in, whatever the current allow list. The message never reveals whether an
+    email is on any list.
     """
 
 
@@ -358,9 +371,10 @@ def finish(
     ``resolve_identity(subject, email, email_verified, display_name) -> int`` is
     the account policy. It runs *after* the identity is known and may raise
     :class:`OAuthError` to reject the login before any account row is written
-    (for example, the owner-only policy in :func:`owner_only_identity`). When it
-    is ``None`` the identity is linked or created unconditionally via the
-    store's ``find_or_create_user_by_identity`` (legacy open behaviour).
+    (for example, the open-registration policy in
+    :func:`open_registration_identity`). When it is ``None`` the identity is
+    linked or created unconditionally via the store's
+    ``find_or_create_user_by_identity`` (legacy open behaviour).
 
     Returns ``{"user_id", "email", "display_name", "next_url"}``. Raises
     :class:`OAuthError` on any failure. Establishing a session and deciding
@@ -409,7 +423,7 @@ def finish(
     }
 
 
-def owner_only_identity(
+def open_registration_identity(
     store,
     provider_name,
     subject,
@@ -420,41 +434,52 @@ def owner_only_identity(
     admin_email,
     owner_user_id,
 ):
-    """Owner-only sign-in policy, applied identically by both WSGI contours.
+    """Open-registration sign-in policy, applied identically by both contours.
 
-    A provider callback is accepted only when it carries a *verified* email that
-    equals the configured owner email (``AISTAT_ADMIN_EMAIL``); when an allow
-    list is configured, the email must also appear on it. The identity is linked
-    to the pre-existing owner account and never creates a new user, so open
-    registration stays off and the owner always lands on the owner tenant. Any
-    failed check raises :class:`OAuthError` *before* an account row could be
-    written, so a non-owner login leaves no trace.
+    Identity resolution is *subject-first*: an already-registered
+    ``(provider, subject)`` always maps back to the same AIStat user, regardless
+    of a later email change or any allow-list change, and is never merged or
+    elevated. Only a brand-new subject is subjected to policy:
+
+    * a verified email equal to the configured admin email
+      (``AISTAT_ADMIN_EMAIL``) links to the pre-existing owner account — the
+      owner stays the single admin and keeps its password login and tenant;
+    * any other new subject registers a fresh ordinary user (``is_admin=0``)
+      together with its own identity and empty tenant, in one atomic
+      transaction. When an allow list is configured the email must match it
+      (case-insensitive); an empty allow list admits any verified user.
+
+    Every callback must carry a non-empty, provider-*verified* email. A new
+    subject that is neither the owner nor allow-listed is rejected with
+    :class:`RegistrationClosedError` and writes no user, identity, tenant or
+    session row. Any store-level anomaly fails the login closed rather than
+    surfacing a 500 on the public callback.
     """
     if not email:
         raise OAuthError("provider returned no email")
     if email_verified is not True:
         raise OAuthError("provider email is not verified")
-    normalized = email.strip().lower()
-    owner_email = (admin_email or "").strip().lower()
-    if not owner_email:
-        raise OAuthError("owner email is not configured")
-    if normalized != owner_email:
-        raise OAuthError("email is not permitted to sign in")
-    if allowed_emails and normalized not in allowed_emails:
-        raise OAuthError("email is not on the allow list")
-    if not owner_user_id:
-        raise OAuthError("owner account is not initialised")
     try:
-        return store.link_identity_to_owner(
-            provider_name, subject, int(owner_user_id), email=email
+        result = store.register_or_link_identity(
+            provider_name,
+            subject,
+            email=email,
+            display_name=display_name,
+            admin_email=admin_email,
+            allowed_emails=allowed_emails,
+            owner_user_id=owner_user_id,
         )
     except OAuthError:
         raise
     except Exception:
-        # A store-level anomaly (identity already linked to a different user, or
-        # a missing owner row) must fail the login closed, never 500 the public
-        # callback.
-        raise OAuthError("owner identity linking failed")
+        # A store-level anomaly (identity already linked elsewhere, a missing
+        # owner row, a write failure) must fail the login closed.
+        raise OAuthError("account registration failed")
+    user_id = result.get("user_id") if result else None
+    if user_id is None:
+        # A new subject that is neither the owner nor permitted to register.
+        raise RegistrationClosedError("registration is closed")
+    return int(user_id)
 
 
 _PROVIDER_FIELDS = (
@@ -501,11 +526,14 @@ def providers_from_env(environ) -> dict:
 
 
 def allowed_emails_from_env(environ) -> frozenset:
-    """Return the lower-cased set of emails allowed to access private data.
+    """Return the lower-cased registration allow list.
 
-    Fail-closed: an unset or empty ``AISTAT_OAUTH_ALLOWED_EMAILS`` yields an
-    empty set, so a successful OAuth login authenticates an identity but grants
-    no access to private statistics until an operator lists it.
+    This gates only the *first* registration of a new provider subject (see
+    :func:`open_registration_identity`): an unset or empty
+    ``AISTAT_OAUTH_ALLOWED_EMAILS`` yields an empty set, which means **open**
+    registration — any verified user may register — while a non-empty set
+    restricts new registrations to the listed emails. It never blocks an
+    already-registered account.
     """
     raw = environ.get("AISTAT_OAUTH_ALLOWED_EMAILS") or ""
     return frozenset(

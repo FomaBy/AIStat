@@ -48,6 +48,8 @@ class FakeStore:
         self.states = {}
         self.identities = {}
         self.owner_links = {}
+        self.tenants = set()
+        self.raise_on_register = False
         self._next_id = 0
 
     def put_oauth_state(
@@ -82,6 +84,31 @@ class FakeStore:
             return linked
         self.owner_links[key] = int(owner_user_id)
         return int(owner_user_id)
+
+    def register_or_link_identity(
+        self, provider, subject, email=None, display_name=None,
+        admin_email=None, allowed_emails=None, owner_user_id=None, now=None,
+    ):
+        """In-memory mirror of SecurityStore.register_or_link_identity."""
+        if self.raise_on_register:
+            raise RuntimeError("injected store anomaly")
+        key = (provider, subject)
+        if key in self.identities:
+            return {"user_id": self.identities[key], "outcome": "existing"}
+        normalized = email.strip().lower() if email else None
+        owner_email = (admin_email or "").strip().lower()
+        if owner_email and owner_user_id and normalized == owner_email:
+            self.identities[key] = int(owner_user_id)
+            self.owner_links[key] = int(owner_user_id)
+            return {"user_id": int(owner_user_id), "outcome": "linked_owner"}
+        if allowed_emails and (
+            normalized is None or normalized not in allowed_emails
+        ):
+            return {"user_id": None, "outcome": "denied"}
+        self._next_id += 1
+        self.identities[key] = self._next_id
+        self.tenants.add(self._next_id)
+        return {"user_id": self._next_id, "outcome": "created"}
 
 
 def fake_http(monkeypatch, token=None, identity=None, captured=None):
@@ -415,67 +442,104 @@ def test_build_authorize_url_requires_https_redirect():
 OWNER_ALLOWED = frozenset({"owner@example.com"})
 
 
-def test_owner_only_identity_links_verified_owner():
+def _register(store, subject, email, email_verified=True, display_name="N",
+              allowed_emails=frozenset(), admin_email="owner@example.com",
+              owner_user_id=7):
+    return oauth.open_registration_identity(
+        store, "google", subject, email, email_verified, display_name,
+        allowed_emails=allowed_emails, admin_email=admin_email,
+        owner_user_id=owner_user_id,
+    )
+
+
+def test_open_registration_creates_ordinary_user_on_empty_allowlist():
+    # an empty allow list admits any verified user as a fresh ordinary account
     store = FakeStore()
-    uid = oauth.owner_only_identity(
-        store, "google", "sub-1", "Owner@Example.com", True, "Owner",
-        allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
-        owner_user_id=7,
+    uid = _register(store, "sub-1", "new@example.com")
+    assert isinstance(uid, int)
+    assert uid != 7  # not the owner
+    # the new user got its own tenant registry row
+    assert uid in store.tenants
+
+
+def test_open_registration_is_subject_first_across_email_and_allowlist():
+    # the same subject always maps back to the same user, whatever the email
+    # or allow list later become
+    store = FakeStore()
+    first = _register(store, "sub-1", "a@example.com")
+    # email changed at the provider -> still the same account, no second user
+    again = _register(store, "sub-1", "b@example.com")
+    assert again == first
+    # and even once an allow list is configured that would exclude them, an
+    # already-registered subject still signs in
+    still = _register(
+        store, "sub-1", "a@example.com",
+        allowed_emails=frozenset({"someone@else.com"}),
+    )
+    assert still == first
+
+
+def test_open_registration_distinct_subjects_same_email_are_distinct_users():
+    store = FakeStore()
+    one = _register(store, "sub-1", "shared@example.com")
+    two = _register(store, "sub-2", "shared@example.com")
+    assert one != two
+
+
+def test_open_registration_links_owner_by_admin_email():
+    # a new subject whose verified email is the admin email links to the owner
+    store = FakeStore()
+    uid = _register(
+        store, "owner-sub", "Owner@Example.com",
+        admin_email="owner@example.com", owner_user_id=7,
     )
     assert uid == 7
-    assert store.owner_links == {("google", "sub-1"): 7}
-    # a second sign-in with the same identity maps back to the owner
-    again = oauth.owner_only_identity(
-        store, "google", "sub-1", "owner@example.com", True, "Owner",
-        allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
-        owner_user_id=7,
-    )
-    assert again == 7
+    assert store.owner_links == {("google", "owner-sub"): 7}
+    # no fresh tenant is minted for the owner-linked identity
+    assert store.tenants == set()
 
 
-def test_owner_only_identity_allows_empty_allowlist_for_owner():
-    # the admin email is the gate; an unset allow-list still admits the owner
-    store = FakeStore()
-    uid = oauth.owner_only_identity(
-        store, "google", "s", "owner@example.com", True, None,
-        allowed_emails=frozenset(), admin_email="owner@example.com",
-        owner_user_id=3,
+def test_open_registration_allowlist_admits_listed_and_denies_outsider():
+    listed = FakeStore()
+    uid = _register(
+        listed, "sub-in", "Owner@Example.com", allowed_emails=OWNER_ALLOWED,
     )
-    assert uid == 3
+    assert isinstance(uid, int)
+
+    outsider = FakeStore()
+    with pytest.raises(oauth.RegistrationClosedError):
+        _register(
+            outsider, "sub-out", "stranger@example.com",
+            allowed_emails=OWNER_ALLOWED,
+        )
+    # a denied new subject writes no identity or tenant row
+    assert outsider.identities == {}
+    assert outsider.tenants == set()
 
 
 @pytest.mark.parametrize(
-    ("email", "email_verified", "admin_email", "allowed", "owner_user_id"),
+    ("email", "email_verified"),
     [
-        ("owner@example.com", False, "owner@example.com", OWNER_ALLOWED, 7),   # unverified
-        (None, True, "owner@example.com", OWNER_ALLOWED, 7),                   # no email
-        ("stranger@example.com", True, "owner@example.com", OWNER_ALLOWED, 7), # not owner
-        ("owner@example.com", True, None, OWNER_ALLOWED, 7),                   # no admin email
-        ("owner@example.com", True, "owner@example.com",
-         frozenset({"someone@else.com"}), 7),                                  # excluded by allow-list
-        ("owner@example.com", True, "owner@example.com", OWNER_ALLOWED, None), # owner not init
+        (None, True),                  # missing email
+        ("u@example.com", False),      # unverified email
+        ("", True),                    # empty email
     ],
 )
-def test_owner_only_identity_rejects_before_creating_account(
-    email, email_verified, admin_email, allowed, owner_user_id
+def test_open_registration_rejects_missing_or_unverified_email(
+    email, email_verified
 ):
     store = FakeStore()
-    with pytest.raises(oauth.OAuthError):
-        oauth.owner_only_identity(
-            store, "google", "sub-x", email, email_verified, "N",
-            allowed_emails=allowed, admin_email=admin_email,
-            owner_user_id=owner_user_id,
-        )
-    # a rejected login never writes an identity row
-    assert store.owner_links == {}
+    with pytest.raises(oauth.OAuthError) as excinfo:
+        _register(store, "sub-x", email, email_verified=email_verified)
+    # a plain OAuthError (generic), not the closed-registration variant
+    assert not isinstance(excinfo.value, oauth.RegistrationClosedError)
+    assert store.identities == {}
 
 
-def test_owner_only_identity_wraps_store_anomaly_as_oauth_error():
+def test_open_registration_wraps_store_anomaly_as_oauth_error():
     store = FakeStore()
-    store.owner_links[("google", "sub-x")] = 999  # linked to a different user
-    with pytest.raises(oauth.OAuthError):
-        oauth.owner_only_identity(
-            store, "google", "sub-x", "owner@example.com", True, "N",
-            allowed_emails=OWNER_ALLOWED, admin_email="owner@example.com",
-            owner_user_id=7,
-        )
+    store.raise_on_register = True
+    with pytest.raises(oauth.OAuthError) as excinfo:
+        _register(store, "sub-x", "owner@example.com")
+    # a store anomaly fails closed as a generic error, never a 500
+    assert not isinstance(excinfo.value, oauth.RegistrationClosedError)

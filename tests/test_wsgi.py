@@ -65,6 +65,31 @@ def state_from(location):
     return parse_qs(urlsplit(location).query)["state"][0]
 
 
+def complete_oauth_login(client, monkeypatch, identity, next_url="/"):
+    """Drive a full mock-provider Google login through the real Flask app.
+
+    The provider's HTTPS egress (token + userinfo) is the only thing stubbed;
+    the /auth/google/start -> provider -> /auth/google/callback redirect loop,
+    the browser-binding cookie and every policy/store write run for real.
+    """
+    install_fake_http(monkeypatch, identity)
+    start = client.get(
+        "/auth/google/start?" + urlencode({"next": next_url}),
+        base_url="https://localhost",
+    )
+    state = state_from(start.headers["Location"])
+    return client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+
+
+def _project_ids(client):
+    response = client.get("/api/meta", base_url="https://localhost")
+    assert response.status_code == 200
+    return {p["id"] for p in response.get_json()["projects"]}
+
+
 @pytest.fixture
 def public_app(tmp_path):
     config = Config()
@@ -693,7 +718,7 @@ def test_login_page_shows_google_button(public_app):
     page = client.get("/login", base_url="https://localhost").get_data(
         as_text=True
     )
-    assert "Войти через Google" in page
+    assert "Войти / зарегистрироваться через Google" in page
     assert 'href="/auth/google/start?next=' in page
 
 
@@ -805,11 +830,12 @@ def test_oauth_callback_sanitizes_next_url_for_browser(
     assert callback.headers.getlist("Location") == [expected_location]
 
 
-def test_oauth_callback_non_owner_is_rejected_before_account(
+def test_oauth_callback_denies_outsider_under_nonempty_allowlist(
     public_app, monkeypatch
 ):
     app, config = public_app
-    # a verified but non-owner email is refused before any account is created
+    # public_app configures a non-empty allow list, so a verified new subject
+    # that is neither the owner nor allow-listed is refused registration
     install_fake_http(
         monkeypatch,
         {
@@ -826,19 +852,28 @@ def test_oauth_callback_non_owner_is_rejected_before_account(
         "/auth/google/callback?state=%s&code=abc" % state,
         base_url="https://localhost",
     )
-    # owner-only: the login fails closed with a generic error, no session
-    assert callback.status_code == 400
+    # closed-registration page, no session, and no allow-list detail leaked
+    assert callback.status_code == 403
+    body = callback.get_data(as_text=True)
+    assert "Регистрация сейчас закрыта" in body
+    assert "stranger@example.com" not in body
+    assert "allowed@example.com" not in body
     assert client.get("/api/meta", base_url="https://localhost").status_code == 401
-    # and no account row was written for the stranger
+    # and no user/identity/tenant row was written for the stranger
     store = SecurityStore(config.security_db_path)
     conn = store._connect()
     try:
         row = conn.execute(
             "SELECT 1 FROM oauth_identities WHERE subject = ?", ("g-2",)
         ).fetchone()
+        users = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE email = ?",
+            ("stranger@example.com",),
+        ).fetchone()["n"]
     finally:
         conn.close()
     assert row is None
+    assert users == 0
 
 
 def test_oauth_callback_unverified_owner_email_is_rejected(
@@ -986,6 +1021,300 @@ def test_oauth_error_callback_burns_state(public_app, monkeypatch):
     )
     assert retry.status_code == 400
     assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+
+def _seed_tenant_with_project(config, user_id, project_id, title):
+    path = config.tenant_db_path(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(path)
+    init_db(conn)
+    conn.execute(
+        "INSERT INTO projects (id, title, status, synced_at) "
+        "VALUES (?, ?, 'in_progress', '2026-01-02T00:00:00Z')",
+        (project_id, title),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _session_user_id(client):
+    return client.get(
+        "/api/session", base_url="https://localhost"
+    ).get_json()["user_id"]
+
+
+def _logout(client):
+    csrf = client.get(
+        "/api/session", base_url="https://localhost"
+    ).get_json()["csrf"]
+    assert client.post(
+        "/logout", headers={"X-CSRF-Token": csrf}, base_url="https://localhost"
+    ).status_code == 303
+
+
+def test_open_registration_first_login_creates_own_empty_tenant(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()  # open registration
+    client = app.test_client()
+    identity = {"sub": "new-1", "email": "new@example.com", "email_verified": True}
+    callback = complete_oauth_login(client, monkeypatch, identity, "/api/meta")
+    assert callback.status_code == 303
+    assert callback.headers["Location"] == "/api/meta"
+    # a fresh ordinary account sees only its own empty tenant, never owner data
+    assert _project_ids(client) == set()
+    new_id = _session_user_id(client)
+
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        is_admin = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (new_id,)
+        ).fetchone()["is_admin"]
+        has_tenant = conn.execute(
+            "SELECT 1 FROM tenants WHERE user_id = ?", (new_id,)
+        ).fetchone()
+        admins = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE is_admin = 1"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert int(is_admin) == 0
+    assert has_tenant is not None
+    assert int(admins) == 1  # the owner is still the only admin
+
+    # signing in again with the same subject returns the same account
+    again = complete_oauth_login(client, monkeypatch, identity, "/api/meta")
+    assert again.status_code == 303
+    assert _session_user_id(client) == new_id
+
+
+def test_open_registration_email_change_keeps_single_account(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    client = app.test_client()
+    first = complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "chg", "email": "old@example.com", "email_verified": True},
+    )
+    assert first.status_code == 303
+    original_id = _session_user_id(client)
+    # the provider later reports a different verified email for the same subject
+    second = complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "chg", "email": "brand-new@example.com", "email_verified": True},
+    )
+    assert second.status_code == 303
+    assert _session_user_id(client) == original_id
+
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        identities = conn.execute(
+            "SELECT COUNT(*) AS n FROM oauth_identities WHERE subject = ?",
+            ("chg",),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert identities == 1
+
+
+def test_open_registration_ab_tenant_isolation(public_app, monkeypatch):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    a_client = app.test_client()
+    b_client = app.test_client()
+    # two distinct subjects that happen to share one email stay separate users
+    assert complete_oauth_login(
+        a_client, monkeypatch,
+        {"sub": "sub-a", "email": "shared@example.com", "email_verified": True},
+    ).status_code == 303
+    assert complete_oauth_login(
+        b_client, monkeypatch,
+        {"sub": "sub-b", "email": "shared@example.com", "email_verified": True},
+    ).status_code == 303
+    a_id = _session_user_id(a_client)
+    b_id = _session_user_id(b_client)
+    assert a_id != b_id
+
+    _seed_tenant_with_project(config, a_id, "PA", "A private project")
+    # A sees only A's data; B sees neither A's project nor the owner's P1/P2
+    assert _project_ids(a_client) == {"PA"}
+    assert _project_ids(b_client) == set()
+
+
+def test_open_registration_admin_email_links_owner_single_admin(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    owner_id = config.publish_tenant_id
+    client = app.test_client()
+    callback = complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "owner-sub", "email": "Allowed@Example.com",
+         "email_verified": True},
+        "/api/meta",
+    )
+    assert callback.status_code == 303
+    # the admin email links to the pre-existing owner: owner tenant, owner data
+    assert _session_user_id(client) == owner_id
+    assert _project_ids(client) == {"P1", "P2"}
+
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        admins = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM users WHERE is_admin = 1"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert admins == [owner_id]
+
+
+def test_open_registration_ordinary_subject_not_elevated_by_admin_email(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    owner_id = config.publish_tenant_id
+    client = app.test_client()
+    # an ordinary subject registers with its own email
+    assert complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "not-owner", "email": "person@example.com",
+         "email_verified": True},
+    ).status_code == 303
+    ordinary_id = _session_user_id(client)
+    assert ordinary_id != owner_id
+
+    # the same subject later presents the admin email — it must NOT be merged
+    # into or elevated to the owner; it stays its own ordinary empty account
+    assert complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "not-owner", "email": "allowed@example.com",
+         "email_verified": True},
+        "/api/meta",
+    ).status_code == 303
+    assert _session_user_id(client) == ordinary_id
+    assert _project_ids(client) == set()  # not the owner's P1/P2
+
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        is_admin = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (ordinary_id,)
+        ).fetchone()["is_admin"]
+        admins = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE is_admin = 1"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert int(is_admin) == 0
+    assert int(admins) == 1
+
+
+def test_open_registration_simultaneous_callbacks_one_account(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    identity = {"sub": "sim", "email": "sim@example.com", "email_verified": True}
+    install_fake_http(monkeypatch, identity)
+    client = app.test_client()
+    # two overlapping flows for the same brand-new subject (shared binding)
+    first_start = client.get("/auth/google/start", base_url="https://localhost")
+    second_start = client.get("/auth/google/start", base_url="https://localhost")
+    first_state = state_from(first_start.headers["Location"])
+    second_state = state_from(second_start.headers["Location"])
+    first = client.get(
+        "/auth/google/callback?state=%s&code=a" % first_state,
+        base_url="https://localhost",
+    )
+    second = client.get(
+        "/auth/google/callback?state=%s&code=b" % second_state,
+        base_url="https://localhost",
+    )
+    assert first.status_code == 303
+    assert second.status_code == 303
+
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        users = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE email = ?",
+            ("sim@example.com",),
+        ).fetchone()["n"]
+        identities = conn.execute(
+            "SELECT COUNT(*) AS n FROM oauth_identities WHERE subject = ?",
+            ("sim",),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert users == 1
+    assert identities == 1
+
+
+def test_open_registration_registered_user_keeps_access_after_delisting(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()  # open at registration time
+    client = app.test_client()
+    assert complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "keeper", "email": "keeper@example.com", "email_verified": True},
+    ).status_code == 303
+    assert _project_ids(client) == set()  # registered, has access
+
+    # an operator now configures a non-empty allow list that excludes them.
+    config.oauth_allowed_emails = frozenset({"someone@else.com"})
+    # the already-registered user keeps access — there is no request-time gate
+    assert client.get(
+        "/api/meta", base_url="https://localhost"
+    ).status_code == 200
+    # but a brand-new outsider can no longer register
+    outsider = app.test_client()
+    denied = complete_oauth_login(
+        outsider, monkeypatch,
+        {"sub": "late", "email": "late@example.com", "email_verified": True},
+    )
+    assert denied.status_code == 403
+    assert outsider.get(
+        "/api/meta", base_url="https://localhost"
+    ).status_code == 401
+
+
+def test_open_registration_logout_to_other_user_no_leak(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()
+    client = app.test_client()
+    assert complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "user-a", "email": "a@example.com", "email_verified": True},
+    ).status_code == 303
+    a_id = _session_user_id(client)
+    _seed_tenant_with_project(config, a_id, "PA", "A private project")
+    assert _project_ids(client) == {"PA"}
+
+    _logout(client)
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+    # a different user logging in on the same browser never inherits A's data
+    assert complete_oauth_login(
+        client, monkeypatch,
+        {"sub": "user-b", "email": "b@example.com", "email_verified": True},
+    ).status_code == 303
+    assert _session_user_id(client) != a_id
+    assert _project_ids(client) == set()
 
 
 def test_password_login_unaffected_by_oauth(public_app):
