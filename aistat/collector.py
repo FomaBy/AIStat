@@ -44,9 +44,19 @@ from .poller import Poller
 from .publish import PublishError, publish_snapshot
 from .tenant import canonical_tenant_id
 from .worker_store import WorkerStoreError, WorkerTokenStore
-from .worker_sync import WorkerSyncError, report_sync
+from .worker_sync import report_sync
 
 logger = logging.getLogger("aistat.collector")
+
+PROFILE_CREATE_FAILURE = "the connection profile could not be created"
+CONNECTION_FAILURE = "connection collection failed"
+
+
+def _safe_status(detail: str) -> str:
+    """Keep outcomes inside the finite worker-visible error vocabulary."""
+    if not detail:
+        return ""
+    return handoff.safe_sync_error(detail, default=CONNECTION_FAILURE)
 
 
 @dataclass
@@ -54,6 +64,11 @@ class ConnectionOutcome:
     user_id: int
     status: str  # "collected" | "skipped" | "failed"
     detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in {"collected", "skipped", "failed"}:
+            self.status = "failed"
+        self.detail = _safe_status(self.detail)
 
     @property
     def ok(self) -> bool:
@@ -91,6 +106,44 @@ class _TenantLock:
                 os.close(self._fd)
                 self._fd = None
 
+    def force_release(self) -> None:
+        """Best-effort descriptor cleanup for a faulting release hook."""
+        fd = self._fd
+        if fd is None:
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        finally:
+            self._fd = None
+
+
+def _safe_lock_release(lock: _TenantLock, user_id: int) -> None:
+    try:
+        lock.release()
+        return
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        logger.error("connection %s: profile lock release failed", user_id)
+    try:
+        force_release = getattr(lock, "force_release", None)
+        if callable(force_release):
+            force_release()
+            return
+        delegate = getattr(lock, "_delegate", None)
+        force_release = getattr(delegate, "force_release", None)
+        if callable(force_release):
+            force_release()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        logger.error("connection %s: profile lock cleanup failed", user_id)
+
 
 class Collector:
     """Collect every active connection, isolating each connection's failures."""
@@ -117,7 +170,19 @@ class Collector:
     def collect_once(self) -> List[ConnectionOutcome]:
         outcomes: List[ConnectionOutcome] = []
         for meta in self.store.list_connections():
-            outcomes.append(self._collect_one(meta))
+            try:
+                outcomes.append(self._collect_one(meta))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Keep a malformed/unexpected tenant record from aborting the
+                # rest of the cycle.  The id is trusted only if it can be
+                # canonicalized; otherwise this is a local diagnostic outcome.
+                try:
+                    user_id = canonical_tenant_id(meta.get("user_id", 0))
+                except Exception:
+                    user_id = 0
+                outcomes.append(ConnectionOutcome(user_id, "failed", CONNECTION_FAILURE))
         return outcomes
 
     # -- per-connection ------------------------------------------------------
@@ -136,6 +201,8 @@ class Collector:
             return self._fail(
                 user_id, listed_epoch, handoff.UNSUPPORTED_MULTICA_SERVER
             )
+        except Exception:
+            return self._fail(user_id, listed_epoch, CONNECTION_FAILURE)
         try:
             # This must precede even the per-tenant lock: its pathname lives in
             # the same root and would otherwise follow a symlink or fail on a
@@ -143,10 +210,20 @@ class Collector:
             assert_safe_profile_storage(self.config.cli_profiles_dir, user_id)
         except CliProfileError as exc:
             return self._fail(user_id, listed_epoch, str(exc))
-        lock = _TenantLock(self.config.cli_profiles_dir, user_id)
+        except Exception:
+            return self._fail(user_id, listed_epoch, CONNECTION_FAILURE)
+        try:
+            lock = _TenantLock(self.config.cli_profiles_dir, user_id)
+        except Exception:
+            return self._fail(
+                user_id, listed_epoch, "the connection profile lock could not be acquired"
+            )
         try:
             acquired = lock.acquire()
-        except OSError:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            _safe_lock_release(lock, user_id)
             return self._fail(
                 user_id,
                 listed_epoch,
@@ -167,6 +244,14 @@ class Collector:
                     listed_epoch,
                     "the stored credential version could not be read",
                 )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return self._fail(
+                    user_id,
+                    listed_epoch,
+                    "the stored credential version could not be read",
+                )
             if credential is None:
                 # Revoked/erased between listing and reading. Do a residue-only
                 # local cleanup so a prior crashed cycle's stale token config is
@@ -182,6 +267,10 @@ class Collector:
                     credential.token_epoch,
                     handoff.UNSUPPORTED_MULTICA_SERVER,
                 )
+            except Exception:
+                return self._fail(
+                    user_id, credential.token_epoch, CONNECTION_FAILURE
+                )
             return self._collect_with_token(
                 user_id,
                 credential.token_epoch,
@@ -189,30 +278,98 @@ class Collector:
                 credential.token,
             )
         finally:
-            lock.release()
+            _safe_lock_release(lock, user_id)
 
     def _discard_revoked(self, user_id: int) -> ConnectionOutcome:
         try:
-            self.profile_factory(self.config, user_id).discard_residue()
-        except CliProfileError:
+            profile = self.profile_factory(self.config, user_id)
+            profile.discard_residue()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             logger.error(
                 "connection %s: revoked-connection residue could not be removed",
                 user_id,
             )
             return ConnectionOutcome(
-                user_id, "failed", "revoked connection residue could not be removed"
+                user_id, "failed", "the connection profile could not be cleaned up"
             )
         return ConnectionOutcome(user_id, "skipped", "connection was revoked")
 
     def _collect_with_token(
         self, user_id: int, epoch: int, label: Optional[str], token: str
     ) -> ConnectionOutcome:
-        profile = self.profile_factory(self.config, user_id)
-        cleaned = False
-        lifecycle_started = False
+        try:
+            profile = self.profile_factory(self.config, user_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return self._record_outcome(
+                user_id,
+                epoch,
+                ConnectionOutcome(user_id, "failed", PROFILE_CREATE_FAILURE),
+            )
+
+        entered = False
+        cleanup_done = False
+
+        def finish(outcome: ConnectionOutcome, *, report: bool = True):
+            nonlocal cleanup_done
+            if not cleanup_done:
+                cleanup_failure = (
+                    self._safe_cleanup(profile, user_id)
+                    if entered
+                    else self._safe_discard(profile, user_id)
+                )
+                cleanup_done = True
+                # A secondary cleanup failure must not hide the primary
+                # authentication/poll/publish failure.  A successful primary
+                # outcome is downgraded because residue must not be reusable.
+                if outcome.ok and cleanup_failure is not None:
+                    outcome = cleanup_failure
+            if outcome.status == "skipped":
+                logger.info(
+                    "connection %s: credential changed during collection",
+                    user_id,
+                )
+                return outcome
+            return self._record_outcome(user_id, epoch, outcome) if report else outcome
+
         try:
             try:
-                outcome, lifecycle_started = self._drive_profile(
+                if not self._credential_is_current(user_id, epoch):
+                    return finish(self._stale_credential(user_id), report=False)
+            except WorkerStoreError:
+                return finish(
+                    ConnectionOutcome(
+                        user_id,
+                        "failed",
+                        "the credential version could not be verified",
+                    )
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return finish(
+                    ConnectionOutcome(user_id, "failed", CONNECTION_FAILURE)
+                )
+
+            try:
+                enter_fn = getattr(profile, "__enter__", None)
+                if callable(enter_fn):
+                    entered_profile = enter_fn()
+                    if entered_profile is not None:
+                        profile = entered_profile
+                entered = True
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return finish(
+                    ConnectionOutcome(user_id, "failed", PROFILE_CREATE_FAILURE)
+                )
+
+            try:
+                outcome, _lifecycle_started = self._drive_profile(
                     profile, user_id, epoch, label, token
                 )
             except WorkerStoreError:
@@ -221,22 +378,18 @@ class Collector:
                     "failed",
                     "the credential version could not be verified",
                 )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.error(
+                    "connection %s lifecycle failed (%s)",
+                    user_id,
+                    "unexpected exception",
+                )
+                outcome = ConnectionOutcome(user_id, "failed", CONNECTION_FAILURE)
+
             if not outcome.ok:
-                stale = outcome.status == "skipped"
-                if lifecycle_started:
-                    cleanup_failure = self._safe_cleanup(profile, user_id)
-                else:
-                    cleanup_failure = self._safe_discard(profile, user_id)
-                cleaned = True
-                if cleanup_failure is not None:
-                    outcome = cleanup_failure
-                if stale:
-                    logger.info(
-                        "connection %s: credential changed during collection",
-                        user_id,
-                    )
-                    return outcome
-                return self._record_outcome(user_id, epoch, outcome)
+                return finish(outcome, report=outcome.status != "skipped")
 
             try:
                 # Linearize freshness immediately before outbound publish. A
@@ -255,37 +408,34 @@ class Collector:
                             outcome = self._publish(user_id)
                     finally:
                         cleanup_failure = self._safe_cleanup(profile, user_id)
-                        cleaned = True
-                    stale = outcome.status == "skipped"
+                        cleanup_done = True
                     if outcome.ok and cleanup_failure is not None:
                         outcome = cleanup_failure
-                    elif stale and cleanup_failure is not None:
-                        outcome = cleanup_failure
-                    if stale:
-                        logger.info(
-                            "connection %s: credential changed during collection",
-                            user_id,
-                        )
-                        return outcome
-                    return self._record_outcome(user_id, epoch, outcome)
+                    return finish(
+                        outcome,
+                        report=outcome.status != "skipped",
+                    )
             except WorkerStoreError:
-                outcome = ConnectionOutcome(
-                    user_id,
-                    "failed",
-                    "the credential version could not be verified before publish",
+                return finish(
+                    ConnectionOutcome(
+                        user_id,
+                        "failed",
+                        "the credential version could not be verified before publish",
+                    )
                 )
-                if not cleaned:
-                    cleanup_failure = self._safe_cleanup(profile, user_id)
-                    cleaned = True
-                    if cleanup_failure is not None:
-                        outcome = cleanup_failure
-                return self._record_outcome(user_id, epoch, outcome)
-        except BaseException:
-            if not cleaned:
-                if lifecycle_started:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return finish(
+                    ConnectionOutcome(user_id, "failed", CONNECTION_FAILURE)
+                )
+        except (KeyboardInterrupt, SystemExit):
+            if not cleanup_done:
+                if entered:
                     self._safe_cleanup(profile, user_id)
                 else:
                     self._safe_discard(profile, user_id)
+            cleanup_done = True
             raise
 
     def _drive_profile(
@@ -304,13 +454,39 @@ class Collector:
         except CliProfileError as exc:
             # Safe, path-free message (auth, symlinked storage or unremovable
             # residue) — never the CLI's raw stderr or a token.
-            return ConnectionOutcome(user_id, "failed", str(exc)), True
+            return ConnectionOutcome(
+                user_id,
+                "failed",
+                handoff.safe_sync_error(
+                    str(exc), default="official CLI login failed for the connection"
+                ),
+            ), True
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.error("connection %s login failed", user_id)
+            return ConnectionOutcome(
+                user_id, "failed", "official CLI login failed for the connection"
+            ), True
         if not self._credential_is_current(user_id, epoch):
             return self._stale_credential(user_id), True
         try:
             profile.select_workspace(label)
         except CliProfileError as exc:
-            return ConnectionOutcome(user_id, "failed", str(exc)), True
+            return ConnectionOutcome(
+                user_id,
+                "failed",
+                handoff.safe_sync_error(
+                    str(exc), default="the connection's workspace could not be resolved"
+                ),
+            ), True
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.error("connection %s workspace selection failed", user_id)
+            return ConnectionOutcome(
+                user_id, "failed", "the connection's workspace could not be resolved"
+            ), True
         if not self._credential_is_current(user_id, epoch):
             return self._stale_credential(user_id), True
         db_path = self.config.worker_tenant_db_path(user_id)
@@ -377,8 +553,14 @@ class Collector:
     ) -> Optional[ConnectionOutcome]:
         """Log out and erase residue; a removal failure becomes a safe failure."""
         try:
-            profile.cleanup()
-        except CliProfileError:
+            exit_fn = getattr(profile, "__exit__", None)
+            if callable(exit_fn):
+                exit_fn(None, None, None)
+            else:
+                profile.cleanup()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             logger.error(
                 "connection %s: profile residue could not be removed on cleanup",
                 user_id,
@@ -394,7 +576,9 @@ class Collector:
         """Erase residue without logout when no login was attempted."""
         try:
             profile.discard_residue()
-        except CliProfileError:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             logger.error(
                 "connection %s: profile residue could not be discarded",
                 user_id,
@@ -414,21 +598,25 @@ class Collector:
             conn.close()
 
     def _fail(self, user_id: int, epoch: int, message: str) -> ConnectionOutcome:
-        logger.error("connection %s: %s", user_id, message)
-        self._report(user_id, epoch, False, message)
-        return ConnectionOutcome(user_id, "failed", message)
+        safe_message = _safe_status(message) or CONNECTION_FAILURE
+        logger.error("connection %s: %s", user_id, safe_message)
+        self._report(user_id, epoch, False, safe_message)
+        return ConnectionOutcome(user_id, "failed", safe_message)
 
     def _report(
         self, user_id: int, epoch: int, ok: bool, error: Optional[str]
     ) -> None:
         if self.report_fn is None:
             return
+        safe_error = None if error is None else _safe_status(error)
         try:
-            self.report_fn(self.config, user_id, epoch, ok, error)
-        except (WorkerSyncError, WorkerStoreError, OSError) as exc:
+            self.report_fn(self.config, user_id, epoch, ok, safe_error)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             logger.warning(
-                "could not report connection %s outcome (%s)",
-                user_id, type(exc).__name__,
+                "could not report connection %s outcome (unexpected exception)",
+                user_id,
             )
 
 

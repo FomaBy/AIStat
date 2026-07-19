@@ -86,6 +86,64 @@ MAX_LABEL_LENGTH = 128
 MAX_SYNC_ERROR_LENGTH = 500
 MAX_ACK_ITEMS = 100
 
+# Worker status is user-visible and is persisted by the public host.  Keep the
+# vocabulary deliberately finite: an exception, CLI stderr, filesystem path
+# or token must never cross the worker boundary just because a caller passed it
+# as ``error``.
+DEFAULT_SYNC_ERROR = "worker collection failed"
+SAFE_SYNC_ERRORS = frozenset(
+    {
+        DEFAULT_SYNC_ERROR,
+        "authentication with the connection's token failed",
+        "official CLI login failed for the connection",
+        "could not list the connection's workspaces",
+        "the connection's token has no accessible workspace",
+        "the connection's token has multiple workspaces but none was selected",
+        "the connection's workspace label is ambiguous",
+        "the connection's workspace could not be resolved",
+        "workspace was not selected before polling",
+        "could not read the connection's workspace data",
+        "could not log out of the connection's profile",
+        "connection profile storage could not be verified",
+        "connection profile storage is unsafe: a symlink is not permitted",
+        "connection profile storage is unsafe: not a directory",
+        "the connection profile residue could not be removed",
+        "the connection profile could not be cleaned up",
+        "the stored credential version could not be read",
+        "the credential version could not be verified",
+        "the credential version could not be verified before publish",
+        "the connection profile could not be created",
+        "the connection profile lock could not be acquired",
+        "connection collection failed",
+        "polling the connection's data failed",
+        "publishing the connection's snapshot failed",
+        "connection was revoked",
+        "connection credential changed during collection",
+        "another poll of this tenant is already in progress",
+        "poll source failed",
+        "issue details synchronization failed",
+        "pricing data could not be loaded",
+        "multica CLI timeout",
+        "multica CLI exited with 1",
+        "CLI failed: exit 1",
+        UNSUPPORTED_MULTICA_SERVER,
+        PENDING_EXPIRED_REASON,
+    }
+)
+
+
+def safe_sync_error(error, default=DEFAULT_SYNC_ERROR):
+    """Return only an allowlisted worker status message.
+
+    The default is intentionally generic.  Callers may provide a different
+    already-allowlisted fallback for a more precise, still-safe status.
+    """
+    if isinstance(error, str):
+        candidate = error.strip()
+        if candidate in SAFE_SYNC_ERRORS:
+            return candidate
+    return default if default in SAFE_SYNC_ERRORS else DEFAULT_SYNC_ERROR
+
 CONNECTIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS connections (
     user_id          INTEGER PRIMARY KEY,
@@ -781,7 +839,7 @@ def record_connection_sync(
             )
             status = "active"
         else:
-            message = (error or "sync failed").strip()[:MAX_SYNC_ERROR_LENGTH]
+            message = safe_sync_error(error)
             conn.execute(
                 "UPDATE connections SET status = 'error', "
                 "last_sync_error = ?, updated_at = ? WHERE user_id = ?",

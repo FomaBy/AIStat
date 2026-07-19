@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import handoff
-from .cli import CliError, run_cli
+from .cli import run_cli
 from .config import Config
 from .tenant import canonical_tenant_id
 
@@ -136,6 +136,8 @@ class _SubprocessExecutor:
             return ExecResult(127, "", "multica binary not found")
         except subprocess.TimeoutExpired:
             return ExecResult(124, "", "multica command timed out")
+        except OSError:
+            return ExecResult(127, "", "multica command could not be started")
         return ExecResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
     def json(
@@ -301,10 +303,17 @@ class ConnectionCliProfile:
         self._prepare_home()
         if not token:
             raise CliProfileError("no token available for the connection")
-        result = self._executor.raw(
-            ["login", "--token"], prepend=self._base(), env=self._env(),
-            stdin=token if token.endswith("\n") else token + "\n",
-        )
+        try:
+            result = self._executor.raw(
+                ["login", "--token"], prepend=self._base(), env=self._env(),
+                stdin=token if token.endswith("\n") else token + "\n",
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise CliProfileError(
+                "official CLI login failed for the connection"
+            ) from None
         if result.returncode != 0:
             # Deliberately generic: the CLI's stderr may echo request context;
             # the connection status must never carry a PAT or profile path.
@@ -316,7 +325,9 @@ class ConnectionCliProfile:
             data = self._executor.json(
                 ["workspace", "list"], prepend=self._base(), env=self._env()
             )
-        except CliError:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             # Raw CLI detail can contain request context and must not survive in
             # a traceback, sync error or diagnostic surface.
             raise CliProfileError(
@@ -339,7 +350,9 @@ class ConnectionCliProfile:
         prepend = self._base() + ["--workspace-id", self._workspace_id]
         try:
             return self._executor.json(args, prepend=prepend, env=self._env())
-        except CliError:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             raise CliProfileError(
                 "could not read the connection's workspace data"
             ) from None
@@ -354,9 +367,16 @@ class ConnectionCliProfile:
         prepend = self._base()
         if self._workspace_id is not None:
             prepend += ["--workspace-id", self._workspace_id]
-        result = self._executor.raw(
-            ["auth", "logout"], prepend=prepend, env=self._env(),
-        )
+        try:
+            result = self._executor.raw(
+                ["auth", "logout"], prepend=prepend, env=self._env(),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise CliProfileError(
+                "could not log out of the connection's profile"
+            ) from None
         if result.returncode != 0:
             logger.warning("auth logout returned non-zero for user %s", self.user_id)
 
@@ -377,6 +397,7 @@ class ConnectionCliProfile:
                 self._workspace_id = None
 
     def __enter__(self) -> "ConnectionCliProfile":
+        self._assert_safe_storage()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

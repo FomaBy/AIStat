@@ -190,7 +190,7 @@ def report_sync(
         "result": "sync_ok" if ok else "sync_error",
     }
     if not ok:
-        ack["error"] = (error or "sync failed")[: handoff.MAX_SYNC_ERROR_LENGTH]
+        ack["error"] = handoff.safe_sync_error(error)
     results = _call(
         config, opener, handoff.WORKER_ACK_PATH, {"acks": [ack]}
     ).get("results") or []
@@ -209,7 +209,7 @@ def watch(config: Config) -> int:
                     summary["revoked"],
                 )
         except (WorkerSyncError, WorkerStoreError) as exc:
-            logger.error("handoff cycle failed: %s", exc)
+            logger.error("handoff cycle failed: %s", handoff.safe_sync_error(str(exc)))
         time.sleep(config.worker_pull_interval_seconds)
 
 
@@ -233,7 +233,7 @@ def main(argv=None) -> int:
     except (WorkerSyncError, WorkerStoreError, KeyboardInterrupt) as exc:
         if isinstance(exc, KeyboardInterrupt):
             return 0
-        logger.error("%s", exc)
+        logger.error("%s", handoff.safe_sync_error(str(exc)))
         return 1
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

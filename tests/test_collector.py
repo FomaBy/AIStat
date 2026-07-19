@@ -475,6 +475,131 @@ def test_failure_detail_carries_no_token_or_path(tmp_path):
     assert str(tmp_path) not in outcome.detail
 
 
+@pytest.mark.parametrize(
+    "fault",
+    ["factory", "enter", "login", "workspace", "poll", "publish", "report", "cleanup"],
+)
+def test_unexpected_tenant_fault_isolated_and_redacted(tmp_path, fault):
+    """Unexpected tenant-A faults never stop the healthy tenant-B cycle."""
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[
+            {"user_id": 101, "workspace_label": "alpha", "token_epoch": 1},
+            {"user_id": 202, "workspace_label": "beta", "token_epoch": 1},
+        ],
+        tokens={101: TOKEN_A, 202: TOKEN_B},
+    )
+
+    class ExplodingProfile(FakeProfile):
+        def __init__(self, config, user_id):
+            super().__init__(config, user_id)
+
+        def __enter__(self):
+            if fault == "enter":
+                raise RuntimeError("PAT=/tmp/secret profile enter sentinel")
+            return self
+
+        def login(self, token):
+            if fault == "login":
+                raise RuntimeError("PAT login stderr sentinel")
+            return super().login(token)
+
+        def select_workspace(self, label):
+            if fault == "workspace":
+                raise RuntimeError("workspace stdout sentinel")
+            return super().select_workspace(label)
+
+        def cleanup(self):
+            self.cleaned = True
+            if fault == "cleanup":
+                raise RuntimeError("cleanup path sentinel")
+
+    def profile_factory(cfg, user_id):
+        if int(user_id) == 101 and fault == "factory":
+            raise RuntimeError("factory PAT sentinel")
+        if int(user_id) == 101:
+            return ExplodingProfile(cfg, user_id)
+        return FakeProfile(cfg, user_id)
+
+    def poll_fn(_cfg, _conn, runner):
+        profile = getattr(runner, "__self__", None)
+        if fault == "poll" and profile is not None and profile.user_id == 101:
+            raise RuntimeError("poll CLI stderr sentinel")
+
+    def publish_fn(_cfg, _db_path, tenant_id):
+        if fault == "publish" and tenant_id == 101:
+            raise RuntimeError("publish PAT sentinel")
+
+    def report_fn(_cfg, user_id, _epoch, _ok, _error):
+        if fault == "report" and user_id == 101:
+            raise RuntimeError("report sentinel")
+
+    outcomes = Collector(
+        config,
+        store,
+        profile_factory=profile_factory,
+        publish_fn=publish_fn,
+        report_fn=report_fn,
+        poll_fn=poll_fn,
+    ).collect_once()
+    by_user = {outcome.user_id: outcome for outcome in outcomes}
+
+    assert by_user[202].status == "collected"
+    if fault == "report":
+        assert by_user[101].status == "collected"
+    else:
+        assert by_user[101].status == "failed"
+    serialized = repr(outcomes)
+    for sentinel in (TOKEN_A, str(tmp_path), "sentinel", "stderr"):
+        assert sentinel not in serialized
+
+
+@pytest.mark.parametrize("phase", ["acquire", "release"])
+def test_lock_fault_does_not_stop_neighbor_or_hold_descriptor(tmp_path, monkeypatch, phase):
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[
+            {"user_id": 101, "workspace_label": "alpha", "token_epoch": 1},
+            {"user_id": 202, "workspace_label": "beta", "token_epoch": 1},
+        ],
+        tokens={101: TOKEN_A, 202: TOKEN_B},
+    )
+    original = collector_module._TenantLock
+
+    class FaultLock(original):
+        def __init__(self, root, user_id):
+            super().__init__(root, user_id)
+            self._fault_user = int(user_id) == 101
+
+        def acquire(self):
+            if phase == "acquire" and self._fault_user:
+                raise RuntimeError("lock PAT sentinel")
+            return super().acquire()
+
+        def release(self):
+            result = super().release()
+            if phase == "release" and self._fault_user:
+                raise RuntimeError("release path sentinel")
+            return result
+
+    monkeypatch.setattr(collector_module, "_TenantLock", FaultLock)
+    outcomes = Collector(
+        config,
+        store,
+        profile_factory=factory_with(),
+        publish_fn=RecordingPublisher(),
+        report_fn=None,
+        poll_fn=lambda *_args: None,
+    ).collect_once()
+
+    by_user = {outcome.user_id: outcome for outcome in outcomes}
+    assert by_user[202].status == "collected"
+    assert by_user[101].status == ("failed" if phase == "acquire" else "collected")
+    lock = original(config.cli_profiles_dir, 101)
+    assert lock.acquire()
+    lock.release()
+
+
 # -- collector storage preflight: no lock/token/profile/lifecycle side effect -
 
 def test_poisoned_persisted_host_fails_before_token_or_profile_lifecycle(tmp_path):
@@ -904,6 +1029,39 @@ def test_cleanup_residue_failure_downgrades_to_safe_failure(tmp_path):
     assert str(tmp_path) not in outcomes[101].detail
     # one connection's cleanup failure does not stop the other
     assert outcomes[202].status == "collected"
+
+
+def test_cleanup_fault_does_not_replace_primary_failure(tmp_path):
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[
+            {"user_id": 101, "workspace_label": "alpha", "token_epoch": 1},
+            {"user_id": 202, "workspace_label": "beta", "token_epoch": 1},
+        ],
+        tokens={101: TOKEN_A, 202: TOKEN_B},
+    )
+
+    class FailingProfile(FakeProfile):
+        def login(self, token):
+            raise CliProfileError("official CLI login failed for the connection")
+
+        def cleanup(self):
+            raise RuntimeError("cleanup PAT sentinel")
+
+    def factory(config, user_id):
+        return FailingProfile(config, user_id) if int(user_id) == 101 else FakeProfile(config, user_id)
+
+    outcomes = Collector(
+        config,
+        store,
+        profile_factory=factory,
+        publish_fn=RecordingPublisher(),
+        report_fn=None,
+        poll_fn=lambda *_args: None,
+    ).collect_once()
+    by_user = {outcome.user_id: outcome for outcome in outcomes}
+    assert by_user[101].detail == "official CLI login failed for the connection"
+    assert by_user[202].status == "collected"
 
 
 def test_unreadable_token_fails_safely(tmp_path):
