@@ -16,9 +16,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
-from urllib.parse import urlsplit
 
 from .config import Config
+from .endpoints import https_endpoint_error
 from .security import snapshot_signature
 from .snapshot import SnapshotError, create_compressed_snapshot
 from .tenant import canonical_tenant_id
@@ -38,14 +38,9 @@ def _validate_publish_endpoint(config: Config) -> None:
     checked by the caller, not here; single-tenant callers add the tenant
     check via ``_validate_publish_config``.
     """
-    if not config.publish_url:
-        raise PublishError("AISTAT_PUBLISH_URL is not configured")
-    parsed = urlsplit(config.publish_url)
-    if parsed.scheme != "https" and not config.allow_insecure_publish:
-        raise PublishError(
-            "AISTAT_PUBLISH_URL must use HTTPS "
-            "(set AISTAT_ALLOW_INSECURE_PUBLISH=1 only for local tests)"
-        )
+    error = https_endpoint_error("AISTAT_PUBLISH_URL", config.publish_url)
+    if error is not None:
+        raise PublishError("AISTAT_PUBLISH_URL {}".format(error))
     if not config.ingest_secret or len(config.ingest_secret.encode("utf-8")) < 32:
         raise PublishError("AISTAT_INGEST_SECRET must contain at least 32 bytes")
     if config.publish_interval_seconds < 60:

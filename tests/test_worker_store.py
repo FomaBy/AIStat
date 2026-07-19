@@ -544,7 +544,8 @@ def test_sync_error_report_reaches_cabinet(host, tmp_path):
     ).get_json()["last_sync_error"] == "multica CLI timeout"
 
 
-def test_worker_sync_config_validation(tmp_path):
+def test_worker_sync_config_validation(tmp_path, monkeypatch):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
     dummy_opener = object()
     config = worker_config(tmp_path, worker_sync_url=None)
     with pytest.raises(WorkerSyncError):
@@ -554,6 +555,8 @@ def test_worker_sync_config_validation(tmp_path):
     )
     with pytest.raises(WorkerSyncError):
         pull_once(config, opener=dummy_opener)
+    assert not config.worker_store_path.exists()
+    assert not config.worker_key_path.exists()
     config = worker_config(tmp_path, worker_secret="short")
     with pytest.raises(WorkerSyncError):
         pull_once(config, opener=dummy_opener)

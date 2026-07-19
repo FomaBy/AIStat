@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference only. The real plist is rendered by `aistat.runtime_install`
+  (`deploy/aistat_runtime.sh install`) from the actual $HOME and runtime root,
+  so there is no hard-coded username. Placeholders below use __NAME__ form.
+
+  The plist carries NO secrets: ingest/session/worker secrets and the tenant id
+  live in the owner-only env file at __ENV_FILE__ (mode 0600), which the
+  supervisor loads at startup. Persistent data is pinned under
+  __RUNTIME_ROOT__/data so a code update never touches it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aistat.runtime</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>aistat.supervisor</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__RUNTIME_ROOT__/code</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AISTAT_RUNTIME_ROOT</key>
+    <string>__RUNTIME_ROOT__</string>
+    <key>AISTAT_ENV_FILE</key>
+    <string>__ENV_FILE__</string>
+    <key>AISTAT_DB_PATH</key>
+    <string>__RUNTIME_ROOT__/data/aistat.db</string>
+    <key>AISTAT_WORKER_STORE_PATH</key>
+    <string>__RUNTIME_ROOT__/data/worker_connections.db</string>
+    <key>AISTAT_WORKER_TENANTS_DIR</key>
+    <string>__RUNTIME_ROOT__/data/worker_tenants</string>
+    <key>AISTAT_CLI_PROFILES_DIR</key>
+    <string>__RUNTIME_ROOT__/data/cli_profiles</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__RUNTIME_ROOT__/data/runtime.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__RUNTIME_ROOT__/data/runtime.stderr.log</string>
+</dict>
+</plist>

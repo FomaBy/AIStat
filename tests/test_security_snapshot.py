@@ -264,8 +264,7 @@ def test_publisher_builds_valid_signed_request(tmp_path):
     seeded_db(db_path)
     config = Config()
     config.db_path = db_path
-    config.publish_url = "http://localhost/api/ingest/snapshot"
-    config.allow_insecure_publish = True
+    config.publish_url = "https://localhost/api/ingest/snapshot"
     config.publish_interval_seconds = 300
     config.ingest_secret = SECRET
     config.publish_tenant_id = TENANT_ID
@@ -306,7 +305,10 @@ def test_publisher_builds_valid_signed_request(tmp_path):
     assert captured["timeout"] == config.publish_timeout_seconds
 
 
-def test_publisher_requires_https_by_default(tmp_path):
+def test_publisher_rejects_http_even_with_insecure_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
     db_path = tmp_path / "source.db"
     seeded_db(db_path)
     config = Config()
@@ -314,8 +316,15 @@ def test_publisher_requires_https_by_default(tmp_path):
     config.publish_url = "http://example.test/upload"
     config.ingest_secret = SECRET
     config.publish_tenant_id = TENANT_ID
-    with pytest.raises(PublishError):
-        publish_once(config)
+    opener_calls = []
+
+    def opener(*args, **kwargs):
+        opener_calls.append((args, kwargs))
+        raise AssertionError("HTTP endpoint must fail before network access")
+
+    with pytest.raises(PublishError, match="must use HTTPS"):
+        publish_once(config, opener=opener)
+    assert opener_calls == []
 
 
 def test_publisher_rejects_mismatched_host_confirmation(tmp_path):
@@ -323,8 +332,7 @@ def test_publisher_rejects_mismatched_host_confirmation(tmp_path):
     seeded_db(db_path)
     config = Config()
     config.db_path = db_path
-    config.publish_url = "http://localhost/upload"
-    config.allow_insecure_publish = True
+    config.publish_url = "https://localhost/upload"
     config.publish_interval_seconds = 300
     config.ingest_secret = SECRET
     config.publish_tenant_id = TENANT_ID
@@ -352,8 +360,7 @@ def test_publish_snapshot_signs_per_tenant(tmp_path):
     db_path = tmp_path / "tenant.db"
     seeded_db(db_path)
     config = Config()
-    config.publish_url = "http://localhost/api/ingest/snapshot"
-    config.allow_insecure_publish = True
+    config.publish_url = "https://localhost/api/ingest/snapshot"
     config.publish_interval_seconds = 300
     config.ingest_secret = SECRET
     config.publish_tenant_id = None  # no single-tenant selector configured
@@ -392,8 +399,7 @@ def test_publish_snapshot_rejects_wrong_tenant_confirmation(tmp_path):
     db_path = tmp_path / "tenant.db"
     seeded_db(db_path)
     config = Config()
-    config.publish_url = "http://localhost/upload"
-    config.allow_insecure_publish = True
+    config.publish_url = "https://localhost/upload"
     config.publish_interval_seconds = 300
     config.ingest_secret = SECRET
 
