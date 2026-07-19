@@ -595,13 +595,14 @@ def create_app(config: Optional[Config] = None) -> Flask:
     def health_payload():
         conn = data_connection()
         try:
+            # Never surface the tenant DB's filesystem path over the public
+            # contour: it would disclose the server layout and the numeric
+            # tenant id embedded in the path. ``db_path`` stays available only
+            # to the loopback CLI / local FastAPI contour, which pass it
+            # explicitly.
             return snapshot(
                 conn,
-                db_path=(
-                    str(config.tenant_db_path(current_user_id()))
-                    if current_user_id()
-                    else None
-                ),
+                db_path=None,
                 credits_per_usd=config.credits_per_usd,
             )
         finally:
