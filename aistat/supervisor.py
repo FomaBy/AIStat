@@ -419,9 +419,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Supervise the local AIStat runtime contours"
     )
-    parser.add_argument("--skip-preflight", action="store_true",
-                        help="start contours without the startup preflight")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -439,13 +437,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.error("could not read env file: %s", type(exc).__name__)
             return 2
 
-    if not args.skip_preflight:
-        report = preflight.run_preflight(Config(), env_file=env_file)
-        if not report.ok:
-            for check in report.failures:
-                logger.error("preflight FAIL %s: %s", check.name, check.detail)
-            logger.error("refusing to start a misconfigured runtime")
-            return 2
+    report = preflight.run_preflight(Config(), env_file=env_file)
+    if not report.ok:
+        for check in report.failures:
+            logger.error("preflight FAIL %s: %s", check.name, check.detail)
+        logger.error("refusing to start a misconfigured runtime")
+        return 2
 
     supervisor = Supervisor(
         default_contours(sys.executable),

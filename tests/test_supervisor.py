@@ -186,6 +186,86 @@ def test_invalid_secrets_never_start_supervisor(
             assert secret not in caplog.text
 
 
+def test_removed_skip_preflight_is_rejected_before_runtime_construction(
+    monkeypatch, capsys, caplog
+):
+    synthetic_secrets = (
+        "synthetic-ingest-secret-never-log-1414",
+        "synthetic-worker-secret-never-log-1414",
+        "synthetic-session-secret-never-log-1414",
+    )
+    for key, value in zip(
+        (
+            "AISTAT_INGEST_SECRET",
+            "AISTAT_WORKER_SECRET",
+            "AISTAT_SESSION_SECRET",
+        ),
+        synthetic_secrets,
+    ):
+        monkeypatch.setenv(key, value)
+
+    runtime_calls = []
+
+    def config_spy():
+        runtime_calls.append("config")
+        raise AssertionError("Config must not be created for invalid CLI")
+
+    class SupervisorSpy:
+        def __init__(self, *args, **kwargs):
+            runtime_calls.append("constructed")
+
+        def run(self):
+            runtime_calls.append("run")
+            return 0
+
+    monkeypatch.setattr(sv, "Config", config_spy)
+    monkeypatch.setattr(sv, "Supervisor", SupervisorSpy)
+
+    for _attempt in range(3):
+        with pytest.raises(SystemExit) as exc_info:
+            sv.main(["--skip-preflight"])
+        assert exc_info.value.code == 2
+
+    captured = capsys.readouterr()
+    assert runtime_calls == []
+    assert captured.err.count("unrecognized arguments: --skip-preflight") == 3
+    for secret in synthetic_secrets:
+        assert secret not in captured.err
+        assert secret not in captured.out
+        assert secret not in caplog.text
+
+
+def test_valid_exact_32_byte_session_secret_starts_once(
+    tmp_path, monkeypatch
+):
+    config = valid_preflight_config(tmp_path)
+    config.session_secret = "é" * 16
+    assert len(config.session_secret.encode("utf-8")) == 32
+    real_run_preflight = sv.preflight.run_preflight
+    runtime_calls = []
+
+    def run_without_imports(candidate, env_file=None):
+        return real_run_preflight(
+            candidate, check_imports=False, env_file=env_file
+        )
+
+    class SupervisorSpy:
+        def __init__(self, *args, **kwargs):
+            runtime_calls.append("constructed")
+
+        def run(self):
+            runtime_calls.append("run")
+            return 17
+
+    monkeypatch.setattr(sv, "Config", lambda: config)
+    monkeypatch.setattr(sv, "_resolve_env_file", lambda: None)
+    monkeypatch.setattr(sv.preflight, "run_preflight", run_without_imports)
+    monkeypatch.setattr(sv, "Supervisor", SupervisorSpy)
+
+    assert sv.main([]) == 17
+    assert runtime_calls == ["constructed", "run"]
+
+
 def test_single_instance_lock_excludes_second(tmp_path):
     path = tmp_path / "supervisor.lock"
     first = SingleInstanceLock(path)
