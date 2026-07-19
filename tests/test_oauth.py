@@ -543,3 +543,87 @@ def test_open_registration_wraps_store_anomaly_as_oauth_error():
         _register(store, "sub-x", "owner@example.com")
     # a store anomaly fails closed as a generic error, never a 500
     assert not isinstance(excinfo.value, oauth.RegistrationClosedError)
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "a@b.co",
+        "  a@b.co  ",                       # harmless outer whitespace is trimmed
+        "\tUser.Name+tag@Example.COM\n",    # case preserved, tabs/newlines stripped
+        "x@sub.example.com",
+    ],
+)
+def test_normalize_email_returns_canonical_trimmed_form(email):
+    assert oauth.normalize_email(email) == email.strip()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,                 # missing
+        "",                   # empty
+        "   ",                # spaces only
+        "\t\n ",              # tabs/newlines only
+        12345,                # non-string
+        True,                 # non-string
+        b"a@b.co",            # bytes, not str
+        "\x01\x02",           # control characters only
+        "a\x00b@example.com", # embedded NUL
+        "a\nb@example.com",   # embedded newline (survives an outer strip)
+        "plainaddress",       # no @
+        "a@b",                # domain has no dot
+        "@example.com",       # empty local part
+        "a b@example.com",    # interior whitespace
+        "a@@example.com",     # doubled @
+        "a@.com",             # empty domain label before dot
+    ],
+)
+def test_normalize_email_rejects_unusable_values(value):
+    assert oauth.normalize_email(value) is None
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        None,
+        "",
+        "   ",
+        "\t\n",
+        12345,
+        "a\x00b@example.com",
+        "plainaddress",
+        "a@b",
+        "a b@example.com",
+    ],
+)
+def test_open_registration_rejects_malformed_email_even_when_verified(email):
+    # every unusable email fails closed as a generic OAuthError (the same safe
+    # login failure), never the closed-registration variant, and writes nothing
+    store = FakeStore()
+    with pytest.raises(oauth.OAuthError) as excinfo:
+        _register(store, "sub-x", email, email_verified=True)
+    assert not isinstance(excinfo.value, oauth.RegistrationClosedError)
+    assert store.identities == {}
+    assert store.tenants == set()
+    assert store.owner_links == {}
+
+
+def test_open_registration_trims_before_owner_and_allowlist_match():
+    # a valid verified email wrapped in whitespace still matches the owner email
+    # (owner link) and the allow list (admission) after canonical trimming
+    owner_store = FakeStore()
+    uid = _register(
+        owner_store, "owner-sub", "  Owner@Example.com  ",
+        admin_email="owner@example.com", owner_user_id=7,
+    )
+    assert uid == 7
+    assert owner_store.owner_links == {("google", "owner-sub"): 7}
+
+    listed = FakeStore()
+    admitted = _register(
+        listed, "sub-in", "\tAllowed@Example.com\n",
+        allowed_emails=frozenset({"allowed@example.com"}),
+        admin_email="owner@example.com",
+    )
+    assert isinstance(admitted, int) and admitted != 7

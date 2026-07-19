@@ -54,6 +54,7 @@ __all__ = [
     "build_authorize_url",
     "exchange_code",
     "fetch_identity",
+    "normalize_email",
     "begin",
     "finish",
     "open_registration_identity",
@@ -68,6 +69,12 @@ HTTP_TIMEOUT_SECONDS = 10
 MAX_RESPONSE_BYTES = 256 * 1024
 USER_AGENT = "AIStat-OAuth/1.0"
 _CLIENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+# A deliberately strict, provider-agnostic address grammar used as the single
+# fail-closed boundary before any account row is written: ``local@domain`` with
+# a dotted domain and no interior whitespace, ``@`` or control characters. It
+# gates open registration, so an exotic or forged address fails closed rather
+# than creating a half-identified account.
+_EMAIL_RE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 
 
 class OAuthError(Exception):
@@ -320,6 +327,34 @@ def fetch_identity(
     return str(subject), email, email_verified, display_name
 
 
+def normalize_email(email) -> Optional[str]:
+    """Return the canonical trimmed provider email, or ``None`` if unusable.
+
+    This is the single, shared fail-closed boundary for a provider-supplied
+    email, applied identically by both WSGI contours before any account-store
+    call. ``None``, a non-``str``, an empty, whitespace-only, control-character
+    bearing or structurally malformed value all yield ``None`` so the caller can
+    reject the login before any user/identity/tenant/session row is written —
+    even when the provider marked the email verified.
+
+    A usable value is returned trimmed of harmless outer whitespace. Its case is
+    preserved for storage while allow-list and owner comparison stay
+    case-insensitive, so the canonical form is stable across logins.
+    """
+    if not isinstance(email, str):
+        return None
+    trimmed = email.strip()
+    if not trimmed:
+        return None
+    # Reject any embedded control character (a C0 control or DEL that survived
+    # the surrounding strip) before the structural check.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed):
+        return None
+    if not _EMAIL_RE.fullmatch(trimmed):
+        return None
+    return trimmed
+
+
 def begin(store, provider: "OAuthProvider", next_url, client_token, now=None) -> str:
     """Start a login: mint a one-time ``state``, persist it, return the URL.
 
@@ -417,7 +452,11 @@ def finish(
         user_id = resolve_identity(subject, email, email_verified, display_name)
     return {
         "user_id": user_id,
-        "email": email,
+        # Surface the canonical trimmed email (when the address is usable) so the
+        # session a contour establishes carries the same form that was stored,
+        # never provider whitespace. A ``None``/absent email (legacy open path)
+        # is preserved as-is.
+        "email": normalize_email(email) or email,
         "display_name": display_name,
         "next_url": record.get("next_url") or "/",
     }
@@ -449,21 +488,28 @@ def open_registration_identity(
       transaction. When an allow list is configured the email must match it
       (case-insensitive); an empty allow list admits any verified user.
 
-    Every callback must carry a non-empty, provider-*verified* email. A new
-    subject that is neither the owner nor allow-listed is rejected with
+    Every callback must carry a structurally valid, provider-*verified* email.
+    The address is normalized once here (:func:`normalize_email`) before any
+    account-store call, so ``None``, empty, whitespace-only, control-character
+    and malformed values fail closed — even when ``email_verified`` is true —
+    and the store only ever sees the canonical trimmed form. A new subject that
+    is neither the owner nor allow-listed is rejected with
     :class:`RegistrationClosedError` and writes no user, identity, tenant or
     session row. Any store-level anomaly fails the login closed rather than
     surfacing a 500 on the public callback.
     """
-    if not email:
-        raise OAuthError("provider returned no email")
+    normalized_email = normalize_email(email)
+    if normalized_email is None:
+        # None, empty, whitespace-only, control-character-only, non-string or
+        # structurally malformed: fail closed before any row is written.
+        raise OAuthError("provider returned no usable email")
     if email_verified is not True:
         raise OAuthError("provider email is not verified")
     try:
         result = store.register_or_link_identity(
             provider_name,
             subject,
-            email=email,
+            email=normalized_email,
             display_name=display_name,
             admin_email=admin_email,
             allowed_emails=allowed_emails,

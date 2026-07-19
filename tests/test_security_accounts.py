@@ -324,6 +324,32 @@ def test_register_denies_new_outsider_under_nonempty_allowlist(tmp_path):
     assert ok["outcome"] == "created"
 
 
+def test_register_stores_canonical_email_and_matches_allowlist_case_insensitively(
+    tmp_path,
+):
+    store = SecurityStore(tmp_path / "security.db")
+    # the policy hands the store an already-canonical (trimmed) address; the
+    # store persists it verbatim and its allow-list match is case-insensitive
+    result = store.register_or_link_identity(
+        "google", "sub-pad", email="New@Example.com",
+        admin_email="owner@example.com",
+        allowed_emails=frozenset({"new@example.com"}), now=100,
+    )
+    assert result["outcome"] == "created"
+    conn = store._connect()
+    try:
+        user_email = conn.execute(
+            "SELECT email FROM users WHERE id = ?", (result["user_id"],)
+        ).fetchone()["email"]
+        id_email = conn.execute(
+            "SELECT email FROM oauth_identities WHERE subject = ?", ("sub-pad",)
+        ).fetchone()["email"]
+    finally:
+        conn.close()
+    assert user_email == "New@Example.com"
+    assert id_email == "New@Example.com"
+
+
 def test_register_concurrent_new_subject_yields_one_account(tmp_path):
     store = SecurityStore(tmp_path / "security.db")
 

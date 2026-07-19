@@ -1329,6 +1329,81 @@ def test_oauth_login_is_fail_closed_for_unverified_owner(legacy, monkeypatch):
     assert status == "400 Bad Request"
 
 
+def _legacy_session_count(module):
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "bad_email",
+    ["   ", "\t\n", "", "not-an-email", "a b@example.com"],
+)
+def test_oauth_login_rejects_malformed_verified_email_fail_closed(
+    legacy, monkeypatch, bad_email
+):
+    module = legacy
+    before = _legacy_counts(module)
+    before_sessions = _legacy_session_count(module)
+    install_fake_http(
+        monkeypatch,
+        {"sub": "g-bad", "email": bad_email, "email_verified": True},
+    )
+    status, headers, _ = request(module.application, "/auth/google/start")
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, headers, body = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    # generic 400 login failure (not the closed-registration 403), no session
+    assert status == "400 Bad Request"
+    assert "Регистрация сейчас закрыта".encode("utf-8") not in body
+    after_cookies = cookie_jar(headers, start_cookies)
+    # no user/identity/tenant/session row was written for the rejected subject
+    assert _legacy_counts(module) == before
+    assert _legacy_session_count(module) == before_sessions
+    status, _, _ = request(module.application, "/api/meta", cookie=after_cookies)
+    assert status == "401 Unauthorized"
+
+    # the state was consumed, so replaying the same callback stays fail-closed
+    status, _, _ = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
+    assert _legacy_counts(module) == before
+    assert _legacy_session_count(module) == before_sessions
+
+
+def test_oauth_login_stores_whitespace_padded_email_canonically(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    status, _, _, _ = oauth_login(
+        module, monkeypatch,
+        {"sub": "pad", "email": "  New@Example.com  ", "email_verified": True},
+    )
+    assert status == "303 See Other"
+    # stored trimmed (case preserved) in both the user and identity rows
+    conn = sqlite3.connect(module.SECURITY_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT u.email, oi.email "
+            "FROM oauth_identities oi JOIN users u ON u.id = oi.user_id "
+            "WHERE oi.subject = ?",
+            ("pad",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "New@Example.com"
+    assert row[1] == "New@Example.com"
+
+
 def test_oauth_callback_rejects_forged_state(legacy):
     status, _, _ = request(
         legacy.application, "/auth/google/callback?state=forged&code=abc"

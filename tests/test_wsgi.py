@@ -896,6 +896,104 @@ def test_oauth_callback_unverified_owner_email_is_rejected(
     assert client.get("/api/meta", base_url="https://localhost").status_code == 401
 
 
+def _security_counts(config):
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        return {
+            "users": conn.execute(
+                "SELECT COUNT(*) AS n FROM users"
+            ).fetchone()["n"],
+            "oauth_identities": conn.execute(
+                "SELECT COUNT(*) AS n FROM oauth_identities"
+            ).fetchone()["n"],
+            "tenants": conn.execute(
+                "SELECT COUNT(*) AS n FROM tenants"
+            ).fetchone()["n"],
+            "sessions": conn.execute(
+                "SELECT COUNT(*) AS n FROM sessions"
+            ).fetchone()["n"],
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "bad_email",
+    ["   ", "\t\n", "", "not-an-email", "a b@example.com"],
+)
+def test_oauth_callback_rejects_malformed_verified_email_fail_closed(
+    public_app, monkeypatch, bad_email
+):
+    app, config = public_app
+    # a *verified* identity whose email is whitespace-only or structurally
+    # malformed must fail closed exactly like any other bad login: the same
+    # generic 400 page, no account rows, no session and a replay-proof state
+    install_fake_http(
+        monkeypatch,
+        {"sub": "g-bad", "email": bad_email, "email_verified": True, "name": "B"},
+    )
+    client = app.test_client()
+    start = client.get("/auth/google/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    before = _security_counts(config)
+
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    # the generic login-failure page (not the closed-registration 403)
+    assert callback.status_code == 400
+    body = callback.get_data(as_text=True)
+    assert "Регистрация сейчас закрыта" not in body
+    # no user/identity/tenant/session row was written by the rejected callback
+    assert _security_counts(config) == before
+    # and the browser is not authenticated
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+    # the state was consumed, so replaying the same callback still fails closed
+    replay = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert replay.status_code == 400
+    assert _security_counts(config) == before
+
+
+def test_oauth_callback_stores_whitespace_padded_email_canonically(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()  # open registration
+    # a valid verified email arrives wrapped in harmless whitespace
+    install_fake_http(
+        monkeypatch,
+        {"sub": "g-pad", "email": "  New@Example.com  ", "email_verified": True},
+    )
+    client = app.test_client()
+    start = client.get("/auth/google/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 303
+    # it is stored trimmed (case preserved) in both the user and identity rows
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT u.email AS user_email, oi.email AS id_email "
+            "FROM oauth_identities oi JOIN users u ON u.id = oi.user_id "
+            "WHERE oi.subject = ?",
+            ("g-pad",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["user_email"] == "New@Example.com"
+    assert row["id_email"] == "New@Example.com"
+
+
 def test_oauth_callback_rejects_forged_state(public_app):
     app, _ = public_app
     client = app.test_client()
