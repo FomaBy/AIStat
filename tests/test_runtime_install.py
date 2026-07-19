@@ -6,7 +6,8 @@ import plistlib
 import pytest
 
 from aistat import runtime_install as ri
-from aistat.preflight import Check, PreflightReport
+from aistat.config import Config
+from aistat.preflight import Check, PreflightReport, run_preflight
 
 
 # ---- fakes ---------------------------------------------------------------
@@ -63,6 +64,40 @@ def make_installer(tmp_path, controller, preflight_fn=ok_preflight):
 def active_marker(installer):
     text = (installer.paths.code / "aistat" / "__init__.py").read_text()
     return text.split("=", 1)[1].strip().strip("'\"")
+
+
+def valid_preflight_config(tmp_path):
+    config = Config()
+    config.publish_tenant_id = 7
+    config.publish_url = "https://aistat.app/api/ingest/snapshot"
+    config.worker_sync_url = "https://aistat.app"
+    config.ingest_secret = "i" * 40
+    config.worker_secret = "w" * 40
+    config.session_secret = "s" * 40
+    config.publish_interval_seconds = 300
+    config.worker_pull_interval_seconds = 300
+    config.worker_collect_interval_seconds = 300
+    config.allow_insecure_publish = False
+    config.worker_key_path = tmp_path / "key" / "worker.key"
+    config.worker_store_path = tmp_path / "store" / "connections.db"
+    return config
+
+
+def invalidate_secret_config(config, case):
+    if case == "session-missing":
+        config.session_secret = None
+    elif case == "session-empty":
+        config.session_secret = ""
+    elif case == "session-31-bytes":
+        config.session_secret = "s" * 31
+    elif case == "session-ingest":
+        config.session_secret = config.ingest_secret
+    elif case == "session-worker":
+        config.session_secret = config.worker_secret
+    elif case == "ingest-worker":
+        config.worker_secret = config.ingest_secret
+    else:  # pragma: no cover - keeps new matrix entries honest
+        raise AssertionError("unknown secret case: {}".format(case))
 
 
 # ---- plist rendering -----------------------------------------------------
@@ -149,6 +184,39 @@ def test_preflight_failure_leaves_old_runtime_untouched(tmp_path):
     assert active_marker(installer) == "v1"
     assert not installer.paths.code_prev.exists()
     assert len(controller.calls) == calls_before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "session-missing",
+        "session-empty",
+        "session-31-bytes",
+        "session-ingest",
+        "session-worker",
+        "ingest-worker",
+    ],
+)
+def test_invalid_secrets_never_reach_runtime_control(tmp_path, case):
+    config = valid_preflight_config(tmp_path)
+    invalidate_secret_config(config, case)
+    controller = FakeController()
+    installer = make_installer(
+        tmp_path,
+        controller,
+        preflight_fn=lambda: run_preflight(config, check_imports=False),
+    )
+
+    with pytest.raises(ri.PreflightFailed):
+        installer.install(make_stage(tmp_path, "stage", "candidate"))
+
+    # Preflight must fail before bootout/bootstrap/kickstart can start or alter
+    # the supervisor job, and before any live-code/plist mutation.
+    assert controller.calls == []
+    assert not controller.loaded
+    assert not installer.paths.code.exists()
+    assert not installer.paths.code_prev.exists()
+    assert not installer.paths.plist.exists()
 
 
 def test_bootstrap_failure_rolls_back_to_previous(tmp_path):

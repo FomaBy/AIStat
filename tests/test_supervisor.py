@@ -13,6 +13,7 @@ import time
 import pytest
 
 from aistat import supervisor as sv
+from aistat.config import Config
 from aistat.supervisor import (
     AlreadyRunning,
     Contour,
@@ -100,7 +101,90 @@ def make_supervisor(tmp_path, spawner, clock, **kw):
     )
 
 
+def valid_preflight_config(tmp_path):
+    config = Config()
+    config.publish_tenant_id = 7
+    config.publish_url = "https://aistat.app/api/ingest/snapshot"
+    config.worker_sync_url = "https://aistat.app"
+    config.ingest_secret = "i" * 40
+    config.worker_secret = "w" * 40
+    config.session_secret = "s" * 40
+    config.publish_interval_seconds = 300
+    config.worker_pull_interval_seconds = 300
+    config.worker_collect_interval_seconds = 300
+    config.allow_insecure_publish = False
+    config.worker_key_path = tmp_path / "key" / "worker.key"
+    config.worker_store_path = tmp_path / "store" / "connections.db"
+    return config
+
+
+def invalidate_secret_config(config, case):
+    if case == "session-missing":
+        config.session_secret = None
+    elif case == "session-empty":
+        config.session_secret = ""
+    elif case == "session-31-bytes":
+        config.session_secret = "s" * 31
+    elif case == "session-ingest":
+        config.session_secret = config.ingest_secret
+    elif case == "session-worker":
+        config.session_secret = config.worker_secret
+    elif case == "ingest-worker":
+        config.worker_secret = config.ingest_secret
+    else:  # pragma: no cover - keeps new matrix entries honest
+        raise AssertionError("unknown secret case: {}".format(case))
+
+
 # ---- single-instance lock ------------------------------------------------
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "session-missing",
+        "session-empty",
+        "session-31-bytes",
+        "session-ingest",
+        "session-worker",
+        "ingest-worker",
+    ],
+)
+def test_invalid_secrets_never_start_supervisor(
+    tmp_path, monkeypatch, caplog, case
+):
+    config = valid_preflight_config(tmp_path)
+    invalidate_secret_config(config, case)
+    real_run_preflight = sv.preflight.run_preflight
+    starts = []
+
+    def run_without_imports(candidate, env_file=None):
+        return real_run_preflight(
+            candidate, check_imports=False, env_file=env_file
+        )
+
+    class SupervisorSpy:
+        def __init__(self, *args, **kwargs):
+            starts.append("constructed")
+
+        def run(self):
+            starts.append("run")
+            return 0
+
+    monkeypatch.setattr(sv, "Config", lambda: config)
+    monkeypatch.setattr(sv, "_resolve_env_file", lambda: None)
+    monkeypatch.setattr(sv.preflight, "run_preflight", run_without_imports)
+    monkeypatch.setattr(sv, "Supervisor", SupervisorSpy)
+
+    assert sv.main([]) == 2
+    assert starts == []
+    assert "refusing to start a misconfigured runtime" in caplog.text
+    for secret in (
+        config.ingest_secret,
+        config.worker_secret,
+        config.session_secret,
+    ):
+        if secret:
+            assert secret not in caplog.text
+
 
 def test_single_instance_lock_excludes_second(tmp_path):
     path = tmp_path / "supervisor.lock"

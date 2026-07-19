@@ -55,22 +55,26 @@
 ```
 AISTAT_TENANT_ID=            # внутренний users.id владельца (из aistat.migrate)
 AISTAT_PUBLISH_URL=          # https://… — куда publisher шлёт snapshot
+AISTAT_SESSION_SECRET=       # ≥32 байта, HMAC сессий; тот же, что на public host
 AISTAT_INGEST_SECRET=        # ≥32 байта, независимый HMAC для snapshot
 AISTAT_WORKER_SYNC_URL=      # https://… — откуда worker тянет токены
 AISTAT_WORKER_SECRET=        # ≥32 байта, независимый HMAC для worker-канала
-# AISTAT_SESSION_SECRET=     # если задан — тоже обязан отличаться от прочих
 ```
 
 Требования, которые проверяет preflight (`python -m aistat.preflight`):
 
 - задан `AISTAT_TENANT_ID`;
 - `AISTAT_PUBLISH_URL` и `AISTAT_WORKER_SYNC_URL` — HTTPS;
-- `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET` присутствуют, ≥32 байт и
-  **взаимно независимы** (и с `AISTAT_SESSION_SECRET`, если он задан);
+- `AISTAT_SESSION_SECRET`, `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET`
+  обязательны, не короче 32 байт и **попарно различаются**;
 - интервалы publish/worker-pull/worker-collect ≥ 60 секунд;
 - ключ шифрования лежит **не** в каталоге store; ключ/store — owner-only
   (`0600`), каталоги — `0700`;
 - все контуры и зависимость `cryptography` импортируются.
+
+Каждый host-side secret генерируется отдельно командой
+`python -m aistat.security generate-secret`; в private runtime env копируются
+те же три значения, чтобы preflight проверял реальную попарную независимость.
 
 > **Fail-closed intake.** Хост не сохраняет новый PAT, пока не увидит свежий
 > подписанный heartbeat worker'а: до первого успешного `worker_sync` intake

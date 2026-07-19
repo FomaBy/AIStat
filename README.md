@@ -70,8 +70,10 @@ deploy/aistat_runtime.sh uninstall   # снять (данные сохраняю
 ```
 
 Secrets только в приватном env-файле `~/.config/aistat/production.env` (права
-`0600`), не в plist. Полная инструкция, контракт приватной активации и раскладка
-рантайма: [`docs/runtime-supervisor.md`](docs/runtime-supervisor.md).
+`0600`), не в plist. `AISTAT_SESSION_SECRET`, `AISTAT_INGEST_SECRET` и
+`AISTAT_WORKER_SECRET` обязательны, не короче 32 байт и попарно различаются.
+Полная инструкция, контракт приватной активации и раскладка рантайма:
+[`docs/runtime-supervisor.md`](docs/runtime-supervisor.md).
 
 ## Запуск по частям
 

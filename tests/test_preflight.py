@@ -73,16 +73,39 @@ def test_short_ingest_secret_fails(tmp_path):
     assert not verdict(report, "ingest_secret").ok
 
 
-def test_reused_secret_fails_independence(tmp_path):
+@pytest.mark.parametrize(
+    "session_secret",
+    [None, "", "s" * 31],
+    ids=["missing", "empty", "31-bytes"],
+)
+def test_invalid_session_secret_fails(tmp_path, session_secret):
     config = valid_config(tmp_path)
-    config.worker_secret = config.ingest_secret
+    config.session_secret = session_secret
     report = preflight.run_preflight(config, check_imports=False)
-    assert not verdict(report, "secret_independence").ok
+    assert not report.ok
+    assert not verdict(report, "session_secret").ok
 
 
-def test_session_secret_reuse_fails_independence(tmp_path):
+def test_session_secret_exactly_32_bytes_passes(tmp_path):
     config = valid_config(tmp_path)
-    config.session_secret = config.worker_secret
+    config.session_secret = "s" * 32
+    report = preflight.run_preflight(config, check_imports=False)
+    assert report.ok, report.render()
+    assert verdict(report, "session_secret").ok
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("session_secret", "ingest_secret"),
+        ("session_secret", "worker_secret"),
+        ("ingest_secret", "worker_secret"),
+    ],
+    ids=["session-ingest", "session-worker", "ingest-worker"],
+)
+def test_reused_secret_pair_fails_independence(tmp_path, left, right):
+    config = valid_config(tmp_path)
+    setattr(config, right, getattr(config, left))
     report = preflight.run_preflight(config, check_imports=False)
     assert not verdict(report, "secret_independence").ok
 
@@ -169,6 +192,15 @@ def test_render_never_contains_secret_values(tmp_path):
     assert config.ingest_secret not in text
     assert config.worker_secret not in text
     assert config.session_secret not in text
+
+
+def test_invalid_session_secret_render_never_contains_value(tmp_path):
+    config = valid_config(tmp_path)
+    config.session_secret = "q" * 31
+    text = preflight.run_preflight(config, check_imports=False).render()
+    assert config.session_secret not in text
+    assert "FAIL session_secret" in text
+    assert "AISTAT_SESSION_SECRET must contain at least 32 bytes" in text
 
 
 def test_cli_exit_code(tmp_path, monkeypatch):

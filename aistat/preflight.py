@@ -211,6 +211,14 @@ def run_preflight(config: Config, *, check_imports: bool = True,
         else "AISTAT_WORKER_SECRET must contain at least 32 bytes",
     ))
 
+    # The runtime needs the hosted session key as well: without its real value
+    # it cannot prove that the two transport keys are independent from it.
+    checks.append(Check(
+        "session_secret", _secret_ok(config.session_secret),
+        "AISTAT_SESSION_SECRET present" if _secret_ok(config.session_secret)
+        else "AISTAT_SESSION_SECRET must contain at least 32 bytes",
+    ))
+
     # The three HMAC keys must be mutually independent so compromising one
     # transport cannot forge another.
     independent = not (
