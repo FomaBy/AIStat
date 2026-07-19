@@ -3,9 +3,11 @@
 import hashlib
 import os
 import stat
+import threading
 
 import pytest
 
+from aistat import handoff
 import aistat.cli_profile as cli_profile_module
 import aistat.collector as collector_module
 from aistat.cli_profile import (
@@ -16,7 +18,11 @@ from aistat.cli_profile import (
 from aistat.collector import Collector, _TenantLock
 from aistat.config import Config
 from aistat.db import connect
-from aistat.worker_store import WorkerStoreError
+from aistat.worker_store import (
+    WorkerCredential,
+    WorkerStoreError,
+    WorkerTokenStore,
+)
 
 from test_poller import make_runner
 
@@ -32,11 +38,19 @@ def make_config(tmp_path):
     return config
 
 
+def make_worker_store(tmp_path):
+    return WorkerTokenStore(
+        tmp_path / "worker-store" / "connections.db",
+        tmp_path / "worker-key" / "worker.key",
+    )
+
+
 class FakeStore:
     def __init__(self, connections, tokens):
         self._connections = connections
         self._tokens = tokens
         self.get_token_calls = []
+        self._fences = {}
 
     def list_connections(self):
         return [dict(c) for c in self._connections]
@@ -47,6 +61,58 @@ class FakeStore:
         if value == "RAISE":
             raise WorkerStoreError("cannot decrypt")
         return value
+
+    def credential_fence(self, user_id):
+        user_id = int(user_id)
+        lock = self._fences.setdefault(user_id, threading.Lock())
+        store = self
+
+        class FakeFence:
+            def __enter__(self):
+                lock.acquire()
+                return self
+
+            def __exit__(self, *_exc):
+                lock.release()
+
+            def get_credential(self):
+                token = store.get_token(user_id)
+                if token is None:
+                    return None
+                meta = next(
+                    (
+                        item
+                        for item in store._connections
+                        if int(item["user_id"]) == user_id
+                    ),
+                    None,
+                )
+                if meta is None:
+                    return None
+                return WorkerCredential(
+                    user_id=user_id,
+                    server_url=meta.get("server_url") or "https://multica.ai",
+                    workspace_label=meta.get("workspace_label"),
+                    token_epoch=int(meta.get("token_epoch") or 0),
+                    token=token,
+                )
+
+            def is_current(self, token_epoch):
+                meta = next(
+                    (
+                        item
+                        for item in store._connections
+                        if int(item["user_id"]) == user_id
+                    ),
+                    None,
+                )
+                return (
+                    meta is not None
+                    and store._tokens.get(user_id) not in (None, "RAISE")
+                    and int(meta.get("token_epoch") or 0) == int(token_epoch)
+                )
+
+        return FakeFence()
 
 
 class FakeProfile:
@@ -63,6 +129,8 @@ class FakeProfile:
         ws_fail=False,
         cleanup_fail=False,
         discard_fail=False,
+        on_login=None,
+        on_workspace=None,
     ):
         self.config = config
         self.user_id = user_id
@@ -70,7 +138,10 @@ class FakeProfile:
         self.ws_fail = ws_fail
         self.cleanup_fail = cleanup_fail
         self.discard_fail = discard_fail
+        self.on_login = on_login
+        self.on_workspace = on_workspace
         self.logged_in_with = None
+        self.workspace_selected = None
         self.cleaned = False
         self.discarded = False
         self._runner = make_runner()
@@ -78,12 +149,17 @@ class FakeProfile:
 
     def login(self, token):
         self.logged_in_with = token
+        if self.on_login is not None:
+            self.on_login()
         if self.login_fail:
             raise CliProfileError("official CLI login failed for the connection")
 
     def select_workspace(self, label):
         if self.ws_fail:
             raise CliProfileError("the connection's workspace could not be resolved")
+        self.workspace_selected = label
+        if self.on_workspace is not None:
+            self.on_workspace()
         return {"id": "ws-" + str(self.user_id)}
 
     def runner(self, args):
@@ -908,3 +984,372 @@ def test_outcome_is_reported_with_epoch(tmp_path):
     )
     collector.collect_once()
     assert reports == [(101, 9, True, None)]
+
+
+def test_replace_after_poll_before_publish_suppresses_stale_publication(tmp_path):
+    """A completed replacement at the publish barrier fences the old epoch."""
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[
+            {"user_id": 101, "workspace_label": "alpha", "token_epoch": 1}
+        ],
+        tokens={101: TOKEN_A},
+    )
+    publisher = RecordingPublisher()
+    reports = []
+    barrier = threading.Barrier(2)
+
+    def replace_credential():
+        barrier.wait(timeout=5)
+        store._tokens[101] = TOKEN_B
+        store._connections[0]["token_epoch"] = 2
+        barrier.wait(timeout=5)
+
+    replacement = threading.Thread(target=replace_credential)
+    replacement.start()
+
+    def poll_then_release_replace(*_args):
+        barrier.wait(timeout=5)
+        barrier.wait(timeout=5)
+
+    collector = Collector(
+        config,
+        store,
+        profile_factory=factory_with(),
+        publish_fn=publisher,
+        report_fn=lambda cfg, user, epoch, ok, error: reports.append(
+            (user, epoch, ok, error)
+        ),
+        poll_fn=poll_then_release_replace,
+    )
+    outcome = collector.collect_once()[0]
+    replacement.join(timeout=5)
+
+    assert not replacement.is_alive()
+    assert outcome.status == "skipped"
+    assert publisher.calls == []
+    assert reports == []
+
+
+@pytest.mark.parametrize("change", ["replace", "revoke"])
+@pytest.mark.parametrize(
+    "change_barrier",
+    ["after_list", "after_read", "after_login", "after_workspace", "after_poll"],
+)
+def test_credential_change_is_causally_fenced_at_each_barrier(
+    tmp_path, change, change_barrier
+):
+    config = make_config(tmp_path)
+    delegate = make_worker_store(tmp_path)
+    delegate.store_token(
+        101, handoff.OFFICIAL_MULTICA_URL, "alpha", TOKEN_A, 1
+    )
+    delegate.store_token(
+        202, handoff.OFFICIAL_MULTICA_URL, "beta", TOKEN_B, 1
+    )
+    ready = threading.Event()
+    changed = threading.Event()
+
+    def mutate_credential():
+        assert ready.wait(timeout=5)
+        if change == "replace":
+            assert delegate.store_token(
+                101,
+                handoff.OFFICIAL_MULTICA_URL,
+                "replacement",
+                TOKEN_A + "-replacement",
+                2,
+            )
+        else:
+            assert delegate.delete_connection(101, 2)
+        changed.set()
+
+    mutation = threading.Thread(target=mutate_credential)
+    mutation.start()
+
+    def complete_change():
+        ready.set()
+        assert changed.wait(timeout=5)
+
+    class ListHookStore:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.triggered = False
+
+        def list_connections(self):
+            rows = self.wrapped.list_connections()
+            if change_barrier == "after_list" and not self.triggered:
+                self.triggered = True
+                complete_change()
+            return rows
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    store = ListHookStore(delegate)
+    behavior = {}
+    if change_barrier == "after_login":
+        behavior["on_login"] = complete_change
+    elif change_barrier == "after_workspace":
+        behavior["on_workspace"] = complete_change
+    base_factory = factory_with({101: behavior})
+
+    def profile_factory(cfg, user_id):
+        if change_barrier == "after_read" and int(user_id) == 101:
+            complete_change()
+        return base_factory(cfg, user_id)
+
+    poll_users = []
+
+    def poll_fn(_cfg, _conn, runner):
+        profile = getattr(runner, "__self__", None)
+        if profile is not None:
+            poll_users.append(profile.user_id)
+        if (
+            change_barrier == "after_poll"
+            and profile is not None
+            and profile.user_id == 101
+        ):
+            complete_change()
+
+    publisher = RecordingPublisher()
+    reports = []
+    collector = Collector(
+        config,
+        store,
+        profile_factory=profile_factory,
+        publish_fn=publisher,
+        report_fn=lambda cfg, user, epoch, ok, error: reports.append(
+            (user, epoch, ok, error)
+        ),
+        poll_fn=poll_fn,
+    )
+    outcomes = {outcome.user_id: outcome for outcome in collector.collect_once()}
+    mutation.join(timeout=5)
+
+    assert not mutation.is_alive()
+    assert outcomes[202].status == "collected"
+    assert (config.worker_tenant_db_path(202), 202) in publisher.calls
+    assert (202, 1, True, None) in reports
+
+    if change_barrier == "after_list" and change == "replace":
+        assert outcomes[101].status == "collected"
+        assert (config.worker_tenant_db_path(101), 101) in publisher.calls
+        assert (101, 2, True, None) in reports
+        user_101_profiles = [p for p in FakeProfile.instances if p.user_id == 101]
+        assert [p.logged_in_with for p in user_101_profiles] == [
+            TOKEN_A + "-replacement"
+        ]
+    else:
+        assert outcomes[101].status == "skipped"
+        assert (config.worker_tenant_db_path(101), 101) not in publisher.calls
+        assert not any(report[0] == 101 for report in reports)
+        user_101_profiles = [p for p in FakeProfile.instances if p.user_id == 101]
+        assert len(user_101_profiles) == 1
+        profile_101 = user_101_profiles[0]
+        if change_barrier == "after_read":
+            assert profile_101.logged_in_with is None
+            assert profile_101.workspace_selected is None
+            assert profile_101.discarded
+            assert not profile_101.cleaned
+            assert 101 not in poll_users
+        elif change_barrier == "after_login":
+            assert profile_101.logged_in_with == TOKEN_A
+            assert profile_101.workspace_selected is None
+            assert profile_101.cleaned
+            assert 101 not in poll_users
+        elif change_barrier == "after_workspace":
+            assert profile_101.workspace_selected == "alpha"
+            assert profile_101.cleaned
+            assert 101 not in poll_users
+        elif change_barrier == "after_poll":
+            assert profile_101.workspace_selected == "alpha"
+            assert profile_101.cleaned
+            assert 101 in poll_users
+
+    for outcome in outcomes.values():
+        assert TOKEN_A not in outcome.detail
+        assert TOKEN_B not in outcome.detail
+        assert str(tmp_path) not in outcome.detail
+
+
+def test_change_after_atomic_read_discards_without_executor_call(tmp_path):
+    config = make_config(tmp_path)
+    store = make_worker_store(tmp_path)
+    store.store_token(101, handoff.OFFICIAL_MULTICA_URL, "alpha", TOKEN_A, 1)
+    executor = RecordingExecutor()
+    real_factory = RealProfileFactory({101: executor})
+    changed = False
+
+    def replacing_factory(cfg, user_id):
+        nonlocal changed
+        if not changed:
+            changed = True
+            assert store.store_token(
+                101,
+                handoff.OFFICIAL_MULTICA_URL,
+                "replacement",
+                TOKEN_A + "-replacement",
+                2,
+            )
+        return real_factory(cfg, user_id)
+
+    publisher = RecordingPublisher()
+    reports = []
+    outcome = Collector(
+        config,
+        store,
+        profile_factory=replacing_factory,
+        publish_fn=publisher,
+        report_fn=lambda cfg, user, epoch, ok, error: reports.append(
+            (user, epoch, ok, error)
+        ),
+        poll_fn=lambda *_args: None,
+    ).collect_once()[0]
+
+    assert outcome.status == "skipped"
+    assert executor.calls == []
+    assert real_factory.lifecycle_events == [(101, "discard")]
+    assert publisher.calls == []
+    assert reports == []
+
+
+@pytest.mark.parametrize("change", ["replace", "revoke"])
+def test_publish_linearization_blocks_same_tenant_version_change(tmp_path, change):
+    config = make_config(tmp_path)
+    store = make_worker_store(tmp_path)
+    store.store_token(101, handoff.OFFICIAL_MULTICA_URL, "alpha", TOKEN_A, 1)
+    publish_entered = threading.Event()
+    publish_release = threading.Event()
+    report_entered = threading.Event()
+    report_release = threading.Event()
+    change_done = threading.Event()
+    publish_calls = []
+    reports = []
+    collected = []
+
+    def blocking_publish(_config, db_path, tenant_id):
+        publish_calls.append((db_path, tenant_id))
+        publish_entered.set()
+        assert publish_release.wait(timeout=5)
+        return {"status": "ok", "tenant_id": tenant_id}
+
+    def blocking_report(_config, user, epoch, ok, error):
+        reports.append((user, epoch, ok, error))
+        report_entered.set()
+        assert report_release.wait(timeout=5)
+
+    collector = Collector(
+        config,
+        store,
+        profile_factory=factory_with(),
+        publish_fn=blocking_publish,
+        report_fn=blocking_report,
+        poll_fn=lambda *_args: None,
+    )
+
+    def collect():
+        collected.extend(collector.collect_once())
+
+    collection = threading.Thread(target=collect)
+    collection.start()
+    assert publish_entered.wait(timeout=5)
+
+    def mutate():
+        if change == "replace":
+            store.store_token(
+                101,
+                handoff.OFFICIAL_MULTICA_URL,
+                "replacement",
+                TOKEN_A + "-replacement",
+                2,
+            )
+        else:
+            store.delete_connection(101, 2)
+        change_done.set()
+
+    mutation = threading.Thread(target=mutate)
+    mutation.start()
+    assert not change_done.wait(timeout=0.1)
+    publish_release.set()
+    assert report_entered.wait(timeout=5)
+    assert not change_done.wait(timeout=0.1)
+    report_release.set()
+    collection.join(timeout=5)
+    mutation.join(timeout=5)
+
+    assert not collection.is_alive() and not mutation.is_alive()
+    assert change_done.is_set()
+    assert [(outcome.user_id, outcome.status) for outcome in collected] == [
+        (101, "collected")
+    ]
+    assert reports == [(101, 1, True, None)]
+    assert publish_calls == [(config.worker_tenant_db_path(101), 101)]
+
+    next_publisher = RecordingPublisher()
+    next_reports = []
+    next_outcomes = Collector(
+        config,
+        store,
+        profile_factory=factory_with(),
+        publish_fn=next_publisher,
+        report_fn=lambda cfg, user, epoch, ok, error: next_reports.append(
+            (user, epoch, ok, error)
+        ),
+        poll_fn=lambda *_args: None,
+    ).collect_once()
+    if change == "replace":
+        assert [(outcome.user_id, outcome.status) for outcome in next_outcomes] == [
+            (101, "collected")
+        ]
+        assert next_reports == [(101, 2, True, None)]
+        assert next_publisher.calls == [(config.worker_tenant_db_path(101), 101)]
+    else:
+        assert next_outcomes == []
+        assert next_reports == []
+        assert next_publisher.calls == []
+
+
+def test_publish_crash_releases_collection_and_version_fences(tmp_path):
+    class SyntheticCrash(BaseException):
+        pass
+
+    config = make_config(tmp_path)
+    store = make_worker_store(tmp_path)
+    store.store_token(101, handoff.OFFICIAL_MULTICA_URL, "alpha", TOKEN_A, 1)
+
+    def crash_publish(*_args):
+        raise SyntheticCrash()
+
+    collector = Collector(
+        config,
+        store,
+        profile_factory=factory_with(),
+        publish_fn=crash_publish,
+        report_fn=None,
+        poll_fn=lambda *_args: None,
+    )
+    with pytest.raises(SyntheticCrash):
+        collector.collect_once()
+    assert FakeProfile.instances[0].cleaned
+
+    assert store.store_token(
+        101,
+        handoff.OFFICIAL_MULTICA_URL,
+        "replacement",
+        TOKEN_A + "-replacement",
+        2,
+    )
+    lock = _TenantLock(config.cli_profiles_dir, 101)
+    assert lock.acquire()
+    lock.release()
+
+    outcome = Collector(
+        config,
+        store,
+        profile_factory=factory_with(),
+        publish_fn=RecordingPublisher(),
+        report_fn=None,
+        poll_fn=lambda *_args: None,
+    ).collect_once()[0]
+    assert outcome.status == "collected"
