@@ -138,6 +138,49 @@ def test_old_oauth_state_schema_is_migrated_fail_closed(tmp_path):
     }
 
 
+def test_old_sessions_schema_migrates_and_purges_pre_opaque_rows(tmp_path):
+    # FAN-1392: an old sessions table (no csrf column) with a live row. The
+    # one-time migration adds the column and drops every pre-opaque row, so a
+    # cookie carrying that old inner id can never resolve after the upgrade —
+    # while fresh opaque sessions then persist across restarts unpurged.
+    path = tmp_path / "security.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "sid_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, "
+            "created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (sid_hash, user_id, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id_hash("legacy-sid"), 7, 100, 10 ** 12),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = SecurityStore(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "csrf" in columns
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert store.resolve_session("legacy-sid") is None
+
+    sid = store.create_session(7, ttl_seconds=3600, now=1000)
+    assert store.resolve_session(sid, now=1001)["user_id"] == 7
+    # A second worker start must not re-purge live sessions.
+    restarted = SecurityStore(path)
+    resolved = restarted.resolve_session(sid, now=1002)
+    assert resolved["user_id"] == 7
+    assert resolved["csrf"]
+
+
 def test_old_schema_migration_is_safe_under_concurrent_startup(tmp_path):
     path = tmp_path / "security.db"
     conn = sqlite3.connect(str(path))

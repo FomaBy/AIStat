@@ -1,8 +1,10 @@
 """Dependency-free cPanel WSGI tests."""
 
 import ast
+import base64
 import gzip
 import hashlib
+import hmac
 import importlib
 import io
 import json
@@ -23,7 +25,11 @@ from aistat.config import Config
 from aistat.migrate import migrate_owner_database
 from aistat.security import SecurityStore
 from aistat.snapshot import create_compressed_snapshot
-from conftest import seed_aggregate_fixture, seed_model_less_fixture
+from conftest import (
+    assert_opaque_session_cookie,
+    seed_aggregate_fixture,
+    seed_model_less_fixture,
+)
 
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "legacy-session-" + "s" * 48
@@ -633,13 +639,11 @@ def test_expired_session_record_is_rejected_and_purged(legacy):
 
 def test_session_table_stores_only_hashed_ids(legacy):
     cookies = login(legacy)
-    value = dict(
+    # The cookie is now the opaque token itself — no envelope to decode.
+    sid = dict(
         part.split("=", 1) for part in cookies.split("; ")
     )["aistat_session"]
-    payload = legacy.json.loads(
-        legacy._b64decode(value.rsplit(".", 1)[0]).decode("utf-8")
-    )
-    sid = payload["sid"]
+    assert "." not in sid  # no signed/serialized structure
     conn = sqlite3.connect(legacy.SECURITY_DB_PATH)
     try:
         rows = [
@@ -649,6 +653,101 @@ def test_session_table_stores_only_hashed_ids(legacy):
         conn.close()
     assert rows == [legacy._session_id_hash(sid)]
     assert sid not in rows
+
+
+def _session_cookie_value(cookies):
+    return dict(part.split("=", 1) for part in cookies.split("; "))[
+        "aistat_session"
+    ]
+
+
+def test_password_session_cookie_is_opaque_legacy(legacy):
+    # AC1: the legacy cookie is one opaque token, not a base64+HMAC envelope.
+    cookies = login(legacy)
+    sid = _session_cookie_value(cookies)
+    csrf = session_csrf(legacy, cookies)
+    assert_opaque_session_cookie(
+        sid, ["sergey", "allowed@example.com", "google", csrf]
+    )
+
+
+def test_google_session_cookie_is_opaque_legacy(legacy, monkeypatch):
+    # AC1: an OAuth login gets the same opaque cookie in the legacy contour.
+    status, _, _, cookies = oauth_login(
+        legacy,
+        monkeypatch,
+        {"sub": "g-op-legacy", "email": "allowed@example.com",
+         "email_verified": True},
+    )
+    assert status == "303 See Other"
+    sid = _session_cookie_value(cookies)
+    csrf = session_csrf(legacy, cookies)
+    assert_opaque_session_cookie(
+        sid, ["allowed@example.com", "google", "g-op-legacy", csrf]
+    )
+
+
+def test_old_structured_cookie_fails_closed_even_with_live_row_legacy(legacy):
+    # AC3: a genuine old base64+HMAC cookie, plus tampered/unknown tokens, fail
+    # closed with no private access while their inner SID row is still live.
+    expires = int(legacy.time.time()) + 3600
+    sid = legacy._create_session_record(legacy.OWNER_USER_ID, expires)
+    assert legacy._resolve_session_record(sid) is not None
+
+    payload = {
+        "u": "sergey",
+        "uid": legacy.OWNER_USER_ID,
+        "sid": sid,
+        "exp": expires,
+        "csrf": "x",
+    }
+    encoded = (
+        base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    structured = encoded + "." + legacy._sign(encoded, legacy.SESSION_SECRET)
+    for value in (structured, sid + ".tampered", "totally-unknown-token"):
+        cookie = "aistat_session=" + value
+        assert request(legacy.application, "/api/meta", cookie=cookie)[0] == (
+            "401 Unauthorized"
+        ), value
+        assert request(legacy.application, "/login", cookie=cookie)[0] == (
+            "200 OK"
+        ), value
+    assert legacy._resolve_session_record(sid) is not None
+
+
+def test_reauth_rotates_and_invalidates_previous_token_legacy(legacy):
+    # AC4: re-auth in the same browser rotates the token and kills the previous
+    # one; the captured pre-rotation cookie replays dead.
+    first = login(legacy)
+    assert request(legacy.application, "/api/meta", cookie=first)[0] == "200 OK"
+
+    token = legacy._make_login_csrf()
+    body = urlencode(
+        {"csrf": token, "username": "sergey", "password": PASSWORD, "next": "/"}
+    ).encode("utf-8")
+    combined = first + "; aistat_login_csrf=" + token
+    status, headers, _ = request(
+        legacy.application,
+        "/login",
+        method="POST",
+        body=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        cookie=combined,
+    )
+    assert status == "303 See Other"
+    second = cookie_jar(headers, first)
+    for _ in range(3):
+        assert request(legacy.application, "/api/meta", cookie=first)[0] == (
+            "401 Unauthorized"
+        )
+    assert request(legacy.application, "/api/meta", cookie=second)[0] == "200 OK"
 
 
 def test_oauth_logout_revokes_replayed_cookie(legacy, monkeypatch):

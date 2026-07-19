@@ -1,7 +1,9 @@
 """Public WSGI authentication, headers and signed snapshot ingestion."""
 
+import base64
 import gzip
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -16,10 +18,14 @@ from aistat import oauth
 from aistat.config import Config
 from aistat.db import SCHEMA_VERSION, connect, init_db
 from aistat.migrate import migrate_owner_database
-from aistat.security import SecurityStore, snapshot_signature
+from aistat.security import SecurityStore, make_login_csrf, snapshot_signature
 from aistat.snapshot import create_compressed_snapshot
 from aistat.wsgi import create_app
-from conftest import seed_aggregate_fixture, seed_model_less_fixture
+from conftest import (
+    assert_opaque_session_cookie,
+    seed_aggregate_fixture,
+    seed_model_less_fixture,
+)
 
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "session-" + "s" * 48
@@ -299,6 +305,120 @@ def test_oauth_logout_revokes_replayed_cookie(public_app, monkeypatch):
     ).status_code == 303
     for _ in range(3):
         assert replay(app, stolen).status_code == 401
+
+
+def _cookie_value(header):
+    return header.split(";", 1)[0].split("=", 1)[1]
+
+
+def test_password_session_cookie_is_opaque(public_app):
+    # AC1/AC2/AC8: the auth cookie is one opaque token — no decodable email,
+    # username, provider, user id, CSRF or serialized envelope — set HttpOnly,
+    # Secure, SameSite=Lax, Path=/.
+    app, config = public_app
+    client = app.test_client()
+    response = login(client)
+    header = next(
+        h for h in response.headers.getlist("Set-Cookie")
+        if h.startswith("aistat_session=")
+    )
+    sid = _cookie_value(header)
+    auth = client.get("/api/session", base_url="https://localhost").get_json()
+    assert_opaque_session_cookie(
+        sid,
+        ["sergey", config.admin_email, "google", auth["csrf"]],
+    )
+    assert auth["csrf"] and auth["csrf"] != sid
+    assert "HttpOnly" in header
+    assert "Secure" in header
+    assert "SameSite=Lax" in header
+    assert "Path=/" in header
+
+
+def test_google_session_cookie_is_opaque(public_app, monkeypatch):
+    # AC1: an OAuth login gets the same opaque cookie — no email/subject/provider.
+    app, _ = public_app
+    client = app.test_client()
+    callback = complete_oauth_login(
+        client,
+        monkeypatch,
+        {"sub": "g-opaque", "email": "allowed@example.com", "email_verified": True},
+    )
+    assert callback.status_code == 303
+    sid = _cookie_value(session_cookie_from(callback))
+    auth = client.get("/api/session", base_url="https://localhost").get_json()
+    assert_opaque_session_cookie(
+        sid,
+        ["allowed@example.com", "google", "g-opaque", auth["csrf"]],
+    )
+
+
+def test_old_structured_cookie_fails_closed_even_with_live_row(public_app):
+    # AC3: an old signed/serialized cookie (or a byte-modified/unknown token)
+    # fails closed with no private access even while its inner SID row is live.
+    app, config = public_app
+    store = SecurityStore(config.security_db_path)
+    owner = config.publish_tenant_id
+    sid = store.create_session(owner, 3600)
+    assert store.session_is_active(sid)
+
+    envelope = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {"user": "sergey", "user_id": owner, "sid": sid, "_csrf": "x"}
+            ).encode("utf-8")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    signature = hmac.new(
+        SESSION_SECRET.encode("utf-8"), envelope.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    structured_cookies = (
+        envelope + "." + signature,   # a full old-style signed envelope
+        sid + ".tampered",            # inner id smuggled into an envelope shape
+        sid[:-4] + ("AAAA" if not sid.endswith("AAAA") else "BBBB"),  # byte-modified
+        "totally-unknown-token",      # never issued
+    )
+    for value in structured_cookies:
+        cookie = "aistat_session=" + value
+        assert replay(app, cookie).status_code == 401, value
+        page = app.test_client(use_cookies=False).get(
+            "/login", base_url="https://localhost", headers={"Cookie": cookie}
+        )
+        assert page.status_code == 200, value
+    # None of the failed reads disturbed the genuine live row.
+    assert store.session_is_active(sid)
+
+
+def test_reauth_rotates_and_invalidates_previous_token(public_app):
+    # AC4: re-authenticating in the same browser rotates the token and kills the
+    # previous one, so a captured pre-rotation cookie replays dead.
+    app, _ = public_app
+    client = app.test_client()
+    first = session_cookie_from(login(client))
+    assert replay(app, first).status_code == 200
+
+    # Re-auth while still holding cookie A: mint a login CSRF the way the form
+    # would and POST /login again with A still in the jar.
+    token = make_login_csrf(SESSION_SECRET)
+    client.set_cookie("aistat_login_csrf", token)
+    response = client.post(
+        "/login",
+        data={
+            "csrf": token,
+            "username": "sergey",
+            "password": PASSWORD,
+            "next": "/",
+        },
+        base_url="https://localhost",
+    )
+    assert response.status_code == 303
+    second = session_cookie_from(response)
+    assert _cookie_value(second) != _cookie_value(first)
+    for _ in range(3):
+        assert replay(app, first).status_code == 401
+    assert replay(app, second).status_code == 200
 
 
 def test_wsgi_hour_filters_accept_repeated_dimensions(public_app):

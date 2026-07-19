@@ -4,7 +4,7 @@ Namecheap Shared Hosting supports WSGI but not ASGI. This module exposes the
 same aggregate API and static dashboard as the local FastAPI app, while adding:
 
 * mandatory password authentication;
-* signed, HttpOnly, SameSite session cookies;
+* opaque, HttpOnly, SameSite session cookies whose state lives server-side;
 * CSRF protection and failed-login throttling;
 * strict host/HTTPS checks and browser security headers;
 * HMAC-authenticated atomic SQLite snapshot ingestion.
@@ -16,7 +16,6 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -24,12 +23,12 @@ from urllib.parse import quote
 from flask import (
     Flask,
     abort,
+    g,
     jsonify,
     redirect,
     render_template,
     request,
     send_from_directory,
-    session,
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
@@ -39,12 +38,13 @@ from .config import Config
 from .db import connect_readonly, init_db
 from .health import snapshot
 from .security import (
+    LOGIN_CSRF_TTL_SECONDS,
     OAUTH_STATE_TTL_SECONDS,
     SecurityStore,
     client_key,
-    csrf_token,
+    make_login_csrf,
     safe_next_url,
-    validate_csrf,
+    valid_login_csrf,
     validate_public_config,
     verify_snapshot_signature,
 )
@@ -58,6 +58,14 @@ TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 # Short-lived HttpOnly cookie binding OAuth states to the browser that started
 # them; only its hash is stored server-side with each state row.
 OAUTH_CLIENT_COOKIE = "aistat_oauth_client"
+
+# The browser auth cookie. It holds one opaque CSPRNG token and nothing else:
+# identity, expiry, CSRF and revocation are all resolved server-side from the
+# ``sessions`` table on every request. No signed/serialized envelope is used.
+SESSION_COOKIE = "aistat_session"
+# Pre-authentication double-submit cookie for the login form's CSRF defence.
+# It carries only a random signed token, never identity.
+LOGIN_CSRF_COOKIE = "aistat_login_csrf"
 
 
 def create_app(config: Optional[Config] = None) -> Flask:
@@ -74,15 +82,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
     app.wsgi_app = ProxyFix(
         app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1
     )
-    app.secret_key = config.session_secret
-    app.permanent_session_lifetime = timedelta(hours=config.session_hours)
-    app.config.update(
-        MAX_CONTENT_LENGTH=config.max_snapshot_bytes,
-        SESSION_COOKIE_NAME="aistat_session",
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SECURE=config.session_cookie_secure,
-        SESSION_COOKIE_SAMESITE="Lax",
-    )
+    # No Flask client-side session is used: the auth cookie is set and read
+    # directly below, so the framework never serializes identity into a signed
+    # cookie. ``MAX_CONTENT_LENGTH`` still bounds snapshot uploads.
+    app.config.update(MAX_CONTENT_LENGTH=config.max_snapshot_bytes)
     security_store = SecurityStore(config.security_db_path)
     owner_user_id = security_store.ensure_owner_user(
         config.auth_username, config.admin_email
@@ -104,26 +107,61 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     session_ttl_seconds = int(config.session_hours) * 3600
 
-    def session_is_active() -> bool:
-        """True while the session's server-side record exists in security.db.
+    def current_session():
+        """Authoritative server-side state for this request's auth cookie.
 
-        Logout deletes that record, so a cookie captured before logout fails
-        closed here — as does any cookie minted before server-side sessions
-        existed (no ``sid`` claim at all).
+        The cookie is one opaque token; every protected request resolves it
+        against ``security.db`` to a live ``{"user_id", "csrf", "expires_at"}``
+        record, or ``None``. Logout/revocation/expiry delete or age out that
+        record, so a captured cookie fails closed here, as does any old
+        signed/structured cookie (its bytes are not a stored id). Cached on
+        ``g`` so one request hits the store once.
         """
-        return security_store.session_is_active(session.get("sid"))
+        if not hasattr(g, "_auth_session"):
+            g._auth_session = security_store.resolve_session(
+                request.cookies.get(SESSION_COOKIE)
+            )
+        return g._auth_session
 
-    def oauth_session_authorized() -> bool:
-        """True when the current session is a registered OAuth login.
+    def set_session_cookie(response, sid: str) -> None:
+        response.set_cookie(
+            SESSION_COOKIE,
+            sid,
+            max_age=session_ttl_seconds,
+            path="/",
+            secure=config.session_cookie_secure,
+            httponly=True,
+            samesite="Lax",
+        )
 
-        Registration is the gate now: a subject reaches an active session only
-        after ``open_registration_identity`` admitted it, so any live session
-        that carries a ``user_id`` is authorised. The allow list is no longer
-        re-checked per request, so de-listing an email cannot revoke an already
-        registered user (their access ends only when the server-side session
-        does). Fail-closed: no ``user_id`` => no access.
+    def clear_cookie(response, name: str) -> None:
+        response.set_cookie(
+            name,
+            "",
+            max_age=0,
+            expires=0,
+            path="/",
+            secure=config.session_cookie_secure,
+            httponly=True,
+            samesite="Lax",
+        )
+
+    def request_csrf_ok() -> bool:
+        """Validate the submitted CSRF against the current session's secret.
+
+        The token is the server-side session's own CSRF value (delivered only
+        through ``/api/session``); it is never carried in the auth cookie.
         """
-        return session.get("user_id") is not None
+        sess = current_session()
+        if sess is None:
+            return False
+        candidate = request.headers.get("X-CSRF-Token") or request.form.get(
+            "csrf"
+        )
+        return bool(
+            candidate
+            and hmac.compare_digest(str(sess["csrf"]), str(candidate))
+        )
 
     def normalized_host() -> str:
         host = request.host.rsplit("@", 1)[-1]
@@ -152,9 +190,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
         if request.endpoint in public_endpoints:
             return None
-        if session.get("user") == config.auth_username and session_is_active():
-            return None
-        if oauth_session_authorized() and session_is_active():
+        # One rule for both password and OAuth logins: a request is authorised
+        # only while its opaque cookie resolves to a live server-side session.
+        if current_session() is not None:
             return None
         if wants_json():
             return jsonify({"detail": "authentication required"}), 401
@@ -199,15 +237,13 @@ def create_app(config: Optional[Config] = None) -> Flask:
         return conn
 
     def current_user_id() -> Optional[int]:
-        raw = session.get("user_id")
-        if raw is not None:
-            try:
-                return canonical_tenant_id(raw)
-            except ValueError:
-                return None
-        if session.get("user") == config.auth_username:
-            return owner_user_id
-        return None
+        sess = current_session()
+        if sess is None:
+            return None
+        try:
+            return canonical_tenant_id(sess["user_id"])
+        except ValueError:
+            return None
 
     def data_connection() -> sqlite3.Connection:
         user_id = current_user_id()
@@ -268,35 +304,48 @@ def create_app(config: Optional[Config] = None) -> Flask:
             google_login_url = "/auth/google/start?next=" + quote(
                 next_url, safe=""
             )
-        response = render_template(
+        token = make_login_csrf(config.session_secret)
+        html = render_template(
             "login.html",
-            csrf=csrf_token(session),
+            csrf=token,
             error=error,
             next_url=next_url,
             google_login_url=google_login_url,
         )
-        return response, status
+        response = app.make_response((html, status))
+        # Double-submit login CSRF: the same signed token is embedded in the
+        # form and set here, and the POST requires the two to match.
+        response.set_cookie(
+            LOGIN_CSRF_COOKIE,
+            token,
+            max_age=LOGIN_CSRF_TTL_SECONDS,
+            path="/",
+            secure=config.session_cookie_secure,
+            httponly=True,
+            samesite="Lax",
+        )
+        return response
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if request.method == "GET":
-            if (
-                session.get("user") == config.auth_username
-                and session_is_active()
-            ):
+            if current_session() is not None:
                 return redirect(safe_next_url(request.args.get("next")), code=303)
             return render_login()
 
-        if not validate_csrf(session, request.form.get("csrf")):
+        if not valid_login_csrf(
+            config.session_secret,
+            request.cookies.get(LOGIN_CSRF_COOKIE),
+            request.form.get("csrf"),
+        ):
             return render_login("Не удалось проверить форму. Обновите страницу.", 400)
 
         key = client_key(config.session_secret, request.remote_addr)
         retry_after = security_store.login_retry_after(key)
         if retry_after:
-            response, status = render_login(
+            response = render_login(
                 "Слишком много попыток. Повторите вход позже.", 429
             )
-            response = app.make_response((response, status))
             response.headers["Retry-After"] = str(retry_after)
             return response
 
@@ -313,36 +362,35 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 if retry_after
                 else "Неверное имя пользователя или пароль."
             )
-            response, status = render_login(
-                message, 429 if retry_after else 401
-            )
-            response = app.make_response((response, status))
+            response = render_login(message, 429 if retry_after else 401)
             if retry_after:
                 response.headers["Retry-After"] = str(retry_after)
             return response
 
         security_store.clear_login_failures(key)
         next_url = safe_next_url(request.form.get("next"))
-        session.clear()
-        session["user"] = config.auth_username
-        session["user_id"] = owner_user_id
-        session["sid"] = security_store.create_session(
-            owner_user_id, session_ttl_seconds
-        )
-        session.permanent = True
-        csrf_token(session)
-        return redirect(next_url, code=303)
+        # Rotate: re-authenticating in this same browser invalidates its own
+        # previous token server-side, so a captured pre-rotation cookie replays
+        # dead. Only the incoming session is revoked, so a parallel session for
+        # the same user in another browser stays live.
+        security_store.revoke_session(request.cookies.get(SESSION_COOKIE))
+        sid = security_store.create_session(owner_user_id, session_ttl_seconds)
+        response = redirect(next_url, code=303)
+        set_session_cookie(response, sid)
+        clear_cookie(response, LOGIN_CSRF_COOKIE)
+        return response
 
     @app.post("/logout")
     def logout():
-        candidate = request.headers.get("X-CSRF-Token") or request.form.get("csrf")
-        if not validate_csrf(session, candidate):
+        if not request_csrf_ok():
             return jsonify({"detail": "invalid CSRF token"}), 400
-        security_store.revoke_session(session.get("sid"))
-        session.clear()
+        security_store.revoke_session(request.cookies.get(SESSION_COOKIE))
         if wants_json():
-            return jsonify({"status": "ok"})
-        return redirect("/login", code=303)
+            response = jsonify({"status": "ok"})
+        else:
+            response = redirect("/login", code=303)
+        clear_cookie(response, SESSION_COOKIE)
+        return response
 
     @app.get("/login.css")
     def login_css():
@@ -425,23 +473,21 @@ def create_app(config: Optional[Config] = None) -> Flask:
             # session is created, and the page reveals no allow-list detail.
             return registration_closed()
         except oauth.OAuthError:
-            body, status = render_login(
+            return render_login(
                 "Не удалось выполнить вход через провайдера. Попробуйте снова.",
                 400,
             )
-            return body, status
         # Registration/link succeeded, so access is granted by the active
         # session alone — there is no second, request-time allow-list gate.
-        session.clear()
-        session["user_id"] = result["user_id"]
-        session["email"] = result["email"]
-        session["provider"] = provider
-        session["sid"] = security_store.create_session(
+        # The cookie is the opaque token; email/provider stay server-side.
+        # Rotate the incoming session so a re-auth invalidates the old token.
+        security_store.revoke_session(request.cookies.get(SESSION_COOKIE))
+        sid = security_store.create_session(
             result["user_id"], session_ttl_seconds
         )
-        session.permanent = True
-        csrf_token(session)
-        return redirect(safe_next_url(result["next_url"]), code=303)
+        response = redirect(safe_next_url(result["next_url"]), code=303)
+        set_session_cookie(response, sid)
+        return response
 
     @app.get("/healthz")
     def healthz():
@@ -449,11 +495,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.get("/api/session")
     def api_session():
+        sess = current_session()
         return jsonify(
             {
                 "username": config.auth_username,
                 "user_id": current_user_id(),
-                "csrf": csrf_token(session),
+                "csrf": sess["csrf"] if sess else None,
             }
         )
 
@@ -688,12 +735,6 @@ def create_app(config: Optional[Config] = None) -> Flask:
             }
         )
 
-    def valid_request_csrf() -> bool:
-        candidate = request.headers.get("X-CSRF-Token") or request.form.get(
-            "csrf"
-        )
-        return validate_csrf(session, candidate)
-
     @app.get("/api/connection")
     def api_connection():
         user_id = current_user_id()
@@ -719,7 +760,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return jsonify(
                 {"detail": "connection intake is not configured"}
             ), 503
-        if not valid_request_csrf():
+        if not request_csrf_ok():
             return jsonify({"detail": "invalid CSRF token"}), 400
         user_id = current_user_id()
         if user_id is None:
@@ -764,7 +805,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
     def api_connection_revoke():
         if not config.multica_connect_enabled:
             return jsonify({"detail": "connection intake is disabled"}), 503
-        if not valid_request_csrf():
+        if not request_csrf_ok():
             return jsonify({"detail": "invalid CSRF token"}), 400
         user_id = current_user_id()
         if user_id is None:

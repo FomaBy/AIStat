@@ -5,13 +5,12 @@ with a package index capped at Flask 2.0.3. This entry point deliberately uses
 only the Python 3.6 standard library, while preserving the security contract of
 the modern Flask WSGI app:
 
-* signed HttpOnly/Secure/SameSite sessions;
+* opaque HttpOnly/Secure/SameSite sessions resolved server-side;
 * CSRF-protected login/logout and persistent login throttling;
 * strict Host/HTTPS checks and browser security headers;
 * HMAC-authenticated, replay-protected, atomic SQLite snapshot ingestion.
 """
 
-import base64
 import fcntl
 import gzip
 import hashlib
@@ -231,7 +230,8 @@ def _bootstrap():
                 sid_hash    TEXT PRIMARY KEY,
                 user_id     INTEGER NOT NULL,
                 created_at  INTEGER NOT NULL,
-                expires_at  INTEGER NOT NULL
+                expires_at  INTEGER NOT NULL,
+                csrf        TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -244,6 +244,19 @@ def _bootstrap():
         }
         if "client_hash" not in columns:
             conn.execute("ALTER TABLE oauth_state ADD COLUMN client_hash TEXT")
+        session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        if "csrf" not in session_columns:
+            # Opaque server-side sessions (FAN-1392): the cookie is now a bare
+            # random token and the per-session CSRF secret lives in this column.
+            # Any pre-migration row belongs to an old signed/structured cookie,
+            # so drop them all here (one time) — those cookies fail closed and
+            # force a fresh sign-in instead of resolving through a stale row.
+            conn.execute("DELETE FROM sessions")
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN csrf TEXT NOT NULL DEFAULT ''"
+            )
         admins = conn.execute(
             "SELECT id FROM users WHERE is_admin = 1 ORDER BY id"
         ).fetchall()
@@ -318,15 +331,6 @@ _validate_config()
 OWNER_USER_ID = _bootstrap()
 
 
-def _b64encode(data):
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _b64decode(value):
-    value += "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value.encode("ascii"))
-
-
 def _sign(data, secret):
     return hmac.new(
         secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
@@ -362,16 +366,24 @@ def _session_id_hash(sid):
 
 
 def _create_session_record(user_id, expires_at, now=None):
+    """Insert one opaque session and return its secret id.
+
+    The id becomes the whole browser cookie; only its hash is stored, next to a
+    fresh per-session CSRF secret, so the cookie carries no identity, expiry or
+    CSRF of its own.
+    """
     now = int(time.time()) if now is None else int(now)
     sid = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32)
     conn = _security_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
         conn.execute(
-            "INSERT INTO sessions (sid_hash, user_id, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?)",
-            (_session_id_hash(sid), int(user_id), now, int(expires_at)),
+            "INSERT INTO sessions "
+            "(sid_hash, user_id, created_at, expires_at, csrf) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (_session_id_hash(sid), int(user_id), now, int(expires_at), csrf),
         )
         conn.commit()
     finally:
@@ -379,19 +391,29 @@ def _create_session_record(user_id, expires_at, now=None):
     return sid
 
 
-def _session_is_active(sid, now=None):
+def _resolve_session_record(sid, now=None):
+    """Authoritative server-side state behind an opaque cookie, or ``None``.
+
+    Returns ``{"uid", "csrf"}`` for a live session; ``None`` for a missing,
+    expired, revoked or superseded token. Only the hash of the presented value
+    is looked up, so an old signed/structured cookie hashes to a non-id and
+    fails closed here even while a row for its inner id still lives.
+    """
     if not sid or not isinstance(sid, str):
-        return False
+        return None
     now = int(time.time()) if now is None else int(now)
     conn = _security_connection()
     try:
         row = conn.execute(
-            "SELECT 1 FROM sessions WHERE sid_hash = ? AND expires_at > ?",
+            "SELECT user_id, csrf FROM sessions "
+            "WHERE sid_hash = ? AND expires_at > ?",
             (_session_id_hash(sid), now),
         ).fetchone()
     finally:
         conn.close()
-    return row is not None
+    if row is None:
+        return None
+    return {"uid": int(row[0]), "csrf": row[1]}
 
 
 def _revoke_session(sid):
@@ -409,71 +431,47 @@ def _revoke_session(sid):
 
 
 def _make_session():
+    """Create the owner password session; return its opaque cookie value."""
     now = int(time.time())
-    expires_at = now + SESSION_SECONDS
-    payload = {
-        "u": ADMIN_USERNAME,
-        "uid": OWNER_USER_ID,
-        "sid": _create_session_record(OWNER_USER_ID, expires_at, now),
-        "exp": expires_at,
-        "csrf": secrets.token_urlsafe(32),
-    }
-    encoded = _b64encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
-    return encoded + "." + _sign(encoded, SESSION_SECRET), payload
+    return _create_session_record(OWNER_USER_ID, now + SESSION_SECONDS, now)
 
 
 def _make_oauth_session(user_id, email, provider):
+    """Create an OAuth login session; return its opaque cookie value.
+
+    ``email``/``provider`` are accepted for call-site symmetry but never enter
+    the cookie or a session row: identity is resolved from ``user_id`` alone.
+    """
     now = int(time.time())
-    expires_at = now + SESSION_SECONDS
-    payload = {
-        "uid": int(user_id),
-        "email": email,
-        "provider": provider,
-        "sid": _create_session_record(user_id, expires_at, now),
-        "exp": expires_at,
-        "csrf": secrets.token_urlsafe(32),
-    }
-    encoded = _b64encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
-    return encoded + "." + _sign(encoded, SESSION_SECRET), payload
+    return _create_session_record(int(user_id), now + SESSION_SECONDS, now)
 
 
 def _read_session(environ):
+    """Resolve this request's opaque cookie to server-side session state.
+
+    The cookie value is the whole token; an old signed/structured cookie hashes
+    to a non-id and returns ``None`` here (fail closed), even while a row for
+    its inner id still exists.
+    """
     value = _cookies(environ).get("aistat_session")
-    if not value or "." not in value:
+    if not value:
         return None
-    encoded, signature = value.rsplit(".", 1)
-    if not hmac.compare_digest(_sign(encoded, SESSION_SECRET), signature):
+    record = _resolve_session_record(value)
+    if record is None:
         return None
-    try:
-        payload = json.loads(_b64decode(encoded).decode("utf-8"))
-    except Exception:
-        return None
-    if int(payload.get("exp", 0)) < time.time():
-        return None
-    # Pre-revocation cookies carry no server-side id and fail closed here.
-    if not _session_is_active(payload.get("sid")):
-        return None
-    return payload
+    return {"sid": value, "uid": record["uid"], "csrf": record["csrf"]}
 
 
 def _session_grants_access(payload):
     """Whether a valid session may reach private data (fail-closed for OAuth).
 
-    The admin password session is unchanged. Registration is the gate now: an
-    OAuth subject reaches a session only after it was admitted at the callback,
-    so any live session carrying a user id is honoured. The allow list is not
-    re-checked per request, so de-listing an email cannot revoke an already
-    registered user before its server-side session expires.
+    Registration is the gate now: an OAuth subject reaches a session only after
+    it was admitted at the callback, and the owner password session is created
+    directly, so any live session carrying a user id is honoured. The allow
+    list is not re-checked per request, so de-listing an email cannot revoke an
+    already registered user before its server-side session expires.
     """
-    if not payload:
-        return False
-    if payload.get("u") == ADMIN_USERNAME:
-        return True
-    return payload.get("uid") is not None
+    return bool(payload and payload.get("uid") is not None)
 
 
 def _make_login_csrf():
@@ -1225,7 +1223,9 @@ def _oauth(environ, start_response, path):
         )
     # Registration/link succeeded, so access is granted by the active session
     # alone — there is no second, request-time allow-list gate.
-    session_value, _payload = _make_oauth_session(
+    # Rotate the incoming session so a re-auth invalidates the old token.
+    _revoke_session(_cookies(environ).get("aistat_session"))
+    session_value = _make_oauth_session(
         result["user_id"], result["email"], parts[1]
     )
     set_cookie = (
@@ -1436,7 +1436,11 @@ def _login(environ, start_response):
             headers,
         )
     _clear_login_failures(key)
-    session_value, _payload = _make_session()
+    # Rotate: a re-auth from this browser invalidates its own previous token
+    # server-side (captured pre-rotation cookies replay dead), while a parallel
+    # session for the same user in another browser stays live.
+    _revoke_session(_cookies(environ).get("aistat_session"))
+    session_value = _make_session()
     headers = [
         ("Location", next_url),
         (
