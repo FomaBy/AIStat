@@ -69,12 +69,27 @@ HTTP_TIMEOUT_SECONDS = 10
 MAX_RESPONSE_BYTES = 256 * 1024
 USER_AGENT = "AIStat-OAuth/1.0"
 _CLIENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
-# A deliberately strict, provider-agnostic address grammar used as the single
-# fail-closed boundary before any account row is written: ``local@domain`` with
-# a dotted domain and no interior whitespace, ``@`` or control characters. It
-# gates open registration, so an exotic or forged address fails closed rather
-# than creating a half-identified account.
-_EMAIL_RE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+# A deliberately strict, provider-agnostic ASCII address grammar used as the
+# single fail-closed boundary before any account row is written. It gates open
+# registration, so an exotic, non-ASCII or forged address fails closed rather
+# than creating a half-identified account. IDN/EAI is explicitly out of scope
+# and fails closed with everything else non-ASCII.
+#
+# ``RFC 5321/5322`` unquoted ``atext``: ASCII letters, digits and a fixed set of
+# punctuation. The quoted-string and comment local-part forms are deliberately
+# excluded, so only a plain dot-atom local part is accepted.
+_LOCAL_ATEXT = r"A-Za-z0-9!#$%&'*+/=?^_`{|}~-"
+# A dot-atom local part: one or more ``atext`` atoms joined by single dots, with
+# no empty, leading, trailing or consecutive dots.
+_LOCAL_RE = re.compile(
+    r"[" + _LOCAL_ATEXT + r"]+(?:\.[" + _LOCAL_ATEXT + r"]+)*"
+)
+# A single LDH domain label: 1–63 ASCII letters/digits/hyphens with no leading
+# or trailing hyphen.
+_DOMAIN_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# RFC 5321 length ceilings: the whole stored address and the local part.
+MAX_EMAIL_LENGTH = 254
+MAX_LOCAL_LENGTH = 64
 
 
 class OAuthError(Exception):
@@ -328,29 +343,60 @@ def fetch_identity(
 
 
 def normalize_email(email) -> Optional[str]:
-    """Return the canonical trimmed provider email, or ``None`` if unusable.
+    """Return the canonical provider email, or ``None`` if unusable.
 
     This is the single, shared fail-closed boundary for a provider-supplied
     email, applied identically by both WSGI contours before any account-store
-    call. ``None``, a non-``str``, an empty, whitespace-only, control-character
-    bearing or structurally malformed value all yield ``None`` so the caller can
-    reject the login before any user/identity/tenant/session row is written —
-    even when the provider marked the email verified.
+    call. It enforces one deterministic, conservative ASCII policy:
 
-    A usable value is returned trimmed of harmless outer whitespace. Its case is
-    preserved for storage while allow-list and owner comparison stay
+    * the value must be a ``str``; only outer ``U+0020`` SPACE is trimmed (tabs,
+      newlines and every other control are structural rejects, never silently
+      stripped);
+    * the whole stored address is capped at 254 characters and must be pure
+      ASCII — this rejects IDN/EAI, C1 controls (``U+0080``–``U+009F``) and
+      Unicode format/bidi controls such as ``U+200B``/``U+202E`` in one step;
+    * any remaining C0 control or ``DEL`` is rejected;
+    * there must be exactly one ``@``; the local part is a 1–64 character RFC
+      unquoted dot-atom (``atext`` atoms joined by single dots, with no empty,
+      leading, trailing or consecutive dots); the domain is two or more LDH
+      labels, each 1–63 characters with no leading or trailing hyphen.
+
+    ``None``, a non-``str``, an empty, whitespace-only, control-bearing,
+    non-ASCII or otherwise structurally malformed value all yield ``None`` so
+    the caller can reject the login before any user/identity/tenant/session row
+    is written — even when the provider marked the email verified.
+
+    A usable value is returned with only outer ``U+0020`` trimmed and its case
+    preserved for storage, while allow-list and owner comparison stay
     case-insensitive, so the canonical form is stable across logins.
     """
     if not isinstance(email, str):
         return None
-    trimmed = email.strip()
-    if not trimmed:
+    # Trim only outer U+0020 SPACE. Tab/newline/other whitespace is not a
+    # harmless pad here — it fails closed below as a control character.
+    trimmed = email.strip(" ")
+    if not trimmed or len(trimmed) > MAX_EMAIL_LENGTH:
         return None
-    # Reject any embedded control character (a C0 control or DEL that survived
-    # the surrounding strip) before the structural check.
+    # ASCII-only in a single check: this rejects all non-ASCII at once —
+    # IDN/EAI, C1 controls (U+0080–U+009F, e.g. U+0081) and Unicode
+    # format/bidi controls (e.g. U+200B, U+202E) — none of which are usable.
+    try:
+        trimmed.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    # Reject any remaining C0 control or DEL (an interior tab/newline, or a
+    # leading/trailing control that survived the space-only trim).
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed):
         return None
-    if not _EMAIL_RE.fullmatch(trimmed):
+    if trimmed.count("@") != 1:
+        return None
+    local, domain = trimmed.split("@", 1)
+    if not local or len(local) > MAX_LOCAL_LENGTH or not _LOCAL_RE.fullmatch(local):
+        return None
+    labels = domain.split(".")
+    if len(labels) < 2 or not all(
+        _DOMAIN_LABEL_RE.fullmatch(label) for label in labels
+    ):
         return None
     return trimmed
 

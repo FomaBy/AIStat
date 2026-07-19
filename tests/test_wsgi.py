@@ -920,7 +920,19 @@ def _security_counts(config):
 
 @pytest.mark.parametrize(
     "bad_email",
-    ["   ", "\t\n", "", "not-an-email", "a b@example.com"],
+    [
+        "   ", "\t\n", "", "not-an-email", "a b@example.com",
+        # dotted-domain / dot-structure false accepts from the QA report
+        "a@b..example", "a@.b.example", "a@b.example.", "a..b@example.com",
+        # non-ASCII / IDN / EAI must fail closed
+        "user@exämple.com",
+        # literal C1 / zero-width / bidi control code points
+        "a@b\u0081.example.com",   # U+0081
+        "a@b\u200bexample.com",    # U+200B
+        "a@ex\u202eample.com",     # U+202E
+        # LDH hyphen violation and length overflow
+        "a@-bad.example.com", "a" * 65 + "@example.com",
+    ],
 )
 def test_oauth_callback_rejects_malformed_verified_email_fail_closed(
     public_app, monkeypatch, bad_email
@@ -958,6 +970,49 @@ def test_oauth_callback_rejects_malformed_verified_email_fail_closed(
     )
     assert replay.status_code == 400
     assert _security_counts(config) == before
+
+
+def test_oauth_callback_rejects_malformed_email_for_registered_subject(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()  # open registration
+    # a subject registers cleanly first
+    first = complete_oauth_login(
+        app.test_client(),
+        monkeypatch,
+        {"sub": "g-known", "email": "known@example.com", "email_verified": True},
+    )
+    assert first.status_code == 303
+    after_register = _security_counts(config)
+
+    # the same, already-registered subject returns with a structurally malformed
+    # verified email. Identity is subject-first, but validation runs before it,
+    # so this fails closed with the same generic 400: no new rows, no session and
+    # a replay-proof state — an existing account cannot be logged in on a bad
+    # address either.
+    client = app.test_client()
+    install_fake_http(
+        monkeypatch,
+        {"sub": "g-known", "email": "a@b..example", "email_verified": True},
+    )
+    start = client.get("/auth/google/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 400
+    assert _security_counts(config) == after_register
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
+
+    # the consumed state cannot be replayed
+    replay = client.get(
+        "/auth/google/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert replay.status_code == 400
+    assert _security_counts(config) == after_register
 
 
 def test_oauth_callback_stores_whitespace_padded_email_canonically(

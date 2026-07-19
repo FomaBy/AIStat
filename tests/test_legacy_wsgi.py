@@ -1339,7 +1339,19 @@ def _legacy_session_count(module):
 
 @pytest.mark.parametrize(
     "bad_email",
-    ["   ", "\t\n", "", "not-an-email", "a b@example.com"],
+    [
+        "   ", "\t\n", "", "not-an-email", "a b@example.com",
+        # dotted-domain / dot-structure false accepts from the QA report
+        "a@b..example", "a@.b.example", "a@b.example.", "a..b@example.com",
+        # non-ASCII / IDN / EAI must fail closed
+        "user@exämple.com",
+        # literal C1 / zero-width / bidi control code points
+        "a@b\u0081.example.com",   # U+0081
+        "a@b\u200bexample.com",    # U+200B
+        "a@ex\u202eample.com",     # U+202E
+        # LDH hyphen violation and length overflow
+        "a@-bad.example.com", "a" * 65 + "@example.com",
+    ],
 )
 def test_oauth_login_rejects_malformed_verified_email_fail_closed(
     legacy, monkeypatch, bad_email
@@ -1378,6 +1390,54 @@ def test_oauth_login_rejects_malformed_verified_email_fail_closed(
     assert status == "400 Bad Request"
     assert _legacy_counts(module) == before
     assert _legacy_session_count(module) == before_sessions
+
+
+def test_oauth_login_rejects_malformed_email_for_registered_subject(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    # a subject registers cleanly first
+    status, _, _, _ = oauth_login(
+        module, monkeypatch,
+        {"sub": "known", "email": "known@example.com", "email_verified": True},
+    )
+    assert status == "303 See Other"
+    after_register = _legacy_counts(module)
+    after_sessions = _legacy_session_count(module)
+
+    # the same, already-registered subject returns with a structurally malformed
+    # verified email. Identity is subject-first, but validation runs before it,
+    # so this fails closed with the same generic 400: no new rows, no new session
+    # and a replay-proof state.
+    install_fake_http(
+        monkeypatch,
+        {"sub": "known", "email": "a@b..example", "email_verified": True},
+    )
+    status, headers, _ = request(module.application, "/auth/google/start")
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, headers, body = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
+    assert "Регистрация сейчас закрыта".encode("utf-8") not in body
+    assert _legacy_counts(module) == after_register
+    assert _legacy_session_count(module) == after_sessions
+    after_cookies = cookie_jar(headers, start_cookies)
+    status, _, _ = request(module.application, "/api/meta", cookie=after_cookies)
+    assert status == "401 Unauthorized"
+
+    # the consumed state cannot be replayed
+    status, _, _ = request(
+        module.application,
+        "/auth/google/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "400 Bad Request"
+    assert _legacy_counts(module) == after_register
+    assert _legacy_session_count(module) == after_sessions
 
 
 def test_oauth_login_stores_whitespace_padded_email_canonically(

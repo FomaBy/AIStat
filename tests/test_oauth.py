@@ -549,13 +549,21 @@ def test_open_registration_wraps_store_anomaly_as_oauth_error():
     "email",
     [
         "a@b.co",
-        "  a@b.co  ",                       # harmless outer whitespace is trimmed
-        "\tUser.Name+tag@Example.COM\n",    # case preserved, tabs/newlines stripped
+        "  a@b.co  ",                       # only outer U+0020 SPACE is trimmed
+        "  User.Name+tag@Example.COM  ",    # case preserved, allowed local dots/+
         "x@sub.example.com",
+        # every RFC unquoted ``atext`` punctuation is an allowed local char
+        "user!#$%&'*+/=?^_`{|}~-@example.com",
+        "a@b-c.example.com",                # interior hyphen in a label is fine
+        "1@2.co",                           # single-char digit labels
+        "a@" + "b" * 63 + ".com",           # 63-char label boundary (allowed)
+        "a" * 64 + "@example.com",          # 64-char local boundary (allowed)
+        "a@" + "x" * 60 + "." + "y" * 60 + ".example.com",  # long but <= 254
     ],
 )
 def test_normalize_email_returns_canonical_trimmed_form(email):
-    assert oauth.normalize_email(email) == email.strip()
+    # only U+0020 SPACE is trimmed; case is preserved for storage
+    assert oauth.normalize_email(email) == email.strip(" ")
 
 
 @pytest.mark.parametrize(
@@ -564,7 +572,8 @@ def test_normalize_email_returns_canonical_trimmed_form(email):
         None,                 # missing
         "",                   # empty
         "   ",                # spaces only
-        "\t\n ",              # tabs/newlines only
+        "\t\n ",              # tabs/newlines (only the space trims off)
+        "\tUser.Name+tag@Example.COM\n",  # outer tab/newline is NOT stripped
         12345,                # non-string
         True,                 # non-string
         b"a@b.co",            # bytes, not str
@@ -577,10 +586,46 @@ def test_normalize_email_returns_canonical_trimmed_form(email):
         "a b@example.com",    # interior whitespace
         "a@@example.com",     # doubled @
         "a@.com",             # empty domain label before dot
+        # dotted-domain / dot-structure false accepts from the QA report
+        "a@b..example",       # consecutive domain dots
+        "a@.b.example",       # leading domain dot
+        "a@b.example.",       # trailing domain dot
+        "a..b@example.com",   # consecutive local dots
+        ".a@example.com",     # leading local dot
+        "a.@example.com",     # trailing local dot
+        # non-ASCII: IDN/EAI is out of scope and fails closed
+        "user@exämple.com",   # ä in the domain (IDN)
+        "пол@example.com",  # Cyrillic local (EAI)
+        # C1 / Unicode format / bidi controls embedded as literal code points
+        "a@b\u0081.example.com",   # C1 control U+0081
+        "a@b\u200bexample.com",    # zero-width space U+200B
+        "a@ex\u202eample.com",     # right-to-left override U+202E
+        # LDH domain-label hyphen violations
+        "a@-bad.example.com",      # leading hyphen
+        "a@bad-.example.com",      # trailing hyphen
+        # quoted / comment local-part forms are not accepted
+        '"a"@example.com',
+        "a(comment)@example.com",
+        # length overflow
+        "a" * 65 + "@example.com",          # local part 65 > 64
+        "a@" + "b" * 64 + ".com",           # domain label 64 > 63
+        "a@" + ("x" * 63 + ".") * 4 + "example.com",  # whole address > 254
     ],
 )
 def test_normalize_email_rejects_unusable_values(value):
     assert oauth.normalize_email(value) is None
+
+
+def test_normalize_email_control_probes_are_literal_code_points():
+    # guard the reject cases above: a ``\u`` escape in a normal string is the
+    # single real code point at runtime, not six characters of backslash text,
+    # so the probes genuinely exercise the control characters they name.
+    assert ord("\u0081") == 0x81
+    assert ord("\u200b") == 0x200B
+    assert ord("\u202e") == 0x202E
+    assert oauth.normalize_email("a@b\u0081.example.com") is None
+    assert oauth.normalize_email("a@b\u200bexample.com") is None
+    assert oauth.normalize_email("a@ex\u202eample.com") is None
 
 
 @pytest.mark.parametrize(
@@ -595,6 +640,20 @@ def test_normalize_email_rejects_unusable_values(value):
         "plainaddress",
         "a@b",
         "a b@example.com",
+        # QA-reported dotted-domain / dot-structure false accepts
+        "a@b..example",
+        "a@.b.example",
+        "a@b.example.",
+        "a..b@example.com",
+        # non-ASCII / IDN / EAI fails closed
+        "user@exämple.com",
+        # literal C1 / format / bidi control code points
+        "a@b\u0081.example.com",   # U+0081
+        "a@b\u200bexample.com",    # U+200B
+        "a@ex\u202eample.com",     # U+202E
+        # LDH hyphen violation and length overflow
+        "a@-bad.example.com",
+        "a" * 65 + "@example.com",
     ],
 )
 def test_open_registration_rejects_malformed_email_even_when_verified(email):
@@ -622,7 +681,7 @@ def test_open_registration_trims_before_owner_and_allowlist_match():
 
     listed = FakeStore()
     admitted = _register(
-        listed, "sub-in", "\tAllowed@Example.com\n",
+        listed, "sub-in", "  Allowed@Example.com  ",
         allowed_emails=frozenset({"allowed@example.com"}),
         admin_email="owner@example.com",
     )
