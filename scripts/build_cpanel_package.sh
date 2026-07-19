@@ -15,6 +15,11 @@ cp requirements-cpanel.txt "$TARGET/requirements.txt"
 # trusted local machine: its code, its `cryptography` dependency and any key
 # or store files must never reach the shared cPanel host.
 rm -f "$TARGET/aistat/worker_store.py" "$TARGET/aistat/worker_sync.py"
+# The shared host serves the dependency-free legacy WSGI entry point (and may
+# run the Flask WSGI contour); it never runs the local FastAPI/uvicorn app.
+# Ship neither `server.py` nor the FastAPI import it carries to the public
+# host — the loopback-only launcher (run.sh) keeps them local.
+rm -f "$TARGET/aistat/server.py"
 find "$TARGET" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$TARGET" -type f -name '*.pyc' -delete
 
