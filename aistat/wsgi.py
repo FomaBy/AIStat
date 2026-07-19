@@ -50,7 +50,8 @@ from .security import (
     validate_public_config,
     verify_snapshot_signature,
 )
-from .snapshot import SnapshotError, install_compressed_snapshot
+from .snapshot import SnapshotError, stage_compressed_snapshot
+from .snapshot_recovery import cleanup_staged_file, swap_staged_into_place
 from .tenant import canonical_tenant_id
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -243,6 +244,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    # Reconcile any snapshot install a crash left half-applied before this
+    # worker serves a request. Under the ingest lock so it cannot race a live
+    # ingest or another worker's recovery pass.
+    with ingest_lock():
+        security_store.recover_snapshot_installs(config.tenants_dir)
 
     def last_sync_state() -> dict:
         conn = data_connection()
@@ -645,18 +652,36 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 tenant_id, timestamp
             ):
                 return jsonify({"detail": "snapshot replay rejected"}), 409
+            target_path = config.tenant_db_path(tenant_id)
             try:
-                info = install_compressed_snapshot(
-                    payload,
-                    config.tenant_db_path(tenant_id),
-                    config.max_snapshot_bytes,
+                staged_path, info = stage_compressed_snapshot(
+                    payload, target_path, config.max_snapshot_bytes
                 )
             except SnapshotError:
                 return jsonify({"detail": "invalid snapshot"}), 422
-            if not security_store.record_tenant_snapshot(
-                tenant_id, timestamp, info.sha256
+            # Journal the intent before touching the tenant database so a crash
+            # between the file swap and the watermark update recovers to a
+            # consistent old/old or new/new state, never a mixed one.
+            security_store.begin_snapshot_install(
+                tenant_id, timestamp, info.sha256, timestamp, str(staged_path)
+            )
+            try:
+                swap_staged_into_place(staged_path, target_path)
+            except (OSError, ValueError):
+                # The swap only raises before os.replace, so the tenant DB is
+                # untouched: safe to roll back to old/old.
+                security_store.abort_snapshot_install(tenant_id)
+                cleanup_staged_file(staged_path)
+                return jsonify({"detail": "invalid snapshot"}), 422
+            if not security_store.finish_snapshot_install(
+                tenant_id, timestamp, info.sha256, timestamp
             ):
-                return jsonify({"detail": "snapshot replay rejected"}), 409
+                # Unreachable while the ingest lock is held: the freshness check
+                # above and this commit use the same strict threshold, and no
+                # other writer advances the watermark under the lock. The DB is
+                # already swapped, so a stuck watermark here is a broken
+                # invariant, not a replay — surface it loudly.
+                return jsonify({"detail": "snapshot install failed"}), 500
         return jsonify(
             {
                 "status": "ok",

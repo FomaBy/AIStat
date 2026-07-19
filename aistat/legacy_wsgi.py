@@ -22,7 +22,6 @@ import json
 import mimetypes
 import os
 import secrets
-import shutil
 import sqlite3
 import tempfile
 import time
@@ -30,7 +29,7 @@ import traceback
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import __version__, aggregates, handoff, oauth
+from . import __version__, aggregates, handoff, oauth, snapshot_recovery
 from .db import SCHEMA_VERSION, init_db
 from .tenant import (
     canonical_tenant_id,
@@ -237,6 +236,7 @@ def _bootstrap():
             """
         )
         conn.executescript(handoff.CONNECTIONS_SCHEMA)
+        conn.executescript(snapshot_recovery.INSTALL_JOURNAL_SCHEMA)
         # Serialize the inspect-and-alter migration across WSGI workers.
         conn.execute("BEGIN IMMEDIATE")
         columns = {
@@ -286,6 +286,32 @@ def _bootstrap():
     except OSError:
         pass
     return owner_user_id
+
+
+def _ingest_lock_path():
+    return os.path.join(os.path.dirname(SECURITY_DB_PATH), "ingest.lock")
+
+
+def _recover_snapshot_installs():
+    """Reconcile any snapshot install a crash left half-applied.
+
+    Runs under the shared ingest lock so it cannot race a live ingest or a
+    second worker's recovery pass on the same host. Called once at import so a
+    restarted worker never serves a mixed snapshot/watermark state.
+    """
+    lock_path = _ingest_lock_path()
+    parent = os.path.dirname(lock_path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, 0o700)
+    with open(lock_path, "a+b") as lock:
+        _chmod_private(lock_path)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        conn = _security_connection()
+        try:
+            snapshot_recovery.recover_pending_installs(conn, TENANTS_DIR)
+        finally:
+            conn.close()
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 _validate_config()
@@ -622,30 +648,33 @@ def _ingest_timestamp_is_fresh(user_id, timestamp):
     )
 
 
-def _record_tenant_snapshot(user_id, timestamp, sha256):
-    user_id = canonical_tenant_id(user_id)
+def _begin_snapshot_install(user_id, timestamp, sha256, snapshot_at, staged_path):
+    """Journal the intent to install one staged snapshot (crash-atomic)."""
     conn = _security_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT last_ingest_timestamp FROM tenants WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if row is None:
-            conn.rollback()
-            return False
-        current = int(row["last_ingest_timestamp"])
-        if timestamp <= current:
-            conn.rollback()
-            return False
-        conn.execute(
-            "UPDATE tenants SET last_ingest_timestamp = ?, "
-            "last_snapshot_at = ?, last_snapshot_sha256 = ? "
-            "WHERE user_id = ?",
-            (timestamp, timestamp, sha256, user_id),
+        snapshot_recovery.record_install_intent(
+            conn, user_id, timestamp, sha256, snapshot_at, staged_path
         )
-        conn.commit()
-        return True
+    finally:
+        conn.close()
+
+
+def _finish_snapshot_install(user_id, timestamp, sha256, snapshot_at):
+    """Advance the watermark and drop the journal row atomically."""
+    conn = _security_connection()
+    try:
+        return snapshot_recovery.commit_install(
+            conn, user_id, timestamp, sha256, snapshot_at
+        )
+    finally:
+        conn.close()
+
+
+def _abort_snapshot_install(user_id):
+    """Drop a tenant's journal row without advancing the watermark."""
+    conn = _security_connection()
+    try:
+        snapshot_recovery.clear_install_intent(conn, user_id)
     finally:
         conn.close()
 
@@ -1183,14 +1212,15 @@ def _verify_snapshot_request(environ, body):
     return tenant_id, timestamp
 
 
-def _unlink_if_exists(path):
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
+def _stage_snapshot(payload, target_path):
+    """Decompress and validate a snapshot into a temp file beside the target.
 
-
-def _install_snapshot(payload, target_path):
+    Returns ``(staged_path, info)`` without touching the target. The caller
+    journals the intent and then swaps the staged file into place with
+    :func:`snapshot_recovery.swap_staged_into_place`, so a crash between the
+    two recovers to a consistent state. The staged file is left on disk on
+    success and cleaned up only when staging itself fails.
+    """
     if len(payload) > MAX_SNAPSHOT_BYTES:
         raise ValueError("snapshot too large")
     parent = os.path.dirname(target_path)
@@ -1241,22 +1271,15 @@ def _install_snapshot(payload, target_path):
         finally:
             conn.close()
 
-        if os.path.exists(target_path):
-            shutil.copy2(target_path, previous)
-            _chmod_private(previous)
-        _unlink_if_exists(target_path + "-wal")
-        _unlink_if_exists(target_path + "-shm")
-        os.replace(temp_path, target_path)
-        _chmod_private(target_path)
-        with open(target_path, "rb") as source:
-            data = source.read()
-        return {
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "size_bytes": len(data),
+        snapshot_recovery.fsync_file(temp_path)
+        return temp_path, {
+            "sha256": snapshot_recovery.file_sha256(temp_path),
+            "size_bytes": total,
             "schema_version": version,
         }
-    finally:
-        _unlink_if_exists(temp_path)
+    except BaseException:
+        snapshot_recovery.cleanup_staged_file(temp_path)
+        raise
 
 
 def _authenticated(environ):
@@ -1383,7 +1406,8 @@ def _ingest(environ, start_response):
         )
     # File paths use the canonical id read from security.db, not raw input.
     tenant_id = int(tenant["user_id"])
-    lock_path = os.path.join(os.path.dirname(SECURITY_DB_PATH), "ingest.lock")
+    target_path = tenant_db_path(TENANTS_DIR, tenant_id)
+    lock_path = _ingest_lock_path()
     with open(lock_path, "a+b") as lock:
         _chmod_private(lock_path)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -1393,18 +1417,38 @@ def _ingest(environ, start_response):
                     environ, start_response, "409 Conflict", {"detail": "snapshot replay rejected"}
                 )
             try:
-                info = _install_snapshot(
-                    body, tenant_db_path(TENANTS_DIR, tenant_id)
-                )
+                staged_path, info = _stage_snapshot(body, target_path)
             except ValueError:
                 return _json_response(
                     environ, start_response, "422 Unprocessable Entity", {"detail": "invalid snapshot"}
                 )
-            if not _record_tenant_snapshot(
-                tenant_id, timestamp, info["sha256"]
-            ):
+            # Journal the intent before touching the tenant database so a crash
+            # between the file swap and the watermark update recovers to a
+            # consistent old/old or new/new state, never a mixed one.
+            _begin_snapshot_install(
+                tenant_id, timestamp, info["sha256"], timestamp, staged_path
+            )
+            try:
+                snapshot_recovery.swap_staged_into_place(staged_path, target_path)
+            except (OSError, ValueError):
+                # The swap only raises before os.replace, so the tenant DB is
+                # untouched: safe to roll back to old/old.
+                _abort_snapshot_install(tenant_id)
+                snapshot_recovery.cleanup_staged_file(staged_path)
                 return _json_response(
-                    environ, start_response, "409 Conflict", {"detail": "snapshot replay rejected"}
+                    environ, start_response, "422 Unprocessable Entity", {"detail": "invalid snapshot"}
+                )
+            if not _finish_snapshot_install(
+                tenant_id, timestamp, info["sha256"], timestamp
+            ):
+                # Unreachable while the ingest lock is held (see the Flask path):
+                # the DB is already swapped, so a stuck watermark here is a
+                # broken invariant, not a replay — surface it loudly.
+                return _json_response(
+                    environ,
+                    start_response,
+                    "500 Internal Server Error",
+                    {"detail": "snapshot install failed"},
                 )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1835,3 +1879,8 @@ def application(environ, start_response):
         return _respond(
             environ, start_response, "500 Internal Server Error", "Internal server error"
         )
+
+
+# Reconcile a crash-interrupted snapshot install once the module (and every
+# helper it needs) is fully defined, before the app serves any request.
+_recover_snapshot_installs()
