@@ -77,7 +77,6 @@ def valid_preflight_config(tmp_path):
     config.publish_interval_seconds = 300
     config.worker_pull_interval_seconds = 300
     config.worker_collect_interval_seconds = 300
-    config.allow_insecure_publish = False
     config.worker_key_path = tmp_path / "key" / "worker.key"
     config.worker_store_path = tmp_path / "store" / "connections.db"
     return config
@@ -285,7 +284,10 @@ def test_invalid_secrets_never_reach_runtime_control(tmp_path, case):
 
 @pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
 @pytest.mark.parametrize("case", INVALID_ENDPOINT_CASES)
-def test_invalid_endpoints_never_reach_runtime_control(tmp_path, field, case):
+def test_invalid_endpoints_never_reach_runtime_control(
+    tmp_path, monkeypatch, field, case
+):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
     config = valid_preflight_config(tmp_path)
     endpoint = invalid_endpoint(case)
     setattr(config, field, endpoint)

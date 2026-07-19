@@ -112,7 +112,6 @@ def valid_preflight_config(tmp_path):
     config.publish_interval_seconds = 300
     config.worker_pull_interval_seconds = 300
     config.worker_collect_interval_seconds = 300
-    config.allow_insecure_publish = False
     config.worker_key_path = tmp_path / "key" / "worker.key"
     config.worker_store_path = tmp_path / "store" / "connections.db"
     return config
@@ -255,6 +254,7 @@ def test_invalid_secrets_never_start_supervisor(
 def test_invalid_endpoints_never_start_supervisor(
     tmp_path, monkeypatch, caplog, capsys, field, case
 ):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
     config = valid_preflight_config(tmp_path)
     endpoint = invalid_endpoint(case)
     setattr(config, field, endpoint)

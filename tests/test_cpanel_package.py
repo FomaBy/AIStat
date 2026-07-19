@@ -34,6 +34,13 @@ def test_cpanel_package_keeps_worker_side_out(tmp_path):
     assert not (package / "aistat" / "supervisor.py").exists()
     assert not (package / "aistat" / "runtime_install.py").exists()
     assert not (package / "aistat" / "preflight.py").exists()
+    assert (package / "aistat" / "endpoints.py").is_file()
+    deployable_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in package.rglob("*.py")
+    )
+    assert "AISTAT_ALLOW_INSECURE_PUBLISH" not in deployable_source
+    assert "allow_insecure_publish" not in deployable_source
     requirements = (package / "requirements.txt").read_text(encoding="utf-8")
     assert "cryptography" not in requirements
     leftovers = [

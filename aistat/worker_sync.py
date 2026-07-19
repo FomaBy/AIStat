@@ -16,10 +16,10 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Optional
-from urllib.parse import urlsplit
 
 from . import handoff
 from .config import Config
+from .endpoints import https_endpoint_error
 from .worker_store import WorkerStoreError, WorkerTokenStore
 
 logger = logging.getLogger("aistat.worker_sync")
@@ -34,16 +34,13 @@ class WorkerSyncError(RuntimeError):
 
 
 def _validate_worker_sync_config(config: Config) -> None:
-    if not config.worker_sync_url:
-        raise WorkerSyncError("AISTAT_WORKER_SYNC_URL is not configured")
-    parsed = urlsplit(config.worker_sync_url)
-    if parsed.scheme != "https" and not config.allow_insecure_publish:
+    error = https_endpoint_error(
+        "AISTAT_WORKER_SYNC_URL", config.worker_sync_url
+    )
+    if error is not None:
         raise WorkerSyncError(
-            "AISTAT_WORKER_SYNC_URL must use HTTPS "
-            "(set AISTAT_ALLOW_INSECURE_PUBLISH=1 only for local tests)"
+            "AISTAT_WORKER_SYNC_URL {}".format(error)
         )
-    if not parsed.netloc:
-        raise WorkerSyncError("AISTAT_WORKER_SYNC_URL is invalid")
     secret = config.worker_secret or ""
     if len(secret.encode("utf-8")) < 32:
         raise WorkerSyncError(

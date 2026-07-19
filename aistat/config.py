@@ -175,9 +175,6 @@ class Config:
     publish_tenant_id: Optional[int] = field(
         default_factory=lambda: _env_optional_int("AISTAT_TENANT_ID")
     )
-    allow_insecure_publish: bool = field(
-        default_factory=lambda: _env_bool("AISTAT_ALLOW_INSECURE_PUBLISH", False)
-    )
     # "Connect your Multica" secure token handoff. The host accepts a user
     # token only while this independent worker-channel secret is configured;
     # the same secret authenticates the trusted local worker's pull channel.

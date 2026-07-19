@@ -35,11 +35,6 @@ INVALID_ENDPOINT_CASES = (
     "leading-hyphen-label",
 )
 
-STRUCTURALLY_INVALID_ENDPOINT_CASES = tuple(
-    case for case in INVALID_ENDPOINT_CASES if case != "http"
-)
-
-
 def invalid_endpoint(case):
     values = {
         "missing": None,
@@ -87,7 +82,6 @@ def valid_config(tmp_path):
     config.publish_interval_seconds = 300
     config.worker_pull_interval_seconds = 300
     config.worker_collect_interval_seconds = 300
-    config.allow_insecure_publish = False
     config.worker_key_path = tmp_path / "key" / "worker.key"
     config.worker_store_path = tmp_path / "store" / "connections.db"
     return config
@@ -113,7 +107,10 @@ def test_missing_tenant_id_fails(tmp_path):
 
 @pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
 @pytest.mark.parametrize("case", INVALID_ENDPOINT_CASES)
-def test_invalid_runtime_endpoint_fails_closed(tmp_path, field, case):
+def test_invalid_runtime_endpoint_fails_closed(
+    tmp_path, monkeypatch, field, case
+):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
     config = valid_config(tmp_path)
     endpoint = invalid_endpoint(case)
     setattr(config, field, endpoint)
@@ -153,37 +150,10 @@ def test_valid_absolute_https_endpoint_passes(tmp_path, field, endpoint):
     assert report.ok, report.render()
 
 
-def test_insecure_flag_allows_http(tmp_path):
-    config = valid_config(tmp_path)
-    config.allow_insecure_publish = True
-    config.publish_url = "http://localhost:9000/ingest"
-    config.worker_sync_url = "http://localhost:9000"
-    report = preflight.run_preflight(config, check_imports=False)
-    assert report.ok, report.render()
-
-
-def test_insecure_test_mode_rejects_other_schemes(tmp_path):
-    config = valid_config(tmp_path)
-    config.allow_insecure_publish = True
-    config.publish_url = "ftp://host.example/path"
-    report = preflight.run_preflight(config, check_imports=False)
-    assert not verdict(report, "AISTAT_PUBLISH_URL").ok
-
-
-@pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
-@pytest.mark.parametrize("case", STRUCTURALLY_INVALID_ENDPOINT_CASES)
-def test_insecure_test_mode_never_allows_malformed_endpoint(
-    tmp_path, field, case
-):
-    config = valid_config(tmp_path)
-    config.allow_insecure_publish = True
-    setattr(config, field, invalid_endpoint(case))
-    report = preflight.run_preflight(config, check_imports=False)
-    name = (
-        "AISTAT_PUBLISH_URL" if field == "publish_url"
-        else "AISTAT_WORKER_SYNC_URL"
-    )
-    assert not verdict(report, name).ok
+def test_insecure_environment_flag_is_not_a_config_route(monkeypatch):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
+    config = Config()
+    assert not hasattr(config, "allow_insecure_publish")
 
 
 def test_short_ingest_secret_fails(tmp_path):

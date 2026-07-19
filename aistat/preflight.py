@@ -17,17 +17,15 @@ crash-looping its children.
 import argparse
 import hmac
 import importlib
-import ipaddress
 import logging
 import os
-import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlsplit
 
 from .config import Config
+from .endpoints import https_endpoint_error
 
 logger = logging.getLogger("aistat.preflight")
 
@@ -44,11 +42,6 @@ CONTOUR_MODULES = (
     "aistat.worker_sync",
     "aistat.collector",
 )
-
-_HOST_LABEL_RE = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
-)
-
 
 @dataclass
 class Check:
@@ -95,83 +88,12 @@ def _same_secret(a: Optional[str], b: Optional[str]) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-def _hostname_ok(hostname: Optional[str]) -> bool:
-    """Validate an IP literal or DNS/IDNA hostname without resolving it."""
-    if not hostname:
-        return False
-    try:
-        ipaddress.ip_address(hostname)
-        return True
-    except ValueError:
-        pass
-
-    # A trailing dot is valid for a fully-qualified DNS name, but it is not a
-    # label.  IDNA conversion rejects malformed Unicode before the ASCII label
-    # grammar and total-length limits are applied.
-    dns_name = hostname[:-1] if hostname.endswith(".") else hostname
-    if not dns_name:
-        return False
-    try:
-        ascii_name = dns_name.encode("idna").decode("ascii")
-    except UnicodeError:
-        return False
-    return (
-        len(ascii_name) <= 253
-        and all(_HOST_LABEL_RE.match(label) for label in ascii_name.split("."))
-    )
-
-
-def _check_https(name: str, url: Optional[str], allow_insecure: bool) -> Check:
-    if not isinstance(url, str) or not url:
-        return Check(name, False, "{} is not configured".format(name))
-
-    malformed = Check(
-        name,
-        False,
-        "must be an absolute URL with a valid host and port",
-    )
-    if "\\" in url or any(
-        ch.isspace() or ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f
-        for ch in url
-    ):
-        return malformed
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-        port = parsed.port
-    except (TypeError, UnicodeError, ValueError):
-        return malformed
-
-    # urllib.parse is a component splitter, not a validator.  In particular,
-    # it accepts empty authorities, userinfo and an empty port delimiter.  The
-    # runtime endpoints must be network locations, never credential-bearing
-    # URLs; a configured port must be usable as a destination port.
-    authority = parsed.netloc
-    invalid_bracket_suffix = False
-    if authority.startswith("["):
-        closing = authority.find("]")
-        suffix = authority[closing + 1:] if closing >= 0 else ""
-        invalid_bracket_suffix = (
-            closing < 0
-            or (suffix and not suffix.startswith(":"))
-            or suffix == ":"
-        )
-    if (
-        not parsed.netloc
-        or "@" in parsed.netloc
-        or parsed.netloc.endswith(":")
-        or invalid_bracket_suffix
-        or not _hostname_ok(hostname)
-        or port == 0
-    ):
-        return malformed
-
-    scheme = parsed.scheme.lower()
-    if scheme == "https":
-        return Check(name, True, "HTTPS endpoint configured")
-    if allow_insecure and scheme == "http":
-        return Check(name, True, "HTTP endpoint allowed (insecure test mode)")
-    return Check(name, False, "must use HTTPS")
+def check_https_endpoint(name: str, url: Optional[str]) -> Check:
+    """Validate one deployable runtime endpoint without exposing its value."""
+    error = https_endpoint_error(name, url)
+    if error is not None:
+        return Check(name, False, error)
+    return Check(name, True, "HTTPS endpoint configured")
 
 
 def _check_path_permissions(config: Config) -> List[Check]:
@@ -268,8 +190,9 @@ def run_preflight(config: Config, *, check_imports: bool = True,
         "AISTAT_TENANT_ID configured" if config.publish_tenant_id is not None
         else "AISTAT_TENANT_ID is required",
     ))
-    checks.append(_check_https("AISTAT_PUBLISH_URL", config.publish_url,
-                               config.allow_insecure_publish))
+    checks.append(check_https_endpoint(
+        "AISTAT_PUBLISH_URL", config.publish_url
+    ))
     checks.append(Check(
         "ingest_secret", _secret_ok(config.ingest_secret),
         "AISTAT_INGEST_SECRET present" if _secret_ok(config.ingest_secret)
@@ -277,8 +200,9 @@ def run_preflight(config: Config, *, check_imports: bool = True,
     ))
 
     # PAT worker: its pull endpoint and independent secret.
-    checks.append(_check_https("AISTAT_WORKER_SYNC_URL", config.worker_sync_url,
-                               config.allow_insecure_publish))
+    checks.append(check_https_endpoint(
+        "AISTAT_WORKER_SYNC_URL", config.worker_sync_url
+    ))
     checks.append(Check(
         "worker_secret", _secret_ok(config.worker_secret),
         "AISTAT_WORKER_SECRET present" if _secret_ok(config.worker_secret)
