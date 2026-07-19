@@ -26,6 +26,7 @@ logger = logging.getLogger("aistat.worker_sync")
 Opener = Callable[..., Any]
 
 MAX_RESPONSE_BYTES = 1024 * 1024
+CREDENTIAL_STORE_FAILURE = "worker credential storage failed"
 
 
 class WorkerSyncError(RuntimeError):
@@ -114,17 +115,27 @@ def pull_once(
     state = _call(config, opener, handoff.WORKER_PULL_PATH, {})
     acks = []
     stored = 0
+    failed = []
     for item in state.get("pending") or []:
         try:
             user_id = int(item["user_id"])
-            accepted = store.store_token(
-                user_id,
-                str(item["server_url"]),
-                item.get("workspace_label"),
-                str(item["token"]),
-                int(item["token_epoch"]),
-            )
+            server_url = str(item["server_url"])
+            workspace_label = item.get("workspace_label")
+            token = str(item["token"])
+            epoch = int(item["token_epoch"])
         except (KeyError, TypeError, ValueError) as exc:
+            raise WorkerSyncError("host sent an invalid pending entry") from exc
+        try:
+            accepted = store.store_token(
+                user_id, server_url, workspace_label, token, epoch
+            )
+        except WorkerStoreError:
+            logger.error("%s for user %s", CREDENTIAL_STORE_FAILURE, user_id)
+            failed.append(
+                {"user_id": user_id, "detail": CREDENTIAL_STORE_FAILURE}
+            )
+            continue
+        except (TypeError, ValueError) as exc:
             raise WorkerSyncError("host sent an invalid pending entry") from exc
         if not accepted:
             logger.warning(
@@ -134,7 +145,7 @@ def pull_once(
         acks.append(
             {
                 "user_id": user_id,
-                "token_epoch": int(item["token_epoch"]),
+                "token_epoch": epoch,
                 "lease_id": item.get("lease_id"),
                 "result": "stored",
             }
@@ -171,7 +182,10 @@ def pull_once(
                     entry.get("user_id"),
                     entry.get("reason"),
                 )
-    return {"stored": stored, "revoked": revoked, "results": results}
+    summary = {"stored": stored, "revoked": revoked, "results": results}
+    if failed:
+        summary["failed"] = failed
+    return summary
 
 
 def report_sync(

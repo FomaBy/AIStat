@@ -24,6 +24,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from . import handoff
+from . import snapshot_recovery
 from .config import Config
 from .tenant import (
     canonical_tenant_id,
@@ -265,6 +266,7 @@ class SecurityStore:
                 """
             )
             conn.executescript(handoff.CONNECTIONS_SCHEMA)
+            conn.executescript(snapshot_recovery.INSTALL_JOURNAL_SCHEMA)
             # Serialize the inspect-and-alter migration across WSGI workers.
             # Without the write lock, concurrent first starts can both observe
             # the old schema and one loses the ALTER race with a duplicate
@@ -584,6 +586,62 @@ class SecurityStore:
             )
             conn.commit()
             return True
+        finally:
+            conn.close()
+
+    def begin_snapshot_install(
+        self,
+        user_id: int,
+        timestamp: int,
+        sha256: str,
+        snapshot_at: int,
+        staged_path: str,
+    ) -> None:
+        """Journal the intent to install one staged snapshot (see
+        :mod:`aistat.snapshot_recovery`)."""
+        conn = self._connect()
+        try:
+            snapshot_recovery.record_install_intent(
+                conn, user_id, timestamp, sha256, snapshot_at, staged_path
+            )
+        finally:
+            conn.close()
+
+    def finish_snapshot_install(
+        self,
+        user_id: int,
+        timestamp: int,
+        sha256: str,
+        snapshot_at: int,
+    ) -> bool:
+        """Advance the watermark and drop the journal row atomically."""
+        conn = self._connect()
+        try:
+            return snapshot_recovery.commit_install(
+                conn, user_id, timestamp, sha256, snapshot_at
+            )
+        finally:
+            conn.close()
+
+    def abort_snapshot_install(self, user_id: int) -> None:
+        """Drop a tenant's journal row without advancing the watermark."""
+        conn = self._connect()
+        try:
+            snapshot_recovery.clear_install_intent(conn, user_id)
+        finally:
+            conn.close()
+
+    def recover_snapshot_installs(self, tenants_dir) -> dict:
+        """Reconcile every journalled install after a restart.
+
+        Callers must hold the ingest lock so recovery cannot race a live
+        ingest or a second worker's recovery pass.
+        """
+        conn = self._connect()
+        try:
+            return snapshot_recovery.recover_pending_installs(
+                conn, tenants_dir
+            )
         finally:
             conn.close()
 

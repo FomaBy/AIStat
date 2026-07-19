@@ -1,8 +1,11 @@
 """Public WSGI authentication, headers and signed snapshot ingestion."""
 
+import gzip
+import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -990,3 +993,208 @@ def test_password_login_unaffected_by_oauth(public_app):
     client = app.test_client()
     assert login(client).status_code == 303
     assert client.get("/api/meta", base_url="https://localhost").status_code == 200
+
+
+# --- FAN-1366: crash-atomic snapshot install + replay watermark -----------
+
+
+class _Boom(Exception):
+    """Stand-in for a process crash at a chosen point in the ingest flow."""
+
+
+def _snapshot_payload(tmp_path, name, bump):
+    source = tmp_path / name
+    conn = connect(source)
+    init_db(conn)
+    seed_aggregate_fixture(conn)
+    if bump:
+        conn.execute(
+            "UPDATE daily_usage SET input_tokens = input_tokens + ? "
+            "WHERE runtime_id = 'R1'",
+            (bump,),
+        )
+        conn.commit()
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    return payload, hashlib.sha256(gzip.decompress(payload)).hexdigest()
+
+
+def _ingest(client, config, payload, timestamp):
+    return client.post(
+        "/api/ingest/snapshot",
+        data=payload,
+        content_type="application/vnd.aistat.snapshot+gzip",
+        headers={
+            "X-AIStat-Timestamp": str(timestamp),
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Signature": snapshot_signature(
+                INGEST_SECRET, config.publish_tenant_id, timestamp, payload
+            ),
+        },
+    )
+
+
+def _tenant_sha(config):
+    return hashlib.sha256(
+        config.tenant_db_path(config.publish_tenant_id).read_bytes()
+    ).hexdigest()
+
+
+def _watermark(config):
+    store = SecurityStore(config.security_db_path)
+    return int(store.get_tenant(config.publish_tenant_id)["last_ingest_timestamp"])
+
+
+def _journal_count(config):
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        return conn.execute(
+            "SELECT count(*) FROM snapshot_install_journal"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_ingest_crash_after_swap_before_watermark_recovers_on_restart(
+    public_app, tmp_path, monkeypatch
+):
+    app, config = public_app
+    old_sha = _tenant_sha(config)
+    old_wm = _watermark(config)
+    payload, new_sha = _snapshot_payload(tmp_path, "new.db", 1_000_000)
+    timestamp = int(time.time())
+
+    monkeypatch.setattr(
+        SecurityStore,
+        "finish_snapshot_install",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom()),
+    )
+    with pytest.raises(_Boom):
+        _ingest(app.test_client(), config, payload, timestamp)
+
+    # Durable mixed state: file swapped to NEW, watermark still OLD.
+    assert _tenant_sha(config) == new_sha
+    assert _watermark(config) == old_wm
+    assert _journal_count(config) == 1
+    monkeypatch.undo()
+
+    # Restart: create_app runs recovery under the ingest lock.
+    restarted = create_app(config)
+    assert _tenant_sha(config) == new_sha
+    assert _watermark(config) == timestamp
+    assert _journal_count(config) == 0
+
+    client = restarted.test_client()
+    assert _ingest(client, config, payload, timestamp).status_code == 409
+    assert login(client).status_code == 303
+    summary = client.get("/api/summary", base_url="https://localhost").get_json()
+    assert summary["total_tokens"] == 5_700_000
+
+
+def test_ingest_crash_after_journal_before_swap_recovers_on_restart(
+    public_app, tmp_path, monkeypatch
+):
+    app, config = public_app
+    old_sha = _tenant_sha(config)
+    old_wm = _watermark(config)
+    payload, new_sha = _snapshot_payload(tmp_path, "new.db", 1_000_000)
+    timestamp = int(time.time())
+
+    monkeypatch.setattr(
+        "aistat.wsgi.swap_staged_into_place",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom()),
+    )
+    with pytest.raises(_Boom):
+        _ingest(app.test_client(), config, payload, timestamp)
+
+    # Tenant DB untouched, but the intent is journalled and staged intact.
+    assert _tenant_sha(config) == old_sha
+    assert _watermark(config) == old_wm
+    assert _journal_count(config) == 1
+    monkeypatch.undo()
+
+    create_app(config)
+    assert _tenant_sha(config) == new_sha
+    assert _watermark(config) == timestamp
+    assert _journal_count(config) == 0
+
+
+def test_ingest_swap_failure_rolls_back_in_request(
+    public_app, tmp_path, monkeypatch
+):
+    app, config = public_app
+    old_sha = _tenant_sha(config)
+    old_wm = _watermark(config)
+    payload, _new_sha = _snapshot_payload(tmp_path, "new.db", 1_000_000)
+    timestamp = int(time.time())
+
+    monkeypatch.setattr(
+        "aistat.wsgi.swap_staged_into_place",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    response = _ingest(app.test_client(), config, payload, timestamp)
+    assert response.status_code == 422
+
+    # Rolled back in-request: old snapshot, old watermark, no journal, no leak.
+    assert _tenant_sha(config) == old_sha
+    assert _watermark(config) == old_wm
+    assert _journal_count(config) == 0
+    leftovers = list(config.tenants_dir.glob(".aistat-snapshot-*.db"))
+    assert leftovers == []
+
+
+def test_ingest_rejects_symlink_target_without_touching_state(
+    public_app, tmp_path
+):
+    app, config = public_app
+    old_wm = _watermark(config)
+    target = config.tenant_db_path(config.publish_tenant_id)
+    real = target.with_name("real.db")
+    target.replace(real)
+    target.symlink_to(real)
+
+    payload, _new_sha = _snapshot_payload(tmp_path, "new.db", 1_000_000)
+    timestamp = int(time.time())
+    response = _ingest(app.test_client(), config, payload, timestamp)
+    assert response.status_code == 422
+    assert target.is_symlink()
+    assert _watermark(config) == old_wm
+    assert _journal_count(config) == 0
+
+
+def test_concurrent_same_tenant_ingests_are_serialized(public_app, tmp_path):
+    app, config = public_app
+    low_payload, _ = _snapshot_payload(tmp_path, "low.db", 1_000_000)
+    high_payload, high_sha = _snapshot_payload(tmp_path, "high.db", 2_000_000)
+    base = int(time.time())
+    low_ts, high_ts = base, base + 1
+
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def run(name, payload, ts):
+        client = app.test_client()
+        barrier.wait()
+        results[name] = _ingest(client, config, payload, ts).status_code
+
+    threads = [
+        threading.Thread(target=run, args=("low", low_payload, low_ts)),
+        threading.Thread(target=run, args=("high", high_payload, high_ts)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Whatever the interleaving, the higher timestamp wins and the file is a
+    # whole, untorn snapshot — never a mix of the two.
+    assert results["high"] == 200
+    assert results["low"] in (200, 409)
+    assert _tenant_sha(config) == high_sha
+    assert _watermark(config) == high_ts
+    assert _journal_count(config) == 0
+
+    client = app.test_client()
+    assert login(client).status_code == 303
+    summary = client.get("/api/summary", base_url="https://localhost").get_json()
+    assert summary["total_tokens"] == 6_700_000

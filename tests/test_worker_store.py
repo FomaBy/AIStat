@@ -253,6 +253,137 @@ def test_pull_once_does_not_ack_or_apply_stale_local_epoch(
     )
 
 
+def test_pull_once_isolates_store_conflict_and_redacts_local_failure(
+    tmp_path, monkeypatch, caplog
+):
+    config = worker_config(tmp_path)
+    conflict_user = 11
+    healthy_user = 22
+    revoked_user = 33
+    conflict_token = TOKEN + "-conflict-secret"
+    healthy_token = TOKEN + "-healthy"
+    raw_path = str(tmp_path / "private-worker-store")
+    raw_cli = "multica auth status --token raw-cli-secret"
+    raw_detail = "synthetic-store-exception-detail"
+
+    store = make_store(tmp_path)
+    assert store.store_token(
+        conflict_user, handoff.OFFICIAL_MULTICA_URL, "original", TOKEN, 1
+    )
+    assert store.store_token(
+        revoked_user, handoff.OFFICIAL_MULTICA_URL, "revoke-me", TOKEN, 1
+    )
+
+    original_store_token = WorkerTokenStore.store_token
+
+    def store_token_with_adversarial_detail(self, *args, **kwargs):
+        try:
+            return original_store_token(self, *args, **kwargs)
+        except WorkerStoreError as exc:
+            raise WorkerStoreError(
+                "{}; token={}; path={}; cli={}; source={}".format(
+                    raw_detail, args[3], raw_path, raw_cli, exc
+                )
+            ) from exc
+
+    monkeypatch.setattr(
+        WorkerTokenStore, "store_token", store_token_with_adversarial_detail
+    )
+    state = {
+        "pending": [
+            {
+                "user_id": conflict_user,
+                "server_url": handoff.OFFICIAL_MULTICA_URL,
+                "workspace_label": "conflict",
+                "token": conflict_token,
+                "token_epoch": 1,
+                "lease_id": "conflict-lease",
+            },
+            {
+                "user_id": healthy_user,
+                "server_url": handoff.OFFICIAL_MULTICA_URL,
+                "workspace_label": "healthy",
+                "token": healthy_token,
+                "token_epoch": 1,
+                "lease_id": "healthy-lease",
+            },
+        ],
+        "revoked": [{"user_id": revoked_user, "token_epoch": 2}],
+    }
+    ack_calls = []
+
+    def fake_call(_config, _opener, path, payload, now=None):
+        if path == handoff.WORKER_PULL_PATH:
+            assert payload == {}
+            return state
+        assert path == handoff.WORKER_ACK_PATH
+        ack_calls.append(payload)
+        return {
+            "results": [
+                {"ok": True, "user_id": ack["user_id"], "status": ack["result"]}
+                for ack in payload["acks"]
+            ]
+        }
+
+    monkeypatch.setattr(worker_sync_module, "_call", fake_call)
+    with caplog.at_level(logging.DEBUG):
+        summary = pull_once(config, opener=object())
+
+    assert summary["stored"] == 1
+    assert summary["revoked"] == 1
+    assert summary["failed"] == [
+        {
+            "user_id": conflict_user,
+            "detail": worker_sync_module.CREDENTIAL_STORE_FAILURE,
+        }
+    ]
+    assert len(summary["results"]) == 2
+    assert len(ack_calls) == 1
+    ack_by_user = {ack["user_id"]: ack for ack in ack_calls[0]["acks"]}
+    assert ack_by_user == {
+        healthy_user: {
+            "user_id": healthy_user,
+            "token_epoch": 1,
+            "lease_id": "healthy-lease",
+            "result": "stored",
+        },
+        revoked_user: {
+            "user_id": revoked_user,
+            "token_epoch": 2,
+            "result": "revoked",
+        },
+    }
+    assert conflict_user not in ack_by_user
+
+    reopened = make_store(tmp_path)
+    conflict = reopened.get_credential(conflict_user)
+    healthy = reopened.get_credential(healthy_user)
+    assert (conflict.token, conflict.workspace_label, conflict.token_epoch) == (
+        TOKEN,
+        "original",
+        1,
+    )
+    assert (healthy.token, healthy.workspace_label, healthy.token_epoch) == (
+        healthy_token,
+        "healthy",
+        1,
+    )
+    assert reopened.get_credential(revoked_user) is None
+
+    local_surfaces = json.dumps(summary) + caplog.text
+    ack_surface = json.dumps(ack_calls)
+    for sensitive in (
+        conflict_token,
+        raw_path,
+        raw_cli,
+        raw_detail,
+        "conflicting data",
+    ):
+        assert sensitive not in local_surfaces
+        assert sensitive not in ack_surface
+    assert worker_sync_module.CREDENTIAL_STORE_FAILURE in caplog.text
+
+
 def test_store_refuses_key_next_to_ciphertext(tmp_path):
     with pytest.raises(WorkerStoreError):
         WorkerTokenStore(

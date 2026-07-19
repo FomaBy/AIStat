@@ -4,15 +4,15 @@ import gzip
 import hashlib
 import io
 import os
-import shutil
 import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Set
+from typing import Set, Tuple
 
 from .db import SCHEMA_VERSION
+from .snapshot_recovery import fsync_file, swap_staged_into_place
 
 REQUIRED_TABLES: Set[str] = {
     "runtimes",
@@ -214,10 +214,17 @@ def validate_snapshot(path: Path) -> SnapshotInfo:
     )
 
 
-def install_compressed_snapshot(
+def stage_compressed_snapshot(
     payload: bytes, target_path: Path, max_bytes: int
-) -> SnapshotInfo:
-    """Validate then atomically replace one trusted tenant database path."""
+) -> Tuple[Path, SnapshotInfo]:
+    """Decompress and validate a snapshot into a temp file next to the target.
+
+    Returns the staged temp path and its :class:`SnapshotInfo`. The target is
+    **not** touched — the caller journals the intent and then swaps the staged
+    file into place with :func:`snapshot_recovery.swap_staged_into_place`, so a
+    crash between the two leaves a recoverable state. The staged file is left on
+    disk on success and cleaned up only when staging itself fails.
+    """
     target_path = Path(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if target_path.is_symlink():
@@ -229,26 +236,27 @@ def install_compressed_snapshot(
     try:
         _decompress_to_file(payload, temp_path, max_bytes)
         info = validate_snapshot(temp_path)
-
-        if target_path.exists():
-            shutil.copy2(target_path, previous)
-            try:
-                os.chmod(previous, 0o600)
-            except OSError:
-                pass
-
-        # The hosted app uses query-only connections and never creates WAL
-        # sidecars. Remove leftovers from the initial empty bootstrap database
-        # before the new inode becomes visible.
-        for suffix in ("-wal", "-shm"):
-            target_path.with_name(target_path.name + suffix).unlink(
-                missing_ok=True
-            )
-        os.replace(temp_path, target_path)
-        try:
-            os.chmod(target_path, 0o600)
-        except OSError:
-            pass
-        return info
-    finally:
+        fsync_file(temp_path)
+        return temp_path, info
+    except BaseException:
         _cleanup_snapshot_temp_files(temp_path)
+        raise
+
+
+def install_compressed_snapshot(
+    payload: bytes, target_path: Path, max_bytes: int
+) -> SnapshotInfo:
+    """Validate then atomically replace one trusted tenant database path.
+
+    Convenience wrapper around :func:`stage_compressed_snapshot` plus the
+    shared atomic swap, for callers that do not need the crash-atomic journal.
+    """
+    target_path = Path(target_path)
+    staged_path, info = stage_compressed_snapshot(
+        payload, target_path, max_bytes
+    )
+    try:
+        swap_staged_into_place(staged_path, target_path)
+    finally:
+        _cleanup_snapshot_temp_files(staged_path)
+    return info

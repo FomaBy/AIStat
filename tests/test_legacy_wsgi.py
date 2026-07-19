@@ -1,6 +1,8 @@
 """Dependency-free cPanel WSGI tests."""
 
 import ast
+import gzip
+import hashlib
 import importlib
 import io
 import json
@@ -167,6 +169,7 @@ def test_source_parses_as_python_36():
         "aistat/legacy_wsgi.py",
         "aistat/migrate.py",
         "aistat/oauth.py",
+        "aistat/snapshot_recovery.py",
         "aistat/tenant.py",
         "aistat.cgi",
     ):
@@ -1103,3 +1106,170 @@ def test_legacy_bootstrap_migrates_old_oauth_state_schema(
     assert module._LegacyOAuthStore().take_oauth_state(
         "legacy-state", now=101
     )["client_hash"] is None
+
+
+# --- FAN-1366: crash-atomic snapshot install + replay watermark -----------
+
+
+class _Boom(Exception):
+    """Stand-in for a process crash at a chosen point in the ingest flow."""
+
+
+def _new_snapshot(tmp_path, name, bump):
+    source = tmp_path / name
+    conn = connect(source)
+    init_db(conn)
+    seed_aggregate_fixture(conn)
+    if bump:
+        conn.execute(
+            "UPDATE daily_usage SET input_tokens = input_tokens + ? "
+            "WHERE runtime_id = 'R1'",
+            (bump,),
+        )
+        conn.commit()
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    return payload, hashlib.sha256(gzip.decompress(payload)).hexdigest()
+
+
+def _legacy_ingest(legacy, payload, ts, tenant_id=None):
+    tenant_id = legacy.OWNER_USER_ID if tenant_id is None else tenant_id
+    return request(
+        legacy.application,
+        "/api/ingest/snapshot",
+        method="POST",
+        body=payload,
+        headers={
+            "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Tenant": str(tenant_id),
+            "X-AIStat-Timestamp": str(ts),
+            "X-AIStat-Signature": legacy._snapshot_signature(
+                tenant_id, ts, payload
+            ),
+        },
+    )
+
+
+def _legacy_tenant_sha(legacy, uid):
+    path = legacy.tenant_db_path(legacy.TENANTS_DIR, uid)
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _legacy_watermark(legacy, uid):
+    return int(legacy._tenant_record(uid)["last_ingest_timestamp"])
+
+
+def _legacy_journal_count(legacy):
+    conn = sqlite3.connect(legacy.SECURITY_DB_PATH)
+    try:
+        return conn.execute(
+            "SELECT count(*) FROM snapshot_install_journal"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_legacy_crash_after_swap_before_watermark_recovers(
+    legacy, tmp_path, monkeypatch
+):
+    uid = legacy.OWNER_USER_ID
+    old_wm = _legacy_watermark(legacy, uid)
+    payload, new_sha = _new_snapshot(tmp_path, "new.db", 1_000_000)
+    ts = int(legacy.time.time())
+
+    monkeypatch.setattr(
+        legacy,
+        "_finish_snapshot_install",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom()),
+    )
+    status, _, _ = _legacy_ingest(legacy, payload, ts)
+    assert status == "500 Internal Server Error"
+
+    # File swapped to NEW, watermark still OLD, intent journalled.
+    assert _legacy_tenant_sha(legacy, uid) == new_sha
+    assert _legacy_watermark(legacy, uid) == old_wm
+    assert _legacy_journal_count(legacy) == 1
+    monkeypatch.undo()
+
+    # Restart recovery reconciles to new + new.
+    legacy._recover_snapshot_installs()
+    assert _legacy_tenant_sha(legacy, uid) == new_sha
+    assert _legacy_watermark(legacy, uid) == ts
+    assert _legacy_journal_count(legacy) == 0
+    assert _legacy_ingest(legacy, payload, ts)[0] == "409 Conflict"
+
+
+def test_legacy_crash_after_journal_before_swap_recovers(
+    legacy, tmp_path, monkeypatch
+):
+    uid = legacy.OWNER_USER_ID
+    old_sha = _legacy_tenant_sha(legacy, uid)
+    old_wm = _legacy_watermark(legacy, uid)
+    payload, new_sha = _new_snapshot(tmp_path, "new.db", 1_000_000)
+    ts = int(legacy.time.time())
+
+    monkeypatch.setattr(
+        legacy.snapshot_recovery,
+        "swap_staged_into_place",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom()),
+    )
+    status, _, _ = _legacy_ingest(legacy, payload, ts)
+    assert status == "500 Internal Server Error"
+
+    assert _legacy_tenant_sha(legacy, uid) == old_sha
+    assert _legacy_watermark(legacy, uid) == old_wm
+    assert _legacy_journal_count(legacy) == 1
+    monkeypatch.undo()
+
+    legacy._recover_snapshot_installs()
+    assert _legacy_tenant_sha(legacy, uid) == new_sha
+    assert _legacy_watermark(legacy, uid) == ts
+    assert _legacy_journal_count(legacy) == 0
+
+
+def test_legacy_swap_failure_rolls_back_in_request(
+    legacy, tmp_path, monkeypatch
+):
+    uid = legacy.OWNER_USER_ID
+    old_sha = _legacy_tenant_sha(legacy, uid)
+    old_wm = _legacy_watermark(legacy, uid)
+    payload, _new_sha = _new_snapshot(tmp_path, "new.db", 1_000_000)
+    ts = int(legacy.time.time())
+
+    monkeypatch.setattr(
+        legacy.snapshot_recovery,
+        "swap_staged_into_place",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    status, _, _ = _legacy_ingest(legacy, payload, ts)
+    assert status == "422 Unprocessable Entity"
+
+    assert _legacy_tenant_sha(legacy, uid) == old_sha
+    assert _legacy_watermark(legacy, uid) == old_wm
+    assert _legacy_journal_count(legacy) == 0
+    leftovers = [
+        name
+        for name in os.listdir(legacy.TENANTS_DIR)
+        if name.startswith(".aistat-snapshot-") and name.endswith(".db")
+    ]
+    assert leftovers == []
+
+
+def test_legacy_rejects_symlink_target_without_touching_state(
+    legacy, tmp_path
+):
+    uid = legacy.OWNER_USER_ID
+    old_wm = _legacy_watermark(legacy, uid)
+    target = legacy.tenant_db_path(legacy.TENANTS_DIR, uid)
+    real = target + ".real"
+    os.replace(target, real)
+    os.symlink(real, target)
+
+    payload, _new_sha = _new_snapshot(tmp_path, "new.db", 1_000_000)
+    ts = int(legacy.time.time())
+    status, _, _ = _legacy_ingest(legacy, payload, ts)
+    assert status == "422 Unprocessable Entity"
+    assert os.path.islink(target)
+    assert _legacy_watermark(legacy, uid) == old_wm
+    assert _legacy_journal_count(legacy) == 0
