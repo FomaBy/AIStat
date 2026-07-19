@@ -135,6 +135,70 @@ def invalidate_secret_config(config, case):
         raise AssertionError("unknown secret case: {}".format(case))
 
 
+INVALID_ENDPOINT_CASES = (
+    "missing",
+    "empty",
+    "relative",
+    "http",
+    "empty-authority",
+    "query-without-authority",
+    "triple-slash-relative",
+    "leading-whitespace",
+    "trailing-whitespace",
+    "internal-whitespace",
+    "tab-whitespace",
+    "backslash",
+    "userinfo",
+    "credentials-only-authority",
+    "empty-port",
+    "zero-port",
+    "non-numeric-port",
+    "negative-port",
+    "double-port",
+    "out-of-range-port",
+    "unterminated-ipv6",
+    "ipv6-bracket-suffix",
+    "empty-dns-label",
+    "leading-hyphen-label",
+)
+
+
+def invalid_endpoint(case):
+    values = {
+        "missing": None,
+        "empty": "",
+        "relative": "/relative",
+        "http": "http://host.example/path",
+        "empty-authority": "https://",
+        "query-without-authority": "https://?query=1",
+        "triple-slash-relative": "https:///relative",
+        "leading-whitespace": " https://host.example/path",
+        "trailing-whitespace": "https://host.example/path ",
+        "internal-whitespace": "https://bad host.example/path",
+        "tab-whitespace": "https://host.example/pa\tth",
+        "backslash": "https://host.example/path\\segment",
+        "userinfo": (
+            "https://synthetic-url-user-never-log:"
+            "synthetic-url-password-never-log@host.example/path"
+        ),
+        "credentials-only-authority": (
+            "https://synthetic-url-user-never-log:"
+            "synthetic-url-password-never-log@"
+        ),
+        "empty-port": "https://host.example:/path",
+        "zero-port": "https://host.example:0/path",
+        "non-numeric-port": "https://host.example:notaport/path",
+        "negative-port": "https://host.example:-1/path",
+        "double-port": "https://host.example:443:444/path",
+        "out-of-range-port": "https://host.example:65536/path",
+        "unterminated-ipv6": "https://[2001:db8::1/path",
+        "ipv6-bracket-suffix": "https://[2001:db8::1]suffix/path",
+        "empty-dns-label": "https://bad..example/path",
+        "leading-hyphen-label": "https://-bad.example/path",
+    }
+    return values[case]
+
+
 # ---- single-instance lock ------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -184,6 +248,45 @@ def test_invalid_secrets_never_start_supervisor(
     ):
         if secret:
             assert secret not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
+@pytest.mark.parametrize("case", INVALID_ENDPOINT_CASES)
+def test_invalid_endpoints_never_start_supervisor(
+    tmp_path, monkeypatch, caplog, capsys, field, case
+):
+    config = valid_preflight_config(tmp_path)
+    endpoint = invalid_endpoint(case)
+    setattr(config, field, endpoint)
+    real_run_preflight = sv.preflight.run_preflight
+    starts = []
+
+    def run_without_imports(candidate, env_file=None):
+        return real_run_preflight(
+            candidate, check_imports=False, env_file=env_file
+        )
+
+    class SupervisorSpy:
+        def __init__(self, *args, **kwargs):
+            starts.append("constructed")
+
+        def run(self):
+            starts.append("run")
+            return 0
+
+    monkeypatch.setattr(sv, "Config", lambda: config)
+    monkeypatch.setattr(sv, "_resolve_env_file", lambda: None)
+    monkeypatch.setattr(sv.preflight, "run_preflight", run_without_imports)
+    monkeypatch.setattr(sv, "Supervisor", SupervisorSpy)
+
+    assert sv.main([]) == 2
+    assert starts == []
+    captured = capsys.readouterr()
+    for output in (caplog.text, captured.out, captured.err):
+        if endpoint:
+            assert endpoint not in output
+        assert "synthetic-url-user-never-log" not in output
+        assert "synthetic-url-password-never-log" not in output
 
 
 def test_removed_skip_preflight_is_rejected_before_runtime_construction(

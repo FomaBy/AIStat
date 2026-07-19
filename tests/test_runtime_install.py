@@ -100,6 +100,70 @@ def invalidate_secret_config(config, case):
         raise AssertionError("unknown secret case: {}".format(case))
 
 
+INVALID_ENDPOINT_CASES = (
+    "missing",
+    "empty",
+    "relative",
+    "http",
+    "empty-authority",
+    "query-without-authority",
+    "triple-slash-relative",
+    "leading-whitespace",
+    "trailing-whitespace",
+    "internal-whitespace",
+    "tab-whitespace",
+    "backslash",
+    "userinfo",
+    "credentials-only-authority",
+    "empty-port",
+    "zero-port",
+    "non-numeric-port",
+    "negative-port",
+    "double-port",
+    "out-of-range-port",
+    "unterminated-ipv6",
+    "ipv6-bracket-suffix",
+    "empty-dns-label",
+    "leading-hyphen-label",
+)
+
+
+def invalid_endpoint(case):
+    values = {
+        "missing": None,
+        "empty": "",
+        "relative": "/relative",
+        "http": "http://host.example/path",
+        "empty-authority": "https://",
+        "query-without-authority": "https://?query=1",
+        "triple-slash-relative": "https:///relative",
+        "leading-whitespace": " https://host.example/path",
+        "trailing-whitespace": "https://host.example/path ",
+        "internal-whitespace": "https://bad host.example/path",
+        "tab-whitespace": "https://host.example/pa\tth",
+        "backslash": "https://host.example/path\\segment",
+        "userinfo": (
+            "https://synthetic-url-user-never-log:"
+            "synthetic-url-password-never-log@host.example/path"
+        ),
+        "credentials-only-authority": (
+            "https://synthetic-url-user-never-log:"
+            "synthetic-url-password-never-log@"
+        ),
+        "empty-port": "https://host.example:/path",
+        "zero-port": "https://host.example:0/path",
+        "non-numeric-port": "https://host.example:notaport/path",
+        "negative-port": "https://host.example:-1/path",
+        "double-port": "https://host.example:443:444/path",
+        "out-of-range-port": "https://host.example:65536/path",
+        "unterminated-ipv6": "https://[2001:db8::1/path",
+        "ipv6-bracket-suffix": "https://[2001:db8::1]suffix/path",
+        "empty-dns-label": "https://bad..example/path",
+        "leading-hyphen-label": "https://-bad.example/path",
+    }
+    return values[case]
+
+
 # ---- plist rendering -----------------------------------------------------
 
 def test_render_plist_is_valid_and_derives_from_root():
@@ -217,6 +281,39 @@ def test_invalid_secrets_never_reach_runtime_control(tmp_path, case):
     assert not installer.paths.code.exists()
     assert not installer.paths.code_prev.exists()
     assert not installer.paths.plist.exists()
+
+
+@pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
+@pytest.mark.parametrize("case", INVALID_ENDPOINT_CASES)
+def test_invalid_endpoints_never_reach_runtime_control(tmp_path, field, case):
+    config = valid_preflight_config(tmp_path)
+    endpoint = invalid_endpoint(case)
+    setattr(config, field, endpoint)
+    controller = FakeController()
+    installer = make_installer(
+        tmp_path,
+        controller,
+        preflight_fn=lambda: run_preflight(config, check_imports=False),
+    )
+    stage = make_stage(tmp_path, "stage", "candidate")
+
+    with pytest.raises(ri.PreflightFailed) as exc_info:
+        installer.install(stage)
+
+    # Every invalid URL fails before launchctl, plist creation, live-code swap
+    # or persistent runtime-directory creation.
+    assert controller.calls == []
+    assert not controller.loaded
+    assert stage.exists()
+    assert not installer.paths.code.exists()
+    assert not installer.paths.code_prev.exists()
+    assert not installer.paths.data.exists()
+    assert not installer.paths.plist.exists()
+    error = str(exc_info.value)
+    if endpoint:
+        assert endpoint not in error
+    assert "synthetic-url-user-never-log" not in error
+    assert "synthetic-url-password-never-log" not in error
 
 
 def test_bootstrap_failure_rolls_back_to_previous(tmp_path):

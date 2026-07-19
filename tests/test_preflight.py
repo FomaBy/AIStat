@@ -8,6 +8,74 @@ from aistat.config import Config
 from aistat import preflight
 
 
+INVALID_ENDPOINT_CASES = (
+    "missing",
+    "empty",
+    "relative",
+    "http",
+    "empty-authority",
+    "query-without-authority",
+    "triple-slash-relative",
+    "leading-whitespace",
+    "trailing-whitespace",
+    "internal-whitespace",
+    "tab-whitespace",
+    "backslash",
+    "userinfo",
+    "credentials-only-authority",
+    "empty-port",
+    "zero-port",
+    "non-numeric-port",
+    "negative-port",
+    "double-port",
+    "out-of-range-port",
+    "unterminated-ipv6",
+    "ipv6-bracket-suffix",
+    "empty-dns-label",
+    "leading-hyphen-label",
+)
+
+STRUCTURALLY_INVALID_ENDPOINT_CASES = tuple(
+    case for case in INVALID_ENDPOINT_CASES if case != "http"
+)
+
+
+def invalid_endpoint(case):
+    values = {
+        "missing": None,
+        "empty": "",
+        "relative": "/relative",
+        "http": "http://host.example/path",
+        "empty-authority": "https://",
+        "query-without-authority": "https://?query=1",
+        "triple-slash-relative": "https:///relative",
+        "leading-whitespace": " https://host.example/path",
+        "trailing-whitespace": "https://host.example/path ",
+        "internal-whitespace": "https://bad host.example/path",
+        "tab-whitespace": "https://host.example/pa\tth",
+        "backslash": "https://host.example/path\\segment",
+        "userinfo": (
+            "https://synthetic-url-user-never-log:"
+            "synthetic-url-password-never-log@host.example/path"
+        ),
+        "credentials-only-authority": (
+            "https://synthetic-url-user-never-log:"
+            "synthetic-url-password-never-log@"
+        ),
+        "empty-port": "https://host.example:/path",
+        "zero-port": "https://host.example:0/path",
+        "non-numeric-port": "https://host.example:notaport/path",
+        "negative-port": "https://host.example:-1/path",
+        "double-port": "https://host.example:443:444/path",
+        "out-of-range-port": "https://host.example:65536/path",
+        "unterminated-ipv6": "https://[2001:db8::1/path",
+        "ipv6-bracket-suffix": "https://[2001:db8::1]suffix/path",
+        "empty-dns-label": "https://bad..example/path",
+        "leading-hyphen-label": "https://-bad.example/path",
+    }
+    return values[case]
+
+
 def valid_config(tmp_path):
     config = Config()
     config.publish_tenant_id = 7
@@ -43,18 +111,46 @@ def test_missing_tenant_id_fails(tmp_path):
     assert not verdict(report, "tenant_id").ok
 
 
-def test_non_https_publish_url_fails(tmp_path):
+@pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
+@pytest.mark.parametrize("case", INVALID_ENDPOINT_CASES)
+def test_invalid_runtime_endpoint_fails_closed(tmp_path, field, case):
     config = valid_config(tmp_path)
-    config.publish_url = "http://aistat.app/api/ingest/snapshot"
+    endpoint = invalid_endpoint(case)
+    setattr(config, field, endpoint)
     report = preflight.run_preflight(config, check_imports=False)
-    assert not verdict(report, "AISTAT_PUBLISH_URL").ok
+    name = (
+        "AISTAT_PUBLISH_URL" if field == "publish_url"
+        else "AISTAT_WORKER_SYNC_URL"
+    )
+    assert not verdict(report, name).ok
+    rendered = report.render()
+    if endpoint:
+        assert endpoint not in rendered
+    assert "synthetic-url-user-never-log" not in rendered
+    assert "synthetic-url-password-never-log" not in rendered
 
 
-def test_non_https_worker_url_fails(tmp_path):
+@pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://host.example",
+        "https://host.example/path/to/endpoint?wait=30",
+        "https://host.example:8443/api/pull?wait=30",
+        "https://[2001:db8::1]:443/api/pull",
+    ],
+    ids=["host", "path-query", "port", "ipv6-port"],
+)
+def test_valid_absolute_https_endpoint_passes(tmp_path, field, endpoint):
     config = valid_config(tmp_path)
-    config.worker_sync_url = "http://aistat.app"
+    setattr(config, field, endpoint)
     report = preflight.run_preflight(config, check_imports=False)
-    assert not verdict(report, "AISTAT_WORKER_SYNC_URL").ok
+    name = (
+        "AISTAT_PUBLISH_URL" if field == "publish_url"
+        else "AISTAT_WORKER_SYNC_URL"
+    )
+    assert verdict(report, name).ok
+    assert report.ok, report.render()
 
 
 def test_insecure_flag_allows_http(tmp_path):
@@ -64,6 +160,30 @@ def test_insecure_flag_allows_http(tmp_path):
     config.worker_sync_url = "http://localhost:9000"
     report = preflight.run_preflight(config, check_imports=False)
     assert report.ok, report.render()
+
+
+def test_insecure_test_mode_rejects_other_schemes(tmp_path):
+    config = valid_config(tmp_path)
+    config.allow_insecure_publish = True
+    config.publish_url = "ftp://host.example/path"
+    report = preflight.run_preflight(config, check_imports=False)
+    assert not verdict(report, "AISTAT_PUBLISH_URL").ok
+
+
+@pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
+@pytest.mark.parametrize("case", STRUCTURALLY_INVALID_ENDPOINT_CASES)
+def test_insecure_test_mode_never_allows_malformed_endpoint(
+    tmp_path, field, case
+):
+    config = valid_config(tmp_path)
+    config.allow_insecure_publish = True
+    setattr(config, field, invalid_endpoint(case))
+    report = preflight.run_preflight(config, check_imports=False)
+    name = (
+        "AISTAT_PUBLISH_URL" if field == "publish_url"
+        else "AISTAT_WORKER_SYNC_URL"
+    )
+    assert not verdict(report, name).ok
 
 
 def test_short_ingest_secret_fails(tmp_path):
