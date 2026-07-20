@@ -13,7 +13,7 @@
 # touched: each deployment is a dedicated clone under
 #   ~/Library/Application Support/AIStat/local/{dev,main}
 # kept OUTSIDE macOS-protected ~/Documents so the launchd agents can read it
-# (same reason as scripts/install_launchd_sync.sh).
+# (same reason the runtime supervisor lives there, see docs/runtime-supervisor.md).
 #
 # Subcommands:
 #   install                       clone/prepare both deployments and load launchd agents

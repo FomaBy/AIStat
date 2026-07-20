@@ -2,8 +2,9 @@
 # Install and manage the trusted local AIStat runtime supervisor (one launchd
 # job keeping owner poller, owner publisher, worker_sync --watch and the
 # per-user collector alive). Runtime root and every plist path derive from the
-# real $HOME — no hard-coded username. Secrets stay in the owner-only env file
-# and never touch the plist, argv or this script's output.
+# real $HOME — no hard-coded username. Secrets live only in the persistent
+# owner-only env file (required for install/preflight/restart/rollback) and
+# never touch the plist, argv or this script's output.
 #
 # Usage:
 #   deploy/aistat_runtime.sh install
@@ -28,8 +29,19 @@ pick_python() {
 }
 
 require_safe_env_file() {
-  # A private env file, if present, must be owner-only (no group/other bits).
-  [ -e "$ENV_FILE" ] || return 0
+  # The persistent private env file is the only secret source the installed
+  # runtime can reload (the plist carries no secret values), so it must exist
+  # as an owner-only regular file before any staging or launchd cutover.
+  # Secrets exported only in the invoking shell can never satisfy this guard.
+  if [ ! -e "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ]; then
+    echo "error: private env file $ENV_FILE does not exist" >&2
+    echo "create it as an owner-only (chmod 0600) regular file; shell-exported secrets alone cannot activate the runtime" >&2
+    exit 2
+  fi
+  if [ -L "$ENV_FILE" ] || [ ! -f "$ENV_FILE" ]; then
+    echo "error: $ENV_FILE must be a regular file (not a symlink)" >&2
+    exit 2
+  fi
   local mode
   mode="$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE")"
   # Normalise to a 3-digit octal and check the low two digits are 0.
@@ -38,15 +50,6 @@ require_safe_env_file() {
     echo "error: $ENV_FILE must be mode 0600 (owner-only); found $mode" >&2
     exit 2
   fi
-}
-
-load_env_file() {
-  # Source secrets/config for preflight without ever echoing them.
-  [ -r "$ENV_FILE" ] || return 0
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
 }
 
 ensure_venv() {
@@ -92,9 +95,10 @@ do_install() {
   plutil -lint "$tmp_plist"
   rm -f "$tmp_plist"
 
-  # Full preflight against the freshly staged code + runtime venv.
+  # Full preflight against the freshly staged code + runtime venv. The
+  # preflight parses and loads the env file itself — it is never sourced as
+  # shell, so a malformed file fails cleanly instead of executing.
   log "running preflight"
-  load_env_file
   ( cd "$STAGE" && AISTAT_ENV_FILE="$ENV_FILE" "$VENV_PY" -m aistat.preflight )
 
   log "installing runtime from staged code"
@@ -115,7 +119,6 @@ do_passthrough() {
 
 do_preflight() {
   require_safe_env_file
-  load_env_file
   local py
   py="$(pick_python)"
   AISTAT_ENV_FILE="$ENV_FILE" "$py" -m aistat.preflight

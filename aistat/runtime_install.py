@@ -21,11 +21,28 @@ The plist never carries a secret: it points at an owner-only env file
 ever writes non-secret paths into the plist.
 
 Every runtime-activating command — ``install``, ``restart`` and ``rollback`` —
-validates the *effective* configuration first: the owner-only private env file
-is permission-checked and loaded with the same source/precedence semantics as
-the supervisor before any ``launchctl`` call or code/plist mutation. Only
-``uninstall`` stays available as a fail-safe removal path when the
-configuration is invalid.
+requires the *persistent* private env file and validates the effective
+configuration first: the file must exist as an owner-only regular file, is
+parsed (never shell-executed) and loaded with the same source/precedence
+semantics as the supervisor before any ``launchctl`` call or code/plist
+mutation. Secrets exported only in the invoking shell can never satisfy this
+gate — the launchd job carries no secrets, so a runtime without the file
+would have no configuration to reload. Only ``uninstall`` (and ``status``/
+``render``) stays available as a fail-safe path when the configuration is
+invalid or absent.
+
+A machine may still run the *legacy* ``com.aistat.sync`` generation — the
+pre-supervisor launchd job that kept ``aistat.poller`` and ``aistat.publish
+--watch`` alive via ``sync_to_host.sh`` on the same runtime root and data.
+``install`` retires that job (verified bootout + plist removal) *before* the
+new supervisor is bootstrapped, so both generations can never run duplicate
+contours; if the cutover then fails on a machine without a previous
+new-generation runtime, the captured legacy plist is restored byte-exact and
+the legacy job is re-bootstrapped — a failed migration always leaves one
+known-good runtime. ``data/`` is shared between generations and is never
+touched by the migration. ``uninstall`` retires both generations; ``rollback``
+also retires a resurrected legacy job; ``restart`` refuses to run while the
+legacy job is loaded (migration goes through ``install``).
 """
 
 import argparse
@@ -42,11 +59,24 @@ from typing import Callable, Dict, List, Optional
 
 from .config import Config
 from . import preflight
-from .supervisor import load_env_file
 
 logger = logging.getLogger("aistat.runtime_install")
 
 LABEL = "com.aistat.runtime"
+
+# The pre-supervisor generation: one launchd job running poller + publisher
+# via sync_to_host.sh on the same runtime root and data/.
+LEGACY_LABEL = "com.aistat.sync"
+
+# Legacy code-generation leftovers directly under the runtime root. Never
+# data/ (shared between generations) and never .venv/ (reused by the wrapper).
+_LEGACY_CODE_ARTIFACTS = (
+    "aistat",
+    "sync_to_host.sh",
+    "pricing.json",
+    "requirements.txt",
+    ".install-stage",
+)
 
 # Env keys that must never appear in the plist (criterion 6). Rendering builds
 # the plist from non-secret paths only; this list backs an explicit guard.
@@ -226,6 +256,10 @@ class InstallPaths:
     def plist(self) -> Path:
         return self.plist_dir / (LABEL + ".plist")
 
+    @property
+    def legacy_plist(self) -> Path:
+        return self.plist_dir / (LEGACY_LABEL + ".plist")
+
 
 class Installer:
     def __init__(
@@ -237,11 +271,9 @@ class Installer:
         *,
         plist_dir: Optional[Path] = None,
         preflight_fn: Optional[Callable[[], "preflight.PreflightReport"]] = None,
-        env_file_explicit: bool = False,
     ):
         self.python = str(python)
         self.env_file = Path(env_file)
-        self.env_file_explicit = bool(env_file_explicit)
         self.controller = controller
         home_agents = Path.home() / "Library" / "LaunchAgents"
         self.paths = InstallPaths(
@@ -250,31 +282,19 @@ class Installer:
         self._preflight_fn = preflight_fn or self._default_preflight
 
     def _load_effective_env(self) -> Optional["preflight.Check"]:
-        """Validate and load the owner-only private env file, supervisor-style.
+        """Validate and load the required persistent env file, supervisor-style.
 
-        Mirrors ``aistat.supervisor.main``: an explicitly configured file must
-        exist, an existing file must be an owner-only regular file, and its
-        values are injected into the process environment (file values win over
-        ambient environment) so the ``Config`` built by preflight sees the
-        configuration the runtime would actually start with. Returns the
-        failing check, or ``None`` when the effective values are loaded.
+        The launchd job intentionally carries no secret values, so the
+        installed supervisor can only reload configuration from this file.
+        Missing (explicit *or* default path), symlinked, group/world-readable
+        and malformed files all fail here — before any ``launchctl`` call or
+        code/plist mutation — and ambient shell secrets alone can never
+        satisfy the gate. On success the file's values are injected into the
+        process environment (file values win over ambient environment) so the
+        ``Config`` built by preflight sees the configuration the runtime
+        would actually start with.
         """
-        if not self.env_file.exists():
-            if self.env_file_explicit:
-                return preflight.Check(
-                    "env_file", False, "configured env file does not exist")
-            # Default path absent: ambient process env, like the supervisor.
-            return None
-        verdict = preflight.check_env_file(self.env_file)
-        if not verdict.ok:
-            return verdict
-        try:
-            load_env_file(self.env_file)
-        except OSError as exc:
-            return preflight.Check(
-                "env_file", False,
-                "could not read env file: {}".format(type(exc).__name__))
-        return None
+        return preflight.load_effective_env(self.env_file)
 
     def _default_preflight(self) -> "preflight.PreflightReport":
         # Effective-config guard: load the private env file first so the
@@ -299,8 +319,12 @@ class Installer:
     def install(self, stage_dir: Path) -> Dict:
         """Preflight, then atomically swap in the staged code and bootstrap.
 
-        On any failure after the swap the previous code copy is restored and
-        re-bootstrapped; data is never touched.
+        A loaded/installed legacy ``com.aistat.sync`` job is retired (verified
+        bootout + plist removal) before the new supervisor is bootstrapped, so
+        the two generations never run duplicate contours. On any failure after
+        the swap the previous code copy is restored and re-bootstrapped — or,
+        when this install was the first migration off the legacy generation,
+        the legacy job is restored instead. Data is never touched.
         """
         stage_dir = Path(stage_dir)
         if not (stage_dir / "aistat").is_dir():
@@ -317,9 +341,11 @@ class Installer:
         self.paths.plist.parent.mkdir(parents=True, exist_ok=True)
 
         had_previous_code = self.paths.code.exists()
+        legacy = self._capture_legacy()
         self._swap_code(stage_dir)
         try:
             self._write_plist(plist_text)
+            self._retire_legacy(legacy)
             self.controller.bootout(LABEL, self.paths.plist)
             self.controller.bootstrap(self.paths.plist)
             self._postflight()
@@ -327,17 +353,48 @@ class Installer:
             logger.error("install failed after swap (%s); rolling back",
                          type(exc).__name__)
             self._restore_previous(had_previous_code)
+            if not had_previous_code:
+                # First install (possibly a legacy migration): deregister the
+                # half-bootstrapped supervisor and drop its plist so launchd
+                # cannot resurrect a runtime whose code was just removed,
+                # then put the legacy generation back if there was one.
+                self.controller.bootout(LABEL, self.paths.plist)
+                try:
+                    if self.paths.plist.exists():
+                        self.paths.plist.unlink()
+                except OSError:
+                    logger.error("could not remove the half-installed plist")
+                self._restore_legacy(legacy)
             raise
+        self._purge_legacy_artifacts()
         return self.status()
 
     def uninstall(self, purge: bool = False) -> Dict:
-        """Stop the supervisor and remove code; keep data unless ``purge``."""
+        """Stop both runtime generations and remove code; keep data unless
+        ``purge``.
+
+        The legacy ``com.aistat.sync`` job is booted out alongside the
+        supervisor and both jobs are verified unloaded *before* any file is
+        removed — a job launchd refuses to unload aborts the uninstall loudly
+        instead of silently leaving its processes behind without a plist.
+        """
+        legacy_plist = self.paths.legacy_plist
+        self.controller.bootout(
+            LEGACY_LABEL, legacy_plist if legacy_plist.exists() else None)
         self.controller.bootout(LABEL, self.paths.plist)
-        if self.paths.plist.exists():
-            self.paths.plist.unlink()
+        for label in (LEGACY_LABEL, LABEL):
+            if self.controller.is_loaded(label):
+                raise LaunchError(
+                    "job {} is still loaded after bootout; uninstall aborted "
+                    "before removing any file".format(label)
+                )
+        for plist in (legacy_plist, self.paths.plist):
+            if plist.exists():
+                plist.unlink()
         for path in (self.paths.code, self.paths.code_prev):
             if path.exists():
                 shutil.rmtree(path)
+        self._purge_legacy_artifacts()
         if purge and self.paths.data.exists():
             shutil.rmtree(self.paths.data)
         return {"uninstalled": True, "purged": purge,
@@ -353,12 +410,22 @@ class Installer:
         if not self.paths.code_prev.exists():
             raise RuntimeInstallError("no previous code copy to roll back to")
         self._require_preflight()
+        # A resurrected legacy job would duplicate the restored contours;
+        # retire it before re-bootstrapping. Rolling back *to* the legacy
+        # generation is not supported — rollback stays within code.prev.
+        self._retire_legacy(self._capture_legacy())
         self._restore_previous(True)
         return self.status()
 
     def restart(self) -> Dict:
         """Preflight the effective configuration, then kickstart/bootstrap."""
         self._require_preflight()
+        if self.controller.is_loaded(LEGACY_LABEL):
+            raise RuntimeInstallError(
+                "legacy job {} is loaded; restarting {} would run duplicate "
+                "contours — run install to migrate first".format(
+                    LEGACY_LABEL, LABEL)
+            )
         if self.controller.is_loaded(LABEL):
             self.controller.kickstart(LABEL)
         else:
@@ -380,9 +447,85 @@ class Installer:
             "code_installed": self.paths.code.exists(),
             "previous_available": self.paths.code_prev.exists(),
             "supervisor": supervisor,
+            "legacy": {
+                "label": LEGACY_LABEL,
+                "loaded": self.controller.is_loaded(LEGACY_LABEL),
+                "plist_present": self.paths.legacy_plist.exists(),
+            },
         }
 
     # ---- internals ------------------------------------------------------
+
+    def _capture_legacy(self) -> Dict:
+        """Snapshot the legacy job's plist bytes and loaded state.
+
+        The snapshot is what makes the migration transactional: a failed
+        cutover on a legacy-only machine restores exactly this state.
+        """
+        plist = self.paths.legacy_plist
+        return {
+            "plist_bytes": plist.read_bytes() if plist.exists() else None,
+            "loaded": self.controller.is_loaded(LEGACY_LABEL),
+        }
+
+    def _retire_legacy(self, legacy: Dict) -> None:
+        """Boot out the legacy job (verified) and remove its plist.
+
+        Idempotent: a machine without the legacy generation is a no-op. The
+        bootout is verified because launchctl treats bootout of an unloaded
+        job as success — a job that *survives* bootout must abort the cutover
+        instead of silently running next to the new supervisor.
+        """
+        if not legacy["loaded"] and legacy["plist_bytes"] is None:
+            return
+        logger.info("retiring legacy %s job", LEGACY_LABEL)
+        plist = self.paths.legacy_plist
+        self.controller.bootout(
+            LEGACY_LABEL, plist if plist.exists() else None)
+        if self.controller.is_loaded(LEGACY_LABEL):
+            raise LaunchError(
+                "legacy job {} is still loaded after bootout".format(
+                    LEGACY_LABEL)
+            )
+        if plist.exists():
+            plist.unlink()
+
+    def _restore_legacy(self, legacy: Dict) -> None:
+        """Put the captured legacy job back after a failed first migration."""
+        if legacy["plist_bytes"] is None:
+            if legacy["loaded"]:
+                logger.error(
+                    "cannot restore the legacy %s job: it was loaded without "
+                    "a plist to re-bootstrap from", LEGACY_LABEL)
+            return
+        try:
+            plist = self.paths.legacy_plist
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            plist.write_bytes(legacy["plist_bytes"])
+            if legacy["loaded"]:
+                self.controller.bootstrap(plist)
+        except Exception:
+            logger.error("could not restore the legacy %s runtime",
+                         LEGACY_LABEL)
+
+    def _purge_legacy_artifacts(self) -> None:
+        """Remove legacy code-generation leftovers under the runtime root.
+
+        Only the exact paths the legacy installer created; ``data/`` (shared
+        by both generations) and ``.venv/`` (reused by the wrapper) are never
+        candidates. Failures are logged, not raised: by the time this runs
+        the new runtime is already live and must not be rolled back over a
+        leftover file.
+        """
+        for name in _LEGACY_CODE_ARTIFACTS:
+            path = self.paths.runtime_root / name
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                elif path.exists() or path.is_symlink():
+                    path.unlink()
+            except OSError:
+                logger.error("could not remove legacy artifact %s", path)
 
     def _swap_code(self, stage_dir: Path) -> None:
         if self.paths.code_prev.exists():
@@ -440,9 +583,6 @@ def _build_installer(args) -> Installer:
         Path(args.env_file) if args.env_file else _default_env_file(),
         LaunchctlController(),
         plist_dir=Path(args.plist_dir) if args.plist_dir else None,
-        env_file_explicit=bool(
-            args.env_file or os.environ.get("AISTAT_ENV_FILE")
-        ),
     )
 
 

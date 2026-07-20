@@ -209,9 +209,10 @@ fail-closed не запускает connection lifecycle.
 опционально `AISTAT_WORKER_KEY_PATH` (по умолчанию
 `~/.config/aistat/worker.key`), `AISTAT_WORKER_STORE_PATH` (по умолчанию
 `./data/worker_connections.db`), `AISTAT_WORKER_PULL_INTERVAL_SECONDS`
-(по умолчанию 300, минимум 60). Запуск — `python -m aistat.worker_sync
---watch` (например, отдельным launchd-агентом по образцу
-`deploy/com.aistat.sync.plist.example`).
+(по умолчанию 300, минимум 60). В production worker-контур
+(`aistat.worker_sync --watch`) держит supervisor `com.aistat.runtime`
+(см. `docs/runtime-supervisor.md`); вручную его можно запустить как
+`python -m aistat.worker_sync --watch`.
 
 Граница пакета: `scripts/build_cpanel_package.sh` не включает
 `worker_store.py`/`worker_sync.py`, а `requirements-cpanel.txt` остаётся
