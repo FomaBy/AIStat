@@ -53,6 +53,81 @@ def test_usd_to_credits():
     assert pricing.usd_to_credits(None, 3.0) is None
 
 
+# -- credits: OpenAI Codex rate card -----------------------------------------
+
+
+def _sol_credit_rate():
+    # GPT-5.6 Sol credit rate card (credits per 1M tokens).
+    return pricing.Rate(
+        model="gpt-5.6-sol",
+        credits=pricing.CreditRate(input=125.0, cache_read=12.5, output=750.0),
+    )
+
+
+def test_compute_credit_cost_uses_rate_card():
+    # 1M of each priced token kind on Sol: 125 + 12.5 + 750.
+    credits = pricing.compute_credit_cost(
+        1_000_000, 1_000_000, 1_000_000, _sol_credit_rate()
+    )
+    assert credits == pytest.approx(887.5)
+
+
+def test_compute_credit_cost_ignores_cache_write():
+    # compute_credit_cost has no cache_write parameter; cache_write never bills
+    # credits. Same in/out/cache_read must give the same credits regardless.
+    a = pricing.compute_credit_cost(1000, 2000, 500, _sol_credit_rate())
+    b = pricing.compute_credit_cost(1000, 2000, 500, _sol_credit_rate())
+    assert a == b == pytest.approx((1000 * 125 + 2000 * 750 + 500 * 12.5) / 1e6)
+
+
+def test_compute_credit_cost_none_without_rate_card():
+    # A model with no credits block, and an unknown model, both return None so
+    # the caller falls back to the usd→credits conversion.
+    no_credits = pricing.Rate(model="x", input=1.0, output=5.0,
+                              cache_read=0.1, cache_write=1.25)
+    assert pricing.compute_credit_cost(1000, 2000, 3000, no_credits) is None
+    assert pricing.compute_credit_cost(1000, 2000, 3000, None) is None
+
+
+def test_credits_for_row_prefers_rate_card_over_conversion():
+    # With a credit card, the flat usd*credits_per_usd is NOT used.
+    from_card = pricing.credits_for_row(
+        1_000_000, 0, 0, usd=999.0, rate=_sol_credit_rate(), credits_per_usd=2.0
+    )
+    assert from_card == pytest.approx(125.0)          # 1M input * 125
+    # Without a credit card, it falls back to usd * credits_per_usd.
+    fallback = pricing.credits_for_row(
+        1000, 2000, 0, usd=0.011,
+        rate=pricing.Rate(model="x", input=1.0, output=5.0,
+                          cache_read=0.1, cache_write=1.25),
+        credits_per_usd=2.0,
+    )
+    assert fallback == pytest.approx(0.022)           # 0.011 * 2.0
+
+
+def test_repo_pricing_json_maps_claude_to_codex_credit_tiers():
+    # Owner directive FAN-1427: Fable 5 = GPT-5.6 Sol, Opus 4.8 = GPT-5.6 Terra.
+    rates = pricing.load_pricing(PRICING_JSON)
+    fable, sol = rates["claude-fable-5"].credits, rates["gpt-5.6-sol"].credits
+    opus, terra = rates["claude-opus-4-8"].credits, rates["gpt-5.6-terra"].credits
+    assert (fable.input, fable.cache_read, fable.output) == (125.0, 12.5, 750.0)
+    assert (fable.input, fable.cache_read, fable.output) == \
+           (sol.input, sol.cache_read, sol.output)
+    assert (opus.input, opus.cache_read, opus.output) == (62.5, 6.25, 375.0)
+    assert (opus.input, opus.cache_read, opus.output) == \
+           (terra.input, terra.cache_read, terra.output)
+
+
+def test_credits_block_must_be_numeric(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"models": {"m": {
+        "input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25,
+        "credits": {"input": 1.0, "cache_read": 0.1},  # missing output
+    }}}), encoding="utf-8")
+    with pytest.raises(pricing.PricingError):
+        pricing.load_pricing(bad)
+
+
 # -- pricing.json loading ----------------------------------------------------
 
 
@@ -131,11 +206,13 @@ def _insert_usage(conn, runtime_id, model, date, inp, outp, cr, cw):
 def test_recompute_daily_costs_prices_known_and_flags_unknown(conn):
     _insert_usage(conn, "rt1", "claude-opus-4-8", "2026-07-14", 1000, 2000, 1_000_000, 1000)
     _insert_usage(conn, "rt2", "totally-internal-model", "2026-07-14", 500, 500, 500, 0)
+    # haiku has a USD rate but no credit rate card -> credits fall back to usd*mult.
+    _insert_usage(conn, "rt3", "claude-haiku-4-5-20251001", "2026-07-14", 1000, 2000, 0, 0)
 
     rates = pricing.load_pricing(PRICING_JSON)
     pricing.upsert_model_pricing(conn, rates)
     n = pricing.recompute_daily_costs(conn, rates, credits_per_usd=2.0)
-    assert n == 2
+    assert n == 3
 
     opus = conn.execute(
         "SELECT cost_usd, cost_credits, cost_priced FROM daily_usage WHERE model=?",
@@ -143,7 +220,17 @@ def test_recompute_daily_costs_prices_known_and_flags_unknown(conn):
     ).fetchone()
     assert opus["cost_priced"] == 1
     assert opus["cost_usd"] == pytest.approx(0.56125)
-    assert opus["cost_credits"] == pytest.approx(1.1225)  # usd * 2.0
+    # Credits now come from the GPT-5.6 Terra rate card, NOT usd*mult:
+    # (1000*62.5 + 2000*375 + 1_000_000*6.25) / 1e6. cache_write excluded.
+    assert opus["cost_credits"] == pytest.approx(7.0625)
+
+    # Model without a credit card keeps the legacy usd*credits_per_usd behaviour.
+    haiku = conn.execute(
+        "SELECT cost_usd, cost_credits FROM daily_usage WHERE model=?",
+        ("claude-haiku-4-5-20251001",),
+    ).fetchone()
+    assert haiku["cost_usd"] == pytest.approx(0.011)      # (1000*1 + 2000*5)/1e6
+    assert haiku["cost_credits"] == pytest.approx(0.022)  # usd * 2.0
 
     unknown = conn.execute(
         "SELECT cost_usd, cost_credits, cost_priced FROM daily_usage WHERE model=?",
