@@ -197,7 +197,8 @@ def test_model_efficiency_keeps_model_less_share(api):
     assert mixed["has_unpriced"] is True
     assert mixed["active_hours"] == pytest.approx(2.0)
     assert mixed["cost_usd"] == pytest.approx(0.0005)
-    assert mixed["cost_per_sp"] == pytest.approx(0.000125)
+    # Priced cost over the priced 2 SP only, not the model-less 4 (QA FAN-1188).
+    assert mixed["cost_per_sp"] == pytest.approx(0.00025)
     assert mixed["weighted_efficiency"] is None
 
     null_only = client.get("/api/model-efficiency", params={"agent": "A5"}).json()
@@ -209,14 +210,14 @@ def test_model_efficiency_keeps_model_less_share(api):
 
     exact = client.get("/api/model-efficiency", params={"project": "P3"}).json()
     assert [m["model"] for m in exact["models"]] == ["m-claude", None]
-    assert exact["cost_per_sp"] == pytest.approx(0.000125)
+    assert exact["cost_per_sp"] == pytest.approx(0.00025)
     assert exact["unpriced_tokens"] == 500
     assert exact["weighted_efficiency"] is None
 
     summary = client.get("/api/summary", params=[
         ("from", "2026-01-04"), ("to", "2026-01-04"), ("project", "P3"),
     ]).json()
-    assert summary["cost_per_sp"] == pytest.approx(0.000125)
+    assert summary["cost_per_sp"] == pytest.approx(0.00025)
     assert summary["weighted_efficiency"] is None
     assert summary["efficiency_has_unpriced"] is True
 

@@ -658,7 +658,7 @@ def test_model_efficiency_keeps_model_less_share_behind_auth(public_app):
     assert mixed["unpriced_tokens"] == 500
     assert mixed["has_unpriced"] is True
     assert mixed["active_hours"] == pytest.approx(2.0)
-    assert mixed["cost_per_sp"] == pytest.approx(0.000125)
+    assert mixed["cost_per_sp"] == pytest.approx(0.00025)  # priced 2 SP (FAN-1188)
     assert mixed["weighted_efficiency"] is None
     null_only = get("?agent=A5")
     assert [m["model"] for m in null_only["models"]] == [None]
@@ -667,7 +667,7 @@ def test_model_efficiency_keeps_model_less_share_behind_auth(public_app):
     assert null_only["unpriced_tokens"] == 500
     exact = get("?project=P3")
     assert [m["model"] for m in exact["models"]] == ["m-claude", None]
-    assert exact["cost_per_sp"] == pytest.approx(0.000125)
+    assert exact["cost_per_sp"] == pytest.approx(0.00025)
     assert exact["weighted_efficiency"] is None
 
 
