@@ -2,6 +2,7 @@
 
 import logging
 import os
+import subprocess
 from pathlib import Path
 
 import plistlib
@@ -760,15 +761,17 @@ def test_cli_restart_missing_explicit_env_file_fails_closed(
     assert rc == 2
     assert all(controller.calls == [] for controller in controllers)
     assert snapshot_state(root, plist_dir) == before
-    assert "configured env file does not exist" in capsys.readouterr().err
+    assert "does not exist" in capsys.readouterr().err
 
 
-def test_cli_restart_absent_default_env_path_uses_ambient(
-    tmp_path, monkeypatch, clean_env
+@pytest.mark.parametrize("command", ["restart", "rollback"])
+def test_cli_absent_default_env_path_fails_closed(
+    tmp_path, monkeypatch, capsys, clean_env, command
 ):
-    # No --env-file and no AISTAT_ENV_FILE: like the supervisor, an absent
-    # default path means the ambient process environment is the effective
-    # configuration.
+    # No --env-file and no AISTAT_ENV_FILE, but a fully valid ambient shell
+    # environment: the persistent default file is still required — shell-only
+    # secrets cannot activate a runtime whose launchd job carries no secrets
+    # (FAN-1411; tightens the FAN-1425 ambient fallback).
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -776,11 +779,14 @@ def test_cli_restart_absent_default_env_path_uses_ambient(
         monkeypatch.setenv(key, value)
     root, plist_dir = make_installed_runtime(tmp_path)
     controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
 
-    rc = run_cli("restart", root, plist_dir)
+    rc = run_cli(command, root, plist_dir)
 
-    assert rc == 0
-    assert ("kickstart", ri.LABEL) in controllers[0].calls
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    assert "does not exist" in capsys.readouterr().err
 
 
 def test_restart_preflight_exception_text_is_sanitized(
@@ -793,7 +799,7 @@ def test_restart_preflight_exception_text_is_sanitized(
     controller = RecordingController(loaded=True)
     installer = ri.Installer(
         tmp_path / "runtime", "/rt/python", env_file, controller,
-        plist_dir=tmp_path / "LaunchAgents", env_file_explicit=True,
+        plist_dir=tmp_path / "LaunchAgents",
     )
 
     with pytest.raises(ri.PreflightFailed) as exc_info:
@@ -836,10 +842,12 @@ def test_install_recovery_after_swap_is_not_blocked_by_gate(
     controller = RecordingController()
     installer = ri.Installer(
         tmp_path / "runtime", "/rt/python", env_file, controller,
-        plist_dir=tmp_path / "LaunchAgents", env_file_explicit=True,
+        plist_dir=tmp_path / "LaunchAgents",
     )
     installer.install(make_stage(tmp_path, "stage1", "v1"))
     assert active_marker(installer) == "v1"
+    owner_db = installer.paths.data / "aistat.db"
+    owner_db.write_bytes(b"owner-data")
 
     events = []
     real_run_preflight = ri.preflight.run_preflight
@@ -856,7 +864,206 @@ def test_install_recovery_after_swap_is_not_blocked_by_gate(
 
     # One preflight for the whole failed install; the internal transactional
     # recovery restored and re-bootstrapped the previous code without a
-    # second gate.
+    # second gate. Persistent data survives the failed cutover untouched.
     assert events == ["preflight"]
     assert active_marker(installer) == "v1"
     assert controller.loaded
+    assert owner_db.read_bytes() == b"owner-data"
+
+
+# ---- persistent private env file required for activation (FAN-1411) -------
+
+def install_cli_argv(stage, root, plist_dir, env_file=None):
+    argv = ["install", "--stage", str(stage), "--runtime-root", str(root),
+            "--plist-dir", str(plist_dir), "--python", "/rt/python"]
+    if env_file is not None:
+        argv += ["--env-file", str(env_file)]
+    return argv
+
+
+@pytest.mark.parametrize("via", ["flag", "env-var", "default-path"])
+def test_cli_install_shell_only_secrets_fail_closed(
+    tmp_path, monkeypatch, capsys, clean_env, via
+):
+    # The QA reproduction: a fully valid configuration exported only in the
+    # invoking shell plus an absent env file. The launchd plist carries no
+    # secrets, so the installed supervisor would have no persistent
+    # configuration to load — install must fail before staging cutover,
+    # launchctl calls or any code/plist mutation.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for key, value in env_file_values(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    root, plist_dir = make_installed_runtime(tmp_path)
+    stage = make_stage(tmp_path, "stage", "candidate")
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    missing = tmp_path / "missing.env"
+    if via == "flag":
+        rc = ri.main(install_cli_argv(stage, root, plist_dir, missing))
+    elif via == "env-var":
+        monkeypatch.setenv("AISTAT_ENV_FILE", str(missing))
+        rc = ri.main(install_cli_argv(stage, root, plist_dir))
+    else:
+        rc = ri.main(install_cli_argv(stage, root, plist_dir))
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    assert stage.exists()
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+    for sentinel in SENTINELS:
+        assert sentinel not in err
+
+
+@pytest.mark.parametrize("command", ["install", "restart", "rollback"])
+def test_cli_malformed_env_file_fails_before_launchctl(
+    tmp_path, monkeypatch, capsys, clean_env, command
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    env_file.write_text(
+        "AISTAT_TENANT_ID=7\nsynthetic-malformed-line-never-log\n",
+        encoding="utf-8")
+    env_file.chmod(0o600)
+    stage = make_stage(tmp_path, "stage", "candidate")
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    if command == "install":
+        rc = ri.main(install_cli_argv(stage, root, plist_dir, env_file))
+    else:
+        rc = run_cli(command, root, plist_dir, env_file)
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    captured = capsys.readouterr()
+    assert "malformed" in captured.err
+    # The malformed line's content never leaks into any output.
+    assert "synthetic-malformed-line-never-log" not in \
+        captured.out + captured.err
+
+
+def test_cli_install_valid_env_file_succeeds_with_secret_free_plist(
+    tmp_path, monkeypatch, clean_env
+):
+    # A valid 0600 env file is the one supported activation path: install
+    # succeeds and the rendered plist/argv stay secret-free (criteria 3/6).
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    root = tmp_path / "runtime"
+    plist_dir = tmp_path / "LaunchAgents"
+    stage = make_stage(tmp_path, "stage", "candidate")
+    controllers = patch_cli_controller(monkeypatch, loaded=False)
+
+    rc = ri.main(install_cli_argv(stage, root, plist_dir, env_file))
+
+    assert rc == 0
+    assert controllers[0].loaded
+    plist_path = plist_dir / (ri.LABEL + ".plist")
+    plist_text = plist_path.read_text(encoding="utf-8")
+    for sentinel in SENTINELS:
+        assert sentinel not in plist_text
+    document = plistlib.loads(plist_text.encode("utf-8"))
+    argv_text = " ".join(document["ProgramArguments"])
+    for sentinel in SENTINELS:
+        assert sentinel not in argv_text
+    assert document["EnvironmentVariables"]["AISTAT_ENV_FILE"] == str(env_file)
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    ["missing", "symlink", "group-readable", "malformed"],
+)
+def test_install_env_file_guard_covers_every_unsafe_shape(
+    tmp_path, clean_env, spoil
+):
+    # Missing, symlinked, group/world-readable and malformed env files all
+    # fail closed through the same install gate, before any controller call.
+    env_file = tmp_path / "production.env"
+    if spoil == "missing":
+        pass
+    elif spoil == "symlink":
+        target = tmp_path / "real.env"
+        write_env_file(target, env_file_values(tmp_path))
+        env_file.symlink_to(target)
+    elif spoil == "group-readable":
+        write_env_file(env_file, env_file_values(tmp_path), mode=0o640)
+    else:
+        env_file.write_text("no assignment here\n", encoding="utf-8")
+        env_file.chmod(0o600)
+    controller = RecordingController(loaded=True)
+    installer = ri.Installer(
+        tmp_path / "runtime", "/rt/python", env_file, controller,
+        plist_dir=tmp_path / "LaunchAgents",
+    )
+
+    with pytest.raises(ri.PreflightFailed):
+        installer.install(make_stage(tmp_path, "stage", "candidate"))
+
+    assert controller.calls == []
+    assert not installer.paths.code.exists()
+    assert not installer.paths.plist.exists()
+
+
+# ---- shell wrapper guard (deploy/aistat_runtime.sh) ------------------------
+
+WRAPPER = Path(__file__).resolve().parent.parent / "deploy" / "aistat_runtime.sh"
+
+
+def run_wrapper(command, env_file, tmp_path):
+    """Run the wrapper with an isolated runtime root and explicit env file."""
+    env = os.environ.copy()
+    env["AISTAT_ENV_FILE"] = str(env_file)
+    env["AISTAT_RUNTIME_ROOT"] = str(tmp_path / "runtime-root")
+    return subprocess.run(
+        ["bash", str(WRAPPER), command],
+        capture_output=True, text=True, env=env,
+        cwd=str(WRAPPER.parent.parent),
+    )
+
+
+@pytest.mark.parametrize("command", ["install", "preflight"])
+def test_wrapper_missing_env_file_fails_before_any_side_effect(
+    tmp_path, command
+):
+    result = run_wrapper(command, tmp_path / "missing.env", tmp_path)
+    assert result.returncode == 2
+    assert "does not exist" in result.stderr
+    # The guard fires before staging: no runtime root is created.
+    assert not (tmp_path / "runtime-root").exists()
+
+
+def test_wrapper_symlinked_env_file_fails(tmp_path):
+    target = tmp_path / "real.env"
+    write_env_file(target, env_file_values(tmp_path))
+    link = tmp_path / "production.env"
+    link.symlink_to(target)
+    result = run_wrapper("preflight", link, tmp_path)
+    assert result.returncode == 2
+    assert "regular file" in result.stderr
+    for sentinel in SENTINELS:
+        assert sentinel not in result.stdout + result.stderr
+
+
+def test_wrapper_group_readable_env_file_fails(tmp_path):
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path), mode=0o640)
+    result = run_wrapper("preflight", env_file, tmp_path)
+    assert result.returncode == 2
+    assert "0600" in result.stderr
+    for sentinel in SENTINELS:
+        assert sentinel not in result.stdout + result.stderr
+
+
+def test_wrapper_never_shell_sources_the_env_file():
+    # The env file is parsed by aistat.preflight, never executed as shell:
+    # a malformed or hostile line must not be able to run commands during
+    # install. Guard against the sourcing pattern coming back.
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert '. "$ENV_FILE"' not in text
+    assert 'source "$ENV_FILE"' not in text

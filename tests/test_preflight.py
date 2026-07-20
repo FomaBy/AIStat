@@ -240,9 +240,12 @@ def test_group_readable_key_dir_fails(tmp_path):
     assert not verdict(report, "worker_key_dir_perms").ok
 
 
-def test_env_file_missing_is_ok(tmp_path):
+def test_env_file_missing_fails(tmp_path):
+    # The plist carries no secrets, so a runtime without a persistent env
+    # file has no configuration to reload: absence must fail, not pass.
     check = preflight.check_env_file(tmp_path / "absent.env")
-    assert check.ok
+    assert not check.ok
+    assert "does not exist" in check.detail
 
 
 def test_env_file_owner_only_is_ok(tmp_path):
@@ -266,6 +269,99 @@ def test_env_file_symlink_rejected(tmp_path):
     link = tmp_path / "link.env"
     link.symlink_to(target)
     assert not preflight.check_env_file(link).ok
+
+
+def test_env_file_dangling_symlink_rejected(tmp_path):
+    link = tmp_path / "link.env"
+    link.symlink_to(tmp_path / "gone.env")
+    assert not preflight.check_env_file(link).ok
+
+
+# ---- env file parsing / loading (persistent activation contract) ----------
+
+@pytest.fixture
+def restore_environ():
+    """Snapshot os.environ around tests that let load_env_file inject values."""
+    saved = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def test_load_env_file_injects_values(tmp_path, restore_environ):
+    env = tmp_path / "production.env"
+    env.write_text(
+        "# comment\n"
+        "\n"
+        "AISTAT_TENANT_ID=7\n"
+        "export AISTAT_PUBLISH_URL=\"https://host.example/ingest\"\n"
+        "AISTAT_WORKER_SYNC_URL='https://host.example'\n",
+        encoding="utf-8")
+    env.chmod(0o600)
+    values = preflight.load_env_file(env)
+    assert values["AISTAT_TENANT_ID"] == "7"
+    assert values["AISTAT_PUBLISH_URL"] == "https://host.example/ingest"
+    assert values["AISTAT_WORKER_SYNC_URL"] == "https://host.example"
+    assert os.environ["AISTAT_TENANT_ID"] == "7"
+
+
+MALFORMED_SENTINEL = "synthetic-malformed-secret-never-log"
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        MALFORMED_SENTINEL,
+        "2BAD={}".format(MALFORMED_SENTINEL),
+        "BAD KEY={}".format(MALFORMED_SENTINEL),
+        "={}".format(MALFORMED_SENTINEL),
+    ],
+    ids=["no-equals", "digit-key", "space-key", "empty-key"],
+)
+def test_load_env_file_malformed_line_raises_without_content(
+    tmp_path, restore_environ, bad_line
+):
+    env = tmp_path / "production.env"
+    env.write_text("AISTAT_TENANT_ID=7\n{}\n".format(bad_line),
+                   encoding="utf-8")
+    env.chmod(0o600)
+    with pytest.raises(ValueError) as exc_info:
+        preflight.load_env_file(env)
+    message = str(exc_info.value)
+    # The error names the line number only — never the (possibly secret) text.
+    assert "line 2" in message
+    assert MALFORMED_SENTINEL not in message
+    assert bad_line not in message
+
+
+def test_load_effective_env_missing_file_fails(tmp_path):
+    failure = preflight.load_effective_env(tmp_path / "absent.env")
+    assert failure is not None
+    assert not failure.ok
+    assert "does not exist" in failure.detail
+
+
+def test_load_effective_env_unsafe_file_never_loads_values(
+    tmp_path, restore_environ
+):
+    os.environ.pop("AISTAT_INGEST_SECRET", None)
+    env = tmp_path / "production.env"
+    env.write_text("AISTAT_INGEST_SECRET=synthetic-never-load\n",
+                   encoding="utf-8")
+    env.chmod(0o644)
+    failure = preflight.load_effective_env(env)
+    assert failure is not None and not failure.ok
+    assert os.environ.get("AISTAT_INGEST_SECRET") is None
+
+
+def test_load_effective_env_malformed_file_fails(tmp_path, restore_environ):
+    env = tmp_path / "production.env"
+    env.write_text("AISTAT_TENANT_ID=7\nbroken line\n", encoding="utf-8")
+    env.chmod(0o600)
+    failure = preflight.load_effective_env(env)
+    assert failure is not None and not failure.ok
+    assert "malformed" in failure.detail
+    assert "broken" not in failure.detail
 
 
 def test_import_checks_pass_for_real_modules(tmp_path):
@@ -299,3 +395,14 @@ def test_cli_exit_code(tmp_path, monkeypatch):
         if key.startswith("AISTAT_"):
             monkeypatch.delenv(key, raising=False)
     assert preflight.main(["--no-imports"]) == 1
+
+
+def test_cli_missing_env_file_fails_closed(tmp_path, monkeypatch, capsys):
+    # An absent persistent env file must fail even when the invoking shell
+    # exports a fully valid configuration (FAN-1411).
+    monkeypatch.setenv("AISTAT_ENV_FILE", str(tmp_path / "absent.env"))
+    rc = preflight.main(["--no-imports"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL env_file" in out
+    assert "does not exist" in out

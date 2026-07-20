@@ -21,11 +21,15 @@ The plist never carries a secret: it points at an owner-only env file
 ever writes non-secret paths into the plist.
 
 Every runtime-activating command — ``install``, ``restart`` and ``rollback`` —
-validates the *effective* configuration first: the owner-only private env file
-is permission-checked and loaded with the same source/precedence semantics as
-the supervisor before any ``launchctl`` call or code/plist mutation. Only
-``uninstall`` stays available as a fail-safe removal path when the
-configuration is invalid.
+requires the *persistent* private env file and validates the effective
+configuration first: the file must exist as an owner-only regular file, is
+parsed (never shell-executed) and loaded with the same source/precedence
+semantics as the supervisor before any ``launchctl`` call or code/plist
+mutation. Secrets exported only in the invoking shell can never satisfy this
+gate — the launchd job carries no secrets, so a runtime without the file
+would have no configuration to reload. Only ``uninstall`` (and ``status``/
+``render``) stays available as a fail-safe path when the configuration is
+invalid or absent.
 """
 
 import argparse
@@ -42,7 +46,6 @@ from typing import Callable, Dict, List, Optional
 
 from .config import Config
 from . import preflight
-from .supervisor import load_env_file
 
 logger = logging.getLogger("aistat.runtime_install")
 
@@ -237,11 +240,9 @@ class Installer:
         *,
         plist_dir: Optional[Path] = None,
         preflight_fn: Optional[Callable[[], "preflight.PreflightReport"]] = None,
-        env_file_explicit: bool = False,
     ):
         self.python = str(python)
         self.env_file = Path(env_file)
-        self.env_file_explicit = bool(env_file_explicit)
         self.controller = controller
         home_agents = Path.home() / "Library" / "LaunchAgents"
         self.paths = InstallPaths(
@@ -250,31 +251,19 @@ class Installer:
         self._preflight_fn = preflight_fn or self._default_preflight
 
     def _load_effective_env(self) -> Optional["preflight.Check"]:
-        """Validate and load the owner-only private env file, supervisor-style.
+        """Validate and load the required persistent env file, supervisor-style.
 
-        Mirrors ``aistat.supervisor.main``: an explicitly configured file must
-        exist, an existing file must be an owner-only regular file, and its
-        values are injected into the process environment (file values win over
-        ambient environment) so the ``Config`` built by preflight sees the
-        configuration the runtime would actually start with. Returns the
-        failing check, or ``None`` when the effective values are loaded.
+        The launchd job intentionally carries no secret values, so the
+        installed supervisor can only reload configuration from this file.
+        Missing (explicit *or* default path), symlinked, group/world-readable
+        and malformed files all fail here — before any ``launchctl`` call or
+        code/plist mutation — and ambient shell secrets alone can never
+        satisfy the gate. On success the file's values are injected into the
+        process environment (file values win over ambient environment) so the
+        ``Config`` built by preflight sees the configuration the runtime
+        would actually start with.
         """
-        if not self.env_file.exists():
-            if self.env_file_explicit:
-                return preflight.Check(
-                    "env_file", False, "configured env file does not exist")
-            # Default path absent: ambient process env, like the supervisor.
-            return None
-        verdict = preflight.check_env_file(self.env_file)
-        if not verdict.ok:
-            return verdict
-        try:
-            load_env_file(self.env_file)
-        except OSError as exc:
-            return preflight.Check(
-                "env_file", False,
-                "could not read env file: {}".format(type(exc).__name__))
-        return None
+        return preflight.load_effective_env(self.env_file)
 
     def _default_preflight(self) -> "preflight.PreflightReport":
         # Effective-config guard: load the private env file first so the
@@ -440,9 +429,6 @@ def _build_installer(args) -> Installer:
         Path(args.env_file) if args.env_file else _default_env_file(),
         LaunchctlController(),
         plist_dir=Path(args.plist_dir) if args.plist_dir else None,
-        env_file_explicit=bool(
-            args.env_file or os.environ.get("AISTAT_ENV_FILE")
-        ),
     )
 
 

@@ -377,37 +377,15 @@ class Supervisor:
                 pass
 
 
-def load_env_file(path: Path) -> Dict[str, str]:
-    """Parse an owner-only ``KEY=VALUE`` env file and inject it into os.environ.
-
-    The private env file is the only place the runtime's secrets live; the
-    plist never carries them. Its permissions are validated by the caller
-    (see :func:`aistat.preflight.check_env_file`) before this runs. Values are
-    injected into the process environment so ``Config`` and every child pick
-    them up, but are never echoed.
-    """
-    values: Dict[str, str] = {}
-    text = Path(path).read_text(encoding="utf-8")
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip()
-        if (len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"')):
-            val = val[1:-1]
-        if key:
-            os.environ[key] = val
-            values[key] = val
-    return values
-
-
 def _resolve_env_file() -> Optional[Path]:
+    """Locate the persistent private env file the supervisor must load.
+
+    Under launchd ``AISTAT_ENV_FILE`` is always baked into the plist, so a
+    configured-but-broken file fails startup below. ``None`` (no variable and
+    no default file) leaves the ambient process environment in charge — that
+    mode is for isolated tests and manual developer runs only; the installer
+    refuses to activate a runtime without the persistent file.
+    """
     raw = os.environ.get("AISTAT_ENV_FILE")
     if raw:
         return Path(raw)
@@ -427,14 +405,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     env_file = _resolve_env_file()
     if env_file is not None:
-        verdict = preflight.check_env_file(env_file)
-        if not verdict.ok:
-            logger.error("refusing to start: %s", verdict.detail)
-            return 2
-        try:
-            load_env_file(env_file)
-        except OSError as exc:
-            logger.error("could not read env file: %s", type(exc).__name__)
+        failure = preflight.load_effective_env(env_file)
+        if failure is not None:
+            logger.error("refusing to start: %s", failure.detail)
             return 2
 
     report = preflight.run_preflight(Config(), env_file=env_file)
