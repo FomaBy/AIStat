@@ -1,5 +1,7 @@
 """Transactional runtime install/rollback and plist rendering (FAN-1404)."""
 
+import logging
+import os
 from pathlib import Path
 
 import plistlib
@@ -398,3 +400,463 @@ def test_restart_kickstarts_when_loaded(tmp_path):
     installer.install(make_stage(tmp_path, "stage1", "v1"))
     installer.restart()
     assert ("kickstart", ri.LABEL) in controller.calls
+
+
+# ---- effective env-file preflight for direct restart/rollback (FAN-1425) --
+
+SENTINEL_INGEST = "synthetic-ingest-secret-never-log-1425"
+SENTINEL_WORKER = "synthetic-worker-secret-never-log-1425"
+SENTINEL_SESSION = "synthetic-session-secret-never-log-1425"
+SENTINELS = (SENTINEL_INGEST, SENTINEL_WORKER, SENTINEL_SESSION)
+
+
+@pytest.fixture
+def clean_env():
+    """Scrub ambient AISTAT_* vars and undo what load_env_file injected."""
+    saved = os.environ.copy()
+    for key in list(os.environ):
+        if key.startswith("AISTAT_"):
+            del os.environ[key]
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+class RecordingController(ri.LaunchController):
+    """Fake launchd surface that records every call, including is_loaded."""
+
+    def __init__(self, loaded=False, fail_bootstraps=0, events=None):
+        self.loaded = loaded
+        self.fail_bootstraps = fail_bootstraps
+        self.calls = []
+        self.events = events
+
+    def _record(self, name, detail):
+        self.calls.append((name, detail))
+        if self.events is not None:
+            self.events.append(name)
+
+    def bootstrap(self, plist_path):
+        self._record("bootstrap", str(plist_path))
+        if self.fail_bootstraps > 0:
+            self.fail_bootstraps -= 1
+            raise ri.LaunchError("bootstrap refused")
+        self.loaded = True
+
+    def bootout(self, label, plist_path=None):
+        self._record("bootout", label)
+        self.loaded = False
+
+    def is_loaded(self, label):
+        self._record("is_loaded", label)
+        return self.loaded
+
+    def kickstart(self, label):
+        self._record("kickstart", label)
+
+
+def patch_cli_controller(monkeypatch, *, loaded=False, fail_bootstraps=0,
+                         events=None):
+    controllers = []
+
+    def factory():
+        controller = RecordingController(
+            loaded=loaded, fail_bootstraps=fail_bootstraps, events=events)
+        controllers.append(controller)
+        return controller
+
+    monkeypatch.setattr(ri, "LaunchctlController", factory)
+    return controllers
+
+
+def env_file_values(tmp_path):
+    return {
+        "AISTAT_TENANT_ID": "7",
+        "AISTAT_PUBLISH_URL": "https://aistat.app/api/ingest/snapshot",
+        "AISTAT_WORKER_SYNC_URL": "https://aistat.app",
+        "AISTAT_INGEST_SECRET": SENTINEL_INGEST,
+        "AISTAT_WORKER_SECRET": SENTINEL_WORKER,
+        "AISTAT_SESSION_SECRET": SENTINEL_SESSION,
+        "AISTAT_PUBLISH_INTERVAL_SECONDS": "300",
+        "AISTAT_WORKER_PULL_INTERVAL_SECONDS": "300",
+        "AISTAT_WORKER_COLLECT_INTERVAL_SECONDS": "300",
+        "AISTAT_WORKER_KEY_PATH": str(tmp_path / "keys" / "worker.key"),
+        "AISTAT_WORKER_STORE_PATH": str(tmp_path / "store" / "connections.db"),
+    }
+
+
+def write_env_file(path, values, mode=0o600):
+    # Double quotes survive load_env_file's strip, so whitespace-bearing
+    # invalid endpoints reach Config exactly as written here.
+    lines = ['{}="{}"'.format(k, v) for k, v in values.items() if v is not None]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(mode)
+
+
+def make_installed_runtime(tmp_path, *, with_previous=True):
+    """A fake installed runtime: active code, previous code, data, plist."""
+    root = tmp_path / "runtime"
+    (root / "code" / "aistat").mkdir(parents=True)
+    (root / "code" / "aistat" / "__init__.py").write_text(
+        "MARKER = 'active'\n", encoding="utf-8")
+    if with_previous:
+        (root / "code.prev" / "aistat").mkdir(parents=True)
+        (root / "code.prev" / "aistat" / "__init__.py").write_text(
+            "MARKER = 'previous'\n", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "aistat.db").write_bytes(b"owner-data")
+    plist_dir = tmp_path / "LaunchAgents"
+    plist_dir.mkdir()
+    (plist_dir / (ri.LABEL + ".plist")).write_bytes(b"installed-plist")
+    return root, plist_dir
+
+
+def snapshot_state(root, plist_dir):
+    """Byte-for-byte view of code, code.prev, data and the plist."""
+    state = {}
+    for base in (Path(root), Path(plist_dir)):
+        if not base.exists():
+            state[str(base)] = None
+            continue
+        for path in sorted(base.rglob("*")):
+            if path.is_symlink():
+                state[str(path)] = ("symlink", os.readlink(str(path)))
+            elif path.is_file():
+                state[str(path)] = path.read_bytes()
+            else:
+                state[str(path)] = "dir"
+    return state
+
+
+def run_cli(command, root, plist_dir, env_file=None):
+    argv = [command, "--runtime-root", str(root), "--plist-dir", str(plist_dir)]
+    if env_file is not None:
+        argv += ["--env-file", str(env_file)]
+    return ri.main(argv)
+
+
+@pytest.mark.parametrize("command", ["restart", "rollback"])
+@pytest.mark.parametrize("field", ["AISTAT_PUBLISH_URL",
+                                   "AISTAT_WORKER_SYNC_URL"])
+@pytest.mark.parametrize("case", INVALID_ENDPOINT_CASES)
+def test_cli_invalid_env_file_endpoint_fails_closed(
+    tmp_path, monkeypatch, caplog, capsys, clean_env, command, field, case
+):
+    monkeypatch.setenv("AISTAT_ALLOW_INSECURE_PUBLISH", "1")
+    root, plist_dir = make_installed_runtime(tmp_path)
+    values = env_file_values(tmp_path)
+    endpoint = invalid_endpoint(case)
+    values[field] = endpoint  # None ("missing") drops the key entirely
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, values)
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    with caplog.at_level(logging.DEBUG):
+        rc = run_cli(command, root, plist_dir, env_file)
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    captured = capsys.readouterr()
+    for output in (captured.out, captured.err, caplog.text):
+        if endpoint:
+            assert endpoint not in output
+        assert "synthetic-url-user-never-log" not in output
+        assert "synthetic-url-password-never-log" not in output
+        for sentinel in SENTINELS:
+            assert sentinel not in output
+
+
+def test_cli_restart_loaded_preflights_once_then_kickstarts(
+    tmp_path, monkeypatch, clean_env
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    events = []
+    real_run_preflight = ri.preflight.run_preflight
+
+    def counting_run_preflight(*args, **kwargs):
+        events.append("preflight")
+        return real_run_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(ri.preflight, "run_preflight", counting_run_preflight)
+    patch_cli_controller(monkeypatch, loaded=True, events=events)
+
+    rc = run_cli("restart", root, plist_dir, env_file)
+
+    assert rc == 0
+    # Full preflight runs exactly once, before every controller call —
+    # including the read-only is_loaded probe.
+    assert events == ["preflight", "is_loaded", "kickstart", "is_loaded"]
+
+
+def test_cli_restart_unloaded_preflights_once_then_bootstraps(
+    tmp_path, monkeypatch, clean_env
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    events = []
+    real_run_preflight = ri.preflight.run_preflight
+
+    def counting_run_preflight(*args, **kwargs):
+        events.append("preflight")
+        return real_run_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(ri.preflight, "run_preflight", counting_run_preflight)
+    controllers = patch_cli_controller(monkeypatch, loaded=False, events=events)
+
+    rc = run_cli("restart", root, plist_dir, env_file)
+
+    assert rc == 0
+    assert events == ["preflight", "is_loaded", "bootstrap", "is_loaded"]
+    assert ("bootstrap", str(plist_dir / (ri.LABEL + ".plist"))) in \
+        controllers[0].calls
+
+
+def test_cli_rollback_valid_env_preflights_once_then_restores(
+    tmp_path, monkeypatch, clean_env
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    events = []
+    real_run_preflight = ri.preflight.run_preflight
+
+    def counting_run_preflight(*args, **kwargs):
+        events.append("preflight")
+        return real_run_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(ri.preflight, "run_preflight", counting_run_preflight)
+    patch_cli_controller(monkeypatch, loaded=True, events=events)
+
+    rc = run_cli("rollback", root, plist_dir, env_file)
+
+    assert rc == 0
+    assert events == ["preflight", "bootout", "bootstrap", "is_loaded"]
+    marker = (root / "code" / "aistat" / "__init__.py").read_text()
+    assert "previous" in marker
+    assert not (root / "code.prev").exists()
+
+
+def test_cli_rollback_without_previous_stays_side_effect_free(
+    tmp_path, monkeypatch, capsys, clean_env
+):
+    root, plist_dir = make_installed_runtime(tmp_path, with_previous=False)
+    values = env_file_values(tmp_path)
+    values["AISTAT_PUBLISH_URL"] = invalid_endpoint("http")
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, values)
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    rc = run_cli("rollback", root, plist_dir, env_file)
+
+    # The early no-previous rejection stays first and side-effect free.
+    assert rc == 1
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    captured = capsys.readouterr()
+    assert "no previous code copy" in captured.err
+    for output in (captured.out, captured.err):
+        assert invalid_endpoint("http") not in output
+        for sentinel in SENTINELS:
+            assert sentinel not in output
+
+
+def test_cli_restart_env_file_overrides_invalid_ambient(
+    tmp_path, monkeypatch, clean_env
+):
+    # Ambient environment carries an invalid endpoint; the owner-only env
+    # file is fully valid. Supervisor precedence: the file wins -> restart ok.
+    monkeypatch.setenv("AISTAT_PUBLISH_URL", "http://ambient-invalid.example/x")
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+
+    rc = run_cli("restart", root, plist_dir, env_file)
+
+    assert rc == 0
+    assert ("kickstart", ri.LABEL) in controllers[0].calls
+
+
+def test_cli_restart_invalid_env_file_overrides_valid_ambient(
+    tmp_path, monkeypatch, clean_env
+):
+    # The QA reproduction: ambient env is fully valid, but the effective env
+    # file carries an invalid endpoint. The file value must win and block.
+    for key, value in env_file_values(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, {
+        "AISTAT_PUBLISH_URL": "http://file-invalid.example/path"})
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    rc = run_cli("restart", root, plist_dir, env_file)
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604])
+def test_cli_restart_rejects_readable_env_file_without_loading(
+    tmp_path, monkeypatch, capsys, clean_env, mode
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path), mode=mode)
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    rc = run_cli("restart", root, plist_dir, env_file)
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    # The unsafe file was never loaded: its values stayed out of the process.
+    assert os.environ.get("AISTAT_INGEST_SECRET") is None
+    captured = capsys.readouterr()
+    for sentinel in SENTINELS:
+        assert sentinel not in captured.out + captured.err
+
+
+def test_cli_restart_rejects_symlinked_env_file(
+    tmp_path, monkeypatch, clean_env
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    target = tmp_path / "real.env"
+    write_env_file(target, env_file_values(tmp_path))
+    env_file = tmp_path / "production.env"
+    env_file.symlink_to(target)
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+
+    rc = run_cli("restart", root, plist_dir, env_file)
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+
+
+@pytest.mark.parametrize("via", ["flag", "env-var"])
+def test_cli_restart_missing_explicit_env_file_fails_closed(
+    tmp_path, monkeypatch, capsys, clean_env, via
+):
+    root, plist_dir = make_installed_runtime(tmp_path)
+    missing = tmp_path / "missing.env"
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+    before = snapshot_state(root, plist_dir)
+
+    if via == "flag":
+        rc = run_cli("restart", root, plist_dir, missing)
+    else:
+        monkeypatch.setenv("AISTAT_ENV_FILE", str(missing))
+        rc = run_cli("restart", root, plist_dir)
+
+    assert rc == 2
+    assert all(controller.calls == [] for controller in controllers)
+    assert snapshot_state(root, plist_dir) == before
+    assert "configured env file does not exist" in capsys.readouterr().err
+
+
+def test_cli_restart_absent_default_env_path_uses_ambient(
+    tmp_path, monkeypatch, clean_env
+):
+    # No --env-file and no AISTAT_ENV_FILE: like the supervisor, an absent
+    # default path means the ambient process environment is the effective
+    # configuration.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for key, value in env_file_values(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    root, plist_dir = make_installed_runtime(tmp_path)
+    controllers = patch_cli_controller(monkeypatch, loaded=True)
+
+    rc = run_cli("restart", root, plist_dir)
+
+    assert rc == 0
+    assert ("kickstart", ri.LABEL) in controllers[0].calls
+
+
+def test_restart_preflight_exception_text_is_sanitized(
+    tmp_path, clean_env
+):
+    values = env_file_values(tmp_path)
+    values["AISTAT_PUBLISH_URL"] = invalid_endpoint("userinfo")
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, values)
+    controller = RecordingController(loaded=True)
+    installer = ri.Installer(
+        tmp_path / "runtime", "/rt/python", env_file, controller,
+        plist_dir=tmp_path / "LaunchAgents", env_file_explicit=True,
+    )
+
+    with pytest.raises(ri.PreflightFailed) as exc_info:
+        installer.restart()
+
+    text = str(exc_info.value)
+    assert invalid_endpoint("userinfo") not in text
+    assert "synthetic-url-user-never-log" not in text
+    assert "synthetic-url-password-never-log" not in text
+    for sentinel in SENTINELS:
+        assert sentinel not in text
+    assert controller.calls == []
+
+
+@pytest.mark.parametrize("method", ["restart", "rollback"])
+def test_injected_preflight_failure_blocks_every_controller_call(
+    tmp_path, method
+):
+    controller = RecordingController(loaded=True)
+    installer = ri.Installer(
+        tmp_path / "runtime", "/rt/python", tmp_path / "production.env",
+        controller,
+        plist_dir=tmp_path / "LaunchAgents",
+        preflight_fn=lambda: PreflightReport([Check("x", False, "nope")]),
+    )
+    if method == "rollback":
+        (installer.paths.code_prev / "aistat").mkdir(parents=True)
+
+    with pytest.raises(ri.PreflightFailed):
+        getattr(installer, method)()
+
+    assert controller.calls == []
+
+
+def test_install_recovery_after_swap_is_not_blocked_by_gate(
+    tmp_path, monkeypatch, clean_env
+):
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    controller = RecordingController()
+    installer = ri.Installer(
+        tmp_path / "runtime", "/rt/python", env_file, controller,
+        plist_dir=tmp_path / "LaunchAgents", env_file_explicit=True,
+    )
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    assert active_marker(installer) == "v1"
+
+    events = []
+    real_run_preflight = ri.preflight.run_preflight
+
+    def counting_run_preflight(*args, **kwargs):
+        events.append("preflight")
+        return real_run_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(ri.preflight, "run_preflight", counting_run_preflight)
+    controller.fail_bootstraps = 1
+
+    with pytest.raises(ri.LaunchError):
+        installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    # One preflight for the whole failed install; the internal transactional
+    # recovery restored and re-bootstrapped the previous code without a
+    # second gate.
+    assert events == ["preflight"]
+    assert active_marker(installer) == "v1"
+    assert controller.loaded

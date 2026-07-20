@@ -19,6 +19,13 @@ touched by an update; only ``--purge`` uninstall removes it.
 The plist never carries a secret: it points at an owner-only env file
 (``AISTAT_ENV_FILE``) that the supervisor loads at startup. This module only
 ever writes non-secret paths into the plist.
+
+Every runtime-activating command — ``install``, ``restart`` and ``rollback`` —
+validates the *effective* configuration first: the owner-only private env file
+is permission-checked and loaded with the same source/precedence semantics as
+the supervisor before any ``launchctl`` call or code/plist mutation. Only
+``uninstall`` stays available as a fail-safe removal path when the
+configuration is invalid.
 """
 
 import argparse
@@ -35,6 +42,7 @@ from typing import Callable, Dict, List, Optional
 
 from .config import Config
 from . import preflight
+from .supervisor import load_env_file
 
 logger = logging.getLogger("aistat.runtime_install")
 
@@ -229,9 +237,11 @@ class Installer:
         *,
         plist_dir: Optional[Path] = None,
         preflight_fn: Optional[Callable[[], "preflight.PreflightReport"]] = None,
+        env_file_explicit: bool = False,
     ):
         self.python = str(python)
         self.env_file = Path(env_file)
+        self.env_file_explicit = bool(env_file_explicit)
         self.controller = controller
         home_agents = Path.home() / "Library" / "LaunchAgents"
         self.paths = InstallPaths(
@@ -239,12 +249,50 @@ class Installer:
         )
         self._preflight_fn = preflight_fn or self._default_preflight
 
+    def _load_effective_env(self) -> Optional["preflight.Check"]:
+        """Validate and load the owner-only private env file, supervisor-style.
+
+        Mirrors ``aistat.supervisor.main``: an explicitly configured file must
+        exist, an existing file must be an owner-only regular file, and its
+        values are injected into the process environment (file values win over
+        ambient environment) so the ``Config`` built by preflight sees the
+        configuration the runtime would actually start with. Returns the
+        failing check, or ``None`` when the effective values are loaded.
+        """
+        if not self.env_file.exists():
+            if self.env_file_explicit:
+                return preflight.Check(
+                    "env_file", False, "configured env file does not exist")
+            # Default path absent: ambient process env, like the supervisor.
+            return None
+        verdict = preflight.check_env_file(self.env_file)
+        if not verdict.ok:
+            return verdict
+        try:
+            load_env_file(self.env_file)
+        except OSError as exc:
+            return preflight.Check(
+                "env_file", False,
+                "could not read env file: {}".format(type(exc).__name__))
+        return None
+
     def _default_preflight(self) -> "preflight.PreflightReport":
-        # Config-level guard (imports are validated by the staged run in the
-        # shell wrapper against the runtime venv before this is reached).
+        # Effective-config guard: load the private env file first so the
+        # Config below validates the values the supervisor would start with,
+        # not just the ambient process environment. Imports are validated by
+        # the staged run in the shell wrapper against the runtime venv.
+        failure = self._load_effective_env()
+        if failure is not None:
+            return preflight.PreflightReport([failure])
         return preflight.run_preflight(
             Config(), check_imports=False, env_file=self.env_file
         )
+
+    def _require_preflight(self) -> None:
+        """Fail closed before any launchd control or runtime-state mutation."""
+        report = self._preflight_fn()
+        if not report.ok:
+            raise PreflightFailed(report)
 
     # ---- public commands ------------------------------------------------
 
@@ -259,9 +307,7 @@ class Installer:
             raise RuntimeInstallError(
                 "stage dir {} has no aistat package".format(stage_dir)
             )
-        report = self._preflight_fn()
-        if not report.ok:
-            raise PreflightFailed(report)
+        self._require_preflight()
 
         plist_text = render_plist(self.paths.runtime_root, self.python,
                                   self.env_file)
@@ -298,13 +344,21 @@ class Installer:
                 "data_preserved": self.paths.data.exists()}
 
     def rollback(self) -> Dict:
-        """Restore the previous code copy and re-bootstrap it."""
+        """Preflight, then restore the previous code copy and re-bootstrap it.
+
+        The gate covers only this public/manual entry point; the internal
+        post-swap recovery in :meth:`install` calls ``_restore_previous``
+        directly after an already-passed preflight and must keep restoring.
+        """
         if not self.paths.code_prev.exists():
             raise RuntimeInstallError("no previous code copy to roll back to")
+        self._require_preflight()
         self._restore_previous(True)
         return self.status()
 
     def restart(self) -> Dict:
+        """Preflight the effective configuration, then kickstart/bootstrap."""
+        self._require_preflight()
         if self.controller.is_loaded(LABEL):
             self.controller.kickstart(LABEL)
         else:
@@ -386,6 +440,9 @@ def _build_installer(args) -> Installer:
         Path(args.env_file) if args.env_file else _default_env_file(),
         LaunchctlController(),
         plist_dir=Path(args.plist_dir) if args.plist_dir else None,
+        env_file_explicit=bool(
+            args.env_file or os.environ.get("AISTAT_ENV_FILE")
+        ),
     )
 
 
