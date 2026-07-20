@@ -93,6 +93,16 @@ def test_agents_endpoint_counts_only_overlapping_hour_runs(api):
     assert {agent["agent_id"]: agent["runs"] for agent in agents} == {"A2": 1}
 
 
+def test_agent_count_and_worktime_expose_and_reconcile(api):
+    client, _ = api
+    s = client.get("/api/summary").json()
+    assert s["agent_count"] == 3
+    assert s["agent_work_seconds"] == 21600
+    agents = client.get("/api/agents").json()["agents"]
+    assert sum(a["work_seconds"] for a in agents) == s["agent_work_seconds"]
+    assert sum(1 for a in agents if a["work_seconds"] > 0) == s["agent_count"]
+
+
 def test_projects_endpoint_uses_configured_credit_rate(api):
     client, _ = api
     projects = {p["title"]: p for p in client.get("/api/projects").json()["projects"]}

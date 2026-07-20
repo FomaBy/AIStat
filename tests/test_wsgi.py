@@ -457,6 +457,20 @@ def test_wsgi_agents_count_only_overlapping_hour_runs(public_app):
             for agent in response.get_json()["agents"]} == {"A2": 1}
 
 
+def test_wsgi_agent_count_and_worktime(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert login(client).status_code == 303
+    s = client.get("/api/summary", base_url="https://localhost").get_json()
+    assert s["agent_count"] == 3
+    assert s["agent_work_seconds"] == 21600
+    agents = client.get(
+        "/api/agents", base_url="https://localhost"
+    ).get_json()["agents"]
+    assert sum(a["work_seconds"] for a in agents) == s["agent_work_seconds"]
+    assert sum(1 for a in agents if a["work_seconds"] > 0) == s["agent_count"]
+
+
 def test_login_is_csrf_protected_and_throttled(public_app):
     app, _ = public_app
     client = app.test_client()

@@ -497,6 +497,20 @@ def test_legacy_agents_count_only_overlapping_hour_runs(legacy):
     assert {agent["agent_id"]: agent["runs"] for agent in agents} == {"A2": 1}
 
 
+def test_legacy_agent_count_and_worktime(legacy):
+    cookies = login(legacy)
+    status, _, body = request(legacy.application, "/api/summary", cookie=cookies)
+    assert status == "200 OK"
+    s = legacy.json.loads(body.decode("utf-8"))
+    assert s["agent_count"] == 3
+    assert s["agent_work_seconds"] == 21600
+    status, _, body = request(legacy.application, "/api/agents", cookie=cookies)
+    assert status == "200 OK"
+    agents = legacy.json.loads(body.decode("utf-8"))["agents"]
+    assert sum(a["work_seconds"] for a in agents) == s["agent_work_seconds"]
+    assert sum(1 for a in agents if a["work_seconds"] > 0) == s["agent_count"]
+
+
 def test_logout_requires_csrf(legacy):
     cookies = login(legacy)
     status, _, body = request(

@@ -290,6 +290,26 @@ def test_valid_empty_range_shows_zeros_not_failure(dashboard):
     assert tokens.rstrip().endswith("0")
 
 
+def test_agent_count_and_worktime_cards_and_column(dashboard):
+    """The two new summary cards and the per-agent duration column render from
+    live /api/summary + /api/agents data (FAN-1228)."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval('document.getElementById("card-agent-count").textContent') == "3"
+    # 21600 s of agent-time reads as a duration (6 hours), not raw seconds.
+    assert cdp.eval('document.getElementById("card-agent-time").textContent') == "6 ч"
+    header = cdp.eval(
+        '[...document.querySelectorAll("#table-agents thead th")]'
+        '.map((th) => th.textContent)')
+    assert header[-1] == "Время работы"
+    durations = cdp.eval(
+        '[...document.querySelectorAll("#table-agents tbody tr")]'
+        '.map((tr) => tr.lastElementChild.textContent)')
+    # A1 1h, A3 2h, A2 3h render as readable durations in the last column.
+    assert "1 ч" in durations and "2 ч" in durations and "3 ч" in durations
+
+
 def _chart_colors(cdp, canvas_id):
     """label -> backgroundColor for a bar chart's datasets, read live from the
     rendered Chart.js instance."""

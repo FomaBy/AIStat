@@ -190,6 +190,21 @@ function fmtDateTime(iso) {
   return d.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+// Agent work-time comes from the API as whole seconds (the canonical value);
+// show it as a readable duration with the two most significant units.
+function fmtDuration(seconds) {
+  if (seconds == null) return "—";
+  let s = Math.round(seconds);
+  if (s <= 0) return "0 с";
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  if (d > 0) return h > 0 ? `${d} дн ${h} ч` : `${d} дн`;
+  if (h > 0) return m > 0 ? `${h} ч ${m} мин` : `${h} ч`;
+  if (m > 0) return s > 0 ? `${m} мин ${s} с` : `${m} мин`;
+  return `${s} с`;
+}
+
 // ---------- data access ----------
 
 async function fetchJSON(url) {
@@ -719,7 +734,8 @@ function renderAgentsTable(agents) {
       <td class="num">${fmtTokens(a.total_tokens)}</td>
       <td class="num">${fmtUSD(a.cost_usd)}${a.has_unpriced ? " *" : ""}</td>
       <td class="num">${fmtCredits(a.cost_credits)}</td>
-      <td class="num">${a.runs}</td>`;
+      <td class="num">${a.runs}</td>
+      <td class="num">${fmtDuration(a.work_seconds)}</td>`;
     tbody.appendChild(tr);
   }
 }
@@ -927,6 +943,10 @@ function renderSummary(s) {
     s.cost_per_sp == null ? "—" : "≈ " + fmtUSDFine(s.cost_per_sp) + effStar;
   $("card-weighted-eff").textContent =
     s.weighted_efficiency == null ? "—" : "≈ " + fmtUSDFine(s.weighted_efficiency) + effStar;
+  // Agent participation and total agent-time — any eligible run over the
+  // window, so they stand apart from the SP/usage-eligible efficiency cards.
+  $("card-agent-count").textContent = fmtNum(s.agent_count == null ? 0 : s.agent_count);
+  $("card-agent-time").textContent = fmtDuration(s.agent_work_seconds);
   $("sync-label").textContent = "синхронизация: " +
     (s.last_cycle ? fmtDateTime(s.last_cycle.finished_at) : "ещё не было");
   const unpriced = s.unpriced_models || [];

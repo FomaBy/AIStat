@@ -346,6 +346,284 @@ def test_agent_run_counts_follow_half_open_filtered_intervals(agg_conn):
     assert daily_agents["A2"]["runs"] == 4
 
 
+# -- agent count and work-time (FAN-1228) -------------------------------------------
+#
+# Fixture agent-time is hand-checkable from seed_aggregate_fixture runs (all on
+# 2026-01-01): A1 10:00-11:00 (1h); A2 10:00-11:00 + 12:00-14:00 (3h);
+# A3 12:00-13:00 + 14:00-15:00 (2h) → 3600 / 10800 / 7200 s, total 21600 s over
+# 3 agents. A helper runtime R9 / model m-fresh with no daily_usage isolates
+# edge-case agents from the fixture's token-attribution math.
+
+
+def _seed_fresh_runtime(conn):
+    """A runtime/model pair with no token usage, for work-only edge cases."""
+    conn.execute(
+        "INSERT INTO runtimes (id, name, provider, status, synced_at) VALUES "
+        "('R9', 'Fresh RT', 'x', 'online', '2026-01-02T00:00:00Z')"
+    )
+
+
+def _add_runs(conn, rows):
+    conn.executemany(
+        "INSERT INTO runs (id, issue_id, agent_id, runtime_id, status, "
+        "started_at, completed_at, synced_at) VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, '2026-01-02T00:00:00Z')",
+        rows,
+    )
+    conn.commit()
+
+
+def test_agent_work_summary_baseline(agg_conn):
+    s = ag.summary(agg_conn)
+    assert s["agent_count"] == 3
+    assert s["agent_work_seconds"] == 21600
+
+
+def test_agent_work_per_agent_values(agg_conn):
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert agents["A1"]["work_seconds"] == 3600
+    assert agents["A2"]["work_seconds"] == 10800
+    assert agents["A3"]["work_seconds"] == 7200
+    # The unattributed token bucket (agent_id None) is never counted as work.
+    assert agents[None]["work_seconds"] == 0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},
+    {"project_ids": ["P1"]},
+    {"project_ids": ["P2"]},
+    {"agent_ids": ["A2"]},
+    {"models": ["m-shared"]},
+    {"date_from": "2026-01-01", "date_to": "2026-01-01"},
+    {"date_from": "2026-01-01T10:00Z", "date_to": "2026-01-01T13:00Z"},
+    {"project_ids": ["P1"], "agent_ids": ["A2"], "models": ["m-shared"],
+     "date_from": "2026-01-01T10:00Z", "date_to": "2026-01-01T11:00Z"},
+])
+def test_agent_work_summary_and_per_agent_reconcile(agg_conn, kwargs):
+    filters = ag.make_filters(**kwargs)
+    s = ag.summary(agg_conn, filters=filters)
+    agents = ag.agent_totals(agg_conn, filters=filters)
+    assert sum(a["work_seconds"] for a in agents) == s["agent_work_seconds"]
+    assert sum(1 for a in agents if a["work_seconds"] > 0) == s["agent_count"]
+
+
+def test_agent_work_project_filter(agg_conn):
+    p1 = ag.summary(agg_conn, project_id="P1")
+    assert p1["agent_count"] == 3
+    assert p1["agent_work_seconds"] == 18000   # A1 1h + A2 3h + A3 run4 1h
+    p2 = ag.summary(agg_conn, project_id="P2")
+    assert p2["agent_count"] == 1
+    assert p2["agent_work_seconds"] == 3600     # only A3 run5
+
+
+def test_agent_work_counts_completed_failed_cancelled(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AF', 'Failer', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    _add_runs(agg_conn, [
+        ("rc", "I1", "AF", "R9", "completed", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+        ("rf", "I1", "AF", "R9", "failed",    "2026-01-05T11:00:00Z", "2026-01-05T11:30:00Z"),
+        ("rx", "I1", "AF", "R9", "cancelled", "2026-01-05T12:00:00Z", "2026-01-05T12:15:00Z"),
+    ])
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert agents["AF"]["work_seconds"] == 3600 + 1800 + 900
+    assert ag.summary(agg_conn)["agent_count"] == 4
+
+
+def test_agent_work_excludes_incomplete_and_running(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AP', 'Pending', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    _add_runs(agg_conn, [
+        ("rp", "I1", "AP", "R9", "pending",    None, None),
+        ("rd", "I1", "AP", "R9", "dispatched", None, None),
+        ("rr", "I1", "AP", "R9", "running",    "2026-01-05T10:00:00Z", None),
+    ])
+    assert ag.summary(agg_conn)["agent_count"] == 3
+    assert "AP" not in {a["agent_id"] for a in ag.agent_totals(agg_conn)}
+
+
+def test_agent_work_excludes_invalid_and_nonpositive_intervals(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AI', 'Invalid', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    _add_runs(agg_conn, [
+        ("r-neg",  "I1", "AI", "R9", "completed", "2026-01-05T11:00:00Z", "2026-01-05T10:00:00Z"),
+        ("r-zero", "I1", "AI", "R9", "completed", "2026-01-05T10:00:00Z", "2026-01-05T10:00:00Z"),
+        ("r-bad",  "I1", "AI", "R9", "completed", "not-a-date",           "2026-01-05T11:00:00Z"),
+        ("r-miss", "I1", "AI", "R9", "completed", None,                   "2026-01-05T11:00:00Z"),
+    ])
+    assert ag.summary(agg_conn)["agent_count"] == 3
+    assert "AI" not in {a["agent_id"] for a in ag.agent_totals(agg_conn)}
+
+
+def test_agent_work_ignores_null_and_empty_agent(agg_conn):
+    _add_runs(agg_conn, [
+        ("r-null",  "I1", None, "R2", "completed", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+        ("r-empty", "I1", "",   "R2", "completed", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+    ])
+    s = ag.summary(agg_conn)
+    assert s["agent_count"] == 3
+    assert s["agent_work_seconds"] == 21600
+
+
+def test_agent_work_concurrent_runs_add_up(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AC', 'Concurrent', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    # Two overlapping one-hour runs are 2h of agent-time, not a merged 1.5h span.
+    _add_runs(agg_conn, [
+        ("rc1", "I1", "AC", "R9", "completed", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+        ("rc2", "I1", "AC", "R9", "completed", "2026-01-05T10:30:00Z", "2026-01-05T11:30:00Z"),
+    ])
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert agents["AC"]["work_seconds"] == 7200
+
+
+def test_agent_work_clips_to_window(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AW', 'Window', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    _add_runs(agg_conn, [
+        ("rw", "I1", "AW", "R9", "completed", "2026-01-05T10:00:00Z", "2026-01-05T12:00:00Z"),
+    ])
+    filters = ag.make_filters("2026-01-05T10:30Z", "2026-01-05T11:00Z")
+    s = ag.summary(agg_conn, filters=filters)
+    assert s["agent_count"] == 1
+    assert s["agent_work_seconds"] == 1800
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn, filters=filters)}
+    assert agents["AW"]["work_seconds"] == 1800
+
+
+def test_agent_work_half_open_boundary_excluded(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AB', 'Boundary', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    # One run starts exactly at the window upper bound, one ends exactly at the
+    # lower bound; both touch a half-open [from, to) window with zero overlap.
+    _add_runs(agg_conn, [
+        ("rb-up",  "I1", "AB", "R9", "completed", "2026-01-05T11:00:00Z", "2026-01-05T12:00:00Z"),
+        ("rb-low", "I1", "AB", "R9", "completed", "2026-01-05T09:00:00Z", "2026-01-05T10:00:00Z"),
+    ])
+    s = ag.summary(agg_conn, filters=ag.make_filters("2026-01-05T10:00Z", "2026-01-05T11:00Z"))
+    assert s["agent_count"] == 0
+    assert s["agent_work_seconds"] == 0
+
+
+def test_agent_work_date_only_to_is_inclusive(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('ND', 'NextDay', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    _add_runs(agg_conn, [
+        ("rnd", "I1", "ND", "R9", "completed", "2026-01-02T09:00:00Z", "2026-01-02T10:00:00Z"),
+    ])
+    day1 = ag.summary(agg_conn, filters=ag.make_filters("2026-01-01", "2026-01-01"))
+    assert day1["agent_count"] == 3
+    assert day1["agent_work_seconds"] == 21600            # Jan-2 run excluded
+    span = ag.summary(agg_conn, filters=ag.make_filters("2026-01-01", "2026-01-02"))
+    assert span["agent_count"] == 4
+    assert span["agent_work_seconds"] == 21600 + 3600      # inclusive Jan-2 day
+
+
+def test_agent_work_counts_each_retry_attempt(agg_conn):
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AR', 'Retrier', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    # A retry is a separate attempt with its own run.id; both intervals count.
+    agg_conn.executemany(
+        "INSERT INTO runs (id, issue_id, agent_id, runtime_id, status, attempt, "
+        "started_at, completed_at, synced_at) VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, '2026-01-02T00:00:00Z')",
+        [
+            ("rt-1", "I1", "AR", "R9", "failed",    1, "2026-01-05T10:00:00Z", "2026-01-05T10:30:00Z"),
+            ("rt-2", "I1", "AR", "R9", "completed", 2, "2026-01-05T11:00:00Z", "2026-01-05T11:45:00Z"),
+        ],
+    )
+    agg_conn.commit()
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert agents["AR"]["work_seconds"] == 1800 + 2700
+
+
+def test_agent_work_duplicate_run_id_counted_once(agg_conn):
+    from aistat import store
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AD', 'Dup', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    run = {
+        "id": "dup-run", "issue_id": "I1", "agent_id": "AD", "runtime_id": "R9",
+        "kind": "direct", "status": "completed", "attempt": 1, "error": None,
+        "created_at": "2026-01-05T10:00:00Z", "dispatched_at": None,
+        "started_at": "2026-01-05T10:00:00Z", "completed_at": "2026-01-05T11:00:00Z",
+    }
+    store.upsert_runs(agg_conn, [run])
+    agg_conn.commit()
+    first = ag.summary(agg_conn)["agent_work_seconds"]
+    # The same run.id can arrive from both `agent tasks` and `issue runs`.
+    store.upsert_runs(agg_conn, [run])
+    agg_conn.commit()
+    second = ag.summary(agg_conn)["agent_work_seconds"]
+    assert first == second == 21600 + 3600
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert agents["AD"]["work_seconds"] == 3600
+
+
+def test_agent_work_visible_without_token_usage(agg_conn):
+    # An agent with eligible work but no attributed token row stays in the
+    # per-agent table with zero token/cost values and its real work-time.
+    _seed_fresh_runtime(agg_conn)
+    agg_conn.execute(
+        "INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES "
+        "('AN', 'NoTokens', 'm-fresh', 'R9', '2026-01-02T00:00:00Z')"
+    )
+    _add_runs(agg_conn, [
+        ("rn", "I1", "AN", "R9", "completed", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+    ])
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert "AN" in agents
+    assert agents["AN"]["total_tokens"] == 0
+    assert agents["AN"]["cost_usd"] == 0.0
+    assert agents["AN"]["work_seconds"] == 3600
+
+
+def test_agent_work_counts_agent_without_catalog_row(agg_conn):
+    # A historical agent_id with no current agents row still counts; a
+    # catalog-based model filter can no longer place it, so it drops out there.
+    _add_runs(agg_conn, [
+        ("rg", "I1", "GHOST", "R2", "completed", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+    ])
+    s = ag.summary(agg_conn)
+    assert s["agent_count"] == 4
+    assert s["agent_work_seconds"] == 21600 + 3600
+    agents = {a["agent_id"]: a for a in ag.agent_totals(agg_conn)}
+    assert agents["GHOST"]["total_tokens"] == 0
+    assert agents["GHOST"]["work_seconds"] == 3600
+    model_only = ag.make_filters(models=["m-shared"])
+    sm = ag.summary(agg_conn, filters=model_only)
+    ghost_rows = [a for a in ag.agent_totals(agg_conn, filters=model_only)
+                  if a["agent_id"] == "GHOST"]
+    assert ghost_rows == []
+    assert "GHOST" not in {a["agent_id"] for a in ag.agent_totals(agg_conn, filters=model_only)}
+    assert sm["agent_count"] == 2   # only m-shared agents A2, A3
+
+
 # -- projects and efficiency --------------------------------------------------------
 
 

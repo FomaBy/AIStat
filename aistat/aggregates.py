@@ -188,6 +188,60 @@ def _overlap_seconds(start: datetime, end: datetime,
     return max(0.0, (right - left).total_seconds())
 
 
+def _agent_work_seconds(conn: sqlite3.Connection,
+                        filters: Dict[str, Any]) -> Dict[str, int]:
+    """Clipped eligible run seconds per agent for the active filters.
+
+    An *eligible work run* is a stored ``runs`` row with a non-empty
+    ``agent_id`` and valid UTC ``started_at``/``completed_at`` forming a
+    strictly positive interval. Completed, failed and cancelled attempts all
+    qualify — they consumed agent time; pending/dispatched/running attempts and
+    rows with missing/invalid/zero/negative timestamps do not, and an
+    unfinished run is never given a ``completed_at``. Each run contributes only
+    the intersection of ``[started_at, completed_at)`` with the selected
+    ``[from, to)`` window (the whole interval when no window is set), so
+    concurrent runs add up as agent-time rather than merging into one
+    wall-clock span. Rows are keyed by ``run.id`` in SQLite, so a run ingested
+    from both ``agent tasks`` and ``issue runs`` is counted once. The project
+    filter joins ``run.issue_id -> issue.project_id``; agent/model filters use
+    the run's ``agent_id`` and the current agent catalog, mirroring the other
+    run-based aggregates. A historical ``agent_id`` with no current catalog row
+    still counts (its model is simply unknown to a model filter); the
+    null/unattributed bucket is never an agent.
+
+    Values are whole seconds (run timestamps are second-precision) so the
+    per-agent totals sum exactly to the summary total.
+    """
+    where, params = "r.agent_id IS NOT NULL AND r.agent_id != ''", []
+    if filters["projects"]:
+        where += _where_values("i.project_id", filters["projects"], params)
+    if filters["agents"]:
+        where += _where_values("r.agent_id", filters["agents"], params)
+    if filters["models"]:
+        where += _where_values("a.model", filters["models"], params)
+    lower = filters["from"] or datetime.min
+    upper = filters["to"] or datetime.max
+    seconds: Dict[str, float] = {}
+    for row in conn.execute(
+        f"""
+        SELECT r.agent_id, r.started_at, r.completed_at FROM runs r
+        LEFT JOIN issues i ON i.id = r.issue_id
+        LEFT JOIN agents a ON a.id = r.agent_id
+        WHERE {where}
+        """,
+        params,
+    ):
+        start = _run_datetime(row["started_at"])
+        end = _run_datetime(row["completed_at"])
+        if start is None or end is None or end <= start:
+            continue
+        overlap = _overlap_seconds(start, end, lower, upper)
+        if overlap <= 0:
+            continue
+        seconds[row["agent_id"]] = seconds.get(row["agent_id"], 0.0) + overlap
+    return {agent_id: int(round(value)) for agent_id, value in seconds.items()}
+
+
 def _run_intervals(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any]]]:
     """Dated task intervals grouped by agent.
 
@@ -609,6 +663,21 @@ def _label(group: str, key: Optional[str], names: Dict[str, Dict[str, str]]) -> 
 # -- agents ---------------------------------------------------------------------
 
 
+def _zero_share_row(key: Any) -> Dict[str, Any]:
+    """A tokens/cost group with no usage, shaped like :func:`_sum_shares`.
+
+    Used for an agent that did eligible work in the window but has no attributed
+    token row this period, so it stays visible with zero token/cost values.
+    """
+    row = {k: 0 for k in TOKEN_KINDS}
+    row.update({
+        "cost_usd": 0.0, "cost_credits": 0.0,
+        "has_unpriced": False, "estimated": False,
+        "_key": key, "total_tokens": 0,
+    })
+    return row
+
+
 def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
                  date_to: Optional[str] = None,
                  project_id: Optional[str] = None,
@@ -621,6 +690,13 @@ def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
     if filters["agents"]:
         shares = [s for s in shares if s["agent_id"] in filters["agents"]]
     grouped = _sum_shares(shares, lambda s: s["agent_id"])
+    work = _agent_work_seconds(conn, filters)
+    # Keep an agent that logged eligible work but produced no attributed token
+    # row visible with zero token/cost values (its work-time is still real).
+    seen = {g["_key"] for g in grouped}
+    for agent_id in work:
+        if agent_id not in seen:
+            grouped.append(_zero_share_row(agent_id))
     agents = {r["id"]: dict(r) for r in conn.execute(
         "SELECT id, name, model, runtime_id FROM agents"
     )}
@@ -665,13 +741,16 @@ def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
         g["model"] = agent["model"] if agent else None
         g["runtime"] = runtimes.get(agent["runtime_id"]) if agent else None
         g["runs"] = run_counts.get(agent_id, 0)
+        g["work_seconds"] = work.get(agent_id, 0)
         # A project filter keeps only each daily row's project-attributed share,
         # so an agent row is estimated even when a single agent owns the
         # (runtime, model) pair — mirror summary/daily_series (FAN-1253 re-QA).
         if filters["projects"]:
             g["estimated"] = True
         out.append(g)
-    out.sort(key=lambda g: -g["total_tokens"])
+    # Token rank stays primary; work-only agents (zero tokens) fall to the
+    # bottom ordered by their work-time so the table is stable.
+    out.sort(key=lambda g: (-g["total_tokens"], -g["work_seconds"]))
     return out
 
 
@@ -1430,6 +1509,11 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
     # contains a run dimension or a date/time range.
     eff = efficiency_breakdown(conn, filters=filters)
 
+    # Agent participation and total agent-time over the window. This counts any
+    # eligible run (not just SP/usage-eligible ones), so it is independent of
+    # ``efficiency_hours``; per-agent ``work_seconds`` sums back to this total.
+    work_seconds = _agent_work_seconds(conn, filters)
+
     last_cycle = conn.execute(
         "SELECT started_at, finished_at, sources_ok, sources_failed "
         "FROM poll_cycles ORDER BY id DESC LIMIT 1"
@@ -1464,6 +1548,8 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "efficiency_cost_sp": eff["cost_story_points"],
         "efficiency_hours": eff["active_hours"],
         "efficiency_has_unpriced": eff["has_unpriced"],
+        "agent_count": len(work_seconds),
+        "agent_work_seconds": sum(work_seconds.values()),
         "unpriced_models": unpriced_models,
         "last_cycle": dict(last_cycle) if last_cycle else None,
     }
