@@ -142,10 +142,53 @@ deploy/aistat_runtime.sh rollback     # code.prev/ → code/, повторный
 
 ### Удаление
 
-`uninstall` делает `bootout` (гасит supervisor и все контуры вместе с их
-группами), удаляет plist и копии кода, но **сохраняет** `data/` и ключ.
-`--purge` дополнительно удаляет `data/`. Ключ `~/.config/aistat/worker.key`
-удаляется только вручную.
+`uninstall` гасит **оба поколения** рантайма: и supervisor
+`com.aistat.runtime`, и legacy-задание `com.aistat.sync`, если оно ещё
+установлено. Сначала `bootout` обоих заданий с проверкой, что они
+действительно выгружены (задание, пережившее bootout, прерывает uninstall с
+ошибкой — файлы не удаляются, чтобы повторная попытка была возможна), затем
+удаляются оба plist, копии кода и legacy-артефакты. `data/` и ключ
+**сохраняются**; `--purge` дополнительно удаляет `data/`. Ключ
+`~/.config/aistat/worker.key` удаляется только вручную.
+
+## Миграция с legacy `com.aistat.sync`
+
+До появления supervisor'а локальный рантайм устанавливался скриптом
+`scripts/install_launchd_sync.sh`: одно launchd-задание `com.aistat.sync`
+держало owner poller и owner publisher через `sync_to_host.sh` в том же
+runtime-root и на тех же данных. Этот скрипт **retired** и теперь только
+сообщает об этом; единственный путь установки — `deploy/aistat_runtime.sh
+install`, который выполняет миграцию автоматически:
+
+1. После обычных гейтов (env-файл, staging, preflight) install обнаруживает
+   legacy-поколение — по plist
+   `~/Library/LaunchAgents/com.aistat.sync.plist` и/или загруженному заданию
+   — и снимает его **до** bootstrap'а нового supervisor'а: `bootout` с
+   проверкой, что задание действительно выгружено (иначе установка
+   прерывается), затем удаление legacy plist. Оба поколения никогда не
+   работают одновременно — дублирующихся poller/publisher не бывает.
+2. `data/` общий для обоих поколений и миграцией не затрагивается: БД
+   владельца, зашифрованный store, tenant-базы, логи и ключ остаются на
+   месте, новый рантайм продолжает работать на тех же данных.
+3. После успешного postflight удаляются legacy-артефакты кода в runtime-root
+   (`aistat/`, `sync_to_host.sh`, `pricing.json`, `requirements.txt`,
+   `.install-stage`). `data/` и `.venv/` (переиспользуется новым рантаймом)
+   не удаляются. Повторный `install` идемпотентен: без legacy-поколения
+   миграционных действий нет.
+4. Если cutover падает (bootstrap/postflight) **при первой миграции** —
+   предыдущего new-gen кода ещё нет — восстанавливается legacy-поколение:
+   plist возвращается byte-exact и задание bootstrap'ится заново, а
+   полуустановленное новое задание снимается и его plist удаляется. Если
+   предыдущий new-gen код существует, восстанавливается он (как обычно), а
+   legacy остаётся снятым. В любом исходе на машине остаётся ровно один
+   известно-рабочий рантайм.
+
+Обратной миграции нет: `rollback` откатывает только внутри нового поколения
+(`code.prev/`) и заодно снимает случайно возродившееся legacy-задание;
+`restart` при загруженном `com.aistat.sync` отказывается работать (иначе
+получились бы дубликаты) и отправляет на `install`; `status` показывает
+состояние обоих поколений (`legacy.loaded`, `legacy.plist_present`). Чтобы
+полностью остановить рантайм, используйте `uninstall` — данные сохраняются.
 
 ## Логи и статус
 
@@ -166,7 +209,12 @@ deploy/aistat_runtime.sh rollback     # code.prev/ → code/, повторный
   пользователя), транзакционный install/rollback/uninstall, сохранность
   данных, обязательность персистентного env-файла (отсутствующий, symlink,
   группо-/миро-читаемый и малформный файл падают до launchctl — включая
-  guard в `deploy/aistat_runtime.sh`);
+  guard в `deploy/aistat_runtime.sh`), а также миграция legacy
+  `com.aistat.sync`: снятие до bootstrap'а нового задания, инжектированные
+  сбои bootout/bootstrap/postflight с восстановлением ровно одного
+  известно-рабочего рантайма, сохранность общих данных, uninstall обоих
+  поколений и инвариант «оба поколения никогда не загружены одновременно»
+  на полном жизненном цикле;
 - `tests/test_runtime_e2e.py` — синтетический lifecycle submit → pull →
   зашифрованный store → ack/erase → collector → per-tenant publish → sync
   report, включая replace, revoke, restart и credential epoch.

@@ -1,35 +1,16 @@
 #!/usr/bin/env bash
-# Install the publisher runtime outside macOS-protected Documents.
+# RETIRED (FAN-1412). The legacy com.aistat.sync generation (poller +
+# publisher via sync_to_host.sh) is replaced by the com.aistat.runtime
+# supervisor. Recreating the legacy job here would run duplicate contours
+# next to the supervisor, so this entry point now refuses to install.
+#
+# `deploy/aistat_runtime.sh install` migrates an existing com.aistat.sync
+# job automatically (verified bootout before the supervisor starts, shared
+# data/ preserved). Upgrade/rollback path: docs/runtime-supervisor.md.
 set -euo pipefail
 
-SOURCE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME_ROOT="${AISTAT_RUNTIME_ROOT:-$HOME/Library/Application Support/AIStat}"
-PLIST_TARGET="$HOME/Library/LaunchAgents/com.aistat.sync.plist"
-LAUNCH_DOMAIN="gui/$(id -u)"
-STAGE="$RUNTIME_ROOT/.install-stage"
-
-rm -rf "$STAGE"
-mkdir -p "$STAGE" "$RUNTIME_ROOT/aistat" "$RUNTIME_ROOT/data"
-trap 'rm -rf "$STAGE"' EXIT
-git -C "$SOURCE_ROOT" archive HEAD -- \
-  aistat \
-  deploy/com.aistat.sync.plist.example \
-  pricing.json \
-  requirements.txt \
-  sync_to_host.sh |
-  tar -x -C "$STAGE"
-PLIST_SOURCE="$STAGE/deploy/com.aistat.sync.plist.example"
-
-plutil -lint "$PLIST_SOURCE"
-launchctl bootout "$LAUNCH_DOMAIN" "$PLIST_TARGET" 2>/dev/null || true
-chmod 700 "$RUNTIME_ROOT"
-rsync -a --delete "$STAGE/aistat/" "$RUNTIME_ROOT/aistat/"
-install -m 0644 "$STAGE/pricing.json" "$RUNTIME_ROOT/pricing.json"
-install -m 0644 "$STAGE/requirements.txt" "$RUNTIME_ROOT/requirements.txt"
-install -m 0755 "$STAGE/sync_to_host.sh" "$RUNTIME_ROOT/sync_to_host.sh"
-
-mkdir -p "$HOME/Library/LaunchAgents"
-install -m 0644 "$PLIST_SOURCE" "$PLIST_TARGET"
-launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST_TARGET"
-
-echo "Installed AIStat sync runtime at $RUNTIME_ROOT"
+echo "error: scripts/install_launchd_sync.sh is retired (FAN-1412)." >&2
+echo "The com.aistat.sync launchd job was replaced by com.aistat.runtime." >&2
+echo "Run: deploy/aistat_runtime.sh install  (migrates com.aistat.sync automatically)" >&2
+echo "See docs/runtime-supervisor.md for the upgrade/rollback path." >&2
+exit 64

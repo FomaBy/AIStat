@@ -19,7 +19,7 @@
   оператора в `~/Documents/AIStat` не трогается: агенты коммитят там, а
   развёртки живут отдельно. Клоны намеренно лежат **вне** защищённого macOS
   каталога `~/Documents`, иначе launchd не смог бы их читать (та же причина, что
-  в `scripts/install_launchd_sync.sh`).
+  у runtime-supervisor'а, см. `docs/runtime-supervisor.md`).
 - Каждая развёртка запускает штатный `./run.sh` (поллер Multica + API +
   дашборд) со своим `AISTAT_PORT` и своей базой SQLite (`data/aistat.db` внутри
   своего клона) — ветки не делят состояние.
@@ -31,8 +31,10 @@
     делает `git fetch` + `reset --hard origin/dev` и, **только если HEAD
     сдвинулся**, перезапускает `dev`-сервер. Лишних перезапусков нет.
 
-Уже установленный агент `com.aistat.sync` (публикация на хостинг) не
-затрагивается — префикс лейблов разный (`com.aistat.local.*`).
+Уже установленный runtime-supervisor `com.aistat.runtime` (публикация на
+хостинг; ранее — legacy `com.aistat.sync`, который автоматически мигрирует
+`deploy/aistat_runtime.sh install`) не затрагивается — префикс лейблов разный
+(`com.aistat.local.*`).
 
 ## Установка
 

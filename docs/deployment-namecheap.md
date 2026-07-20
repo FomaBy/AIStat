@@ -159,22 +159,20 @@ security add-generic-password \
   -w '<тот же ingest secret>'
 ```
 
-`sync_to_host.sh` по умолчанию берёт этот секрет из Keychain, публикует на
-`https://aistat.app/api/ingest/snapshot` и использует интервал 300 секунд:
-
-```bash
-cd /Users/sergeyfomin/Documents/AIStat
-./sync_to_host.sh
-```
-
-Для нестандартного URL/интервала можно создать
-`~/.config/aistat/production.env` с правами `600`; хранить там ingest secret
-не требуется:
+Синхронизацию и публикацию на Mac держит автономный локальный рантайм —
+supervisor `com.aistat.runtime`
+(см. [runtime-supervisor.md](runtime-supervisor.md)). Его конфигурация и
+секреты живут в персистентном owner-only env-файле
+`~/.config/aistat/production.env` (обычный файл, права `0600`; Keychain выше
+нужен только для ручной проверки ниже):
 
 ```text
-AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot
 AISTAT_TENANT_ID=<owner_user_id из aistat.migrate>
-AISTAT_PUBLISH_INTERVAL_SECONDS=300
+AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot
+AISTAT_SESSION_SECRET=<≥32 байта, тот же, что на хосте>
+AISTAT_INGEST_SECRET=<тот же ingest secret, что на хосте>
+AISTAT_WORKER_SYNC_URL=https://aistat.app
+AISTAT_WORKER_SECRET=<≥32 байта, тот же, что на хосте>
 ```
 
 Первичная ручная проверка:
@@ -187,18 +185,23 @@ AISTAT_INGEST_SECRET="$(security find-generic-password \
   .venv/bin/python -m aistat.publish
 ```
 
-Для автозапуска установить отдельную runtime-копию вне защищённого macOS
-каталога `Documents`:
+Для автозапуска установить рантайм вне защищённого macOS каталога
+`Documents` (все пути выводятся из `$HOME`):
 
 ```bash
-./scripts/install_launchd_sync.sh
+deploy/aistat_runtime.sh preflight
+deploy/aistat_runtime.sh install
 ```
 
-Скрипт копирует только исполняемый код в
-`~/Library/Application Support/AIStat`, сохраняет базу там же и регистрирует
-`com.aistat.sync`. Runtime собирается из текущего Git-коммита, поэтому случайные
-незакоммиченные изменения не попадают в работающий сервис. Секрет остаётся в
-login Keychain.
+`install` собирает runtime-копию из текущего Git-коммита в
+`~/Library/Application Support/AIStat` (случайные незакоммиченные изменения
+не попадают в работающий сервис), сохраняет базу там же и регистрирует
+launchd-задание `com.aistat.runtime`. Если на машине ещё работает
+legacy-задание `com.aistat.sync` (его ставил retired-скрипт
+`scripts/install_launchd_sync.sh`), install автоматически снимает его **до**
+запуска нового supervisor'а и продолжает работать на тех же данных —
+дублирующихся poller/publisher не остаётся. Путь обновления и отката описан
+в [runtime-supervisor.md](runtime-supervisor.md).
 
 ## 6. Автообновление сайта через cPanel Git + cron (ежедневно в 05:00)
 
@@ -206,7 +209,7 @@ login Keychain.
 забирает код из **публичного** репозитория `FomaBy/AIStat`, а cron в 05:00
 собирает пакет и атомарно публикует его. Ни одного секрета на стороне
 CI / Mac / агента не появляется. Данные (`~/aistat-private`) и 5-минутный цикл
-публикации (`com.aistat.sync` на Mac) этот механизм не трогает.
+публикации (runtime `com.aistat.runtime` на Mac) этот механизм не трогает.
 
 ### Шаг 1. Клонировать репозиторий (cPanel → Git Version Control)
 

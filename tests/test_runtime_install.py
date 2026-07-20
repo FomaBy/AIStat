@@ -16,24 +16,46 @@ from aistat.preflight import Check, PreflightReport, run_preflight
 # ---- fakes ---------------------------------------------------------------
 
 class FakeController(ri.LaunchController):
-    def __init__(self, fail_bootstraps=0):
-        self.loaded = False
+    """Label-aware launchd fake tracking which jobs are loaded.
+
+    ``loaded`` seeds the initially-loaded labels (True = the new runtime
+    label, or an iterable of labels). ``fail_bootstraps`` fails the next N
+    bootstrap calls. ``sticky_labels`` survive bootout — a job launchd
+    refuses to unload; ``dead_labels`` never report loaded after bootstrap —
+    a job that registers but immediately dies (postflight failure).
+    """
+
+    def __init__(self, fail_bootstraps=0, loaded=False,
+                 sticky_labels=(), dead_labels=()):
+        if loaded is True:
+            self.loaded_labels = {ri.LABEL}
+        else:
+            self.loaded_labels = set(loaded or ())
         self.calls = []
         self.fail_bootstraps = fail_bootstraps
+        self.sticky_labels = set(sticky_labels)
+        self.dead_labels = set(dead_labels)
+
+    @property
+    def loaded(self):
+        return ri.LABEL in self.loaded_labels
 
     def bootstrap(self, plist_path):
         self.calls.append(("bootstrap", str(plist_path)))
         if self.fail_bootstraps > 0:
             self.fail_bootstraps -= 1
             raise ri.LaunchError("bootstrap refused")
-        self.loaded = True
+        label = Path(plist_path).stem  # <label>.plist -> label
+        if label not in self.dead_labels:
+            self.loaded_labels.add(label)
 
     def bootout(self, label, plist_path=None):
         self.calls.append(("bootout", label))
-        self.loaded = False
+        if label not in self.sticky_labels:
+            self.loaded_labels.discard(label)
 
     def is_loaded(self, label):
-        return self.loaded
+        return label in self.loaded_labels
 
     def kickstart(self, label):
         self.calls.append(("kickstart", label))
@@ -423,37 +445,34 @@ def clean_env():
     os.environ.update(saved)
 
 
-class RecordingController(ri.LaunchController):
-    """Fake launchd surface that records every call, including is_loaded."""
+class RecordingController(FakeController):
+    """Label-aware fake that also records is_loaded probes and named events."""
 
-    def __init__(self, loaded=False, fail_bootstraps=0, events=None):
-        self.loaded = loaded
-        self.fail_bootstraps = fail_bootstraps
-        self.calls = []
+    def __init__(self, loaded=False, fail_bootstraps=0, events=None, **kwargs):
+        super().__init__(fail_bootstraps=fail_bootstraps, loaded=loaded,
+                         **kwargs)
         self.events = events
 
-    def _record(self, name, detail):
-        self.calls.append((name, detail))
+    def _note(self, name):
         if self.events is not None:
             self.events.append(name)
 
     def bootstrap(self, plist_path):
-        self._record("bootstrap", str(plist_path))
-        if self.fail_bootstraps > 0:
-            self.fail_bootstraps -= 1
-            raise ri.LaunchError("bootstrap refused")
-        self.loaded = True
+        self._note("bootstrap")
+        super().bootstrap(plist_path)
 
     def bootout(self, label, plist_path=None):
-        self._record("bootout", label)
-        self.loaded = False
+        self._note("bootout")
+        super().bootout(label, plist_path)
 
     def is_loaded(self, label):
-        self._record("is_loaded", label)
-        return self.loaded
+        self.calls.append(("is_loaded", label))
+        self._note("is_loaded")
+        return super().is_loaded(label)
 
     def kickstart(self, label):
-        self._record("kickstart", label)
+        self._note("kickstart")
+        super().kickstart(label)
 
 
 def patch_cli_controller(monkeypatch, *, loaded=False, fail_bootstraps=0,
@@ -589,8 +608,10 @@ def test_cli_restart_loaded_preflights_once_then_kickstarts(
 
     assert rc == 0
     # Full preflight runs exactly once, before every controller call —
-    # including the read-only is_loaded probe.
-    assert events == ["preflight", "is_loaded", "kickstart", "is_loaded"]
+    # including the read-only is_loaded probes (legacy duplicate-contour
+    # guard, own-label probe, then the two status probes).
+    assert events == ["preflight", "is_loaded", "is_loaded", "kickstart",
+                      "is_loaded", "is_loaded"]
 
 
 def test_cli_restart_unloaded_preflights_once_then_bootstraps(
@@ -612,7 +633,8 @@ def test_cli_restart_unloaded_preflights_once_then_bootstraps(
     rc = run_cli("restart", root, plist_dir, env_file)
 
     assert rc == 0
-    assert events == ["preflight", "is_loaded", "bootstrap", "is_loaded"]
+    assert events == ["preflight", "is_loaded", "is_loaded", "bootstrap",
+                      "is_loaded", "is_loaded"]
     assert ("bootstrap", str(plist_dir / (ri.LABEL + ".plist"))) in \
         controllers[0].calls
 
@@ -636,7 +658,10 @@ def test_cli_rollback_valid_env_preflights_once_then_restores(
     rc = run_cli("rollback", root, plist_dir, env_file)
 
     assert rc == 0
-    assert events == ["preflight", "bootout", "bootstrap", "is_loaded"]
+    # The is_loaded probes: legacy capture before restore, then the two
+    # status probes after it.
+    assert events == ["preflight", "is_loaded", "bootout", "bootstrap",
+                      "is_loaded", "is_loaded"]
     marker = (root / "code" / "aistat" / "__init__.py").read_text()
     assert "previous" in marker
     assert not (root / "code.prev").exists()
@@ -1008,6 +1033,366 @@ def test_install_env_file_guard_covers_every_unsafe_shape(
     assert controller.calls == []
     assert not installer.paths.code.exists()
     assert not installer.paths.plist.exists()
+
+
+# ---- legacy com.aistat.sync migration (FAN-1412) ---------------------------
+
+LEGACY = ri.LEGACY_LABEL
+
+LEGACY_PLIST_BYTES = plistlib.dumps({
+    "Label": LEGACY,
+    "ProgramArguments": ["/legacy/sync_to_host.sh"],
+    "RunAtLoad": True,
+    "KeepAlive": True,
+})
+
+
+def install_legacy_generation(installer, controller, *, loaded=True):
+    """Model a machine running the legacy generation: plist, code, data."""
+    root = installer.paths.runtime_root
+    (root / "aistat").mkdir(parents=True)
+    (root / "aistat" / "__init__.py").write_text("LEGACY = True\n",
+                                                 encoding="utf-8")
+    (root / "sync_to_host.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (root / "pricing.json").write_text("{}\n", encoding="utf-8")
+    (root / "requirements.txt").write_text("cryptography\n", encoding="utf-8")
+    data = installer.paths.data
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "aistat.db").write_bytes(b"owner-data")
+    (data / "worker_connections.db").write_bytes(b"encrypted-store")
+    (data / "worker_tenants").mkdir(exist_ok=True)
+    (data / "worker_tenants" / "101.db").write_bytes(b"tenant-data")
+    (data / "sync.stdout.log").write_bytes(b"legacy-log")
+    plist = installer.paths.legacy_plist
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_bytes(LEGACY_PLIST_BYTES)
+    if loaded:
+        controller.loaded_labels.add(LEGACY)
+    return plist
+
+
+def legacy_data_intact(installer):
+    data = installer.paths.data
+    return (
+        (data / "aistat.db").read_bytes() == b"owner-data"
+        and (data / "worker_connections.db").read_bytes() == b"encrypted-store"
+        and (data / "worker_tenants" / "101.db").read_bytes() == b"tenant-data"
+        and (data / "sync.stdout.log").read_bytes() == b"legacy-log"
+    )
+
+
+def test_install_retires_legacy_before_new_bootstrap(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    status = installer.install(make_stage(tmp_path, "stage", "v1"))
+
+    legacy_bootout = controller.calls.index(("bootout", LEGACY))
+    new_bootstrap = controller.calls.index(
+        ("bootstrap", str(installer.paths.plist)))
+    assert legacy_bootout < new_bootstrap
+    assert LEGACY not in controller.loaded_labels
+    assert controller.loaded
+    assert not installer.paths.legacy_plist.exists()
+    assert status["legacy"] == {"label": LEGACY, "loaded": False,
+                                "plist_present": False}
+    # Owner data, encrypted store, tenant dbs and logs survive byte-exact;
+    # the legacy code artifacts are cleaned up alongside the retired job.
+    assert legacy_data_intact(installer)
+    for name in ("aistat", "sync_to_host.sh", "pricing.json",
+                 "requirements.txt"):
+        assert not (installer.paths.runtime_root / name).exists()
+    assert active_marker(installer) == "v1"
+
+
+def test_legacy_migration_is_idempotent_across_reinstalls(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    first_calls = len(controller.calls)
+
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    assert ("bootout", LEGACY) not in controller.calls[first_calls:]
+    assert active_marker(installer) == "v2"
+    assert LEGACY not in controller.loaded_labels
+    assert legacy_data_intact(installer)
+
+
+def test_install_without_legacy_makes_no_legacy_calls(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage", "v1"))
+    assert ("bootout", LEGACY) not in controller.calls
+
+
+def test_failed_cutover_on_legacy_machine_restores_legacy(tmp_path):
+    controller = FakeController(fail_bootstraps=1)
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.LaunchError):
+        installer.install(make_stage(tmp_path, "stage", "v1"))
+
+    # The machine is back on exactly one known-good runtime: the legacy job,
+    # restored byte-exact and re-bootstrapped.
+    assert installer.paths.legacy_plist.read_bytes() == LEGACY_PLIST_BYTES
+    assert LEGACY in controller.loaded_labels
+    assert not controller.loaded
+    assert not installer.paths.plist.exists()
+    assert not installer.paths.code.exists()
+    assert (installer.paths.runtime_root / "sync_to_host.sh").exists()
+    assert legacy_data_intact(installer)
+
+
+def test_postflight_failure_on_legacy_machine_restores_legacy(tmp_path):
+    controller = FakeController(dead_labels={ri.LABEL})
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.LaunchError):
+        installer.install(make_stage(tmp_path, "stage", "v1"))
+
+    assert installer.paths.legacy_plist.read_bytes() == LEGACY_PLIST_BYTES
+    assert LEGACY in controller.loaded_labels
+    # The dead supervisor job was deregistered and its plist removed, so
+    # launchd cannot resurrect a runtime whose code is gone.
+    assert ("bootout", ri.LABEL) in controller.calls
+    assert not installer.paths.plist.exists()
+    assert not installer.paths.code.exists()
+    assert legacy_data_intact(installer)
+
+
+def test_stuck_legacy_bootout_aborts_install_and_keeps_legacy(tmp_path):
+    controller = FakeController(sticky_labels={LEGACY})
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.LaunchError):
+        installer.install(make_stage(tmp_path, "stage", "v1"))
+
+    # The legacy runtime keeps running; the new job never bootstrapped, so
+    # a stuck bootout can not produce duplicate contours.
+    assert LEGACY in controller.loaded_labels
+    assert ("bootstrap", str(installer.paths.plist)) not in controller.calls
+    assert installer.paths.legacy_plist.read_bytes() == LEGACY_PLIST_BYTES
+    assert not installer.paths.plist.exists()
+    assert not installer.paths.code.exists()
+    assert legacy_data_intact(installer)
+
+
+def test_failed_upgrade_with_stale_legacy_restores_new_runtime(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    # The legacy generation resurfaces after the first new-gen install.
+    install_legacy_generation(installer, controller)
+    controller.fail_bootstraps = 1
+
+    with pytest.raises(ri.LaunchError):
+        installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    # Exactly one known-good runtime: the restored new generation. The
+    # legacy job stays retired — a failed upgrade cannot re-duplicate it.
+    assert active_marker(installer) == "v1"
+    assert controller.loaded
+    assert LEGACY not in controller.loaded_labels
+    assert not installer.paths.legacy_plist.exists()
+    assert legacy_data_intact(installer)
+
+
+def test_uninstall_retires_both_generations(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage", "v1"))
+    install_legacy_generation(installer, controller)
+
+    result = installer.uninstall()
+
+    assert controller.loaded_labels == set()
+    assert not installer.paths.legacy_plist.exists()
+    assert not installer.paths.plist.exists()
+    assert not installer.paths.code.exists()
+    for name in ("aistat", "sync_to_host.sh", "pricing.json",
+                 "requirements.txt"):
+        assert not (installer.paths.runtime_root / name).exists()
+    assert result["data_preserved"]
+    assert legacy_data_intact(installer)
+
+
+def test_uninstall_legacy_only_machine_preserves_data(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    result = installer.uninstall()
+
+    assert controller.loaded_labels == set()
+    assert not installer.paths.legacy_plist.exists()
+    assert not (installer.paths.runtime_root / "sync_to_host.sh").exists()
+    assert result["data_preserved"]
+    assert legacy_data_intact(installer)
+
+
+def test_uninstall_purge_removes_shared_data_of_both_generations(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    result = installer.uninstall(purge=True)
+
+    assert controller.loaded_labels == set()
+    assert not installer.paths.data.exists()
+    assert not result["data_preserved"]
+
+
+def test_uninstall_aborts_before_removing_files_if_job_survives(tmp_path):
+    controller = FakeController(sticky_labels={LEGACY})
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage", "v1"))
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.LaunchError):
+        installer.uninstall()
+
+    # Nothing was removed: the stuck job keeps its plist for a retry instead
+    # of silently surviving as an orphan process without a profile.
+    assert installer.paths.legacy_plist.read_bytes() == LEGACY_PLIST_BYTES
+    assert installer.paths.plist.exists()
+    assert installer.paths.code.exists()
+    assert legacy_data_intact(installer)
+
+
+def test_rollback_retires_resurrected_legacy(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+    install_legacy_generation(installer, controller)
+
+    installer.rollback()
+
+    assert active_marker(installer) == "v1"
+    assert controller.loaded
+    assert LEGACY not in controller.loaded_labels
+    assert not installer.paths.legacy_plist.exists()
+    assert legacy_data_intact(installer)
+
+
+def test_restart_refuses_while_legacy_job_is_loaded(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage", "v1"))
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.RuntimeInstallError) as exc_info:
+        installer.restart()
+
+    assert "install" in str(exc_info.value)
+    assert ("kickstart", ri.LABEL) not in controller.calls
+    # Both jobs keep their pre-restart state; nothing was mutated.
+    assert controller.loaded and LEGACY in controller.loaded_labels
+    assert installer.paths.legacy_plist.read_bytes() == LEGACY_PLIST_BYTES
+
+
+def test_status_reports_legacy_generation(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+
+    status = installer.status()
+
+    assert status["legacy"] == {"label": LEGACY, "loaded": True,
+                                "plist_present": True}
+
+
+def test_preflight_failure_leaves_legacy_untouched(tmp_path):
+    controller = FakeController()
+    installer = make_installer(
+        tmp_path, controller,
+        preflight_fn=lambda: PreflightReport([Check("x", False, "nope")]),
+    )
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.PreflightFailed):
+        installer.install(make_stage(tmp_path, "stage", "v1"))
+
+    assert controller.calls == []
+    assert LEGACY in controller.loaded_labels
+    assert installer.paths.legacy_plist.read_bytes() == LEGACY_PLIST_BYTES
+    assert (installer.paths.runtime_root / "sync_to_host.sh").exists()
+    assert legacy_data_intact(installer)
+
+
+class HistoryController(FakeController):
+    """Snapshots the loaded-label set after every state-changing call."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.history = [frozenset(self.loaded_labels)]
+
+    def _snap(self):
+        self.history.append(frozenset(self.loaded_labels))
+
+    def bootstrap(self, plist_path):
+        try:
+            super().bootstrap(plist_path)
+        finally:
+            self._snap()
+
+    def bootout(self, label, plist_path=None):
+        super().bootout(label, plist_path)
+        self._snap()
+
+
+def test_full_lifecycle_never_runs_both_generations_at_once(tmp_path):
+    controller = HistoryController()
+    installer = make_installer(tmp_path, controller)
+    install_legacy_generation(installer, controller)
+    controller.history.append(frozenset(controller.loaded_labels))
+
+    installer.install(make_stage(tmp_path, "stage1", "v1"))   # migrate
+    installer.install(make_stage(tmp_path, "stage2", "v2"))   # reinstall
+    installer.rollback()
+    installer.uninstall()
+
+    # At no observable point were the legacy job and the supervisor loaded
+    # simultaneously, and the lifecycle ends with no jobs, no plists and the
+    # shared data intact.
+    assert all(not ({LEGACY, ri.LABEL} <= snap)
+               for snap in controller.history)
+    assert controller.loaded_labels == set()
+    assert not installer.paths.plist.exists()
+    assert not installer.paths.legacy_plist.exists()
+    assert legacy_data_intact(installer)
+
+
+# ---- retired legacy installer (scripts/install_launchd_sync.sh) ------------
+
+LEGACY_INSTALLER = Path(__file__).resolve().parent.parent / "scripts" / \
+    "install_launchd_sync.sh"
+
+
+def test_legacy_installer_is_retired(tmp_path):
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        ["bash", str(LEGACY_INSTALLER)],
+        capture_output=True, text=True, env=env,
+        cwd=str(LEGACY_INSTALLER.parent.parent),
+    )
+    assert result.returncode != 0
+    assert "aistat_runtime.sh" in result.stderr
+    # The retired stub performs no side effects at all.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_legacy_generation_files_are_gone():
+    repo = Path(__file__).resolve().parent.parent
+    assert not (repo / "sync_to_host.sh").exists()
+    assert not (repo / "deploy" / "com.aistat.sync.plist.example").exists()
 
 
 # ---- shell wrapper guard (deploy/aistat_runtime.sh) ------------------------
