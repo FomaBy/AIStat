@@ -529,7 +529,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="python -m aistat.backup",
         description="Backup, verify and restore AIStat's SQLite data.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    # ``add_subparsers(required=...)`` is Python 3.7+; the production host runs
+    # 3.6.8, so leave the subparsers optional here and enforce a command after
+    # parsing (below) instead.
+    sub = parser.add_subparsers(dest="command")
     sub.add_parser("create", help="create one integrity-checked backup generation")
     sub.add_parser("list", help="list backup generations")
     p_verify = sub.add_parser("verify", help="verify a generation end to end")
@@ -551,6 +554,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--apply", action="store_true", help="actually delete (default is dry-run)"
     )
     args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_usage(sys.stderr)
+        print("error: a command is required", file=sys.stderr)
+        return 2
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"

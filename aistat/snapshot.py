@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -122,35 +123,88 @@ def cleanup_orphan_snapshot_sidecars(parent: Path) -> int:
     return removed
 
 
-def create_compressed_snapshot(db_path: Path) -> bytes:
-    """Use SQLite's backup API so WAL-backed local data is copied coherently."""
-    db_path = Path(db_path)
-    if not db_path.is_file():
-        raise SnapshotError(f"database does not exist: {db_path}")
-    cleanup_orphan_snapshot_sidecars(db_path.parent)
-    temp_path = _temp_path(db_path.parent, ".db")
-    source = None
-    target = None
+# ``sqlite3.Connection.backup()`` — SQLite's online backup API — exists only on
+# Python 3.7+. The production host runs 3.6.8, so a lock-guarded file copy stands
+# in there (FAN-1435). Detected once at import; the owner-publisher on Python
+# 3.9+ keeps using the backup API unchanged.
+_HAS_SQLITE_BACKUP = hasattr(sqlite3.Connection, "backup")
+
+
+def _snapshot_with_backup_api(db_path: Path, temp_path: Path) -> None:
+    """Coherent copy via SQLite's online backup API (Python 3.7+)."""
+    source = sqlite3.connect(str(db_path))
     try:
-        source = sqlite3.connect(str(db_path))
         target = sqlite3.connect(str(temp_path))
         try:
             source.backup(target)
             target.execute("PRAGMA journal_mode = DELETE")
             target.commit()
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def _snapshot_with_file_copy(db_path: Path, temp_path: Path) -> None:
+    """Coherent copy for Python 3.6, which lacks ``Connection.backup()``.
+
+    Holds a write lock (``BEGIN IMMEDIATE``) on the source so no concurrent
+    writer or checkpoint can move it while the main database and any ``-wal``
+    sidecar are copied as a consistent pair; the source's on-disk bytes are
+    never modified. The copied WAL is then folded into the copied main file and
+    the copy is dropped to a self-contained rollback-journal database, matching
+    the backup-API path (which also ends in ``journal_mode=DELETE``).
+    """
+    source = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
+    try:
+        source.execute("BEGIN IMMEDIATE")
+        try:
+            shutil.copyfile(str(db_path), str(temp_path))
+            wal = Path(str(db_path) + "-wal")
+            if wal.is_file():
+                shutil.copyfile(str(wal), str(temp_path) + "-wal")
+        finally:
+            source.execute("COMMIT")
+    finally:
+        source.close()
+    dest = sqlite3.connect(str(temp_path))
+    try:
+        dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        dest.execute("PRAGMA journal_mode = DELETE")
+        dest.commit()
+    finally:
+        dest.close()
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        try:
+            os.unlink(str(temp_path) + suffix)
+        except FileNotFoundError:
+            pass
+
+
+def create_compressed_snapshot(db_path: Path) -> bytes:
+    """Copy a possibly WAL-backed database coherently, gzip-compressed.
+
+    Uses SQLite's online backup API on Python 3.7+; on the production host's
+    Python 3.6.8 (no ``Connection.backup()``) it falls back to a lock-guarded
+    file copy (FAN-1435). Both paths yield a self-contained, integrity-checkable
+    rollback-journal database.
+    """
+    db_path = Path(db_path)
+    if not db_path.is_file():
+        raise SnapshotError(f"database does not exist: {db_path}")
+    cleanup_orphan_snapshot_sidecars(db_path.parent)
+    temp_path = _temp_path(db_path.parent, ".db")
+    try:
+        try:
+            if _HAS_SQLITE_BACKUP:
+                _snapshot_with_backup_api(db_path, temp_path)
+            else:
+                _snapshot_with_file_copy(db_path, temp_path)
         except sqlite3.Error as exc:
             raise SnapshotError(f"cannot create SQLite backup: {exc}") from exc
         return gzip.compress(temp_path.read_bytes(), compresslevel=6)
     finally:
-        try:
-            if target is not None:
-                target.close()
-        finally:
-            try:
-                if source is not None:
-                    source.close()
-            finally:
-                _cleanup_snapshot_temp_files(temp_path)
+        _cleanup_snapshot_temp_files(temp_path)
 
 
 def _decompress_to_file(payload: bytes, target: Path, max_bytes: int) -> int:
