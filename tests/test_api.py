@@ -419,6 +419,35 @@ def test_dashboard_has_filter_reset_and_error_note():
         assert step in reset, step
 
 
+def test_connection_error_is_localized_and_names_the_workspace():
+    """Static contract (FAN-1436): the cabinet never shows the raw English
+    worker code. Each known code maps to an actionable Russian message, an
+    unknown value falls back to the generic Russian one (no verbatim echo), and
+    the workspace-resolution failures name the label the owner typed so
+    "подключил, но не работает" becomes diagnosable ("рабочее пространство «X»
+    не найдено")."""
+    app_js = (Path(server_module.__file__).parent / "static" / "app.js"
+              ).read_text(encoding="utf-8")
+    # The raw allowlist Set is gone; only a code->message map remains.
+    assert "SAFE_CONNECTION_ERRORS" not in app_js
+    # The workspace failure the incident hit is mapped with the typed label.
+    assert '"the connection\'s workspace could not be resolved":' in app_js
+    assert '"the connection\'s workspace label is ambiguous":' in app_js
+    assert "не найдено у этого PAT" in app_js
+    render = _js_function(app_js, "safeConnectionError")
+    assert "CONNECTION_WORKSPACE_ERRORS" in render
+    assert "CONNECTION_ERROR_MESSAGES" in render
+    assert "CONNECTION_ERROR_FALLBACK" in render
+    # The message wraps the label in guillemets rather than echoing a code.
+    assert "«" in render
+    # Both error render paths pass the host-side workspace label so the
+    # message can name it.
+    status_message = _js_function(app_js, "connectionStatusMessage")
+    assert "workspace_label" in status_message
+    render_connection = _js_function(app_js, "renderConnection")
+    assert "normalized.workspace_label" in render_connection
+
+
 # The SSE generator is tested directly: Starlette's TestClient buffers whole
 # responses, so an endless /api/events stream cannot be consumed through it.
 # The live HTTP path is covered by stage-3 manual verification (curl).

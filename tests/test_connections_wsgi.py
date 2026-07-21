@@ -445,6 +445,52 @@ def test_worker_sync_reports_surface_in_cabinet(conn_app):
     assert status["last_sync_error"] == "multica CLI exited with 1"
 
 
+def test_unresolved_workspace_label_surfaces_with_label_in_cabinet(conn_app):
+    """FAN-1436: an unrecognized workspace label surfaces in the cabinet as an
+    error status carrying both the safe workspace code (which the frontend
+    localizes) and the label the owner typed (which it names) — not a silent
+    "connected but not working" with no error."""
+    app, _ = conn_app
+    client = app.test_client()
+    csrf = login(client)
+    warm_worker(client)
+    assert submit(client, csrf, workspace_label="Last").status_code == 200
+    (entry,) = worker_call(
+        client, handoff.WORKER_PULL_PATH
+    ).get_json()["pending"]
+    stored = worker_call(
+        client,
+        handoff.WORKER_ACK_PATH,
+        {"acks": [{
+            "user_id": entry["user_id"],
+            "token_epoch": entry["token_epoch"],
+            "lease_id": entry["lease_id"],
+            "result": "stored",
+        }]},
+    )
+    assert stored.get_json()["results"][0]["ok"]
+    report = worker_call(
+        client,
+        handoff.WORKER_ACK_PATH,
+        {"acks": [{
+            "user_id": entry["user_id"],
+            "token_epoch": entry["token_epoch"],
+            "result": "sync_error",
+            "error": "the connection's workspace could not be resolved",
+        }]},
+    )
+    assert report.get_json()["results"][0]["status"] == "error"
+    status = client.get(
+        "/api/connection", base_url="https://localhost"
+    ).get_json()
+    assert status["status"] == "error"
+    assert (
+        status["last_sync_error"]
+        == "the connection's workspace could not be resolved"
+    )
+    assert status["workspace_label"] == "Last"
+
+
 def test_disabled_worker_channel_fails_closed(tmp_path):
     config = make_config(tmp_path, worker_secret=None)
     app = create_app(config)
