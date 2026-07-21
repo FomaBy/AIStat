@@ -268,6 +268,19 @@ class Config:
             "AISTAT_WORKER_COLLECT_INTERVAL_SECONDS", 300
         )
     )
+    # Local, at-rest backups of the durable SQLite stores (FAN-1185). Each run
+    # of ``python -m aistat.backup create`` writes one integrity-checked,
+    # compressed generation here; older generations beyond the retention count
+    # are pruned. Lives under ``data/`` so it is gitignored and never shipped.
+    backup_dir: Path = field(
+        default_factory=lambda: _env_path(
+            "AISTAT_BACKUP_DIR", PROJECT_ROOT / "data" / "backups"
+        )
+    )
+    # How many backup generations to keep (oldest pruned first). At least one.
+    backup_retention: int = field(
+        default_factory=lambda: max(1, _env_int("AISTAT_BACKUP_RETENTION", 14))
+    )
 
     def ensure_db_dir(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +306,15 @@ class Config:
         self.worker_tenants_dir.mkdir(parents=True, exist_ok=True)
         try:
             self.worker_tenants_dir.chmod(0o700)
+        except OSError:
+            pass
+
+    def ensure_backup_dir(self) -> None:
+        # Backups may contain the accounts and encrypted-token stores, so keep
+        # the directory owner-only just like the tenants directory.
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.backup_dir.chmod(0o700)
         except OSError:
             pass
 
