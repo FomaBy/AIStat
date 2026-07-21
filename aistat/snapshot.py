@@ -7,9 +7,8 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Set, Tuple
+from typing import NamedTuple, Set, Tuple
 
 from .db import SCHEMA_VERSION
 from .snapshot_recovery import fsync_file, swap_staged_into_place
@@ -34,8 +33,11 @@ class SnapshotError(ValueError):
     """Raised when a snapshot is oversized, invalid or incompatible."""
 
 
-@dataclass(frozen=True)
-class SnapshotInfo:
+# A frozen, keyword-constructed value object. Uses ``typing.NamedTuple`` rather
+# than ``@dataclass(frozen=True)`` so this module — part of the ``aistat.backup``
+# import chain — stays importable on the production host's Python 3.6.8, which
+# has no ``dataclasses`` module (FAN-1435).
+class SnapshotInfo(NamedTuple):
     sha256: str
     size_bytes: int
     schema_version: int
@@ -60,7 +62,12 @@ def _temp_path(parent: Path, suffix: str) -> Path:
 def _cleanup_snapshot_temp_files(temp_path: Path) -> None:
     """Remove a temporary SQLite file and every sidecar it may have created."""
     for suffix in ("",) + _SQLITE_SIDECAR_SUFFIXES:
-        Path(str(temp_path) + suffix).unlink(missing_ok=True)
+        # ``Path.unlink(missing_ok=True)`` is Python 3.8+; the production host
+        # runs 3.6.8, so swallow the missing-file case explicitly instead.
+        try:
+            Path(str(temp_path) + suffix).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _path_has_open_owner(path: Path) -> bool:
@@ -74,7 +81,9 @@ def _path_has_open_owner(path: Path) -> bool:
             ["lsof", "-t", "--", str(path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            # ``text=`` is the Python 3.7+ spelling; ``universal_newlines`` is the
+            # identical, 3.6-compatible option (the host runs 3.6.8).
+            universal_newlines=True,
             check=False,
             timeout=2,
         )

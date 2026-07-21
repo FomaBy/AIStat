@@ -229,7 +229,7 @@ def create_backup(cfg: Config, *, now_iso: Optional[str] = None) -> Path:
                     }
                 )
             finally:
-                scratch.unlink(missing_ok=True)
+                _unlink_quiet(scratch)
 
         manifest = {
             "tool": "aistat.backup",
@@ -363,7 +363,7 @@ def _atomic_install(scratch: Path, target: Path) -> None:
     # A restored file comes from a checkpointed .backup() copy, so it has no
     # live WAL; clear any stale sidecar so the new inode is not shadowed.
     for suffix in _SIDECAR_SUFFIXES:
-        Path(str(target) + suffix).unlink(missing_ok=True)
+        _unlink_quiet(Path(str(target) + suffix))
     os.replace(str(scratch), str(target))
     try:
         os.chmod(target, 0o600)
@@ -507,6 +507,18 @@ def _rmtree(path: Path) -> None:
     import shutil
 
     shutil.rmtree(str(path), ignore_errors=True)
+
+
+def _unlink_quiet(path: Path) -> None:
+    """Delete ``path`` if it exists, ignoring a missing file.
+
+    ``Path.unlink(missing_ok=True)`` is Python 3.8+; the production host runs
+    Python 3.6.8, so the missing-file case is swallowed explicitly instead.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
