@@ -43,11 +43,21 @@
         <button type="submit">Войти</button>
       </form>
 
-      {% if google_login_url %}
+      {% if google_login_url or yandex_login_url %}
       <div class="oauth-divider">или</div>
+      {% endif %}
+
+      {% if google_login_url %}
       <a class="oauth-button" href="{{ google_login_url }}">
         <span class="g-mark" aria-hidden="true">G</span>
         Войти / зарегистрироваться через Google
+      </a>
+      {% endif %}
+
+      {% if yandex_login_url %}
+      <a class="oauth-button" href="{{ yandex_login_url }}">
+        <span class="ya-mark" aria-hidden="true">Я</span>
+        Войти / зарегистрироваться через Яндекс
       </a>
       {% endif %}
 

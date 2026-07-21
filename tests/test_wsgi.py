@@ -42,6 +42,21 @@ OAUTH_PROVIDER = oauth.OAuthProvider(
     redirect_uri="https://localhost/auth/google/callback",
 )
 
+# Yandex ID: same generic flow, but userinfo exposes only confirmed addresses
+# and carries no verified-email claim, so the provider opts into
+# assume_email_verified (mirrors AISTAT_OAUTH_YANDEX_ASSUME_EMAIL_VERIFIED=1).
+YANDEX_PROVIDER = oauth.OAuthProvider(
+    name="yandex",
+    authorize_url="https://yandex.example/authorize",
+    token_url="https://oauth.example/token",
+    userinfo_url="https://api.example/userinfo",
+    scopes=("login:email", "login:info"),
+    client_id="ya-client-id",
+    client_secret="ya-client-secret",
+    redirect_uri="https://localhost/auth/yandex/callback",
+    assume_email_verified=True,
+)
+
 
 class _FakeResponse:
     def __init__(self, payload):
@@ -112,7 +127,10 @@ def public_app(tmp_path):
     config.allowed_hosts = ("localhost", "testserver", "aistat.app")
     config.force_https = False
     config.session_cookie_secure = True
-    config.oauth_providers = {"google": OAUTH_PROVIDER}
+    config.oauth_providers = {
+        "google": OAUTH_PROVIDER,
+        "yandex": YANDEX_PROVIDER,
+    }
     config.oauth_allowed_emails = frozenset({"allowed@example.com"})
     config.admin_email = "allowed@example.com"
 
@@ -854,6 +872,98 @@ def test_login_page_shows_google_button(public_app):
     )
     assert "Войти / зарегистрироваться через Google" in page
     assert 'href="/auth/google/start?next=' in page
+
+
+def test_login_page_shows_yandex_button(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    page = client.get("/login", base_url="https://localhost").get_data(
+        as_text=True
+    )
+    assert "Войти / зарегистрироваться через Яндекс" in page
+    assert 'href="/auth/yandex/start?next=' in page
+
+
+def test_yandex_callback_registers_once_and_reuses_account(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    config.oauth_allowed_emails = frozenset()  # open registration
+    # Yandex-shaped userinfo: id/default_email/real_name, no verified claim
+    install_fake_http(
+        monkeypatch,
+        {
+            "id": "ya-1",
+            "default_email": "user@yandex.example",
+            "real_name": "Юзер",
+        },
+    )
+
+    def yandex_login(client):
+        start = client.get(
+            "/auth/yandex/start?next=/api/meta", base_url="https://localhost"
+        )
+        assert start.status_code == 303
+        assert start.headers["Location"].startswith(
+            "https://yandex.example/authorize"
+        )
+        state = state_from(start.headers["Location"])
+        return client.get(
+            "/auth/yandex/callback?state=%s&code=abc" % state,
+            base_url="https://localhost",
+        )
+
+    first_client = app.test_client()
+    callback = yandex_login(first_client)
+    assert callback.status_code == 303
+    assert callback.headers["Location"] == "/api/meta"
+    # a fresh ordinary account sees its own empty tenant, not the owner's data
+    assert _project_ids(first_client) == set()
+
+    # the same Yandex subject from another browser lands in the same account
+    second_client = app.test_client()
+    assert yandex_login(second_client).status_code == 303
+    assert _project_ids(second_client) == set()
+
+    store = SecurityStore(config.security_db_path)
+    conn = store._connect()
+    try:
+        rows = conn.execute(
+            "SELECT user_id FROM oauth_identities "
+            "WHERE provider = ? AND subject = ?",
+            ("yandex", "ya-1"),
+        ).fetchall()
+        users = conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE email = ?",
+            ("user@yandex.example",),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    # exactly one identity row and one user: the repeat login reused them
+    assert len(rows) == 1
+    assert users == 1
+
+
+def test_yandex_outsider_denied_under_nonempty_allowlist(
+    public_app, monkeypatch
+):
+    app, config = public_app
+    # the fixture's allow list stays active: an unlisted new Yandex subject
+    # must not register even though its email counts as verified
+    install_fake_http(
+        monkeypatch,
+        {"id": "ya-2", "default_email": "stranger@yandex.example"},
+    )
+    client = app.test_client()
+    start = client.get("/auth/yandex/start", base_url="https://localhost")
+    state = state_from(start.headers["Location"])
+    callback = client.get(
+        "/auth/yandex/callback?state=%s&code=abc" % state,
+        base_url="https://localhost",
+    )
+    assert callback.status_code == 403
+    assert "Регистрация сейчас закрыта" in callback.get_data(as_text=True)
+    assert client.get("/api/meta", base_url="https://localhost").status_code == 401
 
 
 def test_oauth_start_redirects_to_provider_with_state(public_app):

@@ -304,6 +304,11 @@ def create_app(config: Optional[Config] = None) -> Flask:
             google_login_url = "/auth/google/start?next=" + quote(
                 next_url, safe=""
             )
+        yandex_login_url = None
+        if "yandex" in config.oauth_providers:
+            yandex_login_url = "/auth/yandex/start?next=" + quote(
+                next_url, safe=""
+            )
         token = make_login_csrf(config.session_secret)
         html = render_template(
             "login.html",
@@ -311,6 +316,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
             error=error,
             next_url=next_url,
             google_login_url=google_login_url,
+            yandex_login_url=yandex_login_url,
         )
         response = app.make_response((html, status))
         # Double-submit login CSRF: the same signed token is embedded in the

@@ -50,7 +50,7 @@ def configure_legacy_env(tmp_path, monkeypatch, allowed_emails="allowed@example.
     )
     monkeypatch.setenv("AISTAT_SESSION_SECRET", SESSION_SECRET)
     monkeypatch.setenv("AISTAT_INGEST_SECRET", INGEST_SECRET)
-    monkeypatch.setenv("AISTAT_OAUTH_PROVIDERS", "google")
+    monkeypatch.setenv("AISTAT_OAUTH_PROVIDERS", "google,yandex")
     monkeypatch.setenv(
         "AISTAT_OAUTH_GOOGLE_AUTHORIZE_URL", "https://accounts.example/authorize"
     )
@@ -64,6 +64,22 @@ def configure_legacy_env(tmp_path, monkeypatch, allowed_emails="allowed@example.
     monkeypatch.setenv(
         "AISTAT_OAUTH_GOOGLE_REDIRECT_URI", "https://localhost/auth/google/callback"
     )
+    # Yandex ID mirrors the documented production setup: same generic schema
+    # plus the explicit opt-in for its claimless-but-confirmed userinfo email.
+    monkeypatch.setenv(
+        "AISTAT_OAUTH_YANDEX_AUTHORIZE_URL", "https://yandex.example/authorize"
+    )
+    monkeypatch.setenv("AISTAT_OAUTH_YANDEX_TOKEN_URL", "https://oauth.example/token")
+    monkeypatch.setenv(
+        "AISTAT_OAUTH_YANDEX_USERINFO_URL", "https://api.example/userinfo"
+    )
+    monkeypatch.setenv("AISTAT_OAUTH_YANDEX_SCOPES", "login:email login:info")
+    monkeypatch.setenv("AISTAT_OAUTH_YANDEX_CLIENT_ID", "ya-client-id")
+    monkeypatch.setenv("AISTAT_OAUTH_YANDEX_CLIENT_SECRET", "ya-client-secret")
+    monkeypatch.setenv(
+        "AISTAT_OAUTH_YANDEX_REDIRECT_URI", "https://localhost/auth/yandex/callback"
+    )
+    monkeypatch.setenv("AISTAT_OAUTH_YANDEX_ASSUME_EMAIL_VERIFIED", "1")
     monkeypatch.setenv("AISTAT_OAUTH_ALLOWED_EMAILS", allowed_emails)
     monkeypatch.setenv("AISTAT_ADMIN_EMAIL", "allowed@example.com")
 
@@ -991,6 +1007,90 @@ def test_login_page_shows_google_button(legacy):
     page = body.decode("utf-8")
     assert "Войти / зарегистрироваться через Google" in page
     assert "/auth/google/start?next=" in page
+
+
+def test_login_page_shows_yandex_button(legacy):
+    status, _, body = request(legacy.application, "/login")
+    assert status == "200 OK"
+    page = body.decode("utf-8")
+    assert "Войти / зарегистрироваться через Яндекс" in page
+    assert "/auth/yandex/start?next=" in page
+
+
+def yandex_oauth_login(module, monkeypatch, identity, next_url="/", cookie=None):
+    """Drive a full mock-provider Yandex login through the real legacy app.
+
+    Same shape as :func:`oauth_login`, but over the ``/auth/yandex/*`` routes
+    of the env-configured Yandex provider.
+    """
+    install_fake_http(monkeypatch, identity)
+    status, headers, _ = request(
+        module.application,
+        "/auth/yandex/start?" + urlencode({"next": next_url}),
+        cookie=cookie,
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "https://yandex.example/authorize"
+    )
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers, cookie or "")
+    status, headers, body = request(
+        module.application,
+        "/auth/yandex/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    return status, headers, body, cookie_jar(headers, start_cookies)
+
+
+def test_yandex_login_registers_once_and_reuses_account(
+    legacy_open, monkeypatch
+):
+    module = legacy_open
+    # Yandex-shaped userinfo: id/default_email/real_name and no verified
+    # claim; the env opt-in AISTAT_OAUTH_YANDEX_ASSUME_EMAIL_VERIFIED covers it
+    identity = {
+        "id": "ya-1",
+        "default_email": "user@yandex.example",
+        "real_name": "Юзер",
+    }
+    status, headers, _, cookies = yandex_oauth_login(
+        module, monkeypatch, identity, "/api/meta"
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location") == ["/api/meta"]
+    # a fresh ordinary account sees its own empty tenant, not owner data
+    assert meta_projects(module, cookies) == set()
+    first_user = user_id_for_subject(module, "ya-1")
+    assert first_user is not None
+
+    # a repeat login with the same subject returns the same account
+    status, _, _, cookies = yandex_oauth_login(module, monkeypatch, identity)
+    assert status == "303 See Other"
+    assert user_id_for_subject(module, "ya-1") == first_user
+    assert account_counts_for(module, "ya-1", "user@yandex.example") == {
+        "users": 1, "identities": 1
+    }
+
+
+def test_yandex_outsider_denied_under_nonempty_allowlist(legacy, monkeypatch):
+    # allow-listed mode: a new unlisted Yandex subject is refused registration
+    # even though its email counts as verified via the provider opt-in
+    install_fake_http(
+        monkeypatch,
+        {"id": "ya-2", "default_email": "stranger@yandex.example"},
+    )
+    status, headers, _ = request(legacy.application, "/auth/yandex/start")
+    state = state_from(headers)
+    start_cookies = cookie_jar(headers)
+    status, _, body = request(
+        legacy.application,
+        "/auth/yandex/callback?state=%s&code=abc" % state,
+        cookie=start_cookies,
+    )
+    assert status == "403 Forbidden"
+    assert "Регистрация сейчас закрыта" in body.decode("utf-8")
+    assert user_id_for_subject(legacy, "ya-2") is None
 
 
 def test_oauth_unknown_provider_is_404(legacy):

@@ -227,6 +227,61 @@ def test_fetch_identity_requires_subject(monkeypatch):
         oauth.fetch_identity(PROVIDER, "tok")
 
 
+# Same endpoints as PROVIDER so fake_http serves it; what matters is the name
+# and the explicit opt-in for a claimless-but-confirmed userinfo (Yandex ID).
+YANDEX_PROVIDER = oauth.OAuthProvider(
+    name="yandex",
+    authorize_url=PROVIDER.authorize_url,
+    token_url=PROVIDER.token_url,
+    userinfo_url=PROVIDER.userinfo_url,
+    scopes=("login:email", "login:info"),
+    client_id="ya-client-id",
+    client_secret="ya-client-secret",
+    redirect_uri="https://app.example/auth/yandex/callback",
+    assume_email_verified=True,
+)
+
+
+def test_fetch_identity_yandex_opt_in_treats_present_email_as_verified(
+    monkeypatch,
+):
+    # Yandex ID exposes only already-confirmed addresses and sends no
+    # verified claim at all; the per-provider opt-in fills that gap.
+    fake_http(
+        monkeypatch,
+        identity={
+            "id": "77",
+            "default_email": "user@yandex.example",
+            "real_name": "Юзер",
+        },
+    )
+    assert oauth.fetch_identity(YANDEX_PROVIDER, "tok") == (
+        "77", "user@yandex.example", True, "Юзер"
+    )
+
+
+def test_fetch_identity_assume_verified_limits(monkeypatch):
+    # without the opt-in the same claimless payload stays unverified
+    fake_http(
+        monkeypatch,
+        identity={"id": "77", "default_email": "user@yandex.example"},
+    )
+    assert oauth.fetch_identity(PROVIDER, "tok")[2] is False
+    # the opt-in never invents an email
+    fake_http(monkeypatch, identity={"id": "77"})
+    assert oauth.fetch_identity(YANDEX_PROVIDER, "tok")[1:3] == (None, False)
+    # an explicit false claim from the provider beats the assumption
+    fake_http(
+        monkeypatch,
+        identity={
+            "id": "77",
+            "default_email": "user@yandex.example",
+            "email_verified": False,
+        },
+    )
+    assert oauth.fetch_identity(YANDEX_PROVIDER, "tok")[2] is False
+
+
 def test_generate_state_is_unique_and_urlsafe():
     values = {oauth.generate_state() for _ in range(64)}
     assert len(values) == 64
@@ -420,6 +475,34 @@ def test_providers_from_env_builds_generic_provider():
     google = providers["google"]
     assert google.scopes == ("openid", "email", "profile")
     assert google.client_secret == "secret"
+
+
+def test_providers_from_env_reads_assume_email_verified():
+    env = {
+        "AISTAT_OAUTH_PROVIDERS": "google, yandex",
+        "AISTAT_OAUTH_GOOGLE_AUTHORIZE_URL": "https://a/authorize",
+        "AISTAT_OAUTH_GOOGLE_TOKEN_URL": "https://a/token",
+        "AISTAT_OAUTH_GOOGLE_USERINFO_URL": "https://a/userinfo",
+        "AISTAT_OAUTH_GOOGLE_SCOPES": "openid email profile",
+        "AISTAT_OAUTH_GOOGLE_CLIENT_ID": "cid",
+        "AISTAT_OAUTH_GOOGLE_CLIENT_SECRET": "secret",
+        "AISTAT_OAUTH_GOOGLE_REDIRECT_URI": "https://app/auth/google/callback",
+        # a non-truthy value keeps the fail-closed default
+        "AISTAT_OAUTH_GOOGLE_ASSUME_EMAIL_VERIFIED": "definitely",
+        "AISTAT_OAUTH_YANDEX_AUTHORIZE_URL": "https://y/authorize",
+        "AISTAT_OAUTH_YANDEX_TOKEN_URL": "https://y/token",
+        "AISTAT_OAUTH_YANDEX_USERINFO_URL": "https://y/info",
+        "AISTAT_OAUTH_YANDEX_SCOPES": "login:email login:info",
+        "AISTAT_OAUTH_YANDEX_CLIENT_ID": "ya-cid",
+        "AISTAT_OAUTH_YANDEX_CLIENT_SECRET": "ya-secret",
+        "AISTAT_OAUTH_YANDEX_REDIRECT_URI": "https://app/auth/yandex/callback",
+        "AISTAT_OAUTH_YANDEX_ASSUME_EMAIL_VERIFIED": "1",
+    }
+    providers = oauth.providers_from_env(env)
+    assert set(providers) == {"google", "yandex"}
+    assert providers["google"].assume_email_verified is False
+    assert providers["yandex"].assume_email_verified is True
+    assert providers["yandex"].scopes == ("login:email", "login:info")
 
 
 def test_is_email_authorized_is_fail_closed():

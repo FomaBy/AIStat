@@ -1058,15 +1058,30 @@ def _render_login(csrf, next_url, error=None):
         error_html = '<p class="error" role="alert">{}</p>'.format(
             html.escape(error)
         )
-    oauth_html = ""
+    oauth_buttons = []
     if "google" in OAUTH_PROVIDERS:
         google_url = "/auth/google/start?next=" + quote(next_url or "/", safe="")
-        oauth_html = (
-            '<div class="oauth-divider">или</div>'
-            '<a class="oauth-button" href="{url}">'
-            '<span class="g-mark" aria-hidden="true">G</span>'
-            "Войти / зарегистрироваться через Google</a>"
-        ).format(url=html.escape(google_url, quote=True))
+        oauth_buttons.append(
+            (
+                '<a class="oauth-button" href="{url}">'
+                '<span class="g-mark" aria-hidden="true">G</span>'
+                "Войти / зарегистрироваться через Google</a>"
+            ).format(url=html.escape(google_url, quote=True))
+        )
+    if "yandex" in OAUTH_PROVIDERS:
+        yandex_url = "/auth/yandex/start?next=" + quote(next_url or "/", safe="")
+        oauth_buttons.append(
+            (
+                '<a class="oauth-button" href="{url}">'
+                '<span class="ya-mark" aria-hidden="true">Я</span>'
+                "Войти / зарегистрироваться через Яндекс</a>"
+            ).format(url=html.escape(yandex_url, quote=True))
+        )
+    oauth_html = ""
+    if oauth_buttons:
+        oauth_html = '<div class="oauth-divider">или</div>' + "".join(
+            oauth_buttons
+        )
     return """<!DOCTYPE html>
 <html lang="ru">
 <head>

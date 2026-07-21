@@ -291,8 +291,8 @@ metadata задачи, а не по проекту).
 | `AISTAT_DB_PATH` | `./data/aistat.db` | путь к файлу SQLite |
 | `AISTAT_SECURITY_DB_PATH` | `./data/security.db` | аккаунты, OAuth-state и реестр тенантов публичного WSGI |
 | `AISTAT_TENANTS_DIR` | `./data/tenants` | каталог изолированных публичных БД `<user_id>.db` |
-| `AISTAT_ADMIN_EMAIL` | — | email владельца; новый Google-subject с этим email привязывается к существующему владельцу (владелец остаётся единственным админом и сохраняет вход по паролю и свой tenant) |
-| `AISTAT_OAUTH_ALLOWED_EMAILS` | — | allowlist регистрации (через запятую, регистронезависимо). Пусто = **открытая** регистрация: любой verified Google-пользователь получает свой аккаунт и пустой tenant. Непусто = регистрация только для перечисленных email. Гейт применяется только к **новой** регистрации subject и никогда не блокирует уже зарегистрированный аккаунт |
+| `AISTAT_ADMIN_EMAIL` | — | email владельца; новый OAuth-subject (Google/Яндекс) с этим email привязывается к существующему владельцу (владелец остаётся единственным админом и сохраняет вход по паролю и свой tenant) |
+| `AISTAT_OAUTH_ALLOWED_EMAILS` | — | allowlist регистрации (через запятую, регистронезависимо). Пусто = **открытая** регистрация: любой verified OAuth-пользователь (Google/Яндекс) получает свой аккаунт и пустой tenant. Непусто = регистрация только для перечисленных email. Гейт применяется только к **новой** регистрации subject и никогда не блокирует уже зарегистрированный аккаунт |
 | `AISTAT_TENANT_ID` | — | внутренний `users.id`, к которому publisher привязывает snapshot и HMAC-подпись |
 | `AISTAT_POLL_INTERVAL_SECONDS` | `45` | интервал между стартами циклов поллера (от старта до старта); он же — дедлайн, по которому бэкфилл деталей откладывается на следующий цикл |
 | `AISTAT_USAGE_DAYS` | `90` | окно `runtime usage --days N` (макс. 365) |
@@ -343,9 +343,54 @@ Verified email, равный `AISTAT_ADMIN_EMAIL`, привязывает нов
 цированный email отклоняется. После входа доступ определяется активной серверной
 сессией, а не повторной проверкой allowlist на каждый запрос.
 
+## Регистрация и вход через Яндекс
+
+Кнопка «Войти / зарегистрироваться через Яндекс» появляется на обеих страницах
+входа (Flask и legacy WSGI) рядом с кнопкой Google, как только провайдер
+`yandex` полностью настроен. Семантика идентична Google: identity резолвится по
+`(provider, subject)` — первый вход регистрирует нового пользователя, повторный
+вход тем же Yandex-аккаунтом возвращает в тот же аккаунт AIStat; allowlist
+(`AISTAT_OAUTH_ALLOWED_EMAILS`) и привязка владельца (`AISTAT_ADMIN_EMAIL`)
+работают так же и применяются только к **новому** subject.
+
+Настройка:
+
+1. Зарегистрируйте приложение в кабинете Yandex OAuth
+   (<https://oauth.yandex.ru/>): платформа «Веб-сервисы», Redirect URI — точный
+   HTTPS callback `https://<host>/auth/yandex/callback`; включите доступы
+   «Доступ к адресу электронной почты» (`login:email`) и «Доступ к логину,
+   имени и фамилии» (`login:info`).
+2. Задайте переменные окружения. Провайдеры перечисляются через запятую в
+   `AISTAT_OAUTH_PROVIDERS`; схема ключей общая для любого провайдера —
+   `AISTAT_OAUTH_<NAME>_*`:
+
+```
+AISTAT_OAUTH_PROVIDERS=google,yandex
+AISTAT_OAUTH_YANDEX_AUTHORIZE_URL=https://oauth.yandex.ru/authorize
+AISTAT_OAUTH_YANDEX_TOKEN_URL=https://oauth.yandex.ru/token
+AISTAT_OAUTH_YANDEX_USERINFO_URL=https://login.yandex.ru/info
+AISTAT_OAUTH_YANDEX_SCOPES=login:email login:info
+AISTAT_OAUTH_YANDEX_CLIENT_ID=<ClientID приложения>
+AISTAT_OAUTH_YANDEX_CLIENT_SECRET=<Client secret приложения>
+AISTAT_OAUTH_YANDEX_REDIRECT_URI=https://<host>/auth/yandex/callback
+AISTAT_OAUTH_YANDEX_ASSUME_EMAIL_VERIFIED=1
+```
+
+Секреты живут только в env (в проде — приватный env-файл хостинга) и никогда не
+попадают в репозиторий. Провайдер с любым незаполненным полем пропускается
+целиком: кнопка не показывается, маршруты `/auth/yandex/*` отвечают 404, частично
+настроенный вход невозможен.
+
+`AISTAT_OAUTH_YANDEX_ASSUME_EMAIL_VERIFIED=1` обязателен именно для Яндекса:
+userinfo Yandex ID (`login.yandex.ru/info`) отдаёт только уже подтверждённые
+адреса и не присылает claim `email_verified`, поэтому без явного opt-in ядро
+считает email неподтверждённым и отклоняет каждый вход через Яндекс
+(fail-closed). Флаг действует только на провайдера, для которого задан, и не
+ослабляет проверку verified email у Google.
+
 ## Подключение своего Мультика
 
-Регистрация/вход — через Google; свой Multica API-токен (PAT) пользователь вводит
+Регистрация/вход — через Google или Яндекс; свой Multica API-токен (PAT) пользователь вводит
 вручную в кабинете, и PAT никогда не выступает паролем AIStat. Хост держит токен
 только до подтверждённого handoff доверенному локальному worker'у, который хранит
 токены зашифрованными. Функция ship'ится **выключенной**

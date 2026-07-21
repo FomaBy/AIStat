@@ -118,6 +118,12 @@ class OAuthProvider(object):
     A provider is entirely data: adding Yandex (or any other authorization-code
     provider) is a matter of supplying these fields, with no change to the flow
     core.
+
+    ``assume_email_verified`` covers providers whose userinfo endpoint exposes
+    only already-confirmed addresses and therefore sends no verified claim at
+    all (Yandex ID's ``login.yandex.ru/info``). It is an explicit per-provider
+    opt-in: when set, a *present* email counts as verified; the default keeps
+    the fail-closed behaviour where an absent claim means unverified.
     """
 
     __slots__ = (
@@ -129,6 +135,7 @@ class OAuthProvider(object):
         "client_id",
         "client_secret",
         "redirect_uri",
+        "assume_email_verified",
     )
 
     def __init__(
@@ -141,6 +148,7 @@ class OAuthProvider(object):
         client_id,
         client_secret,
         redirect_uri,
+        assume_email_verified=False,
     ):
         self.name = name
         self.authorize_url = authorize_url
@@ -150,6 +158,7 @@ class OAuthProvider(object):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
+        self.assume_email_verified = bool(assume_email_verified)
 
     def __repr__(self):
         # Never render secrets.
@@ -299,6 +308,11 @@ def fetch_identity(
     absent or non-truthy means ``False``), and ``name`` / ``display_name`` /
     ``real_name`` for the display name. The subject is required and is what an
     account is keyed on.
+
+    A provider configured with ``assume_email_verified`` (Yandex ID exposes
+    only confirmed addresses and sends no verified claim) counts a present
+    email as verified; an explicit false claim from such a provider still
+    wins, and a missing email stays unverified.
     """
     _require_https(provider.userinfo_url, "userinfo")
     if not access_token:
@@ -331,9 +345,21 @@ def fetch_identity(
     if subject is None or subject == "":
         raise OAuthError("identity response missing subject")
     email = payload.get("email") or payload.get("default_email")
-    email_verified = _coerce_verified(
-        payload.get("email_verified"), payload.get("verified_email")
+    verified_claims = (
+        payload.get("email_verified"),
+        payload.get("verified_email"),
     )
+    email_verified = _coerce_verified(*verified_claims)
+    if (
+        not email_verified
+        and provider.assume_email_verified
+        and email
+        and all(claim is None for claim in verified_claims)
+    ):
+        # The provider vouches for addresses by construction (opt-in via
+        # configuration) and sent no claim either way; an explicit false
+        # claim above still fails closed.
+        email_verified = True
     display_name = (
         payload.get("name")
         or payload.get("display_name")
@@ -592,8 +618,12 @@ def providers_from_env(environ) -> dict:
     ``AISTAT_OAUTH_<NAME>_``): ``AUTHORIZE_URL``, ``TOKEN_URL``,
     ``USERINFO_URL``, ``SCOPES`` (comma/space separated), ``CLIENT_ID``,
     ``CLIENT_SECRET`` and ``REDIRECT_URI``. A provider missing any field is
-    skipped rather than half-configured. The schema is deliberately generic so
-    Google or Yandex are configuration only.
+    skipped rather than half-configured. The optional
+    ``ASSUME_EMAIL_VERIFIED`` key (``1``/``true``/``yes``) opts the provider
+    into :attr:`OAuthProvider.assume_email_verified` — required for Yandex ID,
+    whose userinfo carries no verified-email claim; anything else keeps the
+    fail-closed default. The schema is deliberately generic so Google or
+    Yandex are configuration only.
     """
     names = [
         item.strip().lower()
@@ -613,7 +643,15 @@ def providers_from_env(environ) -> dict:
         )
         if not scopes or not all(values[field] for field in _PROVIDER_FIELDS):
             continue
-        providers[name] = OAuthProvider(name=name, scopes=scopes, **values)
+        assume_email_verified = _coerce_verified(
+            environ.get(prefix + "ASSUME_EMAIL_VERIFIED")
+        )
+        providers[name] = OAuthProvider(
+            name=name,
+            scopes=scopes,
+            assume_email_verified=assume_email_verified,
+            **values
+        )
     return providers
 
 
