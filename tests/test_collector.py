@@ -475,6 +475,37 @@ def test_failure_detail_carries_no_token_or_path(tmp_path):
     assert str(tmp_path) not in outcome.detail
 
 
+def test_unresolved_workspace_label_is_reported_not_silent(tmp_path):
+    """FAN-1436: an unrecognized workspace label must surface as a reported
+    failure carrying the safe, allowlisted message — never a silent fail-loop
+    that leaves the cabinet showing "connected" with no error."""
+    config = make_config(tmp_path)
+    store = FakeStore(
+        connections=[{"user_id": 101, "workspace_label": "Last", "token_epoch": 4}],
+        tokens={101: TOKEN_A},
+    )
+    reports = []
+    collector = Collector(
+        config, store,
+        profile_factory=factory_with({101: {"ws_fail": True}}),
+        publish_fn=RecordingPublisher(),
+        report_fn=lambda cfg, user, epoch, ok, error: reports.append(
+            (user, epoch, ok, error)
+        ),
+    )
+    outcome = collector.collect_once()[0]
+    assert outcome.status == "failed"
+    assert outcome.detail == "the connection's workspace could not be resolved"
+    # The failure is pushed to the host for the cabinet, not swallowed.
+    assert reports == [
+        (101, 4, False, "the connection's workspace could not be resolved")
+    ]
+    # The status is allowlisted, so it survives the worker->host boundary intact.
+    assert outcome.detail in handoff.SAFE_SYNC_ERRORS
+    # The connection was still cleaned up (no residue left behind).
+    assert FakeProfile.instances[0].cleaned
+
+
 @pytest.mark.parametrize(
     "fault",
     ["factory", "enter", "login", "workspace", "poll", "publish", "report", "cleanup"],
