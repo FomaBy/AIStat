@@ -15,12 +15,14 @@ import argparse
 import getpass
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
+
 from urllib.parse import urlsplit
 
 from . import handoff
@@ -29,6 +31,7 @@ from .config import Config
 from .tenant import (
     canonical_tenant_id,
     snapshot_signature as tenant_snapshot_signature,
+    tenant_db_path,
 )
 
 LOGIN_WINDOW_SECONDS = 15 * 60
@@ -221,6 +224,30 @@ def verify_snapshot_signature(
     ):
         raise ValueError("invalid ingest signature")
     return timestamp
+
+
+def remove_tenant_databases(tenants_dir, user_id) -> List[str]:
+    """Delete one tenant's SQLite database and every file derived from it.
+
+    Removes ``<tenants_dir>/<id>.db``, its ``.previous`` backup and any SQLite
+    ``-wal`` / ``-shm`` sidecars of either. The base path is resolved through
+    the escape-checked :func:`aistat.tenant.tenant_db_path`, so a hostile or
+    malformed id can never reach a file outside the tenants directory. Returns
+    the list of paths that were actually removed; missing files are skipped.
+    """
+    base = tenant_db_path(tenants_dir, user_id)
+    candidates = [base, base + ".previous"]
+    for path in list(candidates):
+        for suffix in ("-wal", "-shm"):
+            candidates.append(path + suffix)
+    removed = []
+    for path in candidates:
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
 
 
 class SecurityStore:
@@ -733,6 +760,104 @@ class SecurityStore:
         finally:
             conn.close()
 
+    def delete_user(self, user_id: int, now: Optional[int] = None) -> dict:
+        """Purge a non-owner user and every trace of their data (FAN-1183).
+
+        Safe, host-authoritative account and data deletion. In one
+        ``BEGIN IMMEDIATE`` transaction on security.db (opened with
+        ``secure_delete = ON`` so any lingering token bytes are zeroed rather
+        than left in free pages) this removes the user's account row, external
+        identities, live sessions, per-tenant registry row, connection
+        submission throttle and any snapshot install journal, and drives an
+        outstanding "connect your Multica" connection through the existing
+        two-party revocation so the trusted worker deletes its own encrypted
+        credential copy.
+
+        Deleting the ``tenants`` row is what makes the purge durable against a
+        late background publish: the snapshot ingest endpoint rejects any
+        upload whose tenant row is absent, so a removed tenant can never be
+        resurrected by the worker's next collection cycle.
+
+        Returns ``{"existed", "connection_teardown", "staged_path"}`` where
+        ``connection_teardown`` is one of:
+
+        * ``"none"``    — the user had no connection;
+        * ``"revoked"`` — the connection was already terminally ``revoked`` (no
+          worker copy remained); its row is removed;
+        * ``"pending"`` — an active or pending connection was moved to
+          ``revocation_pending`` (its host token erased) and its row is kept as
+          a token-free tombstone until the worker acknowledges deleting its
+          copy, after which the row reads ``revoked``. This is required so the
+          worker still learns it must purge the credential.
+
+        The single admin/owner account is never deletable through this path: a
+        request to delete it fails closed with :class:`SecurityConfigError` and
+        changes nothing. ``staged_path`` names an orphaned in-flight snapshot
+        temp file the caller should also unlink, or ``None``.
+        """
+        user_id = canonical_tenant_id(user_id)
+        now = int(time.time()) if now is None else int(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            user_row = conn.execute(
+                "SELECT is_admin FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if user_row is not None and int(user_row["is_admin"]) == 1:
+                conn.rollback()
+                raise SecurityConfigError(
+                    "refusing to delete the owner/admin account"
+                )
+            connection = conn.execute(
+                "SELECT status, token_epoch FROM connections WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if connection is None:
+                teardown = "none"
+            elif connection["status"] == "revoked":
+                teardown = "revoked"
+            else:
+                teardown = "pending"
+                conn.execute(
+                    "UPDATE connections SET token = NULL, "
+                    "status = 'revocation_pending', token_epoch = ?, "
+                    "updated_at = ?, lease_id = NULL, lease_expires_at = 0, "
+                    "revoke_acked_at = NULL, last_sync_error = NULL "
+                    "WHERE user_id = ?",
+                    (int(connection["token_epoch"]) + 1, now, user_id),
+                )
+            journal = conn.execute(
+                "SELECT staged_path FROM snapshot_install_journal "
+                "WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            staged_path = journal["staged_path"] if journal else None
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            conn.execute(
+                "DELETE FROM oauth_identities WHERE user_id = ?", (user_id,)
+            )
+            conn.execute(
+                "DELETE FROM connection_throttle WHERE user_id = ?", (user_id,)
+            )
+            conn.execute(
+                "DELETE FROM snapshot_install_journal WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute("DELETE FROM tenants WHERE user_id = ?", (user_id,))
+            if teardown != "pending":
+                conn.execute(
+                    "DELETE FROM connections WHERE user_id = ?", (user_id,)
+                )
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            return {
+                "existed": user_row is not None,
+                "connection_teardown": teardown,
+                "staged_path": staged_path,
+            }
+        finally:
+            conn.close()
+
     def find_or_create_user_by_identity(
         self,
         provider: str,
@@ -1053,6 +1178,40 @@ class SecurityStore:
         return handoff.apply_worker_acks(self._connect, acks, now)
 
 
+def purge_user(config: Config, user_id: int, now: Optional[int] = None) -> dict:
+    """Safe, complete host-side deletion of one user and all of their data.
+
+    The single entry point operators and callers should use: it removes every
+    security.db record for the user (via :meth:`SecurityStore.delete_user`),
+    unlinks the on-disk tenant databases (so no stats data survives at rest),
+    and cleans up any orphaned in-flight snapshot temp file. Row removal and
+    file removal are intentionally combined here so no caller can complete one
+    and forget the other. Returns a summary dict.
+
+    The DB rows are cleared first: once the ``tenants`` row is gone the tenant
+    is already unreadable and un-resurrectable, so an interrupted file cleanup
+    can only leave orphaned bytes that no code path can reach, never a live
+    tenant.
+    """
+    store = SecurityStore(config.security_db_path)
+    result = store.delete_user(user_id, now=now)
+    removed = remove_tenant_databases(config.tenants_dir, user_id)
+    staged_path = result.get("staged_path")
+    if staged_path:
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            pass
+        else:
+            removed.append(staged_path)
+    return {
+        "user_id": canonical_tenant_id(user_id),
+        "existed": result["existed"],
+        "connection_teardown": result["connection_teardown"],
+        "files_removed": removed,
+    }
+
+
 def _main(argv=None) -> int:
     from werkzeug.security import generate_password_hash
 
@@ -1060,17 +1219,73 @@ def _main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("generate-secret", help="print a new 384-bit URL-safe secret")
     sub.add_parser("hash-password", help="prompt for a password and print its hash")
+    delete_parser = sub.add_parser(
+        "delete-user",
+        help="permanently purge a non-owner user and all of their data",
+    )
+    delete_parser.add_argument(
+        "--user-id", type=int, required=True, help="internal numeric user id"
+    )
+    delete_parser.add_argument(
+        "--yes", action="store_true", help="skip the interactive confirmation"
+    )
     args = parser.parse_args(argv)
 
     if args.command == "generate-secret":
         print(secrets.token_urlsafe(48))
         return 0
 
+    if args.command == "delete-user":
+        return _delete_user_command(args)
+
     password = getpass.getpass("Password: ")
     confirmation = getpass.getpass("Repeat password: ")
     if not password or password != confirmation:
         parser.error("passwords do not match or are empty")
     print(generate_password_hash(password, method="pbkdf2:sha256:600000"))
+    return 0
+
+
+def _delete_user_command(args) -> int:
+    """Owner-run purge of one non-owner user across every host-side store.
+
+    This is the operator entry point for the ``delete_user`` primitive: it
+    resolves the deployment's configured security.db and tenants directory,
+    removes the account and its data, and unlinks the tenant database files.
+    The single admin/owner account is refused fail-closed.
+    """
+    config = Config()
+    if not args.yes:
+        prompt = (
+            "Permanently delete user {} and ALL of their data? "
+            "[y/N] ".format(args.user_id)
+        )
+        try:
+            answer = input(prompt)
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return 1
+    try:
+        result = purge_user(config, args.user_id)
+    except SecurityConfigError as exc:
+        print("refused: {}".format(exc))
+        return 1
+    except ValueError as exc:
+        print("invalid user id: {}".format(exc))
+        return 1
+    print(
+        json.dumps(
+            {
+                "user_id": result["user_id"],
+                "existed": result["existed"],
+                "connection_teardown": result["connection_teardown"],
+                "tenant_files_removed": len(result["files_removed"]),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
