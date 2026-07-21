@@ -439,7 +439,7 @@ def test_model_efficiency_keeps_model_less_share(legacy):
     assert mixed["unpriced_tokens"] == 500
     assert mixed["has_unpriced"] is True
     assert abs(mixed["active_hours"] - 2.0) < 1e-6
-    assert abs(mixed["cost_per_sp"] - 0.000125) < 1e-9
+    assert abs(mixed["cost_per_sp"] - 0.00025) < 1e-9  # priced 2 SP (FAN-1188)
     assert mixed["weighted_efficiency"] is None
     null_only = get("?agent=A5")
     assert [m["model"] for m in null_only["models"]] == [None]
@@ -448,7 +448,7 @@ def test_model_efficiency_keeps_model_less_share(legacy):
     assert null_only["unpriced_tokens"] == 500
     exact = get("?project=P3")
     assert [m["model"] for m in exact["models"]] == ["m-claude", None]
-    assert abs(exact["cost_per_sp"] - 0.000125) < 1e-9
+    assert abs(exact["cost_per_sp"] - 0.00025) < 1e-9
     assert exact["weighted_efficiency"] is None
 
 

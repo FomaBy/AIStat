@@ -1233,7 +1233,10 @@ def efficiency_breakdown(conn: sqlite3.Connection,
       the subset that also has runs, so the exact token counts can be split
       across the models that ran the issue and priced. Tokens landing on an
       unpriced/unknown model are surfaced in ``unpriced_tokens`` and flagged,
-      never priced as 0.
+      never priced as 0. Both numerator and denominator of ``cost_per_sp``
+      cover the priced shares only: an unpriced share's SP never lands in the
+      denominator paired against a $0 cost, so a partially priced issue is not
+      made to look cheaper than it was (QA FAN-1188).
     - Weighted efficiency (``weighted_efficiency``, USD per active hour per SP,
       lower is better) is the SP-weighted mean of each fully priced issue's
       cost ÷ active-hours ÷ story-points; algebraically ``Σ(cost_i / hours_i)
@@ -1280,7 +1283,6 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     active_hours = 0.0
     unpriced_tokens = 0.0
     has_unpriced = False
-    any_priced = False
     cost_issues = 0
     weighted_num = 0.0   # Σ cost_i / hours_i over fully priced issues
     weighted_den = 0.0   # Σ sp_i over those same issues
@@ -1310,7 +1312,6 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         if not issue_models:
             continue  # usage but no (matching) runs → not attributable to a model
         cost_issues += 1
-        cost_sp += sp
         keys = list(issue_models)
         weights = _weights(
             keys,
@@ -1325,6 +1326,11 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         issue_cost = 0.0
         issue_priced = True
         for model, weight in weights.items():
+            # A zero attribution weight means the model touched none of the
+            # selected work, so it must influence nothing — no cost, no SP in a
+            # denominator, and it never flips the unpriced flag (QA FAN-1188).
+            if weight <= 0:
+                continue
             b = bucket(model)
             for kind in TOKEN_KINDS:
                 b["tokens"][kind] += (row[f"total_{kind}"] or 0) * factor * weight
@@ -1333,6 +1339,8 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             b["active_hours"] += model_hours
             rate = rates.get(model)
             if rate is None or rate["unpriced"]:
+                # Unknown cost: surface the tokens, never price them as $0, and
+                # keep this share's SP out of the cost denominator (QA FAN-1188).
                 unpriced_tokens += issue_total * weight
                 has_unpriced = True
                 issue_priced = False
@@ -1345,7 +1353,10 @@ def efficiency_breakdown(conn: sqlite3.Connection,
                 + (row["total_cache_write_tokens"] or 0) * factor * weight * rate["cache_write_rate"]
             ) / 1_000_000
             issue_cost += model_cost
-            any_priced = True
+            # cost_per_sp pairs priced cost with the SP of that same priced
+            # share only, so a partially priced issue never divides known cost
+            # by unpriced SP (QA FAN-1188).
+            cost_sp += sp * weight
             b["cost_usd"] += model_cost
             if model_hours > 0:
                 b["weighted_num"] += model_cost / model_hours
@@ -1393,7 +1404,9 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         "has_unpriced": has_unpriced,
         "cost_issues": cost_issues,
         "tokens_per_sp": (total_tokens / sp_sum) if sp_sum > 0 else None,
-        "cost_per_sp": (cost_usd / cost_sp) if (cost_sp > 0 and any_priced) else None,
+        # cost_sp only accumulates fully priced shares, so a positive value
+        # already implies priced cost — the denominator matches the numerator.
+        "cost_per_sp": (cost_usd / cost_sp) if cost_sp > 0 else None,
         "weighted_efficiency": (
             weighted_num / weighted_den if weighted_den > 0 else None
         ),

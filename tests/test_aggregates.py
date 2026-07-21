@@ -917,8 +917,10 @@ def test_efficiency_breakdown_project_filter(agg_conn):
 
 
 def test_efficiency_breakdown_flags_unpriced_model(agg_conn):
-    # An issue whose only run used an unpriced model surfaces the model with
-    # no cost (never $0) and flips the unpriced flag; priced rows stay intact.
+    # QA FAN-1188 regression: a wholly unpriced task must not enter the cost
+    # metric. Its model surfaces with no cost (never $0) and flips the unpriced
+    # flag, but its SP stays out of the cost_per_sp denominator, so cost_per_sp
+    # keeps dividing the known $0.0025 by the priced 5 SP only — not 5 + 4.
     now = "2026-01-02T00:00:00Z"
     agg_conn.executescript(f"""
     INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
@@ -944,10 +946,136 @@ def test_efficiency_breakdown_flags_unpriced_model(agg_conn):
     assert mystery["cost_per_sp"] is None
     assert mystery["weighted_efficiency"] is None
     assert mystery["has_unpriced"] is True
-    # Priced cost is unchanged; cost_per_sp now spreads it over 5 + 4 SP.
+    # Priced cost and its denominator are both unchanged by the unpriced task.
     assert eff["cost_usd"] == pytest.approx(0.0025)
-    assert eff["cost_per_sp"] == pytest.approx(0.0025 / 9)
+    assert eff["cost_story_points"] == pytest.approx(5.0)
+    assert eff["cost_per_sp"] == pytest.approx(0.0005)   # 0.0025 / 5, NOT / 9
     # Weighted efficiency ignores the unpriced (not fully priced) issue.
+    assert eff["weighted_efficiency"] == pytest.approx(0.00025)
+
+
+def test_efficiency_breakdown_mixed_priced_and_unpriced_model(agg_conn):
+    # QA FAN-1188: one issue split 50/50 between a priced model and a known
+    # unpriced model. Only the priced half's cost AND its SP enter the metric;
+    # the unpriced half's SP must not dilute the denominator.
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A4', 'Mystery', 'm-mystery', 'R4', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I6', 'T-6', 'mixed priced/unpriced', 'done', 'P1', 4, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I6', 1, 1000, 0, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run6a', 'I6', 'A1', 'R1', 'completed',
+       '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', '{now}'),
+      ('run6b', 'I6', 'A4', 'R4', 'completed',
+       '2026-01-01T11:00:00Z', '2026-01-01T12:00:00Z', '{now}');
+    """)
+    agg_conn.commit()
+    eff = ag.efficiency_breakdown(agg_conn)
+    # I1 priced $0.0025 / 5 SP + I6 priced half $0.0005 / 2 SP.
+    assert eff["cost_usd"] == pytest.approx(0.0030)
+    assert eff["cost_story_points"] == pytest.approx(7.0)   # 5 + 2, NOT 5 + 4
+    assert eff["cost_per_sp"] == pytest.approx(0.0030 / 7.0)
+    assert eff["has_unpriced"] is True
+    # I6 is only partially priced → out of weighted; I1 stays the sole source.
+    assert eff["weighted_efficiency"] == pytest.approx(0.00025)
+    by_model = {m["model"]: m for m in eff["models"]}
+    assert by_model["m-mystery"]["cost_usd"] is None
+    assert by_model["m-mystery"]["cost_per_sp"] is None
+
+
+def test_efficiency_breakdown_ignores_zero_weight_model(agg_conn):
+    # QA FAN-1188: a priced model whose run has zero duration gets zero
+    # attribution weight next to a real unpriced run. It must influence
+    # nothing — not the cost denominator, not a spurious $0, not the flag.
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A4', 'Mystery', 'm-mystery', 'R4', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I7', 'T-7', 'zero-weight priced run', 'done', 'P1', 3, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I7', 1, 900, 0, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run7a', 'I7', 'A1', 'R1', 'completed',
+       '2026-01-01T10:00:00Z', '2026-01-01T10:00:00Z', '{now}'),
+      ('run7b', 'I7', 'A4', 'R4', 'completed',
+       '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', '{now}');
+    """)
+    agg_conn.commit()
+    eff = ag.efficiency_breakdown(agg_conn)
+    # The zero-duration m-claude run contributes no SP and no $0 to the metric;
+    # cost_per_sp stays exactly I1's 0.0025 / 5.
+    assert eff["cost_usd"] == pytest.approx(0.0025)
+    assert eff["cost_story_points"] == pytest.approx(5.0)
+    assert eff["cost_per_sp"] == pytest.approx(0.0005)
+    assert eff["has_unpriced"] is True   # m-mystery had the real weight
+    by_model = {m["model"]: m for m in eff["models"]}
+    # m-claude appears only through I1 (2.5 SP) — the zero-weight I7 run is out.
+    assert by_model["m-claude"]["story_points"] == pytest.approx(2.5)
+
+
+def test_efficiency_breakdown_sp_usage_without_runs_excluded_from_cost(agg_conn):
+    # An eligible issue (SP > 0 + usage) but no runs cannot be attributed to a
+    # model. It counts toward token efficiency yet must stay out of the cost
+    # denominator, so cost_per_sp is not diluted by un-attributable SP.
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I8', 'T-8', 'sp and usage, no runs', 'done', 'P1', 6, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I8', 1, 1200, 0, 0, 0, '{now}');
+    """)
+    agg_conn.commit()
+    eff = ag.efficiency_breakdown(agg_conn)
+    # Token efficiency sees I8: (1500 + 1200) / (5 + 6).
+    assert eff["story_points"] == pytest.approx(11.0)
+    assert eff["tokens_per_sp"] == pytest.approx(2700 / 11)
+    # Cost efficiency does not: only I1 is attributable.
+    assert eff["cost_story_points"] == pytest.approx(5.0)
+    assert eff["cost_per_sp"] == pytest.approx(0.0005)
+    assert eff["cost_issues"] == 1
+
+
+def test_efficiency_breakdown_zero_duration_priced_run(agg_conn):
+    # A priced issue whose only run has no usable duration (missing/zero) is
+    # still cost-attributable (cost comes from tokens, not time), but with no
+    # active hours it drops out of weighted efficiency instead of dividing by 0.
+    now = "2026-01-02T00:00:00Z"
+    agg_conn.executescript(f"""
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I9', 'T-9', 'zero duration run', 'done', 'P1', 2, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I9', 1, 2000, 0, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run9', 'I9', 'A1', 'R1', 'completed',
+       '2026-01-01T10:00:00Z', NULL, '{now}');
+    """)
+    agg_conn.commit()
+    eff = ag.efficiency_breakdown(agg_conn)
+    # I1 $0.0025 / 5 SP + I9 $0.002 / 2 SP enter cost; I9 adds no hours.
+    assert eff["cost_usd"] == pytest.approx(0.0045)
+    assert eff["cost_story_points"] == pytest.approx(7.0)
+    assert eff["cost_per_sp"] == pytest.approx(0.0045 / 7.0)
+    assert eff["active_hours"] == pytest.approx(2.0)   # I9 contributes 0 hours
+    # Weighted efficiency ignores the zero-hour issue → still I1 only.
     assert eff["weighted_efficiency"] == pytest.approx(0.00025)
 
 
@@ -1049,7 +1177,10 @@ def test_efficiency_breakdown_keeps_model_less_share(agg_conn):
     assert by_model[None]["active_hours"] == pytest.approx(1.0)
     assert mixed["cost_usd"] == pytest.approx(0.0005)
     assert mixed["active_hours"] == pytest.approx(2.0)
-    assert mixed["cost_per_sp"] == pytest.approx(0.000125)
+    # Priced $0.0005 over the known model's 2 SP only — the model-less 2 SP
+    # never dilutes the denominator as if it cost $0 (QA FAN-1188).
+    assert mixed["cost_story_points"] == pytest.approx(2.0)
+    assert mixed["cost_per_sp"] == pytest.approx(0.00025)
     assert mixed["unpriced_tokens"] == 500
     assert mixed["has_unpriced"] is True
     # A partially unpriced issue never yields a fully-priced weighted metric.
@@ -1080,7 +1211,7 @@ def test_efficiency_breakdown_keeps_model_less_share(agg_conn):
     assert [m["model"] for m in exact["models"]] == ["m-claude", None]
     assert exact["cost_usd"] == pytest.approx(0.0005)
     assert exact["active_hours"] == pytest.approx(2.0)
-    assert exact["cost_per_sp"] == pytest.approx(0.000125)
+    assert exact["cost_per_sp"] == pytest.approx(0.00025)   # 0.0005 / 2 priced SP
     assert exact["unpriced_tokens"] == 500
     assert exact["weighted_efficiency"] is None
 
@@ -1088,7 +1219,7 @@ def test_efficiency_breakdown_keeps_model_less_share(agg_conn):
     s = ag.summary(agg_conn, filters=ag.make_filters(
         "2026-01-04", "2026-01-04", ["P3"]
     ))
-    assert s["cost_per_sp"] == pytest.approx(0.000125)
+    assert s["cost_per_sp"] == pytest.approx(0.00025)
     assert s["weighted_efficiency"] is None
     assert s["efficiency_hours"] == pytest.approx(2.0)
     assert s["efficiency_has_unpriced"] is True
