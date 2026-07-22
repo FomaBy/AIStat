@@ -114,6 +114,26 @@ def _usage_db(path, dates):
         conn.close()
 
 
+def _monotonic_usage_db(path, rows):
+    """Create the production-shaped subset used by the freshness helper."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE daily_usage ("
+            "runtime_id TEXT NOT NULL, model TEXT NOT NULL, date TEXT NOT NULL, "
+            "input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, "
+            "cache_read_tokens INTEGER NOT NULL, "
+            "cache_write_tokens INTEGER NOT NULL, "
+            "PRIMARY KEY (runtime_id, model, date))"
+        )
+        conn.executemany(
+            "INSERT INTO daily_usage VALUES (?, ?, ?, ?, ?, ?, ?)", rows
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_daily_usage_max_date_reads_latest(tmp_path):
     path = tmp_path / "usage.db"
     _usage_db(path, ["2026-07-12", "2026-07-19", "2026-07-15"])
@@ -136,13 +156,21 @@ def test_daily_usage_max_date_is_none_for_missing_empty_or_tableless(tmp_path):
 def test_snapshot_is_fresh_enough_blocks_backwards_usage(tmp_path):
     # FAN-1442: a stale/degraded snapshot must never move a tenant's usage back.
     fresh = tmp_path / "fresh.db"
-    _usage_db(fresh, ["2026-07-22"])
+    _monotonic_usage_db(
+        fresh, [("R1", "m1", "2026-07-22", 10, 20, 30, 40)]
+    )
     stale = tmp_path / "stale.db"
-    _usage_db(stale, ["2026-07-19"])
+    _monotonic_usage_db(
+        stale, [("R1", "m1", "2026-07-19", 10, 20, 30, 40)]
+    )
     same = tmp_path / "same.db"
-    _usage_db(same, ["2026-07-22"])
+    _monotonic_usage_db(
+        same, [("R1", "m1", "2026-07-22", 10, 20, 30, 40)]
+    )
     empty = tmp_path / "degraded.db"
-    _usage_db(empty, [])
+    _monotonic_usage_db(empty, [])
+    empty_target = tmp_path / "empty-target.db"
+    _monotonic_usage_db(empty_target, [])
     missing = tmp_path / "missing.db"
 
     # Strictly older data over newer -> rejected.
@@ -153,9 +181,127 @@ def test_snapshot_is_fresh_enough_blocks_backwards_usage(tmp_path):
     assert snapshot_is_fresh_enough(same, fresh) is True
     # Newer data over older -> accepted.
     assert snapshot_is_fresh_enough(fresh, stale) is True
-    # First ingest / empty target -> always accepted, even an empty snapshot.
+    # First ingest / valid empty target accepts a valid (even empty) snapshot.
     assert snapshot_is_fresh_enough(stale, missing) is True
     assert snapshot_is_fresh_enough(empty, missing) is True
+    assert snapshot_is_fresh_enough(stale, empty_target) is True
+
+
+@pytest.mark.parametrize("counter_index", range(4))
+def test_snapshot_is_fresh_enough_rejects_each_lower_same_day_counter(
+    tmp_path, counter_index
+):
+    target = tmp_path / "target.db"
+    incoming = tmp_path / "incoming.db"
+    counters = [10, 20, 30, 40]
+    lower = list(counters)
+    lower[counter_index] -= 1
+    _monotonic_usage_db(
+        target, [("R1", "m1", "2026-07-22") + tuple(counters)]
+    )
+    _monotonic_usage_db(
+        incoming, [("R1", "m1", "2026-07-22") + tuple(lower)]
+    )
+
+    assert snapshot_is_fresh_enough(incoming, target) is False
+
+
+def test_snapshot_is_fresh_enough_same_day_row_matrix(tmp_path):
+    target_rows = [
+        ("R1", "m1", "2026-07-22", 10, 20, 30, 40),
+        ("R2", "m2", "2026-07-22", 50, 60, 70, 80),
+    ]
+    target = tmp_path / "target.db"
+    _monotonic_usage_db(target, target_rows)
+
+    missing = tmp_path / "missing-row.db"
+    _monotonic_usage_db(missing, target_rows[:1])
+    assert snapshot_is_fresh_enough(missing, target) is False
+
+    equal = tmp_path / "equal.db"
+    _monotonic_usage_db(equal, target_rows)
+    assert snapshot_is_fresh_enough(equal, target) is True
+
+    growth = tmp_path / "growth.db"
+    _monotonic_usage_db(
+        growth,
+        [
+            ("R1", "m1", "2026-07-22", 11, 22, 33, 44),
+            ("R2", "m2", "2026-07-22", 55, 66, 77, 88),
+        ],
+    )
+    assert snapshot_is_fresh_enough(growth, target) is True
+
+    new_row = tmp_path / "new-row.db"
+    _monotonic_usage_db(
+        new_row,
+        target_rows
+        + [("R3", "m3", "2026-07-22", 1, 2, 3, 4)],
+    )
+    assert snapshot_is_fresh_enough(new_row, target) is True
+
+    mixed = tmp_path / "mixed.db"
+    _monotonic_usage_db(
+        mixed,
+        [
+            ("R1", "m1", "2026-07-22", 11, 21, 31, 41),
+            ("R2", "m2", "2026-07-22", 49, 60, 70, 80),
+        ],
+    )
+    assert snapshot_is_fresh_enough(mixed, target) is False
+
+
+def test_snapshot_is_fresh_enough_ignores_derived_and_sync_fields(tmp_path):
+    target = tmp_path / "target.db"
+    incoming = tmp_path / "incoming.db"
+    for path, provider, cost, credits, priced, synced_at in (
+        (target, "codex", 10.0, 20.0, 1, "2026-07-22T10:00:00Z"),
+        (incoming, "other", None, None, 0, "2026-07-22T09:00:00Z"),
+    ):
+        conn = connect(path)
+        init_db(conn)
+        conn.execute(
+            "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+            "input_tokens, output_tokens, cache_read_tokens, "
+            "cache_write_tokens, synced_at, cost_usd, cost_credits, "
+            "cost_priced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "R1",
+                "m1",
+                "2026-07-22",
+                provider,
+                10,
+                20,
+                30,
+                40,
+                synced_at,
+                cost,
+                credits,
+                priced,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    assert snapshot_is_fresh_enough(incoming, target) is True
+
+
+def test_snapshot_is_fresh_enough_fails_closed_on_read_errors(tmp_path):
+    valid = tmp_path / "valid.db"
+    _monotonic_usage_db(
+        valid, [("R1", "m1", "2026-07-22", 10, 20, 30, 40)]
+    )
+    invalid = tmp_path / "invalid.db"
+    invalid.write_bytes(b"not sqlite")
+    tableless = tmp_path / "tableless.db"
+    conn = sqlite3.connect(str(tableless))
+    conn.execute("CREATE TABLE other (value INTEGER)")
+    conn.commit()
+    conn.close()
+
+    assert snapshot_is_fresh_enough(invalid, valid) is False
+    assert snapshot_is_fresh_enough(valid, invalid) is False
+    assert snapshot_is_fresh_enough(valid, tableless) is False
 
 
 def test_snapshot_round_trip_and_size_limit(tmp_path):

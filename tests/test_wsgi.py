@@ -621,16 +621,36 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
     # Baseline install: fixture's latest usage day is 2026-01-02.
     assert post(build(), base_ts).status_code == 200
     assert daily_usage_max_date(owner_path) == "2026-01-02"
+    baseline = owner_path.read_bytes()
+
+    # Same latest day but one runtime/model row missing: rejecting it must not
+    # touch the tenant database.
+    degraded = build(
+        "DELETE FROM daily_usage WHERE runtime_id = 'R2' "
+        "AND model = 'm-mystery' AND date = '2026-01-02';"
+    )
+    rejected = post(degraded, base_ts + 10)
+    assert rejected.status_code == 409
+    assert owner_path.read_bytes() == baseline
+
+    lower = build(
+        "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
+        "WHERE runtime_id = 'R4' AND model = 'm-claude' "
+        "AND date = '2026-01-02';"
+    )
+    rejected = post(lower, base_ts + 20)
+    assert rejected.status_code == 409
+    assert owner_path.read_bytes() == baseline
 
     # Stale snapshot (older max date) with a strictly newer timestamp: it clears
     # the replay guard but must be refused by the data-freshness guard.
     stale = build("DELETE FROM daily_usage WHERE date = '2026-01-02';")
-    rejected = post(stale, base_ts + 10)
+    rejected = post(stale, base_ts + 30)
     assert rejected.status_code == 409
     assert rejected.get_json()["detail"] == (
         "snapshot older than current data rejected"
     )
-    assert daily_usage_max_date(owner_path) == "2026-01-02"  # unchanged
+    assert owner_path.read_bytes() == baseline
 
     # A genuinely newer snapshot still installs.
     fresh = build(
@@ -640,7 +660,7 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "('R1', 'm-claude', '2026-01-03', 1, 0, 0, 0, NULL, NULL, 0, "
         "'2026-01-03T00:00:00Z');"
     )
-    assert post(fresh, base_ts + 20).status_code == 200
+    assert post(fresh, base_ts + 40).status_code == 200
     assert daily_usage_max_date(owner_path) == "2026-01-03"
 
 
