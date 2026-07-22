@@ -45,6 +45,13 @@ class SnapshotInfo(NamedTuple):
 
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
+_DAILY_USAGE_COUNTERS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+_UNREADABLE_DAILY_USAGE = object()
 
 
 def _temp_path(parent: Path, suffix: str) -> Path:
@@ -302,6 +309,53 @@ def daily_usage_max_date(path: Path):
     return str(row[0])
 
 
+def _daily_usage_state(path: Path):
+    """Return the latest day and its keyed token counters, or unreadable.
+
+    Cost and sync columns are deliberately excluded: costs are derived from
+    pricing and may be recomputed, while sync timestamps describe collection
+    time rather than cumulative usage. Token counters are the monotonic source
+    of truth. The sentinel keeps a read error distinct from a valid empty
+    ``daily_usage`` table so an existing but damaged target fails closed.
+    """
+    path = Path(path)
+    try:
+        if not path.is_file():
+            return _UNREADABLE_DAILY_USAGE
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            columns = ", ".join(
+                ("runtime_id", "model", "date") + _DAILY_USAGE_COUNTERS
+            )
+            # Validate the canonical columns even when the table has no rows.
+            conn.execute("SELECT %s FROM daily_usage LIMIT 0" % columns)
+            row = conn.execute("SELECT MAX(date) FROM daily_usage").fetchone()
+            if not row or row[0] is None:
+                return None, {}
+            latest = str(row[0])
+            rows = conn.execute(
+                "SELECT %s FROM daily_usage WHERE date = ?" % columns,
+                (latest,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return _UNREADABLE_DAILY_USAGE
+
+    usage = {}
+    for row in rows:
+        key = tuple(row[:3])
+        counters = tuple(row[3:])
+        if (
+            key in usage
+            or any(not isinstance(value, str) for value in key)
+            or any(not isinstance(value, int) or value < 0 for value in counters)
+        ):
+            return _UNREADABLE_DAILY_USAGE
+        usage[key] = counters
+    return latest, usage
+
+
 def snapshot_is_fresh_enough(staged_path: Path, target_path: Path) -> bool:
     """Whether installing ``staged_path`` over ``target_path`` keeps usage moving forward.
 
@@ -313,19 +367,48 @@ def snapshot_is_fresh_enough(staged_path: Path, target_path: Path) -> bool:
     but old-dated snapshots — overwriting a tenant database that a healthier
     publisher has already advanced to a newer day.
 
-    Accepts when the target has no usage yet (first ingest / empty tenant) or
-    when the staged snapshot's latest usage date is greater than or equal to the
-    target's (re-publishing the same day, or a newer day, is always fine).
-    Rejects only when the target already holds usage and the staged snapshot is
-    strictly older, or carries no usage at all.
+    Accepts a valid first ingest, an empty target, a newer latest day, or a
+    same-day snapshot in which every existing ``(runtime_id, model, date)`` row
+    remains present and all four token counters stay equal or grow. New rows are
+    allowed. Rejects older/empty-over-populated data, missing or decreased
+    same-day rows, and every read/type error. This is deliberately fail-closed
+    for an existing target: only a genuinely absent target means first ingest.
     """
-    current = daily_usage_max_date(target_path)
-    if current is None:
-        return True
-    incoming = daily_usage_max_date(staged_path)
-    if incoming is None:
+    incoming_state = _daily_usage_state(staged_path)
+    if incoming_state is _UNREADABLE_DAILY_USAGE:
         return False
-    return incoming >= current
+    incoming_date, incoming_rows = incoming_state
+
+    target_path = Path(target_path)
+    try:
+        if not target_path.exists():
+            return True
+    except OSError:
+        return False
+
+    current_state = _daily_usage_state(target_path)
+    if current_state is _UNREADABLE_DAILY_USAGE:
+        return False
+    current_date, current_rows = current_state
+    if current_date is None:
+        return True
+    if incoming_date is None or incoming_date < current_date:
+        return False
+    if incoming_date > current_date:
+        return True
+
+    for key, current_counters in current_rows.items():
+        incoming_counters = incoming_rows.get(key)
+        if incoming_counters is None:
+            return False
+        if any(
+            incoming_value < current_value
+            for incoming_value, current_value in zip(
+                incoming_counters, current_counters
+            )
+        ):
+            return False
+    return True
 
 
 def stage_compressed_snapshot(
