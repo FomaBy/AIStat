@@ -48,7 +48,11 @@ from .security import (
     validate_public_config,
     verify_snapshot_signature,
 )
-from .snapshot import SnapshotError, stage_compressed_snapshot
+from .snapshot import (
+    SnapshotError,
+    snapshot_is_fresh_enough,
+    stage_compressed_snapshot,
+)
 from .snapshot_recovery import cleanup_staged_file, swap_staged_into_place
 from .tenant import canonical_tenant_id
 
@@ -708,6 +712,15 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 )
             except SnapshotError:
                 return jsonify({"detail": "invalid snapshot"}), 422
+            # Data-freshness guard: never let a stale or degraded snapshot move
+            # this tenant's usage backwards in time (e.g. a lapsed owner poller
+            # overwriting a newer connected-collector snapshot). Independent of
+            # the timestamp replay check above, which only bounds the signature.
+            if not snapshot_is_fresh_enough(staged_path, target_path):
+                cleanup_staged_file(staged_path)
+                return jsonify(
+                    {"detail": "snapshot older than current data rejected"}
+                ), 409
             # Journal the intent before touching the tenant database so a crash
             # between the file swap and the watermark update recovers to a
             # consistent old/old or new/new state, never a mixed one.

@@ -82,6 +82,9 @@ class Config:
         issue_page_limit=_UNSET,
         cli_bin=_UNSET,
         cli_timeout_seconds=_UNSET,
+        multica_token=_UNSET,
+        multica_server_url=_UNSET,
+        multica_workspace_id=_UNSET,
         pricing_path=_UNSET,
         pricing_overrides_path=_UNSET,
         credits_per_usd=_UNSET,
@@ -157,6 +160,30 @@ class Config:
             _env_int("AISTAT_CLI_TIMEOUT_SECONDS", 120)
             if cli_timeout_seconds is _UNSET
             else cli_timeout_seconds
+        )
+        # Durable credential for the owner poller's `multica` CLI calls. When set,
+        # the poller scrubs the ambient MULTICA_* identity and authenticates with
+        # this long-lived PAT instead, so collection no longer depends on an
+        # interactive `multica login` session that silently expires (FAN-1442).
+        # Secret: environment-only, 0600 private env file, never committed.
+        self.multica_token = (
+            (os.environ.get("AISTAT_MULTICA_TOKEN") or None)
+            if multica_token is _UNSET
+            else multica_token
+        )
+        # Host + workspace the durable owner credential authenticates against.
+        # server_url defaults to the CLI's own default when unset; workspace_id
+        # falls back to the ambient MULTICA_WORKSPACE_ID so an existing runtime
+        # env keeps working unchanged.
+        self.multica_server_url = (
+            (os.environ.get("AISTAT_MULTICA_SERVER_URL") or None)
+            if multica_server_url is _UNSET
+            else multica_server_url
+        )
+        self.multica_workspace_id = (
+            (os.environ.get("MULTICA_WORKSPACE_ID") or None)
+            if multica_workspace_id is _UNSET
+            else multica_workspace_id
         )
         # Versioned pricing table (model -> official per-1M-token rates + source).
         self.pricing_path = (
@@ -409,6 +436,30 @@ class Config:
             if backup_retention is _UNSET
             else backup_retention
         )
+
+    def poller_cli_env(self) -> Optional[Dict[str, str]]:
+        """Environment for the owner poller's ``multica`` CLI subprocesses.
+
+        Returns ``None`` to inherit the ambient environment — the historical
+        behaviour, kept for tests and for installs that still rely on an
+        interactive ``multica login`` in ``~/.multica``.
+
+        When ``AISTAT_MULTICA_TOKEN`` is configured, returns a copy of the
+        environment with every ambient ``MULTICA_*`` key scrubbed and only the
+        configured durable credential re-injected. The poller then authenticates
+        with a long-lived PAT instead of an interactive session that expires and
+        silently freezes collection (FAN-1442). ``PATH``/``HOME`` are preserved
+        so the CLI binary resolves and reads its own profile directory.
+        """
+        if not self.multica_token:
+            return None
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MULTICA_")}
+        env["MULTICA_TOKEN"] = self.multica_token
+        if self.multica_server_url:
+            env["MULTICA_SERVER_URL"] = self.multica_server_url
+        if self.multica_workspace_id:
+            env["MULTICA_WORKSPACE_ID"] = self.multica_workspace_id
+        return env
 
     def ensure_db_dir(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

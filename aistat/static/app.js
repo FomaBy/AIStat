@@ -249,24 +249,57 @@ const CONNECTION_STATE_TITLES = {
   revocation_pending: "Отключение Multica выполняется",
   revoked: "Подключение Multica отозвано",
 };
-const SAFE_CONNECTION_ERRORS = new Set([
-  "worker collection failed",
-  "authentication with the connection's token failed",
-  "official CLI login failed for the connection",
-  "could not list the connection's workspaces",
-  "the connection's token has no accessible workspace",
-  "the connection's token has multiple workspaces but none was selected",
-  "the connection's workspace label is ambiguous",
-  "the connection's workspace could not be resolved",
-  "workspace was not selected before polling",
-  "could not read the connection's workspace data",
-  "connection collection failed",
-  "polling the connection's data failed",
-  "publishing the connection's snapshot failed",
-  "connection was revoked",
-  "poll source failed",
-  "issue details synchronization failed",
-]);
+// Every worker-reported status is an internal English allowlist code, never a
+// user-facing message. The cabinet renders a clear, actionable Russian message
+// for each known code and falls back to a generic one for anything else, so an
+// unexpected value can never be echoed verbatim. Workspace-label failures name
+// the label the owner typed — that label is host-side cabinet data
+// (workspace_label), not anything crossing the worker boundary — turning the
+// opaque "подключил, но не работает" into a diagnosable "рабочее пространство
+// «X» не найдено".
+const CONNECTION_ERROR_MESSAGES = {
+  "worker collection failed":
+    "Сбор статистики завершился с ошибкой. Попробуйте позже или переподключите PAT.",
+  "authentication with the connection's token failed":
+    "PAT не прошёл авторизацию в Multica. Проверьте токен и переподключите его.",
+  "official CLI login failed for the connection":
+    "Не удалось войти в Multica с этим PAT. Проверьте токен и переподключите его.",
+  "could not list the connection's workspaces":
+    "Не удалось получить список рабочих пространств для этого PAT. Попробуйте переподключить его.",
+  "the connection's token has no accessible workspace":
+    "У этого PAT нет доступных рабочих пространств. Проверьте права токена в Multica.",
+  "the connection's token has multiple workspaces but none was selected":
+    "У PAT несколько рабочих пространств — укажите нужное в поле «Рабочее пространство» и переподключите PAT.",
+  "workspace was not selected before polling":
+    "Рабочее пространство для подключения не выбрано. Переподключите PAT, указав название рабочего пространства.",
+  "could not read the connection's workspace data":
+    "Не удалось прочитать данные рабочего пространства. Попробуйте позже или переподключите PAT.",
+  "connection collection failed":
+    "Сбор статистики завершился с ошибкой. Попробуйте позже или переподключите PAT.",
+  "polling the connection's data failed":
+    "Не удалось загрузить данные из Multica. Попробуйте позже.",
+  "publishing the connection's snapshot failed":
+    "Не удалось сохранить полученную статистику. Попробуйте позже.",
+  "connection was revoked":
+    "Подключение было отозвано. Подключите новый PAT, если хотите продолжить синхронизацию.",
+  "poll source failed":
+    "Источник данных Multica ответил ошибкой. Попробуйте позже.",
+  "issue details synchronization failed":
+    "Не удалось синхронизировать детали задач. Попробуйте позже.",
+};
+
+// Codes whose message names the workspace label the owner typed.
+const CONNECTION_WORKSPACE_ERRORS = {
+  "the connection's workspace could not be resolved": (ws) =>
+    "Рабочее пространство " + ws + " не найдено у этого PAT. Проверьте точное "
+    + "название рабочего пространства в Multica и переподключите PAT.",
+  "the connection's workspace label is ambiguous": (ws) =>
+    "Название рабочего пространства " + ws + " подходит сразу нескольким. "
+    + "Уточните точное название и переподключите PAT.",
+};
+
+const CONNECTION_ERROR_FALLBACK =
+  "Синхронизация Multica завершилась с ошибкой. Попробуйте подключить PAT ещё раз.";
 
 function connectionSupportedSurface() {
   const cabinet = $("connection-cabinet");
@@ -283,11 +316,13 @@ function clearConnectionToken() {
   input.removeAttribute("value");
 }
 
-function safeConnectionError(value) {
-  const candidate = typeof value === "string" ? value.trim() : "";
-  return SAFE_CONNECTION_ERRORS.has(candidate)
-    ? candidate
-    : "Синхронизация Multica завершилась с ошибкой. Попробуйте подключить PAT ещё раз.";
+function safeConnectionError(value, label) {
+  const code = typeof value === "string" ? value.trim() : "";
+  const workspace = typeof label === "string" ? label.trim() : "";
+  const named = workspace ? "«" + workspace + "»" : "указанное";
+  const withLabel = CONNECTION_WORKSPACE_ERRORS[code];
+  if (withLabel) return withLabel(named);
+  return CONNECTION_ERROR_MESSAGES[code] || CONNECTION_ERROR_FALLBACK;
 }
 
 function connectionRequestError(status) {
@@ -362,7 +397,11 @@ function setConnectionBusy(busy) {
 }
 
 function connectionStatusMessage(status, data) {
-  if (status === "error") return safeConnectionError(data && data.last_sync_error);
+  if (status === "error") {
+    return safeConnectionError(
+      data && data.last_sync_error, data && data.workspace_label
+    );
+  }
   const messages = {
     none: "Подключите Multica, чтобы загрузить вашу статистику.",
     disabled: "Администратор временно отключил ручное подключение.",
@@ -423,7 +462,8 @@ function renderConnection(data) {
   }
   const error = $("connection-error");
   if (error) {
-    error.textContent = status === "error" ? safeConnectionError(normalized.last_sync_error) : "";
+    error.textContent = status === "error"
+      ? safeConnectionError(normalized.last_sync_error, normalized.workspace_label) : "";
     error.hidden = status !== "error";
   }
   const advice = $("connection-advice");

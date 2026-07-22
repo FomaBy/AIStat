@@ -581,6 +581,69 @@ def test_signed_snapshot_install_and_replay_rejection(public_app, tmp_path):
     assert summary["total_tokens"] == 5_700_000
 
 
+def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
+    """FAN-1442: a snapshot whose daily_usage is older than the tenant's current
+    data must be rejected even with a fresh (non-replay) timestamp, so a lapsed
+    owner poller cannot overwrite the newer connected-collector snapshot."""
+    from aistat.snapshot import daily_usage_max_date
+
+    app, config = public_app
+    owner_path = config.tenant_db_path(config.publish_tenant_id)
+
+    def build(mutate_sql=None):
+        src = tmp_path / "ingest_src.db"
+        if src.exists():
+            src.unlink()
+        conn = connect(src)
+        init_db(conn)
+        seed_aggregate_fixture(conn)
+        if mutate_sql:
+            conn.executescript(mutate_sql)
+        conn.commit()
+        conn.close()
+        return create_compressed_snapshot(src)
+
+    def post(payload, ts):
+        return app.test_client().post(
+            "/api/ingest/snapshot",
+            data=payload,
+            content_type="application/vnd.aistat.snapshot+gzip",
+            headers={
+                "X-AIStat-Timestamp": str(ts),
+                "X-AIStat-Tenant": str(config.publish_tenant_id),
+                "X-AIStat-Signature": snapshot_signature(
+                    INGEST_SECRET, config.publish_tenant_id, ts, payload
+                ),
+            },
+        )
+
+    base_ts = int(time.time())
+    # Baseline install: fixture's latest usage day is 2026-01-02.
+    assert post(build(), base_ts).status_code == 200
+    assert daily_usage_max_date(owner_path) == "2026-01-02"
+
+    # Stale snapshot (older max date) with a strictly newer timestamp: it clears
+    # the replay guard but must be refused by the data-freshness guard.
+    stale = build("DELETE FROM daily_usage WHERE date = '2026-01-02';")
+    rejected = post(stale, base_ts + 10)
+    assert rejected.status_code == 409
+    assert rejected.get_json()["detail"] == (
+        "snapshot older than current data rejected"
+    )
+    assert daily_usage_max_date(owner_path) == "2026-01-02"  # unchanged
+
+    # A genuinely newer snapshot still installs.
+    fresh = build(
+        "INSERT INTO daily_usage (runtime_id, model, date, input_tokens, "
+        "output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, "
+        "cost_credits, cost_priced, synced_at) VALUES "
+        "('R1', 'm-claude', '2026-01-03', 1, 0, 0, 0, NULL, NULL, 0, "
+        "'2026-01-03T00:00:00Z');"
+    )
+    assert post(fresh, base_ts + 20).status_code == 200
+    assert daily_usage_max_date(owner_path) == "2026-01-03"
+
+
 def test_model_efficiency_endpoint_behind_auth(public_app):
     app, _ = public_app
     client = app.test_client()
@@ -740,6 +803,10 @@ def test_ingest_rejects_bad_signature_and_invalid_database(public_app):
     valid_source = config.tenants_dir.parent / "valid-after-invalid.db"
     conn = connect(valid_source)
     init_db(conn)
+    # A non-degrading snapshot: seeded so it does not move the tenant's usage
+    # backwards and trip the FAN-1442 data-freshness guard (this test asserts
+    # signature/validity handling, not freshness).
+    seed_aggregate_fixture(conn)
     conn.close()
     valid_payload = create_compressed_snapshot(valid_source)
     accepted = client.post(

@@ -28,7 +28,7 @@ import traceback
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import __version__, aggregates, handoff, oauth, snapshot_recovery
+from . import __version__, aggregates, handoff, oauth, snapshot, snapshot_recovery
 from .db import SCHEMA_VERSION, init_db
 from .tenant import (
     canonical_tenant_id,
@@ -1514,6 +1514,18 @@ def _ingest(environ, start_response):
             except ValueError:
                 return _json_response(
                     environ, start_response, "422 Unprocessable Entity", {"detail": "invalid snapshot"}
+                )
+            # Data-freshness guard: never let a stale or degraded snapshot move
+            # this tenant's usage backwards in time (e.g. a lapsed owner poller
+            # overwriting a newer connected-collector snapshot). Independent of
+            # the timestamp replay check above, which only bounds the signature.
+            if not snapshot.snapshot_is_fresh_enough(staged_path, target_path):
+                snapshot_recovery.cleanup_staged_file(staged_path)
+                return _json_response(
+                    environ,
+                    start_response,
+                    "409 Conflict",
+                    {"detail": "snapshot older than current data rejected"},
                 )
             # Journal the intent before touching the tenant database so a crash
             # between the file swap and the watermark update recovers to a
