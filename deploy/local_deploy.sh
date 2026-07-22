@@ -277,10 +277,12 @@ cmd_release() {
   git -C "$mdir" fetch --quiet origin || die "fetch origin failed"
 
   # 1. Resolve the release candidate to an immutable SHA.
-  local candidate sha
+  local candidate sha tree
   if [ "$promote" = 1 ]; then candidate="$from"; else candidate="origin/main"; fi
   sha="$(git -C "$mdir" rev-parse --verify "${candidate}^{commit}" 2>/dev/null)" \
     || die "cannot resolve release candidate '$candidate'"
+  tree="$(git -C "$mdir" rev-parse "${sha}^{tree}" 2>/dev/null)" \
+    || die "cannot resolve release candidate tree '$candidate'"
   if [ "$promote" = 1 ] && [ "$force" != 1 ] \
      && git -C "$mdir" rev-parse --verify --quiet origin/main >/dev/null; then
     git -C "$mdir" merge-base --is-ancestor origin/main "$sha" \
@@ -298,10 +300,16 @@ cmd_release() {
   log "staging + validating candidate $(git -C "$mdir" rev-parse --short "$sha")"
   git -C "$mdir" archive "$sha" | tar -x -C "$stage" \
     || die "could not export candidate — nothing published, main untouched"
-  ( cd "$stage" && AISTAT_SKIP_ZIP=1 bash scripts/build_cpanel_package.sh >/dev/null ) \
+  ( cd "$stage" && \
+    AISTAT_SOURCE_REPOSITORY="$mdir" AISTAT_SKIP_ZIP=1 \
+      bash scripts/build_cpanel_package.sh "$sha" "$tree" >/dev/null ) \
     || die "package build failed for candidate — origin/main and main deployment left untouched"
-  python3 -m compileall -q -f "$stage/dist/aistat-cpanel/aistat" \
+  python3 -m compileall -q -f "$stage/dist/aistat-cpanel" \
     || die "candidate failed py_compile — origin/main and main deployment left untouched"
+  python3 -m py_compile \
+    "$stage/dist/aistat-cpanel/aistat.cgi" \
+    "$stage/dist/aistat-cpanel/passenger_wsgi.py" \
+    || die "candidate entry point failed py_compile — origin/main and main deployment left untouched"
   rm -rf "$stage"; trap - EXIT
   log "candidate validated"
 

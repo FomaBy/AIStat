@@ -1,10 +1,9 @@
-"""Focused regression for the cPanel deploy log's `previous:` field (FAN-1208).
+"""Focused regression for the legacy deploy-log previous-label helper.
 
-`deploy/cpanel_deploy.sh` prints a `PUBLISHED ... (previous: ...)` line on every
-run. The `previous` value must be unambiguous and reproducible: exactly `none`
-when there is no prior release, or exactly one release name otherwise — never a
-basename glued to a full path (the old `${PREV:+...}${PREV:-none}` expansion
-concatenated both when PREV was set).
+FAN-1208 made the human label unambiguous: exactly `none` with no prior release,
+or one basename otherwise. FAN-1499 now proves the full exact previous/new paths
+through the executable deploy harness, while retaining this pure helper for
+backwards-compatible focused coverage.
 
 The script exposes a pure `prev_label` helper; sourcing it with
 AISTAT_DEPLOY_LIB_ONLY=1 loads the helpers without running a real deploy.
