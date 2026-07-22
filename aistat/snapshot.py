@@ -277,6 +277,57 @@ def validate_snapshot(path: Path) -> SnapshotInfo:
     )
 
 
+def daily_usage_max_date(path: Path):
+    """Return the latest ``daily_usage.date`` in a SQLite file, or ``None``.
+
+    Read-only and deliberately defensive: a missing file, a missing or empty
+    ``daily_usage`` table, or any read error all yield ``None`` so a caller
+    reads that as "this database carries no usage data". Standard-library only
+    and Python 3.6 compatible so the Flask app and the legacy cPanel WSGI entry
+    point share one identical check (the ingest freshness guard below).
+    """
+    path = Path(path)
+    try:
+        if not path.is_file():
+            return None
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT MAX(date) FROM daily_usage").fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if not row or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def snapshot_is_fresh_enough(staged_path: Path, target_path: Path) -> bool:
+    """Whether installing ``staged_path`` over ``target_path`` keeps usage moving forward.
+
+    The host already rejects timestamp *replays* (a snapshot whose signed
+    timestamp is not newer than the last accepted one). This adds an orthogonal
+    guard on the *data*: a snapshot must never move a tenant's daily usage
+    backwards in time. It protects against a stale or degraded publisher — e.g.
+    an owner poller whose CLI session lapsed and now emits freshly-timestamped
+    but old-dated snapshots — overwriting a tenant database that a healthier
+    publisher has already advanced to a newer day.
+
+    Accepts when the target has no usage yet (first ingest / empty tenant) or
+    when the staged snapshot's latest usage date is greater than or equal to the
+    target's (re-publishing the same day, or a newer day, is always fine).
+    Rejects only when the target already holds usage and the staged snapshot is
+    strictly older, or carries no usage at all.
+    """
+    current = daily_usage_max_date(target_path)
+    if current is None:
+        return True
+    incoming = daily_usage_max_date(staged_path)
+    if incoming is None:
+        return False
+    return incoming >= current
+
+
 def stage_compressed_snapshot(
     payload: bytes, target_path: Path, max_bytes: int
 ) -> Tuple[Path, SnapshotInfo]:

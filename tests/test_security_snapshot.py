@@ -22,7 +22,9 @@ from aistat.snapshot import (
     SnapshotError,
     cleanup_orphan_snapshot_sidecars,
     create_compressed_snapshot,
+    daily_usage_max_date,
     install_compressed_snapshot,
+    snapshot_is_fresh_enough,
 )
 import aistat.snapshot as snapshot_module
 from conftest import seed_aggregate_fixture
@@ -97,6 +99,63 @@ def test_security_store_persists_throttle_and_replay_state(tmp_path):
     assert store.ingest_timestamp_is_fresh(bob, 999) is True
     assert store.record_tenant_snapshot(bob, 999, "b" * 64) is True
     assert store.record_tenant_snapshot(alice, 1001, "c" * 64) is True
+
+
+def _usage_db(path, dates):
+    """A minimal SQLite file with a ``daily_usage`` table holding ``dates``."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE daily_usage (date TEXT)")
+        conn.executemany(
+            "INSERT INTO daily_usage (date) VALUES (?)", [(d,) for d in dates]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_daily_usage_max_date_reads_latest(tmp_path):
+    path = tmp_path / "usage.db"
+    _usage_db(path, ["2026-07-12", "2026-07-19", "2026-07-15"])
+    assert daily_usage_max_date(path) == "2026-07-19"
+
+
+def test_daily_usage_max_date_is_none_for_missing_empty_or_tableless(tmp_path):
+    assert daily_usage_max_date(tmp_path / "absent.db") is None
+    empty = tmp_path / "empty.db"
+    _usage_db(empty, [])
+    assert daily_usage_max_date(empty) is None
+    tableless = tmp_path / "tableless.db"
+    conn = sqlite3.connect(str(tableless))
+    conn.execute("CREATE TABLE other (x)")
+    conn.commit()
+    conn.close()
+    assert daily_usage_max_date(tableless) is None
+
+
+def test_snapshot_is_fresh_enough_blocks_backwards_usage(tmp_path):
+    # FAN-1442: a stale/degraded snapshot must never move a tenant's usage back.
+    fresh = tmp_path / "fresh.db"
+    _usage_db(fresh, ["2026-07-22"])
+    stale = tmp_path / "stale.db"
+    _usage_db(stale, ["2026-07-19"])
+    same = tmp_path / "same.db"
+    _usage_db(same, ["2026-07-22"])
+    empty = tmp_path / "degraded.db"
+    _usage_db(empty, [])
+    missing = tmp_path / "missing.db"
+
+    # Strictly older data over newer -> rejected.
+    assert snapshot_is_fresh_enough(stale, fresh) is False
+    # An empty/degraded snapshot over real data -> rejected (no data loss).
+    assert snapshot_is_fresh_enough(empty, fresh) is False
+    # Same latest day -> accepted (re-publish / newer within-day is fine).
+    assert snapshot_is_fresh_enough(same, fresh) is True
+    # Newer data over older -> accepted.
+    assert snapshot_is_fresh_enough(fresh, stale) is True
+    # First ingest / empty target -> always accepted, even an empty snapshot.
+    assert snapshot_is_fresh_enough(stale, missing) is True
+    assert snapshot_is_fresh_enough(empty, missing) is True
 
 
 def test_snapshot_round_trip_and_size_limit(tmp_path):
