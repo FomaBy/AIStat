@@ -53,6 +53,68 @@ def table_counts(conn):
     return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
 
 
+def test_poller_cli_env_scrubs_ambient_and_injects_durable_credential(monkeypatch):
+    # FAN-1442: the owner poller must authenticate with a durable PAT, not the
+    # interactive ~/.multica session that expired. When a token is configured,
+    # the CLI env carries only the injected credential — no ambient MULTICA_*.
+    monkeypatch.setenv("MULTICA_TOKEN", "ambient-session-should-be-scrubbed")
+    monkeypatch.setenv("MULTICA_WORKSPACE_ID", "ambient-ws")
+    cfg = Config(
+        multica_token="mat_durable",
+        multica_server_url="https://api.multica.ai",
+        multica_workspace_id="ws-1",
+    )
+    env = cfg.poller_cli_env()
+    assert env["MULTICA_TOKEN"] == "mat_durable"
+    assert env["MULTICA_SERVER_URL"] == "https://api.multica.ai"
+    assert env["MULTICA_WORKSPACE_ID"] == "ws-1"
+    injected = {"MULTICA_TOKEN", "MULTICA_SERVER_URL", "MULTICA_WORKSPACE_ID"}
+    assert not [
+        k for k in env if k.startswith("MULTICA_") and k not in injected
+    ]
+    assert "PATH" in env  # binary still resolves
+    # No token configured -> inherit the ambient environment (unchanged behaviour).
+    assert Config(multica_token=None).poller_cli_env() is None
+
+
+def test_poller_runner_binds_durable_cli_env(monkeypatch):
+    seen = {}
+
+    def fake_run_cli(args, *, binary, timeout, env=None, prepend=()):
+        seen["env"] = env
+        return []
+
+    monkeypatch.setattr("aistat.poller.run_cli", fake_run_cli)
+    poller = Poller(Config(multica_token="mat_durable"), conn=None)
+    poller.runner(["runtime", "list"])
+    assert seen["env"]["MULTICA_TOKEN"] == "mat_durable"
+
+
+def test_runtime_list_failure_still_polls_known_runtime_usage(conn):
+    # FAN-1442 root mechanism: without a fallback, a single failed `runtime list`
+    # skips every per-runtime usage source for the whole cycle, silently freezing
+    # daily_usage. Usage must still be polled for the runtimes already known.
+    Poller(Config(), conn, runner=make_runner()).run_cycle()
+    known = {row[0] for row in conn.execute("SELECT id FROM runtimes")}
+    assert known
+
+    calls = []
+    base = make_runner(fail_sources=("runtime list",))
+
+    def tracking(args):
+        calls.append(list(args))
+        return base(args)
+
+    Poller(Config(), conn, runner=tracking).run_cycle()
+    usage_targets = {c[2] for c in calls if c[:2] == ["runtime", "usage"]}
+    assert usage_targets == known  # every known runtime still polled for usage
+    # …and the list source itself is honestly recorded as failed.
+    ok = conn.execute(
+        "SELECT ok FROM sync_state WHERE source = 'runtimes'"
+    ).fetchone()[0]
+    assert ok == 0
+
+
 def test_cycle_ingests_fixture_data(conn):
     poller = Poller(Config(), conn, runner=make_runner())
     result = poller.run_cycle()

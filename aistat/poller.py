@@ -102,7 +102,8 @@ class Poller:
         self.conn = conn
         self.clock = clock  # injectable for deadline tests
         self.runner: Runner = runner or functools.partial(
-            run_cli, binary=config.cli_bin, timeout=config.cli_timeout_seconds
+            run_cli, binary=config.cli_bin, timeout=config.cli_timeout_seconds,
+            env=config.poller_cli_env(),
         )
 
     # -- helpers ------------------------------------------------------------
@@ -147,6 +148,21 @@ class Poller:
         rows = [normalize.normalize_project(item) for item in data]
         store.upsert_projects(self.conn, rows)
         return rows
+
+    def known_runtime_ids(self) -> List[str]:
+        """Runtime ids already stored locally.
+
+        Used as a fallback when the live ``runtime list`` source fails: without
+        it, a single transient list/auth error skips every per-runtime usage
+        source for the whole cycle, silently freezing ``daily_usage`` (the
+        FAN-1442 incident). Polling the runtimes we already know keeps usage
+        flowing on a list blip, and surfaces the real per-runtime failure in
+        health when auth is genuinely down instead of hiding it.
+        """
+        return [
+            row[0]
+            for row in self.conn.execute("SELECT id FROM runtimes ORDER BY id")
+        ]
 
     def sync_runtime_usage(self, runtime_id: str) -> int:
         data = self.runner(
@@ -302,8 +318,14 @@ class Poller:
         _, agents = self._source(result, "agents", self.sync_agents)
         _, projects = self._source(result, "projects", self.sync_projects)
 
-        for runtime in runtimes or []:
-            rid = runtime["id"]
+        # When the live runtime list succeeds, poll usage for exactly that set.
+        # When it fails, fall back to the runtimes already known locally so a
+        # transient list/auth error cannot silently freeze usage for the cycle.
+        if runtimes:
+            runtime_ids = [runtime["id"] for runtime in runtimes]
+        else:
+            runtime_ids = self.known_runtime_ids()
+        for rid in runtime_ids:
             self._source(result, f"runtime_usage:{rid}",
                          functools.partial(self.sync_runtime_usage, rid))
             self._source(result, f"runtime_activity:{rid}",

@@ -12,6 +12,7 @@ import os
 import re
 import runpy
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -23,8 +24,8 @@ from werkzeug.security import generate_password_hash
 from aistat.db import SCHEMA_VERSION, connect, init_db
 from aistat.config import Config
 from aistat.migrate import migrate_owner_database
-from aistat.security import SecurityStore
-from aistat.snapshot import create_compressed_snapshot
+from aistat.security import SecurityStore, snapshot_signature
+from aistat.snapshot import create_compressed_snapshot, daily_usage_max_date
 from conftest import (
     assert_opaque_session_cookie,
     seed_aggregate_fixture,
@@ -204,12 +205,74 @@ def test_source_parses_as_python_36():
         "aistat/legacy_wsgi.py",
         "aistat/migrate.py",
         "aistat/oauth.py",
+        "aistat/snapshot.py",
         "aistat/snapshot_recovery.py",
         "aistat/tenant.py",
         "aistat.cgi",
     ):
         source = open(path, encoding="utf-8").read()
         ast.parse(source, filename=path, feature_version=(3, 6))
+
+
+def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
+    """FAN-1442 on the production (legacy 3.6 CGI) contour: a stale snapshot
+    with a fresh timestamp must be refused by the data-freshness guard, leaving
+    the tenant database untouched; a newer snapshot still installs."""
+    module = legacy
+    owner_id = migrate_owner_database(Config())["owner_user_id"]
+    owner_path = Config().tenant_db_path(owner_id)
+
+    def build(mutate_sql=None):
+        src = tmp_path / "legacy_ingest_src.db"
+        if src.exists():
+            src.unlink()
+        conn = connect(src)
+        init_db(conn)
+        seed_aggregate_fixture(conn)
+        if mutate_sql:
+            conn.executescript(mutate_sql)
+        conn.commit()
+        conn.close()
+        return create_compressed_snapshot(src)
+
+    def post(payload, ts):
+        return request(
+            module.application,
+            "/api/ingest/snapshot",
+            method="POST",
+            body=payload,
+            headers={
+                "Content-Type": "application/vnd.aistat.snapshot+gzip",
+                "X-AIStat-Timestamp": str(ts),
+                "X-AIStat-Tenant": str(owner_id),
+                "X-AIStat-Signature": snapshot_signature(
+                    INGEST_SECRET, owner_id, ts, payload
+                ),
+            },
+        )
+
+    base_ts = int(time.time())
+    # Baseline: owner tenant already holds the fixture (latest day 2026-01-02);
+    # re-installing the same latest day is accepted.
+    assert post(build(), base_ts)[0] == "200 OK"
+    assert daily_usage_max_date(owner_path) == "2026-01-02"
+
+    # Stale snapshot (older max date) with a strictly newer timestamp: rejected.
+    stale = build("DELETE FROM daily_usage WHERE date = '2026-01-02';")
+    status, _, _ = post(stale, base_ts + 10)
+    assert status == "409 Conflict"
+    assert daily_usage_max_date(owner_path) == "2026-01-02"  # unchanged
+
+    # A genuinely newer snapshot still installs.
+    fresh = build(
+        "INSERT INTO daily_usage (runtime_id, model, date, input_tokens, "
+        "output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, "
+        "cost_credits, cost_priced, synced_at) VALUES "
+        "('R1', 'm-claude', '2026-01-03', 1, 0, 0, 0, NULL, NULL, 0, "
+        "'2026-01-03T00:00:00Z');"
+    )
+    assert post(fresh, base_ts + 20)[0] == "200 OK"
+    assert daily_usage_max_date(owner_path) == "2026-01-03"
 
 
 class _FakeResponse:
@@ -906,6 +969,10 @@ def test_snapshot_age_and_size_limits_are_enforced_per_request(
     source = tmp_path / "limits.db"
     conn = connect(source)
     init_db(conn)
+    # A non-degrading snapshot: seeded so it does not move the tenant's usage
+    # backwards and trip the FAN-1442 data-freshness guard (this test asserts
+    # age/validity/size enforcement, not freshness).
+    seed_aggregate_fixture(conn)
     conn.close()
     payload = create_compressed_snapshot(source)
     stale_at = int(legacy.time.time()) - legacy.INGEST_MAX_AGE - 1

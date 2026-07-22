@@ -5,6 +5,17 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Load a private, gitignored .env if present so the poller can authenticate with
+# a durable Multica PAT (AISTAT_MULTICA_TOKEN + MULTICA_WORKSPACE_ID) instead of
+# an interactive `multica login` session in ~/.multica that silently expires and
+# freezes collection (FAN-1442). The file is never committed; see .env.example.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
 PORT="${AISTAT_PORT:-8787}"
 VENV=".venv"
 
