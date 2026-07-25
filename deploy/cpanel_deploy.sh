@@ -20,6 +20,7 @@ VALIDATION_ROOT=""
 NEXT_LINK=""
 STAGED_RELEASE=""
 PREVIOUS_TARGET=""
+LIVE_TARGET_BROKEN=0
 RELEASE_TARGET=""
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
@@ -69,8 +70,16 @@ print(digest.hexdigest())
 PY
 }
 
+# verify_manifest <root> <commit> <tree> [strict|runtime]
+#
+# `strict` (default) demands an exact payload set and is used for the freshly
+# built package and for the staged release before publication. `runtime` is used
+# for a release that has already served traffic: sha256 integrity of every
+# manifest file is still enforced, and the only tolerated extra paths are
+# interpreter-written `__pycache__/*.pyc` files. Anything else — `data/`
+# included — still fails closed and is named in the error.
 verify_manifest() {
-  python3 - "$1" "$2" "$3" "$MANIFEST_NAME" <<'PY'
+  python3 - "$1" "$2" "$3" "$MANIFEST_NAME" "${4:-strict}" <<'PY'
 from __future__ import print_function
 
 import hashlib
@@ -80,7 +89,9 @@ import posixpath
 import stat
 import sys
 
-root, expected_commit, expected_tree, manifest_name = sys.argv[1:]
+root, expected_commit, expected_tree, manifest_name, mode = sys.argv[1:]
+if mode not in ("strict", "runtime"):
+    raise SystemExit("unknown manifest verification mode: " + mode)
 manifest_path = os.path.join(root, manifest_name)
 if os.path.islink(manifest_path) or not os.path.isfile(manifest_path):
     raise SystemExit("missing regular package manifest")
@@ -132,6 +143,14 @@ for entry in entries:
         raise SystemExit("manifest digest mismatch: " + relative)
     expected_paths.add(relative)
 
+
+def is_runtime_bytecode(relative):
+    # Exactly `<dir>/__pycache__/<name>.pyc`, at any depth. Nothing else.
+    parts = relative.split("/")
+    return (len(parts) >= 2 and parts[-2] == "__pycache__"
+            and parts[-1].endswith(".pyc"))
+
+
 actual_paths = set()
 for current, dirs, files in os.walk(root):
     for name in dirs + files:
@@ -142,11 +161,35 @@ for current, dirs, files in os.walk(root):
         relative = os.path.relpath(os.path.join(current, name), root).replace(
             os.sep, "/"
         )
-        if relative != manifest_name:
-            actual_paths.add(relative)
-if actual_paths != expected_paths:
-    raise SystemExit("manifest payload set does not match package")
+        if relative == manifest_name:
+            continue
+        if (mode == "runtime" and relative not in expected_paths
+                and is_runtime_bytecode(relative)):
+            continue
+        actual_paths.add(relative)
+unexpected = sorted(actual_paths - expected_paths)
+missing = sorted(expected_paths - actual_paths)
+if unexpected or missing:
+    details = []
+    if unexpected:
+        details.append("unexpected paths: " + ", ".join(unexpected))
+    if missing:
+        details.append("missing paths: " + ", ".join(missing))
+    raise SystemExit(
+        "manifest payload set does not match package (" + "; ".join(details) + ")"
+    )
 PY
+}
+
+# True when $APP_LINK is a symlink whose exact text is $1. Deliberately reads the
+# live link instead of trusting shell bookkeeping, so it stays correct even when
+# a signal interrupts the publish sequence between the rename and its follow-up.
+is_current_live_target() {
+  local candidate="$1" current
+  [ -n "$candidate" ] || return 1
+  [ -L "$APP_LINK" ] || return 1
+  current="$(readlink "$APP_LINK")" || return 1
+  [ "$current" = "$candidate" ]
 }
 
 # Sourcing with AISTAT_DEPLOY_LIB_ONLY loads pure helpers for focused tests.
@@ -159,12 +202,23 @@ fi
 cleanup() {
   [ -z "$VALIDATION_ROOT" ] || rm -rf "$VALIDATION_ROOT"
   [ -z "$NEXT_LINK" ] || rm -f "$NEXT_LINK"
-  [ -z "$STAGED_RELEASE" ] || rm -rf "$STAGED_RELEASE"
+  # Never remove whatever $APP_LINK actually points at. A signal or a failing
+  # helper around the commit point can reach this trap while the bookkeeping
+  # still calls the published release "staged"; deleting it would leave a
+  # dangling live symlink and a dead site.
+  if [ -n "$STAGED_RELEASE" ] && ! is_current_live_target "$STAGED_RELEASE"; then
+    rm -rf "$STAGED_RELEASE"
+  fi
 }
+
+install_signal_traps() {
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+install_signal_traps
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "$1 not found on host"
@@ -221,27 +275,45 @@ validate_configured_paths() {
     || die "AISTAT_APP_ROOT and AISTAT_DEPLOY_LOCK_FILE must be different paths"
 }
 
-validate_release_target() {
+# Everything about a release path that must hold regardless of whether the
+# directory is still there: absolute, non-traversing, not itself a symlink and a
+# direct child of the managed releases directory.
+validate_release_target_shape() {
   local target="$1" target_normalized releases_real parent_real
   [ "${target#/}" != "$target" ] || die "release target must be an absolute path: $target"
   target_normalized="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$target")"
   [ "$target" = "$target_normalized" ] \
     || die "release target must not contain traversal or redundant components: $target"
   [ ! -L "$target" ] || die "release target must not be a symlink: $target"
-  [ -d "$target" ] || die "release target does not exist: $target"
-  releases_real="$(cd "$RELEASES_DIR" && pwd -P)"
-  parent_real="$(cd "$(dirname "$target")" && pwd -P)"
+  releases_real="$(cd "$RELEASES_DIR" && pwd -P)" \
+    || die "release directory does not exist: $RELEASES_DIR"
+  parent_real="$(cd "$(dirname "$target")" && pwd -P)" \
+    || die "release target parent does not exist: $(dirname "$target")"
   [ "$parent_real" = "$releases_real" ] \
     || die "release target must be a direct child of $releases_real: $target"
+}
+
+validate_release_target() {
+  validate_release_target_shape "$1"
+  [ -d "$1" ] || die "release target does not exist: $1"
 }
 
 capture_live_target() {
   local require_existing="${1:-0}"
   PREVIOUS_TARGET=""
+  LIVE_TARGET_BROKEN=0
   if [ -L "$APP_LINK" ]; then
     PREVIOUS_TARGET="$(readlink "$APP_LINK")" \
       || die "could not read current live symlink: $APP_LINK"
-    validate_release_target "$PREVIOUS_TARGET"
+    # A live symlink left dangling by an interrupted publish is the state this
+    # tool has to recover from, not a reason to refuse: the shape of the target
+    # is still enforced, only its existence is tolerated. Refusal stays reserved
+    # for a target the caller actually passed in.
+    validate_release_target_shape "$PREVIOUS_TARGET"
+    if [ ! -d "$PREVIOUS_TARGET" ]; then
+      LIVE_TARGET_BROKEN=1
+      log "WARNING: live symlink points at a missing release: $APP_LINK -> $PREVIOUS_TARGET"
+    fi
   elif [ -e "$APP_LINK" ]; then
     die "$APP_LINK is not a symlink; use the documented first-migration maintenance procedure"
   elif [ "$require_existing" = "1" ]; then
@@ -258,12 +330,14 @@ assert_live_unchanged() {
       || die "live symlink changed during validation; refusing publish"
     [ "$(readlink "$APP_LINK")" = "$PREVIOUS_TARGET" ] \
       || die "live target drifted during validation; refusing publish"
-    validate_release_target "$PREVIOUS_TARGET"
+    validate_release_target_shape "$PREVIOUS_TARGET"
+    [ "$LIVE_TARGET_BROKEN" = "1" ] || [ -d "$PREVIOUS_TARGET" ] \
+      || die "live target disappeared during validation; refusing publish"
   fi
 }
 
 atomic_switch() {
-  local target="$1" app_parent app_name
+  local target="$1" app_parent app_name switch_status=0
   app_parent="$(dirname "$APP_LINK")"
   app_name="$(basename "$APP_LINK")"
   [ -d "$app_parent" ] || die "application parent does not exist: $app_parent"
@@ -271,8 +345,13 @@ atomic_switch() {
   [ ! -e "$NEXT_LINK" ] && [ ! -L "$NEXT_LINK" ] \
     || die "temporary publish link already exists: $NEXT_LINK"
   ln -s "$target" "$NEXT_LINK" || die "could not create temporary publish link"
-  python3 - "$NEXT_LINK" "$APP_LINK" <<'PY' \
-    || die "atomic live-link rename failed"
+
+  # Critical section around the commit point. Ignoring these signals here also
+  # makes the helper ignore them, so a TERM/HUP/INT aimed at the process group
+  # or at this shell alone can neither tear the rename in half nor divert this
+  # shell into the EXIT trap before the bookkeeping below has run.
+  trap '' HUP INT TERM
+  python3 - "$NEXT_LINK" "$APP_LINK" <<'PY' || switch_status=$?
 from __future__ import print_function
 
 import os
@@ -280,12 +359,18 @@ import sys
 
 os.replace(sys.argv[1], sys.argv[2])
 PY
-  NEXT_LINK=""
-  # The commit point has happened. Never let EXIT cleanup remove the now-live
-  # release even if the read-back check or later retention/logging fails.
-  STAGED_RELEASE=""
-  [ -L "$APP_LINK" ] && [ "$(readlink "$APP_LINK")" = "$target" ] \
-    || die "published link does not match exact target: $target"
+  if is_current_live_target "$target"; then
+    # The commit point has happened. Never let EXIT cleanup remove the now-live
+    # release even if the helper, retention or logging fails afterwards.
+    NEXT_LINK=""
+    STAGED_RELEASE=""
+  fi
+  install_signal_traps
+
+  is_current_live_target "$target" \
+    || die "atomic live-link rename failed; live target left unchanged"
+  [ "$switch_status" -eq 0 ] || log \
+    "WARNING: publish helper exited with status $switch_status after $APP_LINK was already committed to $target"
 }
 
 candidate_gate() {
@@ -424,7 +509,7 @@ cmd_deploy() {
     live_identity="$(manifest_identity "$PREVIOUS_TARGET")" \
       || die "could not read current live release identity"
     read -r live_sha live_tree <<<"$live_identity"
-    verify_manifest "$PREVIOUS_TARGET" "$live_sha" "$live_tree" \
+    verify_manifest "$PREVIOUS_TARGET" "$live_sha" "$live_tree" runtime \
       || die "current live release manifest is invalid"
     if [ "$live_sha" = "$expected_sha" ] && [ "$live_tree" = "$expected_tree" ]; then
       manifest_hash="$(manifest_sha256 "$PREVIOUS_TARGET")"
@@ -480,7 +565,7 @@ cmd_rollback() {
   if ! is_full_sha "$target_sha" || ! is_full_sha "$target_tree"; then
     die "rollback target manifest has invalid commit/tree identity"
   fi
-  verify_manifest "$target" "$target_sha" "$target_tree" \
+  verify_manifest "$target" "$target_sha" "$target_tree" runtime \
     || die "rollback target package manifest verification failed"
   if [ "$target" = "$PREVIOUS_TARGET" ]; then
     log "ALREADY LIVE rollback target=$target commit=$target_sha tree=$target_tree"

@@ -371,17 +371,17 @@ LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/r
 3. Сбрасывает checkout на точный commit и строит пакет только через
    `git archive <expected-sha>`; tracked-правки, untracked и ignored файлы хоста
    в release не попадают.
-4. Проверяет весь manifest, принудительно компилирует весь пакет, отдельно
-   `aistat.cgi` и `passenger_wsgi.py`, затем импортирует Passenger-контур с
-   временными `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH` и
+4. Проверяет манифест в режиме `strict`, принудительно компилирует весь пакет,
+   отдельно `aistat.cgi` и `passenger_wsgi.py`, затем импортирует
+   Passenger-контур с временными `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH` и
    `AISTAT_TENANTS_DIR`. Production DB/tenant paths в smoke не используются.
 5. Создаёт уникальный release и повторяет fetch + full SHA/tree gate
    непосредственно перед publish. Drift оставляет live link прежним и удаляет
    unpublished stage.
 6. Создаёт новый symlink рядом с `~/aistat_app`, затем делает один атомарный
-   `os.replace` на том же host filesystem. Перед commit-point прежний exact
-   target повторно проверяется существующим прямым дочерним каталогом
-   `~/aistat_releases`.
+   `os.replace` на том же host filesystem. Перед commit-point прежняя live-цель
+   повторно сверяется: тот же exact target, валидной формы, прямым дочерним
+   каталогом `~/aistat_releases` и не исчезнувший во время проверки.
 7. Хранит live и exact previous target. `AISTAT_KEEP_RELEASES` принимает только
    `0` (не удалять релизы) или каноническое целое `>=2`; default — `5`.
 
@@ -389,6 +389,39 @@ LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/r
 После switch cleanup retention является best-effort и никогда не удаляет live
 или exact previous release. CGI перечитывает код на каждом запросе; для
 Passenger после публикации нужен Restart в `Setup Python App`.
+
+Publish и rollback неделимы относительно `TERM`, `HUP` и `INT`: вокруг
+commit-point эти сигналы игнорируются, поэтому сигнал не разрывает rename
+пополам и не удаляет только что опубликованный release, а cleanup никогда не
+удаляет каталог, на который фактически указывает `~/aistat_app`. Deploy и
+rollback всегда оставляют валидную live-цель — прежнюю или новую.
+
+Проверка манифеста имеет два режима. `strict` — для свежесобранного package и
+для staged release до публикации: состав файлов должен совпадать с манифестом
+точно, без исключений. `runtime` — для release, который уже обслуживал трафик:
+текущая live-цель при следующем deploy и target при rollback; здесь допускаются
+ровно каталоги `__pycache__/` и файлы `*.pyc` внутри них, и больше ничего.
+
+Причина исключения: `aistat.cgi` работает как отдельный CGI-процесс на запрос
+под `#!/usr/bin/python3` (на хосте это CPython 3.6.8), поэтому интерпретатор
+пишет `__pycache__/*.cpython-36.pyc` рядом с исходниками — то есть через
+live-symlink внутрь опубликованного release. Это нормальная работа, а не
+повреждение пакета.
+
+Целостность при этом не ослаблена: sha256, размер и режим каждого файла из
+манифеста проверяются всегда и в обоих режимах. Любой другой лишний или
+пропавший путь по-прежнему fail-closed останавливает deploy/rollback, а ошибка
+перечисляет конкретные пути:
+`manifest payload set does not match package (unexpected paths: ...)`.
+
+Отдельно: каталог `data/` внутри release — это **ошибка, а не allowlist**. Он
+появляется, когда приватный env-файл `~/aistat-private/aistat.env` не задаёт
+`AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH` и `AISTAT_TENANTS_DIR`: тогда
+`aistat/legacy_wsgi.py` резолвит их по умолчанию в `<app_root>/data`, то есть
+внутрь release, и следующий deploy остановится. Лечение — задать все три
+переменные вне release в `~/aistat-private/aistat.env` (см. `.env.example` и
+раздел 4), перенести накопленные там базы в `~/aistat-private`, затем убрать
+созданный внутри release каталог `data/`.
 
 ### Как убедиться, что деплой прошёл
 
@@ -442,6 +475,32 @@ Rollback принимает только существующий **absolute** d
 target и использует тот же атомарный switch. Git fetch/build и retention при
 rollback не выполняются. Для аварийного возврата `MANUAL_BACKUP` используется
 отдельное maintenance-окно, описанное выше.
+
+### Восстановление «висящего» live-symlink
+
+Состояние: `~/aistat_app` существует как symlink, но каталог, на который он
+указывает, отсутствует (например, release удалили вручную) — сайт не работает.
+
+Сломанная **текущая** live-цель инструмент не блокирует. Проверяется только
+форма пути: absolute, без traversal, не symlink, прямой ребёнок
+`~/aistat_releases`. Отсутствие самого каталога допускается и логируется
+строкой `WARNING: live symlink points at a missing release: ...`. Отказ
+остаётся только для невалидного аргумента, переданного оператором, — например
+`rollback` на несуществующий target.
+
+Штатное восстановление — обычный rollback на существующий release:
+
+```bash
+readlink "$HOME/aistat_app"              # видно, что цель отсутствует
+ls -1t "$HOME/aistat_releases"           # выбрать существующий release
+TARGET="$HOME/aistat_releases/<полное-имя-релиза>"
+/bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" rollback "$TARGET"
+```
+
+Обычный `deploy` следующего кандидата из этого состояния тоже проходит и
+восстанавливает работу. Удалять сам symlink `~/aistat_app` вручную не нужно и
+не помогает: без него `rollback` откажет (`rollback requires an existing live
+symlink`), а deploy всё равно создаёт link заново.
 
 ## Защита данных
 
