@@ -301,9 +301,36 @@ legacy-задание `com.aistat.sync` (его ставил retired-скрип�
 
 Прод принимает только заранее одобренную пару **full commit SHA + root tree
 SHA** из `main`. Скрипт никогда не подставляет текущий mutable `origin/main`
-вместо ожидаемого кандидата: если ветка сдвинулась, публикация fail-closed
-останавливается. Cron ежедневно проверяет и при необходимости публикует именно
-запиненную пару; уже работающий exact-кандидат даёт безопасный `ALREADY LIVE`.
+вместо ожидаемого кандидата: собирается и публикуется ровно запиненный commit.
+«Одобренность» — это принадлежность истории `main`, а не совпадение с её
+вершиной, поэтому продвижение `main` вперёд не делает уже одобренного кандидата
+невыкатываемым. Cron раз в сутки проверяет и при необходимости публикует именно
+запиненную пару; уже работающий exact-кандидат даёт безопасный `ALREADY LIVE`
+с кодом возврата 0 и без строки `ERROR` в `deploy.log`.
+
+Fail-closed сохраняется для всего, что не является одобренным кандидатом:
+commit отсутствует после fetch, commit не содержится в `origin/main` (например,
+`main` был переписан force-push или кандидат так и не попал в ветку), либо tree
+запиненного commit не совпадает с ожидаемым. Проверка выполняется дважды. На
+`pre-build` отказ происходит **до** reset checkout, сборки и staging. На
+`pre-publish` release уже собран, поэтому отказ происходит до commit-point:
+live-symlink остаётся прежним, а неопубликованный stage удаляется. Ни в одном
+случае действующая live-цель не меняется.
+
+Три следствия новой семантики, которые важно знать оператору:
+
+- **Revert на `main` не отзывает пин.** Отменённый commit остаётся достижимым из
+  `origin/main`, поэтому продолжает считаться одобренным. Чтобы прекратить
+  выкат плохого кандидата, нужно заменить пару SHA/tree в cron (при
+  необходимости — сделать rollback); одного revert недостаточно.
+- **Пин старого предка оставляет сам инструмент на старой версии.** Deploy
+  делает `git reset --hard` в `~/repositories/AIStat`, то есть следующий запуск
+  cron исполнит `cpanel_deploy.sh` и `build_cpanel_package.sh` из запиненного
+  commit. При откате пина далеко назад это возвращает и старое поведение
+  деплой-скриптов.
+- **Клон должен содержать историю до пина.** Fetch тянет только `main`; в
+  shallow-клоне старый предок будет отсутствовать, и gate откажет с
+  `candidate commit missing after fetch`.
 
 Репозиторий публичный, поэтому fetch не требует production credentials. Секреты
 приложения, данные (`~/aistat-private`) и 5-минутный цикл публикации
@@ -328,20 +355,28 @@ SHA** из `main`. Скрипт никогда не подставляет те�
 ```bash
 EXPECTED_SHA=<40-символьный approved commit SHA>
 EXPECTED_TREE=<40-символьный approved root tree SHA>
-git -C "$HOME/repositories/AIStat" fetch origin main
-test "$(git -C "$HOME/repositories/AIStat" rev-parse origin/main)" = "$EXPECTED_SHA"
-test "$(git -C "$HOME/repositories/AIStat" rev-parse "${EXPECTED_SHA}^{tree}")" = "$EXPECTED_TREE"
+git -C "$HOME/repositories/AIStat" fetch origin main \
+  && git -C "$HOME/repositories/AIStat" merge-base --is-ancestor "$EXPECTED_SHA" origin/main \
+  && test "$(git -C "$HOME/repositories/AIStat" rev-parse "${EXPECTED_SHA}^{tree}")" = "$EXPECTED_TREE" \
+  && echo "APPROVED $EXPECTED_SHA"
 ```
 
-Short SHA, имя ветки или автоматически вычисленное после fetch значение не
-заменяет этот approval gate.
+Обе проверки молчаливы при успехе, поэтому они соединены `&&` с финальным
+`echo`: единственный признак прохождения gate — строка `APPROVED`. Её
+отсутствие означает, что кандидат не одобрен, и продолжать нельзя.
+
+Проверяется принадлежность кандидата истории `main` и точное совпадение tree, а
+не равенство вершине: к моменту пиннинга `main` уже может уйти вперёд. Short
+SHA, имя ветки или автоматически вычисленное после fetch значение не заменяет
+этот approval gate.
 
 ### Шаг 3. Добавить cron-задачу (cPanel → Cron Jobs)
 
 `cPanel → Advanced → Cron Jobs → Add New Cron Job`. Часовой пояс сервера
 Namecheap может отличаться от часового пояса владельца. Чтобы обновление всегда
 проходило в **05:00 Europe/Vilnius**, включая переходы на летнее и зимнее время,
-cron запускает лёгкую проверку каждый час:
+cron запускает лёгкую проверку времени каждый час, но сам deploy выполняется
+**один раз в сутки** — в единственный час, прошедший фильтр:
 
 - Minute `0`;
 - Hour `*`;
@@ -358,7 +393,9 @@ LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/r
 
 При принятии следующего кандидата заменить в cron **оба** значения одной
 операцией. До этого сайт остаётся на прежнем approved-кандидате независимо от
-движения `main`.
+движения `main`, а ежедневный запуск на уже живом кандидате остаётся тихим
+(`ALREADY LIVE`, exit 0). Строка `ERROR` в `deploy.log` означает реальную
+проблему, а не то, что `main` ушёл вперёд.
 
 ### Что делает `deploy/cpanel_deploy.sh`
 
@@ -367,7 +404,9 @@ LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/r
    до fetch, staging и publish. Lock держится kernel `flock` через Python
    `fcntl` и автоматически освобождается при exit/crash; оставшийся файл
    удалять не нужно, строка `pid=...` в нём только диагностическая.
-2. Делает fetch и сравнивает fetched full commit/tree с ожидаемой парой.
+2. Делает fetch и проверяет одобренность запиненного кандидата: commit
+   существует локально, содержится в `origin/main` и его root tree совпадает с
+   ожидаемым. Вершина `origin/main` при этом может быть любой.
 3. Сбрасывает checkout на точный commit и строит пакет только через
    `git archive <expected-sha>`; tracked-правки, untracked и ignored файлы хоста
    в release не попадают.
@@ -375,15 +414,20 @@ LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/r
    отдельно `aistat.cgi` и `passenger_wsgi.py`, затем импортирует
    Passenger-контур с временными `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH` и
    `AISTAT_TENANTS_DIR`. Production DB/tenant paths в smoke не используются.
-5. Создаёт уникальный release и повторяет fetch + full SHA/tree gate
-   непосредственно перед publish. Drift оставляет live link прежним и удаляет
-   unpublished stage.
+5. Создаёт уникальный release и повторяет fetch + тот же approval gate
+   непосредственно перед publish. Продвижение `main` между двумя fetch
+   безопасно и публикацию не отменяет; отзыв одобрения (кандидат перестал
+   содержаться в `origin/main`) или расхождение tree оставляют live link
+   прежним и удаляют unpublished stage.
 6. Создаёт новый symlink рядом с `~/aistat_app`, затем делает один атомарный
    `os.replace` на том же host filesystem. Перед commit-point прежняя live-цель
    повторно сверяется: тот же exact target, валидной формы, прямым дочерним
    каталогом `~/aistat_releases` и не исчезнувший во время проверки.
 7. Хранит live и exact previous target. `AISTAT_KEEP_RELEASES` принимает только
-   `0` (не удалять релизы) или каноническое целое `>=2`; default — `5`.
+   `0` (не удалять релизы) или любое каноническое целое `>=2` — как однозначное
+   (`2`, `9`), так и многозначное (`10`, `19`, `100`); default — `5`. Значения
+   `1`, отрицательные, с ведущим нулём, дробные и нечисловые отклоняются до
+   каких-либо изменений на диске.
 
 Любая ошибка до `os.replace` прекращает deploy без изменения live target.
 После switch cleanup retention является best-effort и никогда не удаляет live
@@ -449,6 +493,11 @@ MANUAL_BACKUP="$HOME/aistat-manual-backup-$STAMP"
 mv "$HOME/aistat_app" "$MANUAL_BACKUP"
 /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" deploy <FULL_COMMIT_SHA> <FULL_TREE_SHA>
 ```
+
+Процедура не требует, чтобы approved-кандидат был вершиной `main` на момент
+выполнения: подойдёт любой одобренный commit, содержащийся в `origin/main`. По
+той же причине можно перевыпустить release после потери каталога, не сдвигая
+пин.
 
 Между `mv` и успешным deploy возможна краткая недоступность — поэтому это
 только maintenance procedure, не cron. Если deploy завершился ошибкой до

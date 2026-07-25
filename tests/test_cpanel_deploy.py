@@ -72,6 +72,26 @@ exec "$REAL_PYTHON3" "$@"
 """
 
 
+# Stands in for git during a deploy. Every call passes through untouched; the
+# second `fetch` — the pre-publish gate — additionally rewrites the published
+# `main` first, so the gate sees a branch that moved after the stage was built.
+DRIFT_GIT = """#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" fetch "*)
+    count=0
+    [ ! -f "$FETCH_COUNT" ] || count="$(cat "$FETCH_COUNT")"
+    count=$((count + 1))
+    printf '%s\\n' "$count" >"$FETCH_COUNT"
+    if [ "$count" -eq 2 ]; then
+      "$REAL_GIT" --git-dir="$DRIFT_ORIGIN" update-ref refs/heads/main "$DRIFT_SHA"
+    fi
+    ;;
+esac
+exec "$REAL_GIT" "$@"
+"""
+
+
 def _git(repo, *args):
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -175,6 +195,21 @@ class DeployHarness:
             text=True,
         )
 
+    def validate_keep_releases(self, value):
+        """Call the script's own retention check without running a deploy."""
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'AISTAT_DEPLOY_LIB_ONLY=1 . "$1"; validate_keep_releases',
+                "aistat-validate-keep-releases",
+                str(self.host / "deploy" / "cpanel_deploy.sh"),
+            ],
+            env=dict(self.env, AISTAT_KEEP_RELEASES=value),
+            capture_output=True,
+            text=True,
+        )
+
     def import_live_app(self):
         """Import the application through the live symlink, like the CGI does."""
         env = {
@@ -225,6 +260,23 @@ class DeployHarness:
         _git(self.source, "push", "origin", "HEAD:refs/heads/main")
         return self.identity()
 
+    def unrelated_commit(self, message):
+        """Push a commit on an orphan history — never contained in `main`."""
+        _git(self.source, "checkout", "--quiet", "--orphan", "unrelated")
+        _git(self.source, "commit", "-m", message)
+        sha = _git(self.source, "rev-parse", "HEAD")
+        _git(self.source, "push", "origin", "HEAD:refs/heads/unrelated")
+        _git(self.source, "checkout", "--quiet", "main")
+        return sha
+
+    def set_origin_main(self, sha):
+        """Rewrite the published branch, as a force-push or a revert would."""
+        subprocess.run(
+            ["git", "--git-dir", str(self.origin), "update-ref", "refs/heads/main", sha],
+            check=True,
+            capture_output=True,
+        )
+
     def managed_releases(self):
         if not self.releases.exists():
             return []
@@ -238,8 +290,40 @@ def harness(tmp_path):
     return DeployHarness(tmp_path)
 
 
+@pytest.fixture
+def symlinked_harness(tmp_path):
+    """A harness whose every configured path runs through a symlinked parent.
+
+    `tmp_path` alone cannot express this: pytest hands out an already resolved
+    directory, so a deploy driven from it never exercises a host where the
+    checkout, `$HOME`, the releases dir or the app root is reached via a link.
+    """
+    real = tmp_path / "real-workspace"
+    real.mkdir()
+    link = tmp_path / "linked-workspace"
+    link.symlink_to(real, target_is_directory=True)
+    return DeployHarness(link)
+
+
 def _manifest(release):
     return json.loads((release / "PACKAGE-MANIFEST.json").read_text("utf-8"))
+
+
+def _drift_env(harness, tmp_path, drift_sha):
+    """Move the published `main` in between the pre-build and pre-publish gates."""
+    wrapper_dir = tmp_path / "fake-bin"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(DRIFT_GIT, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return dict(
+        harness.env,
+        PATH=str(wrapper_dir) + os.pathsep + harness.env["PATH"],
+        REAL_GIT=shutil.which("git"),
+        FETCH_COUNT=str(tmp_path / "fetch-count"),
+        DRIFT_ORIGIN=str(harness.origin),
+        DRIFT_SHA=drift_sha,
+    )
 
 
 def _fault_env(harness, tmp_path, mode, signal="TERM", exit_code="0"):
@@ -288,73 +372,105 @@ def test_exact_candidate_excludes_untracked_and_logs_evidence(harness):
     assert harness.managed_releases() == releases
 
 
-def test_remote_commit_and_tree_drift_leave_live_target_unchanged(harness):
-    first_sha, first_tree = harness.identity()
-    first = harness.deploy(first_sha, first_tree)
+def test_approved_candidate_publishes_after_main_moves_on(harness):
+    """Approval is containment in `main`'s history, not being its current tip."""
+    pinned_sha, pinned_tree = harness.identity()
+    harness.commit("candidate two")
+
+    result = harness.deploy(pinned_sha, pinned_tree)
+
+    assert result.returncode == 0, result.stderr
+    assert "contained-in=origin/main" in result.stdout
+    release = Path(os.readlink(str(harness.app)))
+    manifest = _manifest(release)
+    assert manifest["source_commit_sha"] == pinned_sha
+    assert manifest["source_tree_sha"] == pinned_tree
+
+
+def test_daily_cron_on_a_live_approved_candidate_stays_quiet(harness):
+    """The unchanged cron line must not log an ERROR a day once `main` moves on."""
+    pinned_sha, pinned_tree = harness.identity()
+    first = harness.deploy(pinned_sha, pinned_tree)
     assert first.returncode == 0, first.stderr
     live = os.readlink(str(harness.app))
     releases = harness.managed_releases()
-    second_sha, second_tree = harness.commit("candidate two")
+    harness.commit("candidate two")
 
-    stale = harness.deploy(first_sha, first_tree)
-    assert stale.returncode != 0
-    assert "commit drift" in stale.stderr
-    assert os.readlink(str(harness.app)) == live
-    assert harness.managed_releases() == releases
+    repeated = harness.deploy(pinned_sha, pinned_tree)
 
-    wrong_tree = harness.deploy(second_sha, "0" * 40)
-    assert wrong_tree.returncode != 0
-    assert "tree drift" in wrong_tree.stderr
+    assert repeated.returncode == 0, repeated.stderr
+    assert "ALREADY LIVE" in repeated.stdout
+    assert "ERROR" not in repeated.stderr
     assert os.readlink(str(harness.app)) == live
     assert harness.managed_releases() == releases
 
 
-def test_second_fetch_detects_drift_and_removes_unpublished_stage(harness, tmp_path):
+def test_candidate_no_longer_contained_in_main_is_refused(harness):
+    """A rewritten `main` revokes approval even though the object is still local."""
+    pinned_sha, pinned_tree = harness.identity()
+    harness.set_origin_main(harness.unrelated_commit("unrelated history"))
+    # The orphan carries the same tree as the pin, so the tree check cannot be
+    # what rejects this: containment is isolated. And the host clone still holds
+    # the object, so this is the "not approved" branch, not "missing after fetch".
+    assert _git(harness.host, "cat-file", "-t", pinned_sha) == "commit"
+
+    result = harness.deploy(pinned_sha, pinned_tree)
+
+    assert result.returncode != 0
+    assert "pre-build candidate is not approved" in result.stderr
+    assert not harness.app.exists() and not harness.app.is_symlink()
+    assert harness.managed_releases() == []
+
+
+def test_candidate_absent_after_fetch_is_refused(harness):
+    """`rev-parse --verify` alone would accept this; the object does not exist."""
+    absent_sha = "0" * 39 + "1"
+
+    result = harness.deploy(absent_sha, "0" * 40)
+
+    assert result.returncode != 0
+    assert "pre-build candidate commit missing after fetch" in result.stderr
+    assert not harness.app.exists() and not harness.app.is_symlink()
+    assert harness.managed_releases() == []
+
+
+def test_candidate_tree_mismatch_is_refused(harness):
+    pinned_sha, _pinned_tree = harness.identity()
+
+    result = harness.deploy(pinned_sha, "0" * 40)
+
+    assert result.returncode != 0
+    assert "pre-build tree drift" in result.stderr
+    assert not harness.app.exists() and not harness.app.is_symlink()
+    assert harness.managed_releases() == []
+
+
+def test_main_advancing_between_the_two_fetches_still_publishes(harness, tmp_path):
+    """The staged candidate stays approved when `main` merely gains a commit."""
     expected_sha, expected_tree = harness.identity()
     next_sha, _next_tree = harness.commit("future candidate")
-    _git(harness.source, "push", "origin", "HEAD:refs/heads/next")
-    subprocess.run(
-        ["git", "--git-dir", str(harness.origin), "update-ref", "refs/heads/main", expected_sha],
-        check=True,
-    )
+    harness.set_origin_main(expected_sha)
+    env = _drift_env(harness, tmp_path, next_sha)
 
-    real_git = shutil.which("git")
-    wrapper_dir = tmp_path / "fake-bin"
-    wrapper_dir.mkdir()
-    counter = tmp_path / "fetch-count"
-    wrapper = wrapper_dir / "git"
-    wrapper.write_text(
-        """#!/usr/bin/env bash
-set -euo pipefail
-case " $* " in
-  *" fetch "*)
-    count=0
-    [ ! -f "$FETCH_COUNT" ] || count="$(cat "$FETCH_COUNT")"
-    count=$((count + 1))
-    printf '%s\n' "$count" >"$FETCH_COUNT"
-    if [ "$count" -eq 2 ]; then
-      "$REAL_GIT" --git-dir="$DRIFT_ORIGIN" update-ref refs/heads/main "$DRIFT_SHA"
-    fi
-    ;;
-esac
-exec "$REAL_GIT" "$@"
-""",
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o755)
-    env = dict(
-        harness.env,
-        PATH=str(wrapper_dir) + os.pathsep + harness.env["PATH"],
-        REAL_GIT=real_git,
-        FETCH_COUNT=str(counter),
-        DRIFT_ORIGIN=str(harness.origin),
-        DRIFT_SHA=next_sha,
-    )
+    result = harness.deploy(expected_sha, expected_tree, env)
+
+    assert result.returncode == 0, result.stderr
+    release = Path(os.readlink(str(harness.app)))
+    assert _manifest(release)["source_commit_sha"] == expected_sha
+    assert list(harness.releases.glob(".incoming-*")) == []
+
+
+def test_second_fetch_detects_revoked_approval_and_removes_unpublished_stage(
+    harness, tmp_path
+):
+    expected_sha, expected_tree = harness.identity()
+    unrelated_sha = harness.unrelated_commit("unrelated history")
+    env = _drift_env(harness, tmp_path, unrelated_sha)
 
     result = harness.deploy(expected_sha, expected_tree, env)
 
     assert result.returncode != 0
-    assert "pre-publish commit drift" in result.stderr
+    assert "pre-publish candidate is not approved" in result.stderr
     assert not harness.app.exists() and not harness.app.is_symlink()
     assert harness.managed_releases() == []
     assert list(harness.releases.glob(".incoming-*")) == []
@@ -404,6 +520,31 @@ def test_first_repeat_retention_and_atomic_rollback(harness):
 
 def test_retention_zero_preserves_every_release(harness):
     env = dict(harness.env, AISTAT_KEEP_RELEASES="0")
+    identities = [harness.identity()]
+    assert harness.deploy(*identities[-1], env).returncode == 0
+    identities.append(harness.commit("candidate two"))
+    assert harness.deploy(*identities[-1], env).returncode == 0
+    identities.append(harness.commit("candidate three"))
+    assert harness.deploy(*identities[-1], env).returncode == 0
+    assert len(harness.managed_releases()) == 3
+
+
+@pytest.mark.parametrize("value", ["0", "2", "5", "9", "10", "12", "19", "20", "100"])
+def test_canonical_retention_values_are_accepted(harness, value):
+    """`0` plus every canonical integer >= 2, single- and multi-digit alike."""
+    result = harness.validate_keep_releases(value)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("value", ["1", "-1", "x", "1.5", "02", "0x2", "2.0", " 2"])
+def test_non_canonical_retention_values_are_rejected(harness, value):
+    result = harness.validate_keep_releases(value)
+    assert result.returncode != 0
+    assert "must be 0" in result.stderr
+
+
+def test_multi_digit_retention_is_accepted_end_to_end(harness):
+    env = dict(harness.env, AISTAT_KEEP_RELEASES="10")
     identities = [harness.identity()]
     assert harness.deploy(*identities[-1], env).returncode == 0
     identities.append(harness.commit("candidate two"))
@@ -595,6 +736,101 @@ def test_runtime_state_in_the_live_release_blocks_the_next_deploy_by_name(harnes
     assert "data/aistat.db" in result.stderr
     assert os.readlink(str(harness.app)) == str(release1)
     assert harness.managed_releases() == [release1]
+
+
+def test_deploy_and_rollback_work_through_a_symlinked_path(symlinked_harness):
+    harness = symlinked_harness
+    # The whole point of this fixture: an unresolved path with a real link in it.
+    assert os.path.realpath(str(harness.home)) != str(harness.home)
+
+    sha1, tree1 = harness.identity()
+    first = harness.deploy(sha1, tree1)
+    assert first.returncode == 0, first.stderr
+    release1 = Path(os.readlink(str(harness.app)))
+    assert _manifest(release1)["source_commit_sha"] == sha1
+
+    sha2, tree2 = harness.commit("candidate two")
+    second = harness.deploy(sha2, tree2)
+    assert second.returncode == 0, second.stderr
+    release2 = Path(os.readlink(str(harness.app)))
+    assert _manifest(release2)["source_commit_sha"] == sha2
+
+    rolled_back = harness.rollback(release1)
+    assert rolled_back.returncode == 0, rolled_back.stderr
+    assert os.readlink(str(harness.app)) == str(release1)
+
+
+def test_symlinked_payload_file_is_still_refused(harness, tmp_path):
+    sha, tree = harness.identity()
+    assert harness.deploy(sha, tree).returncode == 0
+    package = tmp_path / "linked-file-package"
+    shutil.copytree(Path(os.readlink(str(harness.app))), package)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = package / "pricing.json"
+    stolen = outside / "pricing.json"
+    stolen.write_text(victim.read_text("utf-8"), encoding="utf-8")
+    victim.unlink()
+    victim.symlink_to(stolen)
+
+    result = harness.verify_manifest(package, sha, tree, "strict")
+
+    assert result.returncode != 0
+    assert "manifest path is not a regular file: pricing.json" in result.stderr
+
+
+def test_payload_resolving_outside_the_package_is_still_refused(harness, tmp_path):
+    """A directory alias cannot smuggle content in from outside the root."""
+    sha, tree = harness.identity()
+    assert harness.deploy(sha, tree).returncode == 0
+    package = tmp_path / "aliased-package"
+    shutil.copytree(Path(os.readlink(str(harness.app))), package)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.move(str(package / "aistat"), str(outside / "aistat"))
+    (package / "aistat").symlink_to(outside / "aistat", target_is_directory=True)
+
+    result = harness.verify_manifest(package, sha, tree, "strict")
+
+    assert result.returncode != 0
+    assert "manifest path escapes package: aistat/" in result.stderr
+
+
+def test_directory_alias_inside_the_package_is_still_refused(harness, tmp_path):
+    """Resolving inside the root is not enough — no symlink may live in a package."""
+    sha, tree = harness.identity()
+    assert harness.deploy(sha, tree).returncode == 0
+    package = tmp_path / "internal-alias-package"
+    shutil.copytree(Path(os.readlink(str(harness.app))), package)
+    (package / "aistat-alias").symlink_to(package / "aistat", target_is_directory=True)
+
+    result = harness.verify_manifest(package, sha, tree, "strict")
+
+    assert result.returncode != 0
+    assert "package contains symlink" in result.stderr
+
+
+def test_manifest_entry_through_an_internal_alias_is_still_refused(harness, tmp_path):
+    """The one layout whose rejection *path* moved when the escape check was cut.
+
+    A manifest path traversing an in-package directory alias used to be caught by
+    the removed dirname comparison; it resolves back inside the root, so only the
+    symlink walk can reject it now. Nothing else in the suite pins that, and a
+    refactor of the walk would silently reopen the hole.
+    """
+    sha, tree = harness.identity()
+    assert harness.deploy(sha, tree).returncode == 0
+    package = tmp_path / "entry-through-alias-package"
+    shutil.copytree(Path(os.readlink(str(harness.app))), package)
+    # The manifest still lists `aistat/...`; those paths now reach their files
+    # through the alias, and each one resolves back inside the package root.
+    shutil.move(str(package / "aistat"), str(package / "real"))
+    (package / "aistat").symlink_to(package / "real", target_is_directory=True)
+
+    result = harness.verify_manifest(package, sha, tree, "strict")
+
+    assert result.returncode != 0
+    assert "package contains symlink" in result.stderr
 
 
 def test_only_already_published_releases_relax_to_the_runtime_allowlist():

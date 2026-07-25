@@ -125,9 +125,11 @@ for entry in entries:
     full_path = os.path.join(root, *relative.split("/"))
     if os.path.islink(full_path) or not os.path.isfile(full_path):
         raise SystemExit("manifest path is not a regular file: " + relative)
-    if os.path.dirname(os.path.realpath(full_path)) != os.path.dirname(
-            os.path.abspath(full_path)):
-        raise SystemExit("manifest path escapes package: " + relative)
+    # Containment is decided on fully resolved paths on both sides, so a symlink
+    # anywhere *above* the package (a linked home, releases dir or checkout) is
+    # simply followed instead of being mistaken for an escape. Symlinks *inside*
+    # the package remain rejected: payload links by the check above, directory
+    # aliases by the walk below.
     if not os.path.realpath(full_path).startswith(root_real + os.sep):
         raise SystemExit("manifest path escapes package: " + relative)
     info = os.stat(full_path)
@@ -192,6 +194,15 @@ is_current_live_target() {
   [ "$current" = "$candidate" ]
 }
 
+validate_keep_releases() {
+  if [ "$KEEP_RELEASES" = "0" ]; then return; fi
+  # Any canonical integer >= 2, single- or multi-digit. The alternation is what
+  # allows the second digit: a plain `[2-9][0-9]*` would reject `10`..`19` while
+  # accepting `20`. Leading zeros, `1`, negatives and non-integers stay rejected.
+  [[ "$KEEP_RELEASES" =~ ^([2-9]|[1-9][0-9]+)$ ]] \
+    || die "AISTAT_KEEP_RELEASES must be 0 (unlimited) or a canonical integer >= 2"
+}
+
 # Sourcing with AISTAT_DEPLOY_LIB_ONLY loads pure helpers for focused tests.
 if [ -n "${AISTAT_DEPLOY_LIB_ONLY:-}" ]; then
   # `exit` is the direct-execution fallback for the source-only `return`.
@@ -251,12 +262,6 @@ os.ftruncate(fd, 0)
 os.write(fd, ("pid=%s\n" % pid).encode("ascii"))
 PY
   log "host-local lock acquired: $LOCK_FILE"
-}
-
-validate_keep_releases() {
-  if [ "$KEEP_RELEASES" = "0" ]; then return; fi
-  [[ "$KEEP_RELEASES" =~ ^[2-9][0-9]*$ ]] \
-    || die "AISTAT_KEEP_RELEASES must be 0 (unlimited) or a canonical integer >= 2"
 }
 
 validate_configured_paths() {
@@ -373,20 +378,40 @@ PY
     "WARNING: publish helper exited with status $switch_status after $APP_LINK was already committed to $target"
 }
 
+# Proves the pinned candidate is authentic and approved — not that it happens to
+# be the current tip of `main`. Approval is membership in `main`'s history, so an
+# approved candidate stays deployable after the branch moves on, and a daily cron
+# on an already-live pin reaches the quiet ALREADY LIVE path instead of erroring
+# once a day.
+#
+# Fail-closed, precisely: the `pre-build` call rejects before the checkout reset,
+# before any build and before any staging. The `pre-publish` call runs after a
+# release has been staged, so it rejects before the commit point instead — the
+# live symlink is left untouched and the EXIT trap removes the unpublished stage.
 candidate_gate() {
-  local expected_sha="$1" expected_tree="$2" phase="$3" actual_sha actual_tree
+  local expected_sha="$1" expected_tree="$2" phase="$3" actual_tree contained=0
   git -C "$REPO_DIR" fetch --quiet origin \
     '+refs/heads/main:refs/remotes/origin/main' \
     || die "$phase fetch failed — keeping current release"
-  actual_sha="$(git -C "$REPO_DIR" rev-parse --verify 'refs/remotes/origin/main^{commit}')" \
-    || die "$phase could not resolve fetched origin/main"
-  actual_tree="$(git -C "$REPO_DIR" rev-parse 'refs/remotes/origin/main^{tree}')" \
-    || die "$phase could not resolve fetched origin/main tree"
-  [ "$actual_sha" = "$expected_sha" ] \
-    || die "$phase commit drift: expected $expected_sha, fetched $actual_sha"
+  # `^{commit}` is load-bearing: `rev-parse --verify` alone accepts any
+  # 40-character hex string, peeling is what forces the object to actually exist.
+  git -C "$REPO_DIR" rev-parse --verify --quiet "${expected_sha}^{commit}" >/dev/null \
+    || die "$phase candidate commit missing after fetch: $expected_sha"
+  # Status 1 is the real "not an ancestor" answer; anything else (128 for a
+  # missing or corrupt tracking ref) is a broken repository, not a revoked
+  # approval. Both refuse, but the operator must not be sent after the wrong one.
+  git -C "$REPO_DIR" merge-base --is-ancestor \
+    "$expected_sha" 'refs/remotes/origin/main' || contained=$?
+  case "$contained" in
+    0) ;;
+    1) die "$phase candidate is not approved: $expected_sha is not contained in origin/main" ;;
+    *) die "$phase could not test candidate against origin/main (git exit $contained)" ;;
+  esac
+  actual_tree="$(git -C "$REPO_DIR" rev-parse --verify "${expected_sha}^{tree}")" \
+    || die "$phase could not resolve candidate tree: $expected_sha"
   [ "$actual_tree" = "$expected_tree" ] \
-    || die "$phase tree drift: expected $expected_tree, fetched $actual_tree"
-  log "$phase candidate verified: commit=$actual_sha tree=$actual_tree"
+    || die "$phase tree drift: expected $expected_tree, candidate $actual_tree"
+  log "$phase candidate verified: commit=$expected_sha tree=$actual_tree contained-in=origin/main"
 }
 
 validate_package_runtime() {
