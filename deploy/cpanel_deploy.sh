@@ -36,10 +36,6 @@ EOF
   exit 64
 }
 
-prev_label() {
-  if [ -n "${1-}" ]; then basename "$1"; else printf 'none\n'; fi
-}
-
 is_full_sha() { [[ "${1-}" =~ ^[0-9a-f]{40}$ ]]; }
 
 manifest_identity() {

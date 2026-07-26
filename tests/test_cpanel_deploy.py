@@ -72,6 +72,29 @@ exec "$REAL_PYTHON3" "$@"
 """
 
 
+# Stands in for python3 during a deploy. The import smoke is the only call it
+# treats specially: before passing it through, it records the DB/tenant path
+# environment the script actually handed to the smoke. Everything the smoke
+# creates lives in a throwaway root the script removes afterwards, so this
+# capture is the only way a test can observe those overrides at all.
+SMOKE_ENV_PYTHON3 = """#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    *"import passenger_wsgi"*)
+      {
+        printf 'HOME=%s\\n' "${HOME-<unset>}"
+        printf 'AISTAT_DB_PATH=%s\\n' "${AISTAT_DB_PATH-<unset>}"
+        printf 'AISTAT_SECURITY_DB_PATH=%s\\n' "${AISTAT_SECURITY_DB_PATH-<unset>}"
+        printf 'AISTAT_TENANTS_DIR=%s\\n' "${AISTAT_TENANTS_DIR-<unset>}"
+      } >"$SMOKE_ENV_FILE"
+      ;;
+  esac
+done
+exec "$REAL_PYTHON3" "$@"
+"""
+
+
 # Stands in for git during a deploy. Every call passes through untouched; the
 # second `fetch` — the pre-publish gate — additionally rewrites the published
 # `main` first, so the gate sees a branch that moved after the stage was built.
@@ -326,6 +349,21 @@ def _drift_env(harness, tmp_path, drift_sha):
     )
 
 
+def _smoke_env(harness, tmp_path):
+    """Record the DB/tenant path environment of the real import smoke."""
+    wrapper_dir = tmp_path / "smoke-bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "python3"
+    wrapper.write_text(SMOKE_ENV_PYTHON3, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return dict(
+        harness.env,
+        PATH=str(wrapper_dir) + os.pathsep + harness.env["PATH"],
+        REAL_PYTHON3=shutil.which("python3"),
+        SMOKE_ENV_FILE=str(tmp_path / "smoke-env"),
+    )
+
+
 def _fault_env(harness, tmp_path, mode, signal="TERM", exit_code="0"):
     wrapper_dir = tmp_path / "fault-bin"
     wrapper_dir.mkdir()
@@ -362,7 +400,6 @@ def test_exact_candidate_excludes_untracked_and_logs_evidence(harness):
     assert "previous=none" in result.stdout
     assert "new=" + str(release) in result.stdout
     assert "manifest_sha256=" in result.stdout
-    assert not (harness.home / "data").exists()
 
     releases = harness.managed_releases()
     repeated = harness.deploy(sha, tree)
@@ -370,6 +407,35 @@ def test_exact_candidate_excludes_untracked_and_logs_evidence(harness):
     assert "ALREADY LIVE" in repeated.stdout
     assert os.readlink(str(harness.app)) == str(release)
     assert harness.managed_releases() == releases
+
+
+def test_import_smoke_overrides_every_db_and_tenant_path(harness, tmp_path):
+    """The smoke must run with all three DB/tenant paths forced into the
+    throwaway validation root — production paths and the deploy $HOME stay
+    untouched. Captured from the real smoke invocation, so deleting any one of
+    the AISTAT_DB_PATH / AISTAT_SECURITY_DB_PATH / AISTAT_TENANTS_DIR overrides
+    in cpanel_deploy.sh turns this test red: the un-overridden variable falls
+    back to `<package>/data` (aistat/config.py resolves defaults relative to
+    the package, not $HOME) and is reported here as `<unset>`."""
+    sha, tree = harness.identity()
+    env = _smoke_env(harness, tmp_path)
+
+    result = harness.deploy(sha, tree, env)
+
+    assert result.returncode == 0, result.stderr
+    captured = dict(
+        line.split("=", 1)
+        for line in (tmp_path / "smoke-env").read_text("utf-8").splitlines()
+    )
+    smoke_home = captured["HOME"]
+    assert "aistat-cpanel-validate" in smoke_home
+    assert smoke_home != str(harness.home)
+    for key in ("AISTAT_DB_PATH", "AISTAT_SECURITY_DB_PATH", "AISTAT_TENANTS_DIR"):
+        value = captured[key]
+        assert value != "<unset>", key + " override missing from the smoke env"
+        assert "aistat-cpanel-validate" in value, key + " must point into the validation root"
+        assert not value.startswith(str(harness.home)), key
+        assert not value.startswith(str(harness.runtime_data)), key
 
 
 def test_approved_candidate_publishes_after_main_moves_on(harness):
@@ -579,8 +645,21 @@ def test_existing_manual_directory_requires_separate_maintenance(harness):
     assert harness.managed_releases() == []
 
 
-@pytest.mark.parametrize("relative", ["aistat.cgi", "passenger_wsgi.py"])
-def test_forced_top_level_compile_blocks_invalid_candidate(harness, relative):
+@pytest.mark.parametrize(
+    ("relative", "expected_error"),
+    [
+        # A broken .py is stopped by the package-wide compileall gate: it walks
+        # every *.py, so it always fires before the dedicated entry-point gate.
+        ("passenger_wsgi.py", "package failed forced compileall"),
+        # A broken .cgi is invisible to compileall — only the dedicated
+        # top-level entry-point gate can reject it. This is the one candidate
+        # shape that proves that gate exists at all.
+        ("aistat.cgi", "top-level entry point failed forced compile"),
+    ],
+)
+def test_forced_top_level_compile_blocks_invalid_candidate(
+    harness, relative, expected_error
+):
     target = harness.source / relative
     target.write_text("def broken(:\n", encoding="utf-8")
     _git(harness.source, "add", relative)
@@ -591,7 +670,7 @@ def test_forced_top_level_compile_blocks_invalid_candidate(harness, relative):
     result = harness.deploy(sha, tree)
 
     assert result.returncode != 0
-    assert "forced compile" in result.stderr
+    assert expected_error in result.stderr
     assert not harness.app.exists() and not harness.app.is_symlink()
     assert harness.managed_releases() == []
 
