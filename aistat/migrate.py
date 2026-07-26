@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from .tenant import tenant_db_path
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REQUIRED_TABLES = {
     "runtimes",
     "agents",

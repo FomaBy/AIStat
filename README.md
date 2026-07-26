@@ -476,14 +476,14 @@ python3 -m aistat.migrate
 - **Факты**: `daily_usage` — токены по (runtime, model, date) — 4 вида
   токенов: input / output / cache read / cache write; `issue_usage` —
   суммарные токены и число задач по issue; `runs` — задачи Multica
-  (атрибуция issue↔агент↔runtime, статусы, времена); `runtime_activity` —
+  (атрибуция issue↔агент↔runtime, исторический снимок model, статусы, времена); `runtime_activity` —
   почасовой снапшот активности.
 - **Служебные**: `sync_state` (здоровье источников), `poll_cycles` (журнал
   циклов), `sync_beats` (однострочный счётчик «данные обновились» для SSE).
 
 Потокенной статистики по отдельным задачам у Multica нет (проверено);
 атрибуция токенов агентам делается через (runtime_id, model, date) +
-карту агент→(runtime_id, model) — это работа этапа 3. Агенты Codex Dev Sol
+исторические run-снимки агент→(runtime_id, model) — это работа этапа 3. Агенты Codex Dev Sol
 и QA Codex Sol делят одну модель и один runtime, поэтому их раздельные
 значения будут помечаться как оценочные.
 
@@ -499,6 +499,7 @@ python3 -m aistat.migrate
 | Модель | Вендор | input | output | cache read | cache write (5m) | Источник |
 |---|---|---|---|---|---|---|
 | `claude-opus-4-8` | Anthropic | $5 | $25 | $0.50 | $6.25 | docs.claude.com/pricing |
+| `claude-opus-5` | Anthropic | $5 | $25 | $0.50 | $6.25 | docs.claude.com/pricing |
 | `claude-fable-5` | Anthropic | $10 | $50 | $1.00 | $12.50 | docs.claude.com/pricing |
 | `claude-haiku-4-5-20251001` | Anthropic | $1 | $5 | $0.10 | $1.25 | docs.claude.com/pricing |
 | `gpt-5.6-sol` | OpenAI | $5 | $30 | $0.50 | $6.25 | developers.openai.com/api/docs/pricing |
@@ -510,6 +511,11 @@ python3 -m aistat.migrate
 появится модель без официального тарифа (внутреннее/неизвестное имя), она
 **не** оценивается в 0, а помечается `unpriced` (стоимость `NULL`) и выводится
 в health (`pricing.unpriced_models_in_usage`).
+
+`claude-opus-4-8` и `claude-opus-5` имеют одинаковые USD- и Credit-ставки, но
+это разные model ID. `daily_usage.model` никогда не переименовывается, а модель
+в `runs` сохраняется при ingest; поэтому смена текущего `agents.model` не
+переклассифицирует исторические runs, task/SP, active-time или model-efficiency.
 
 **Формула стоимости строки usage** (четыре счётчика токенов — независимые
 слагаемые; `input_tokens` — это уже некешированный остаток):
@@ -530,10 +536,11 @@ Multica отдаёт `cache_write_tokens = 0`, поэтому ставка ке�
 в таблицу `daily_usage` и пересчитываются идемпотентно каждый цикл поллера
 (источник `pricing` в health). Агрегации по дням/агентам/проектам — этап 3.
 
-**Кредиты.** Официальной публичной модели кредитов у Multica нет, поэтому курс
-задаётся допущением: конфигурируемый `credits_per_usd` (env
-`AISTAT_CREDITS_PER_USD`, по умолчанию **1.0** → 1 кредит = $1). Кредиты =
-стоимость USD × курс.
+**Кредиты.** Для моделей с блоком `credits` в `pricing.json` (включая оба
+Opus) Credit считается напрямую по ставкам input/cache read/output; cache write
+в Credit не входит. Для остальных моделей без такой карты действует
+конфигурируемый fallback `credits_per_usd` (env `AISTAT_CREDITS_PER_USD`, по
+умолчанию **1.0** → 1 кредит = $1): Credits = стоимость USD × курс.
 
 **Переопределение тарифов без изменения кода.** Правьте `pricing.json`
 напрямую, либо укажите `AISTAT_PRICING_OVERRIDES=/path/to/overrides.json` —

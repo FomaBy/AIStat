@@ -3,7 +3,7 @@
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional
 
-from .db import utcnow_iso
+from .db import model_snapshot_for_run, utcnow_iso
 
 
 def _upsert(
@@ -85,9 +85,38 @@ def upsert_issue_usage(conn: sqlite3.Connection, row: Dict[str, Any],
 
 def upsert_runs(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
                 synced_at: Optional[str] = None) -> int:
+    """Upsert runs while preserving their first recorded model snapshot.
+
+    A later agent-catalog refresh must not rewrite an old run after that agent
+    changes model.  When Multica supplies no model (its current contract), use
+    the contemporaneous catalog, including the documented Opus transition.
+    """
     synced_at = synced_at or utcnow_iso()
     count = 0
     for row in rows:
+        row = dict(row)
+        existing = conn.execute(
+            "SELECT model FROM runs WHERE id = ?", (row["id"],)
+        ).fetchone()
+        if existing is not None and existing["model"] is not None:
+            # Stored snapshots are immutable, even if a later payload happens
+            # to include a different current model.
+            row["model"] = existing["model"]
+        elif row.get("model") is None:
+            agent_model = None
+            agent_id = row.get("agent_id")
+            if agent_id:
+                agent = conn.execute(
+                    "SELECT model FROM agents WHERE id = ?", (agent_id,)
+                ).fetchone()
+                agent_model = agent["model"] if agent is not None else None
+            row["model"] = model_snapshot_for_run(
+                agent_id,
+                row.get("started_at"),
+                row.get("dispatched_at"),
+                row.get("created_at"),
+                agent_model,
+            )
         _upsert(conn, "runs", ["id"], row, synced_at)
         count += 1
     return count

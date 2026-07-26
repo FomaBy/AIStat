@@ -18,7 +18,7 @@ from aistat.backup import (
     verify_backup,
 )
 from aistat.config import Config
-from aistat.db import connect, init_db
+from aistat.db import SCHEMA_VERSION, connect, init_db
 from conftest import seed_aggregate_fixture
 
 
@@ -68,7 +68,7 @@ def test_create_produces_verified_generation(cfg):
     assert "aistat.db" in members
     main = members["aistat.db"]
     assert main["integrity"] == "ok"
-    assert main["schema_version"] == 4
+    assert main["schema_version"] == SCHEMA_VERSION
     assert main["row_counts"]["issues"] == 5
     assert (gen / "aistat.db.gz").is_file()
     # The compressed member is genuinely smaller than the raw database.

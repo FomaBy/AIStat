@@ -204,9 +204,10 @@ def _agent_work_seconds(conn: sqlite3.Connection,
     wall-clock span. Rows are keyed by ``run.id`` in SQLite, so a run ingested
     from both ``agent tasks`` and ``issue runs`` is counted once. The project
     filter joins ``run.issue_id -> issue.project_id``; agent/model filters use
-    the run's ``agent_id`` and the current agent catalog, mirroring the other
-    run-based aggregates. A historical ``agent_id`` with no current catalog row
-    still counts (its model is simply unknown to a model filter); the
+    the run's ``agent_id`` and immutable model snapshot. A NULL snapshot from
+    a legacy row falls back to the current catalog for compatibility. A
+    historical ``agent_id`` with no current catalog row still counts (its model
+    is simply unknown to a model filter); the
     null/unattributed bucket is never an agent.
 
     Values are whole seconds (run timestamps are second-precision) so the
@@ -218,7 +219,7 @@ def _agent_work_seconds(conn: sqlite3.Connection,
     if filters["agents"]:
         where += _where_values("r.agent_id", filters["agents"], params)
     if filters["models"]:
-        where += _where_values("a.model", filters["models"], params)
+        where += _where_values("COALESCE(r.model, a.model)", filters["models"], params)
     lower = filters["from"] or datetime.min
     upper = filters["to"] or datetime.max
     seconds: Dict[str, float] = {}
@@ -252,8 +253,12 @@ def _run_intervals(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any]]]:
     intervals: Dict[str, List[Dict[str, Any]]] = {}
     for row in conn.execute(
         """
-        SELECT r.agent_id, i.project_id, r.started_at, r.completed_at
-        FROM runs r LEFT JOIN issues i ON i.id = r.issue_id
+        SELECT r.agent_id, i.project_id, r.runtime_id,
+               COALESCE(r.model, a.model) AS model,
+               r.started_at, r.completed_at
+        FROM runs r
+        LEFT JOIN issues i ON i.id = r.issue_id
+        LEFT JOIN agents a ON a.id = r.agent_id
         WHERE r.agent_id IS NOT NULL
         """
     ):
@@ -303,7 +308,8 @@ def _run_filter_selection(conn: sqlite3.Connection,
     models: Dict[str, Dict[str, Dict[str, float]]] = {}
     for row in conn.execute(
         """
-        SELECT r.issue_id, r.agent_id, a.model, r.started_at, r.completed_at
+        SELECT r.issue_id, r.agent_id, COALESCE(r.model, a.model) AS model,
+               r.started_at, r.completed_at
         FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
         WHERE r.issue_id IS NOT NULL
         """
@@ -377,6 +383,23 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
     for a in agents:
         pair_agents.setdefault((a["runtime_id"], a["model"]), []).append(a["id"])
 
+    # ``agents.model`` is a current catalog value.  Preserve historical daily
+    # attribution after an agent changes model by admitting every stored
+    # run-snapshot pair as a candidate too.  The daily usage row itself keeps
+    # its literal model identity and remains the pricing source of truth.
+    for r in conn.execute(
+        """
+        SELECT DISTINCT r.agent_id, r.runtime_id, COALESCE(r.model, a.model) AS model
+        FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
+        WHERE r.agent_id IS NOT NULL
+          AND r.runtime_id IS NOT NULL
+          AND COALESCE(r.model, a.model) IS NOT NULL
+        """
+    ):
+        candidates = pair_agents.setdefault((r["runtime_id"], r["model"]), [])
+        if r["agent_id"] not in candidates:
+            candidates.append(r["agent_id"])
+
     intervals = _run_intervals(conn)
 
     where, params = _date_clause("date", date_from, date_to)
@@ -434,6 +457,13 @@ def daily_shares(conn: sqlite3.Connection, date_from: Optional[str] = None,
         counts: Dict[Tuple[str, Optional[str]], int] = {}
         for agent_id in candidates:
             for item in intervals.get(agent_id, []):
+                # An agent can change models (and even runtime).  Only runs
+                # matching this literal daily usage identity may assign its
+                # tokens, otherwise post-transition work would weight an old
+                # model's daily row.
+                if (item["runtime_id"] != row["runtime_id"]
+                        or item["model"] != row["model"]):
+                    continue
                 start, end = item["start"], item["end"]
                 key = (agent_id, item["project_id"])
                 if start is None or end is None or end <= start:
@@ -707,7 +737,7 @@ def agent_totals(conn: sqlite3.Connection, date_from: Optional[str] = None,
     if filters["agents"]:
         run_where += _where_values("r.agent_id", filters["agents"], run_params)
     if filters["models"]:
-        run_where += _where_values("a.model", filters["models"], run_params)
+        run_where += _where_values("COALESCE(r.model, a.model)", filters["models"], run_params)
     run_counts: Dict[str, int] = {}
     has_time_window = filters["from"] is not None or filters["to"] is not None
     lower = filters["from"] or datetime.min
@@ -777,11 +807,11 @@ def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str
     stats: Dict[str, Dict[str, Dict[str, float]]] = {}
     rows = conn.execute(
         """
-        SELECT r.issue_id, a.model,
+        SELECT r.issue_id, COALESCE(r.model, a.model) AS model,
                COUNT(*) AS n,
                SUM(MAX(COALESCE(julianday(r.completed_at) - julianday(r.started_at), 0), 0)) AS dur
-        FROM runs r JOIN agents a ON a.id = r.agent_id
-        GROUP BY r.issue_id, a.model
+        FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
+        GROUP BY r.issue_id, COALESCE(r.model, a.model)
         """
     )
     for row in rows:
@@ -1060,7 +1090,8 @@ def efficiency_chart_breakdown(
         SELECT i.id AS issue_id, i.story_points,
                u.total_input_tokens, u.total_output_tokens,
                u.total_cache_read_tokens, u.total_cache_write_tokens,
-               r.agent_id, a.name AS agent_name, a.model,
+               r.agent_id, a.name AS agent_name,
+               COALESCE(r.model, a.model) AS model,
                r.started_at, r.completed_at
         FROM issues i
         JOIN issue_usage u ON u.issue_id = i.id

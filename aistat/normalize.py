@@ -164,6 +164,9 @@ def normalize_run(obj: Dict[str, Any]) -> Dict[str, Any]:
         "issue_id": obj.get("issue_id"),
         "agent_id": obj.get("agent_id"),
         "runtime_id": obj.get("runtime_id"),
+        # Present on some future/extended payloads.  Standard Multica run
+        # responses currently omit it; store.upsert_runs snapshots then.
+        "model": obj.get("model"),
         "kind": obj.get("kind"),
         "status": obj.get("status"),
         "attempt": obj.get("attempt"),
