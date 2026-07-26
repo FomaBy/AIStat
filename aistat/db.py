@@ -17,6 +17,18 @@ from typing import Union
 
 SCHEMA_VERSION = 5
 
+# Serving contract for hosted tenant databases (FAN-1734). The run-attributed
+# aggregates introduced with schema v5 physically require ``runs.model``, so
+# only the current schema may be admitted for serving: an older upload (e.g. a
+# valid v4 snapshot) or an unknown future version must be rejected before it
+# can reach aggregate SQL. Snapshot admission, owner migration admission and
+# both WSGI serving surfaces all consult this single definition via
+# :func:`schema_admission_error` so the surfaces cannot drift. The public host
+# never mutates authenticated snapshot bytes; a v4 database becomes servable
+# only by running :func:`init_db` on the writable source and re-publishing.
+MIN_SERVABLE_SCHEMA_VERSION = SCHEMA_VERSION
+REQUIRED_SERVABLE_COLUMNS = {"runs": ("model",)}
+
 # Multica's run payload does not carry a model snapshot.  The one documented
 # Claude transition must therefore be applied both when upgrading stored runs
 # and when a historical run is first received after the transition.  Keep the
@@ -293,6 +305,35 @@ def _backfill_run_models(conn: sqlite3.Connection) -> None:
         """,
         (OPUS_TRANSITION_AGENT_ID,),
     )
+
+
+def schema_admission_error(conn: sqlite3.Connection):
+    """Why ``conn``'s database may not be served, or ``None`` when it may.
+
+    Fail-closed: any schema version outside the servable range — older valid
+    snapshots such as v4 as well as unknown future versions — or a physically
+    missing required column disqualifies the database before any aggregate SQL
+    can touch it. Works on a query-only connection; never mutates the database.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < MIN_SERVABLE_SCHEMA_VERSION or version > SCHEMA_VERSION:
+        return "unsupported schema version {}; server requires {}".format(
+            version, SCHEMA_VERSION
+        )
+    for table in sorted(REQUIRED_SERVABLE_COLUMNS):
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info({})".format(table))
+        }
+        missing = [
+            name
+            for name in REQUIRED_SERVABLE_COLUMNS[table]
+            if name not in existing
+        ]
+        if missing:
+            return "table {} is missing required columns: {}".format(
+                table, ", ".join(missing)
+            )
+    return None
 
 
 def utcnow_iso() -> str:

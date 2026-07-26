@@ -2,8 +2,9 @@
 
 from aistat import aggregates as ag
 from aistat import store
-from aistat.db import SCHEMA_VERSION, connect, init_db
+from aistat.db import SCHEMA_VERSION, connect, init_db, schema_admission_error
 from conftest import seed_opus_transition_fixture
+from test_security_snapshot import build_v4_database
 
 
 def test_init_db_backfills_legacy_runs_at_exact_opus_cutoff(tmp_path):
@@ -41,6 +42,36 @@ def test_init_db_backfills_legacy_runs_at_exact_opus_cutoff(tmp_path):
     conn.execute("UPDATE agents SET model = 'claude-fable-5' WHERE id = ?", (agent_id,))
     init_db(conn)
     assert dict(conn.execute("SELECT id, model FROM runs ORDER BY id").fetchall()) == first
+    conn.close()
+
+
+def test_real_v4_database_upgrades_to_servable_v5(tmp_path):
+    """FAN-1734: a real v4 database is not servable until init_db upgrades it
+    in place; the upgrade backfills runs.model once and a re-run is a no-op."""
+    path = tmp_path / "owner-v4.db"
+    build_v4_database(path)
+    conn = connect(path)
+    problem = schema_admission_error(conn)
+    assert problem == "unsupported schema version 4; server requires 5"
+
+    init_db(conn)
+    assert schema_admission_error(conn) is None
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    models = dict(conn.execute("SELECT id, model FROM runs ORDER BY id"))
+    # Legacy rows adopt the agent catalog's model exactly once (the seeded
+    # fixture has no transition-agent rows, so the generic backfill applies).
+    assert models == {
+        "run1": "m-claude",
+        "run2": "m-shared",
+        "run3": "m-shared",
+        "run4": "m-shared",
+        "run5": "m-shared",
+    }
+
+    # Re-running the upgrade rewrites nothing, even after a catalog change.
+    conn.execute("UPDATE agents SET model = 'm-next' WHERE id = 'A1'")
+    init_db(conn)
+    assert dict(conn.execute("SELECT id, model FROM runs ORDER BY id")) == models
     conn.close()
 
 

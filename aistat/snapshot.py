@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import NamedTuple, Set, Tuple
 
-from .db import SCHEMA_VERSION
+from .db import SCHEMA_VERSION, schema_admission_error
 from .snapshot_recovery import fsync_file, swap_staged_into_place
 
 REQUIRED_TABLES: Set[str] = {
@@ -231,7 +231,16 @@ def _decompress_to_file(payload: bytes, target: Path, max_bytes: int) -> int:
     return total
 
 
-def validate_snapshot(path: Path) -> SnapshotInfo:
+def validate_snapshot(path: Path, require_servable: bool = False) -> SnapshotInfo:
+    """Check that ``path`` is a well-formed AIStat SQLite snapshot.
+
+    With ``require_servable`` the snapshot must additionally satisfy the
+    serving contract (:func:`aistat.db.schema_admission_error`): exactly the
+    current schema version with every physically required column, so a valid
+    but outdated v4 snapshot is rejected before it can be installed (FAN-1734).
+    The default keeps the historical shape-only semantics for non-serving
+    consumers such as backup verification and restore of older generations.
+    """
     path = Path(path)
     try:
         with path.open("rb") as source:
@@ -264,6 +273,10 @@ def validate_snapshot(path: Path) -> SnapshotInfo:
                 raise SnapshotError(
                     "snapshot is missing required tables: " + ", ".join(missing)
                 )
+            if require_servable:
+                problem = schema_admission_error(conn)
+                if problem is not None:
+                    raise SnapshotError(problem)
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -349,7 +362,10 @@ def stage_compressed_snapshot(
     temp_path = _temp_path(target_path.parent, ".db")
     try:
         _decompress_to_file(payload, temp_path, max_bytes)
-        info = validate_snapshot(temp_path)
+        # Serving admission: the staged snapshot must carry exactly the current
+        # schema, so a valid-but-outdated upload fails here — before the intent
+        # journal or the atomic swap can ever see it (FAN-1734).
+        info = validate_snapshot(temp_path, require_servable=True)
         fsync_file(temp_path)
         return temp_path, info
     except BaseException:

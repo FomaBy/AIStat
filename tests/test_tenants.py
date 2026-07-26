@@ -15,6 +15,7 @@ from aistat.migrate import (
 )
 from aistat.security import SecurityConfigError, SecurityStore
 from conftest import seed_aggregate_fixture
+from test_security_snapshot import build_v4_database
 
 
 class _NoBackupConnection:
@@ -293,3 +294,58 @@ def test_owner_migration_archive_failure_rolls_back(
         result["owner_user_id"]
     )
     assert tenant["last_snapshot_sha256"] == result["sha256"]
+
+
+def test_owner_migration_rejects_v4_source_fail_closed(tmp_path):
+    """FAN-1734: a v4 legacy source is rejected before any archive, install or
+    removal; source bytes and the security registry stay untouched."""
+    config = tenant_config(tmp_path)
+    build_v4_database(config.db_path)
+    source_bytes = config.db_path.read_bytes()
+
+    with pytest.raises(MigrationError, match="unsupported schema version 4"):
+        migrate_owner_database(config, now=1000)
+
+    assert config.db_path.read_bytes() == source_bytes
+    assert not config.db_path.with_name("aistat.db.migrated").exists()
+    assert list(config.tenants_dir.glob("*.db")) == []
+    assert [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(".aistat-owner-")
+    ] == []
+    sec = sqlite3.connect(str(config.security_db_path))
+    try:
+        assert sec.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        assert sec.execute("SELECT COUNT(*) FROM tenants").fetchone()[0] == 0
+    finally:
+        sec.close()
+
+    # Upgrading the writable source in place unblocks the same migration.
+    conn = connect(config.db_path)
+    init_db(conn)
+    conn.close()
+    result = migrate_owner_database(config, now=2000)
+    assert result["migrated"] is True
+    assert config.tenant_db_path(result["owner_user_id"]).is_file()
+
+
+def test_owner_migration_rejects_v4_target_fail_closed(tmp_path):
+    """FAN-1734: an already-installed v4 owner tenant is rejected before the
+    migration can archive, install or remove anything."""
+    config = tenant_config(tmp_path)
+    source = connect(config.db_path)
+    init_db(source)
+    seed_aggregate_fixture(source)
+    source.close()
+    first = migrate_owner_database(config, now=1000)
+    target = config.tenant_db_path(first["owner_user_id"])
+
+    # Simulate a tenant database installed before the schema contract.
+    target.unlink()
+    build_v4_database(target)
+    target_bytes = target.read_bytes()
+
+    with pytest.raises(MigrationError, match="unsupported schema version 4"):
+        migrate_owner_database(config, now=2000)
+    assert target.read_bytes() == target_bytes

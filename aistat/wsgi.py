@@ -35,7 +35,7 @@ from werkzeug.security import check_password_hash
 
 from . import __version__, aggregates, handoff, oauth
 from .config import Config
-from .db import connect_readonly, init_db
+from .db import connect_readonly, init_db, schema_admission_error
 from .health import snapshot
 from .security import (
     LOGIN_CSRF_TTL_SECONDS,
@@ -70,6 +70,10 @@ SESSION_COOKIE = "aistat_session"
 # Pre-authentication double-submit cookie for the login form's CSRF defence.
 # It carries only a random signed token, never identity.
 LOGIN_CSRF_COOKIE = "aistat_login_csrf"
+
+
+class SchemaUpgradeRequired(Exception):
+    """An installed tenant database predates the servable schema (FAN-1734)."""
 
 
 def create_app(config: Optional[Config] = None) -> Flask:
@@ -256,7 +260,21 @@ def create_app(config: Optional[Config] = None) -> Flask:
         path = config.tenant_db_path(user_id)
         if not path.is_file():
             return empty_data_connection()
-        return connect_readonly(path)
+        conn = connect_readonly(path)
+        # A tenant database installed before the current schema contract (e.g.
+        # a v4 snapshot without runs.model) must fail closed here, before any
+        # aggregate SQL can raise OperationalError or report empty metrics. The
+        # request never mutates the tenant database; the owner republishes an
+        # upgraded snapshot instead (FAN-1734).
+        problem = schema_admission_error(conn)
+        if problem is not None:
+            conn.close()
+            raise SchemaUpgradeRequired(problem)
+        return conn
+
+    @app.errorhandler(SchemaUpgradeRequired)
+    def schema_upgrade_required(_error):
+        return jsonify({"detail": "database schema upgrade required"}), 503
 
     def query_filters():
         return aggregates.make_filters(
