@@ -1,41 +1,46 @@
-# AGENTS.md — AIStat
+# AIStat agent context
 
-Рабочие правила для агентов, выполняющих задачи в проекте **AIStat**
-(приложение для подсчёта статистики использования токенов агентами и расчёта
-эффективности их работы).
+AIStat measures agent token usage and work efficiency. Keep this file as a
+lightweight repository map; workspace estimation, dispatch, ownership, QA, Git,
+and completion transactions live in the bound
+`multica-workspace-governance` skill.
 
-Этот файл дублирует обязательные процессные правила проекта. При расхождении с
-описанием проекта и workspace-контекстом в Multica — источником истины остаётся
-Multica; правила ниже приведены здесь для удобства работы в репозитории.
+## Before changing code
 
-## Обязательные правила
+- Work only the Multica issue explicitly assigned to the current agent. Re-read
+  its acceptance criteria, dependencies, owner, active runs, and locked paths.
+- Inspect the affected code and tests before loading broad documentation.
+- Match the surrounding Python/TypeScript/operations patterns and preserve
+  backward compatibility unless the issue explicitly changes a contract.
 
-### [GLOBAL-GIT-SYNC-V1] — синхронизация локальной копии и git
+## Load context on demand
 
-Обязательное правило для всех задач: локальная рабочая копия и git-репозиторий
-всегда должны быть синхронизированы.
+- Usage and efficiency semantics: `docs/metrics-efficiency.md`
+- Per-user collection and privacy boundaries: `docs/per-user-collection.md`
+- Runtime lifecycle and supervision: `docs/runtime-supervisor.md`
+- Operator recovery: `docs/operations-runbook.md`
+- Local deployment: `docs/deployment-local.md`
+- Namecheap deployment: `docs/deployment-namecheap.md`
+- Secret/token transfer: `docs/secure-token-handoff.md`
 
-- **Перед началом работы** подтягивать свежие изменения из удалённого
-  репозитория (`git fetch` / `git pull --rebase`), чтобы работать поверх
-  актуального состояния `origin`.
-- **После завершения работы** фиксировать все изменения задачи осмысленным
-  коммитом (с идентификатором задачи, например `FAN-1204: …`) и выполнять
-  `git push` в `origin`.
-- Локальная копия и удалённый репозиторий всегда синхронизированы: по завершении
-  `git status` чистый (нет незакоммиченных изменений) и локальная ветка не
-  опережает и не отстаёт от `origin` (всё запушено).
-- **Задача не считается завершённой** (`in_review` / `done`), пока изменения не
-  закоммичены и не запушены в `origin`. Любые незакоммиченные или незапушенные
-  изменения блокируют закрытие задачи.
-- Артефакты сборки, секреты и локальные файлы, которым не место в репозитории,
-  добавлять в `.gitignore`, а не коммитить, чтобы рабочее дерево оставалось
-  чистым.
+Read only the references needed by the assigned scope. Do not copy transient
+quota state, incident details, worker IDs, or task-specific exceptions into this
+file.
 
-### [GLOBAL-CUE-STORY-POINTS-V1] — оценка задач по CUE
+## Repository gotchas
 
-Оценивать каждую новую или существенно изменённую actionable-задачу целостно по
-CUE (Complexity, Uncertainty, Effort) в шкале Fibonacci (1, 2, 3, 5, 8, 13).
-Story points, модель CUE/Fibonacci и обоснование указывать в description;
-одновременно задавать ровно один Label `SP:<N>` и числовую metadata
-`story_points=<N>` — все три записи должны совпадать. Полная формулировка — в
-описании проекта AIStat и в workspace-контексте Multica.
+- Usage/efficiency claims require observed data; do not invent provider
+  denominators, reset times, savings, or performance gains.
+- Treat tokens, credentials, tenant data, and per-user telemetry as sensitive.
+  Keep secrets out of commands, logs, fixtures, commits, and screenshots.
+- Preserve data compatibility and migration safety. A schema or deployment
+  change needs the relevant negative/recovery check, not only a happy-path test.
+- Keep generated environments, caches, local databases, and `.opencode`
+  dependencies out of task-owned commits unless the issue explicitly owns them.
+
+## Verification
+
+Run the focused tests for the changed contract, then the smallest relevant
+regression/security checks. Inspect the complete diff and report exact commands,
+results, pushed SHA, residual risk, and cleanup. Never call an unexecuted check
+PASS.
