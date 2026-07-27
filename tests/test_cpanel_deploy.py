@@ -126,6 +126,17 @@ exec "$REAL_GIT" "$@"
 """
 
 
+NOOP_RESET_GIT = """#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" reset --hard "*)
+    exit 0
+    ;;
+esac
+exec "$REAL_GIT" "$@"
+"""
+
+
 def _git(repo, *args):
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -382,6 +393,20 @@ def _merge_base_failure_env(harness, tmp_path):
     )
 
 
+def _noop_reset_env(harness, tmp_path):
+    """Report only `reset --hard` as successful without changing the checkout."""
+    wrapper_dir = tmp_path / "noop-reset-bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(NOOP_RESET_GIT, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return dict(
+        harness.env,
+        PATH=str(wrapper_dir) + os.pathsep + harness.env["PATH"],
+        REAL_GIT=shutil.which("git"),
+    )
+
+
 def _smoke_env(harness, tmp_path):
     """Record the DB/tenant path environment of the real import smoke."""
     wrapper_dir = tmp_path / "smoke-bin"
@@ -505,6 +530,32 @@ def test_approved_pin_resets_checkout_and_publishes_its_bytes_after_main_moves_o
     manifest = _manifest(release)
     assert manifest["source_commit_sha"] == pinned_sha
     assert manifest["source_tree_sha"] == pinned_tree
+
+
+def test_successful_reset_that_leaves_the_wrong_checkout_is_refused(
+    harness, tmp_path
+):
+    """The post-reset identity guard must reject a false-successful reset."""
+    pinned_sha, pinned_tree = harness.identity()
+    tip_sha, tip_tree = harness.commit("candidate two")
+    _git(
+        harness.host,
+        "fetch",
+        "--quiet",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+    )
+    _git(harness.host, "reset", "--hard", tip_sha)
+    assert harness.identity(harness.host) == (tip_sha, tip_tree)
+    env = _noop_reset_env(harness, tmp_path)
+
+    result = harness.deploy(pinned_sha, pinned_tree, env)
+
+    assert result.returncode != 0
+    assert "checkout identity mismatch after reset" in result.stderr
+    assert harness.identity(harness.host) == (tip_sha, tip_tree)
+    assert not harness.app.exists() and not harness.app.is_symlink()
+    assert harness.managed_releases() == []
 
 
 def test_daily_cron_on_a_live_approved_candidate_stays_quiet(harness):
