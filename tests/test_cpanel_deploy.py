@@ -115,6 +115,17 @@ exec "$REAL_GIT" "$@"
 """
 
 
+MERGE_BASE_FAILURE_GIT = """#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" merge-base --is-ancestor "*)
+    exit 128
+    ;;
+esac
+exec "$REAL_GIT" "$@"
+"""
+
+
 def _git(repo, *args):
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -122,6 +133,14 @@ def _git(repo, *args):
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _git_bytes(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+    ).stdout
 
 
 class DeployHarness:
@@ -349,6 +368,20 @@ def _drift_env(harness, tmp_path, drift_sha):
     )
 
 
+def _merge_base_failure_env(harness, tmp_path):
+    """Make only the approval-membership query fail as a broken repository."""
+    wrapper_dir = tmp_path / "merge-base-failure-bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(MERGE_BASE_FAILURE_GIT, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return dict(
+        harness.env,
+        PATH=str(wrapper_dir) + os.pathsep + harness.env["PATH"],
+        REAL_GIT=shutil.which("git"),
+    )
+
+
 def _smoke_env(harness, tmp_path):
     """Record the DB/tenant path environment of the real import smoke."""
     wrapper_dir = tmp_path / "smoke-bin"
@@ -438,16 +471,37 @@ def test_import_smoke_overrides_every_db_and_tenant_path(harness, tmp_path):
         assert not value.startswith(str(harness.runtime_data)), key
 
 
-def test_approved_candidate_publishes_after_main_moves_on(harness):
-    """Approval is containment in `main`'s history, not being its current tip."""
+def test_approved_pin_resets_checkout_and_publishes_its_bytes_after_main_moves_on(
+    harness,
+):
+    """The checkout and published bytes both come from the approved pin."""
     pinned_sha, pinned_tree = harness.identity()
-    harness.commit("candidate two")
+    pinned_pricing = _git_bytes(
+        harness.source, "cat-file", "blob", pinned_sha + ":pricing.json"
+    )
+    tip_sha, tip_tree = harness.commit("candidate two")
+    tip_pricing = _git_bytes(
+        harness.source, "cat-file", "blob", tip_sha + ":pricing.json"
+    )
+    assert pinned_pricing != tip_pricing
+    _git(
+        harness.host,
+        "fetch",
+        "--quiet",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+    )
+    _git(harness.host, "reset", "--hard", tip_sha)
+    assert harness.identity(harness.host) == (tip_sha, tip_tree)
 
     result = harness.deploy(pinned_sha, pinned_tree)
 
     assert result.returncode == 0, result.stderr
     assert "contained-in=origin/main" in result.stdout
+    assert harness.identity(harness.host) == (pinned_sha, pinned_tree)
     release = Path(os.readlink(str(harness.app)))
+    assert (release / "pricing.json").read_bytes() == pinned_pricing
+    assert (release / "pricing.json").read_bytes() != tip_pricing
     manifest = _manifest(release)
     assert manifest["source_commit_sha"] == pinned_sha
     assert manifest["source_tree_sha"] == pinned_tree
@@ -501,12 +555,37 @@ def test_candidate_absent_after_fetch_is_refused(harness):
 
 
 def test_candidate_tree_mismatch_is_refused(harness):
-    pinned_sha, _pinned_tree = harness.identity()
+    pinned_sha, pinned_tree = harness.identity()
+    _tip_sha, foreign_tree = harness.commit("candidate two")
+    assert foreign_tree != pinned_tree
 
-    result = harness.deploy(pinned_sha, "0" * 40)
+    result = harness.deploy(pinned_sha, foreign_tree)
 
     assert result.returncode != 0
-    assert "pre-build tree drift" in result.stderr
+    assert (
+        "pre-build tree drift: expected "
+        + foreign_tree
+        + ", candidate "
+        + pinned_tree
+    ) in result.stderr
+    assert not harness.app.exists() and not harness.app.is_symlink()
+    assert harness.managed_releases() == []
+
+
+def test_merge_base_exit_128_reports_broken_repository_not_revoked_approval(
+    harness, tmp_path
+):
+    pinned_sha, pinned_tree = harness.identity()
+    env = _merge_base_failure_env(harness, tmp_path)
+
+    result = harness.deploy(pinned_sha, pinned_tree, env)
+
+    assert result.returncode != 0
+    assert (
+        "pre-build could not test candidate against origin/main (git exit 128)"
+        in result.stderr
+    )
+    assert "is not approved" not in result.stderr
     assert not harness.app.exists() and not harness.app.is_symlink()
     assert harness.managed_releases() == []
 
@@ -858,13 +937,18 @@ def test_symlinked_payload_file_is_still_refused(harness, tmp_path):
     assert "manifest path is not a regular file: pricing.json" in result.stderr
 
 
-def test_payload_resolving_outside_the_package_is_still_refused(harness, tmp_path):
+@pytest.mark.parametrize("harness_fixture", ("harness", "symlinked_harness"))
+def test_payload_resolving_outside_the_package_is_still_refused(
+    request, harness_fixture
+):
     """A directory alias cannot smuggle content in from outside the root."""
+    harness = request.getfixturevalue(harness_fixture)
     sha, tree = harness.identity()
     assert harness.deploy(sha, tree).returncode == 0
-    package = tmp_path / "aliased-package"
+    workspace = harness.source.parent
+    package = workspace / "aliased-package"
     shutil.copytree(Path(os.readlink(str(harness.app))), package)
-    outside = tmp_path / "outside"
+    outside = workspace / "outside"
     outside.mkdir()
     shutil.move(str(package / "aistat"), str(outside / "aistat"))
     (package / "aistat").symlink_to(outside / "aistat", target_is_directory=True)
@@ -889,7 +973,10 @@ def test_directory_alias_inside_the_package_is_still_refused(harness, tmp_path):
     assert "package contains symlink" in result.stderr
 
 
-def test_manifest_entry_through_an_internal_alias_is_still_refused(harness, tmp_path):
+@pytest.mark.parametrize("harness_fixture", ("harness", "symlinked_harness"))
+def test_manifest_entry_through_an_internal_alias_is_still_refused(
+    request, harness_fixture
+):
     """The one layout whose rejection *path* moved when the escape check was cut.
 
     A manifest path traversing an in-package directory alias used to be caught by
@@ -897,9 +984,10 @@ def test_manifest_entry_through_an_internal_alias_is_still_refused(harness, tmp_
     symlink walk can reject it now. Nothing else in the suite pins that, and a
     refactor of the walk would silently reopen the hole.
     """
+    harness = request.getfixturevalue(harness_fixture)
     sha, tree = harness.identity()
     assert harness.deploy(sha, tree).returncode == 0
-    package = tmp_path / "entry-through-alias-package"
+    package = harness.source.parent / "entry-through-alias-package"
     shutil.copytree(Path(os.readlink(str(harness.app))), package)
     # The manifest still lists `aistat/...`; those paths now reach their files
     # through the alias, and each one resolves back inside the package root.
