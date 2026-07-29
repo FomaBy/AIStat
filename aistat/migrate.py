@@ -15,10 +15,10 @@ import tempfile
 import time
 from contextlib import contextmanager
 
+from .db import SCHEMA_VERSION, schema_admission_error
 from .tenant import tenant_db_path
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCHEMA_VERSION = 4
 REQUIRED_TABLES = {
     "runtimes",
     "agents",
@@ -145,6 +145,14 @@ def _validate_database(path):
                     "database is missing required tables: "
                     + ", ".join(missing)
                 )
+            # Migration admission (FAN-1734): a valid but outdated database
+            # (e.g. v4 without runs.model) is rejected before any archive,
+            # install or source removal, leaving source, target and the
+            # security registry untouched. The v4->v5 upgrade runs only on a
+            # writable source via aistat.db.init_db, never here.
+            problem = schema_admission_error(conn)
+            if problem is not None:
+                raise MigrationError(problem)
         finally:
             conn.close()
     except sqlite3.Error as exc:

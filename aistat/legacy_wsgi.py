@@ -29,7 +29,7 @@ from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlsplit
 
 from . import __version__, aggregates, handoff, oauth, snapshot, snapshot_recovery
-from .db import SCHEMA_VERSION, init_db
+from .db import SCHEMA_VERSION, init_db, schema_admission_error
 from .tenant import (
     canonical_tenant_id,
     snapshot_signature as tenant_snapshot_signature,
@@ -975,6 +975,10 @@ def _empty_data_connection():
     return conn
 
 
+class _SchemaUpgradeRequired(Exception):
+    """An installed tenant database predates the servable schema (FAN-1734)."""
+
+
 def _data_connection(session):
     try:
         user_id = canonical_tenant_id(session.get("uid"))
@@ -988,6 +992,15 @@ def _data_connection(session):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
+    # A tenant database installed before the current schema contract (e.g. a
+    # v4 snapshot without runs.model) must fail closed here, before any
+    # aggregate SQL can raise OperationalError or report empty metrics. The
+    # request never mutates the tenant database; the owner republishes an
+    # upgraded snapshot instead (FAN-1734).
+    problem = schema_admission_error(conn)
+    if problem is not None:
+        conn.close()
+        raise _SchemaUpgradeRequired(problem)
     return conn
 
 
@@ -1357,6 +1370,12 @@ def _stage_snapshot(payload, target_path):
             }
             if REQUIRED_TABLES - tables:
                 raise ValueError("missing tables")
+            # Serving admission (FAN-1734): only the current schema with the
+            # physically present runs.model column may be installed, so a valid
+            # v4 snapshot is refused before the intent journal or atomic swap.
+            problem = schema_admission_error(conn)
+            if problem is not None:
+                raise ValueError(problem)
         finally:
             conn.close()
 
@@ -1815,7 +1834,15 @@ def _api(environ, start_response, path):
         return _json_response(
             environ, start_response, "422 Unprocessable Entity", {"detail": str(exc)}
         )
-    conn = _data_connection(session)
+    try:
+        conn = _data_connection(session)
+    except _SchemaUpgradeRequired:
+        return _json_response(
+            environ,
+            start_response,
+            "503 Service Unavailable",
+            {"detail": "database schema upgrade required"},
+        )
     try:
         if path == "/api/meta":
             data = aggregates.meta(conn)

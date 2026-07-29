@@ -118,6 +118,29 @@ def test_repo_pricing_json_maps_claude_to_codex_credit_tiers():
            (terra.input, terra.cache_read, terra.output)
 
 
+def test_opus_5_is_a_distinct_id_with_opus_4_8_rates_and_credits():
+    rates = pricing.load_pricing(PRICING_JSON)
+    opus_4_8, opus_5 = rates["claude-opus-4-8"], rates["claude-opus-5"]
+    assert opus_4_8.model != opus_5.model
+    assert (opus_5.input, opus_5.output, opus_5.cache_read,
+            opus_5.cache_write, opus_5.cache_write_1h) == \
+        (opus_4_8.input, opus_4_8.output, opus_4_8.cache_read,
+         opus_4_8.cache_write, opus_4_8.cache_write_1h)
+    assert (opus_5.credits.input, opus_5.credits.cache_read,
+            opus_5.credits.output) == \
+        (opus_4_8.credits.input, opus_4_8.credits.cache_read,
+         opus_4_8.credits.output) == (62.5, 6.25, 375.0)
+
+    # 1M input + cache read + output + cache write: cache write is USD-only.
+    for rate in (opus_4_8, opus_5):
+        assert pricing.compute_cost(
+            1_000_000, 1_000_000, 1_000_000, 1_000_000, rate
+        ).usd == pytest.approx(36.75)
+        assert pricing.compute_credit_cost(
+            1_000_000, 1_000_000, 1_000_000, rate
+        ) == pytest.approx(443.75)
+
+
 def test_credits_block_must_be_numeric(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"models": {"m": {
@@ -239,6 +262,30 @@ def test_recompute_daily_costs_prices_known_and_flags_unknown(conn):
     assert unknown["cost_priced"] == 0
     assert unknown["cost_usd"] is None
     assert unknown["cost_credits"] is None
+
+
+def test_mixed_opus_day_keeps_two_priced_rows(conn):
+    """One runtime/day may contain both exact Opus IDs without an overwrite."""
+    for model in ("claude-opus-4-8", "claude-opus-5"):
+        _insert_usage(
+            conn, "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188", model,
+            "2026-07-24", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+        )
+    rates = pricing.load_pricing(PRICING_JSON)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0)
+
+    rows = conn.execute(
+        """
+        SELECT model, cost_usd, cost_credits, cost_priced FROM daily_usage
+        WHERE runtime_id = ? AND date = ? ORDER BY model
+        """,
+        ("fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188", "2026-07-24"),
+    ).fetchall()
+    assert [row["model"] for row in rows] == ["claude-opus-4-8", "claude-opus-5"]
+    assert all(row["cost_priced"] == 1 for row in rows)
+    assert all(row["cost_usd"] == pytest.approx(36.75) for row in rows)
+    assert all(row["cost_credits"] == pytest.approx(443.75) for row in rows)
+    assert pricing.unpriced_models_in_usage(conn, rates) == []
 
 
 def test_recompute_is_idempotent(conn):

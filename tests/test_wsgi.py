@@ -26,6 +26,7 @@ from conftest import (
     seed_aggregate_fixture,
     seed_model_less_fixture,
 )
+from test_security_snapshot import build_v4_database
 
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "session-" + "s" * 48
@@ -642,6 +643,112 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
     )
     assert post(fresh, base_ts + 20).status_code == 200
     assert daily_usage_max_date(owner_path) == "2026-01-03"
+
+
+def test_ingest_rejects_v4_snapshot_fail_closed(public_app, tmp_path):
+    """FAN-1734: a real v4 snapshot (no runs.model) is refused with 422 before
+    the journal/swap; the tenant bytes, .previous backup, staged temp files and
+    the replay watermark all stay untouched. Upgrading the writable source via
+    init_db yields the exact v5 snapshot the same pipeline then serves."""
+    app, config = public_app
+    owner_path = config.tenant_db_path(config.publish_tenant_id)
+    before = owner_path.read_bytes()
+
+    src = tmp_path / "v4-upload-src.db"
+    build_v4_database(src)
+    v4_payload = create_compressed_snapshot(src)
+    ts = int(time.time())
+    client = app.test_client()
+
+    def post(payload, at):
+        return client.post(
+            "/api/ingest/snapshot",
+            data=payload,
+            content_type="application/vnd.aistat.snapshot+gzip",
+            headers={
+                "X-AIStat-Timestamp": str(at),
+                "X-AIStat-Tenant": str(config.publish_tenant_id),
+                "X-AIStat-Signature": snapshot_signature(
+                    INGEST_SECRET, config.publish_tenant_id, at, payload
+                ),
+            },
+        )
+
+    rejected = post(v4_payload, ts)
+    assert rejected.status_code == 422
+    assert rejected.get_json()["detail"] == "invalid snapshot"
+    assert owner_path.read_bytes() == before
+    assert not owner_path.with_name(owner_path.name + ".previous").exists()
+    assert list(config.tenants_dir.glob(".aistat-snapshot-*")) == []
+
+    # The watermark was not consumed: the very same timestamp still admits the
+    # in-place-upgraded v5 snapshot, whose echo matches the uploaded bytes.
+    conn = connect(src)
+    init_db(conn)
+    conn.close()
+    v5_payload = create_compressed_snapshot(src)
+    accepted = post(v5_payload, ts)
+    assert accepted.status_code == 200
+    echoed = accepted.get_json()
+    plain = gzip.decompress(v5_payload)
+    assert echoed["schema_version"] == SCHEMA_VERSION
+    assert echoed["sha256"] == hashlib.sha256(plain).hexdigest()
+    assert echoed["size_bytes"] == len(plain)
+    assert owner_path.read_bytes() == plain
+
+
+def test_installed_v4_tenant_db_returns_controlled_503(public_app, tmp_path):
+    """FAN-1734: an already-installed v4 tenant database yields a controlled
+    503 on every aggregate endpoint — no OperationalError, no request-time
+    writes, no empty 'successful' metrics — until a v5 snapshot is published."""
+    app, config = public_app
+    owner_path = config.tenant_db_path(config.publish_tenant_id)
+    src = tmp_path / "v4-installed-src.db"
+    build_v4_database(src)
+    owner_path.write_bytes(gzip.decompress(create_compressed_snapshot(src)))
+    before = owner_path.read_bytes()
+
+    client = app.test_client()
+    assert login(client).status_code == 303
+    endpoints = (
+        "/api/meta", "/api/summary", "/api/daily", "/api/agents",
+        "/api/projects", "/api/efficiency", "/api/model-efficiency",
+        "/api/efficiency-breakdown", "/api/health", "/health", "/api/sync",
+    )
+    for endpoint in endpoints:
+        response = client.get(endpoint, base_url="https://localhost")
+        assert response.status_code == 503, endpoint
+        assert response.get_json() == {
+            "detail": "database schema upgrade required"
+        }, endpoint
+    # Controlled degradation: liveness and session stay up, and the reads
+    # never mutated the installed tenant bytes.
+    assert client.get("/healthz", base_url="https://localhost").status_code == 200
+    assert client.get("/api/session", base_url="https://localhost").status_code == 200
+    assert owner_path.read_bytes() == before
+
+    # Republishing the upgraded v5 snapshot heals serving via the normal path.
+    conn = connect(src)
+    init_db(conn)
+    conn.close()
+    payload = create_compressed_snapshot(src)
+    ts = int(time.time())
+    healed = client.post(
+        "/api/ingest/snapshot",
+        data=payload,
+        content_type="application/vnd.aistat.snapshot+gzip",
+        headers={
+            "X-AIStat-Timestamp": str(ts),
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Signature": snapshot_signature(
+                INGEST_SECRET, config.publish_tenant_id, ts, payload
+            ),
+        },
+    )
+    assert healed.status_code == 200
+    summary = client.get("/api/summary", base_url="https://localhost")
+    assert summary.status_code == 200
+    assert summary.get_json()["total_tokens"] == 4_700_000
 
 
 def test_model_efficiency_endpoint_behind_auth(public_app):

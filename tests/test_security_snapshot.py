@@ -25,6 +25,7 @@ from aistat.snapshot import (
     daily_usage_max_date,
     install_compressed_snapshot,
     snapshot_is_fresh_enough,
+    validate_snapshot,
 )
 import aistat.snapshot as snapshot_module
 from conftest import seed_aggregate_fixture
@@ -37,6 +38,35 @@ def seeded_db(path):
     conn = connect(path)
     init_db(conn)
     seed_aggregate_fixture(conn)
+    conn.close()
+
+
+def build_v4_database(path, seed=seed_aggregate_fixture):
+    """A real pre-FAN-1715 schema v4 database at ``path`` (FAN-1734).
+
+    ``user_version`` is 4 and ``runs`` physically lacks the ``model`` column,
+    exactly as produced by the v4 release. Seeding happens after the downgrade
+    so run rows exist in the v4 shape, and the file is left as a standalone
+    rollback-journal database — the same form an installed tenant snapshot has.
+    """
+    conn = connect(path)
+    init_db(conn)
+    conn.executescript("""
+    DROP TABLE runs;
+    CREATE TABLE runs (
+        id TEXT PRIMARY KEY, issue_id TEXT, agent_id TEXT, runtime_id TEXT,
+        kind TEXT, status TEXT, attempt INTEGER, error TEXT, created_at TEXT,
+        dispatched_at TEXT, started_at TEXT, completed_at TEXT,
+        synced_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_runs_issue ON runs(issue_id);
+    CREATE INDEX idx_runs_agent ON runs(agent_id);
+    PRAGMA user_version = 4;
+    """)
+    if seed is not None:
+        seed(conn)
+    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.commit()
     conn.close()
 
 
@@ -171,6 +201,55 @@ def test_snapshot_round_trip_and_size_limit(tmp_path):
         install_compressed_snapshot(payload, tmp_path / "small.db", 100)
 
 
+def test_servable_validation_rejects_v4_and_missing_model_column(tmp_path):
+    """FAN-1734: serving admission accepts only the current schema and requires
+    a physically present ``runs.model`` column."""
+    v4_path = tmp_path / "v4.db"
+    build_v4_database(v4_path)
+
+    # Non-serving consumers (backup verification / restore of historical
+    # generations) keep accepting the older, once-valid shape...
+    assert validate_snapshot(v4_path).schema_version == 4
+
+    # ...but serving admission fails closed on it.
+    with pytest.raises(SnapshotError, match="unsupported schema version 4"):
+        validate_snapshot(v4_path, require_servable=True)
+
+    # A v5-stamped database physically missing runs.model is equally refused.
+    forged = tmp_path / "forged.db"
+    build_v4_database(forged)
+    conn = sqlite3.connect(str(forged))
+    conn.execute("PRAGMA user_version = {}".format(SCHEMA_VERSION))
+    conn.commit()
+    conn.close()
+    with pytest.raises(SnapshotError, match="runs is missing required columns: model"):
+        validate_snapshot(forged, require_servable=True)
+
+
+def test_install_rejects_v4_snapshot_without_touching_target(tmp_path):
+    source = tmp_path / "v4-source.db"
+    build_v4_database(source)
+    payload = create_compressed_snapshot(source)
+    target = tmp_path / "target.db"
+
+    with pytest.raises(SnapshotError, match="unsupported schema version 4"):
+        install_compressed_snapshot(payload, target, 64 * 1024 * 1024)
+    assert not target.exists()
+    assert not target.with_name(target.name + ".previous").exists()
+    assert list(tmp_path.glob(".aistat-snapshot-*")) == []
+
+    # Upgrading the writable source in place via init_db yields the exact v5
+    # snapshot the same pipeline then accepts and installs.
+    conn = connect(source)
+    init_db(conn)
+    conn.close()
+    info = install_compressed_snapshot(
+        create_compressed_snapshot(source), target, 64 * 1024 * 1024
+    )
+    assert info.schema_version == SCHEMA_VERSION
+    assert target.is_file()
+
+
 def test_snapshot_cleanup_does_not_leak_sidecars(tmp_path):
     source = tmp_path / "source.db"
     seeded_db(source)
@@ -287,7 +366,7 @@ def test_snapshot_validation_failure_cleans_sidecars(tmp_path, monkeypatch):
     payload = create_compressed_snapshot(source)
     created = []
 
-    def fail_validate(path):
+    def fail_validate(path, require_servable=False):
         created.append(path)
         for suffix in ("-wal", "-shm"):
             Path(str(path) + suffix).touch()

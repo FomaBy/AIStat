@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 import aistat.server as server_module
 from aistat.config import Config
 from aistat.db import connect, init_db
-from conftest import seed_aggregate_fixture, seed_model_less_fixture
+from conftest import (
+    seed_aggregate_fixture,
+    seed_model_less_fixture,
+    seed_opus_transition_fixture,
+)
 
 
 @pytest.fixture
@@ -33,6 +37,33 @@ def test_meta(api):
     assert [p["title"] for p in meta["projects"]] == ["Alpha", "Beta"]
     assert len(meta["agents"]) == 3
     assert meta["date_span"] == {"first": "2026-01-01", "last": "2026-01-02"}
+
+
+def test_opus_5_api_models_filters_and_efficiency_stay_separate(api):
+    client, conn = api
+    seed_opus_transition_fixture(conn)
+
+    meta = client.get("/api/meta").json()
+    assert {"claude-opus-4-8", "claude-opus-5"} <= set(meta["models"])
+    daily = client.get("/api/daily", params={
+        "group": "model", "from": "2026-07-24", "to": "2026-07-24",
+    }).json()["rows"]
+    assert {row["key"] for row in daily} == {
+        "claude-opus-4-8", "claude-opus-5",
+    }
+    assert all(row["total_tokens"] == 1_000_000 for row in daily)
+
+    for model in ("claude-opus-4-8", "claude-opus-5"):
+        summary = client.get("/api/summary", params={"model": model}).json()
+        assert summary["total_tokens"] == 1_000_000
+        assert summary["story_points"] == pytest.approx(5.0)
+        assert summary["agent_work_seconds"] == 3600
+    efficiency = client.get("/api/model-efficiency", params=[
+        ("model", "claude-opus-4-8"), ("model", "claude-opus-5"),
+    ]).json()
+    assert {row["model"] for row in efficiency["models"]} == {
+        "claude-opus-4-8", "claude-opus-5",
+    }
 
 
 def test_summary_endpoint(api):

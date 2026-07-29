@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aistat.db import connect, init_db  # noqa: E402
+from aistat import pricing, store  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -153,6 +154,57 @@ def seed_model_less_fixture(conn):
       ('run10', 'I8', 'A5', 'R4', 'completed',
        '2026-01-04T11:00:00Z', '2026-01-04T12:00:00Z', '{now}');
     """)
+    conn.commit()
+
+
+def seed_opus_transition_fixture(conn):
+    """FAN-1715: same-day Opus 4.8/5 usage and exact run cutoff snapshots."""
+    now = "2026-07-24T23:00:00Z"
+    agent_id = "e2e1c89f-587d-4a2d-bbaa-ce9b5dea908d"
+    runtime_id = "fb4bfde9-ea2a-4dba-8a4f-bafd8d7c9188"
+    conn.executescript(f"""
+    INSERT INTO runtimes (id, name, provider, status, synced_at) VALUES
+      ('{runtime_id}', 'Mixed Opus runtime', 'claude', 'online', '{now}');
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('{agent_id}', 'Opus transition agent', 'claude-opus-5', '{runtime_id}', '{now}');
+    INSERT INTO projects (id, title, status, synced_at) VALUES
+      ('P-OPUS', 'Opus transition', 'done', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I-OPUS-4', 'FAN-OLD', 'pre-transition Opus 4.8', 'done', 'P-OPUS', 5, '{now}', '{now}'),
+      ('I-OPUS-5', 'FAN-1669', 'confirmed Opus 5', 'done', 'P-OPUS', 5, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I-OPUS-4', 1, 1000000, 0, 0, 0, '{now}'),
+      ('I-OPUS-5', 1, 1000000, 0, 0, 0, '{now}');
+    INSERT INTO daily_usage (runtime_id, model, date, input_tokens, output_tokens,
+                             cache_read_tokens, cache_write_tokens, synced_at) VALUES
+      ('{runtime_id}', 'claude-opus-4-8', '2026-07-24', 1000000, 0, 0, 0, '{now}'),
+      ('{runtime_id}', 'claude-opus-5', '2026-07-24', 1000000, 0, 0, 0, '{now}');
+    """)
+    store.upsert_runs(conn, [
+        {
+            "id": "run-opus-4", "issue_id": "I-OPUS-4", "agent_id": agent_id,
+            "runtime_id": runtime_id, "kind": "direct", "status": "completed",
+            "attempt": 1, "error": None, "created_at": "2026-07-24T21:31:45Z",
+            "dispatched_at": "2026-07-24T21:31:45Z",
+            "started_at": "2026-07-24T21:31:45Z",
+            "completed_at": "2026-07-24T22:31:45Z",
+        },
+        {
+            "id": "run-opus-5", "issue_id": "I-OPUS-5", "agent_id": agent_id,
+            "runtime_id": runtime_id, "kind": "direct", "status": "completed",
+            "attempt": 1, "error": None, "created_at": "2026-07-24T21:31:46Z",
+            "dispatched_at": "2026-07-24T21:31:46Z",
+            "started_at": "2026-07-24T21:31:46Z",
+            "completed_at": "2026-07-24T22:31:46Z",
+        },
+    ], synced_at=now)
+    rates = pricing.load_pricing(FIXTURES.parent.parent / "pricing.json")
+    pricing.upsert_model_pricing(conn, rates, loaded_at=now)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0,
+                                  computed_at=now)
     conn.commit()
 
 

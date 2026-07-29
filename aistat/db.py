@@ -15,7 +15,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+# Serving contract for hosted tenant databases (FAN-1734). The run-attributed
+# aggregates introduced with schema v5 physically require ``runs.model``, so
+# only the current schema may be admitted for serving: an older upload (e.g. a
+# valid v4 snapshot) or an unknown future version must be rejected before it
+# can reach aggregate SQL. Snapshot admission, owner migration admission and
+# both WSGI serving surfaces all consult this single definition via
+# :func:`schema_admission_error` so the surfaces cannot drift. The public host
+# never mutates authenticated snapshot bytes; a v4 database becomes servable
+# only by running :func:`init_db` on the writable source and re-publishing.
+MIN_SERVABLE_SCHEMA_VERSION = SCHEMA_VERSION
+REQUIRED_SERVABLE_COLUMNS = {"runs": ("model",)}
+
+# Multica's run payload does not carry a model snapshot.  The one documented
+# Claude transition must therefore be applied both when upgrading stored runs
+# and when a historical run is first received after the transition.  Keep the
+# constants here beside the schema migration so the two paths cannot drift.
+OPUS_TRANSITION_AGENT_ID = "e2e1c89f-587d-4a2d-bbaa-ce9b5dea908d"
+OPUS_TRANSITION_AT = "2026-07-24T21:31:46Z"
+OPUS_4_8_MODEL = "claude-opus-4-8"
+OPUS_5_MODEL = "claude-opus-5"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtimes (
@@ -128,6 +149,9 @@ CREATE TABLE IF NOT EXISTS runs (
     issue_id       TEXT,
     agent_id       TEXT,
     runtime_id     TEXT,
+    -- Immutable model snapshot for historical run-level metrics.  Multica
+    -- currently omits this field from run payloads, so it is set at ingest.
+    model          TEXT,
     kind           TEXT,
     status         TEXT,
     attempt        INTEGER,
@@ -216,6 +240,9 @@ _ADDED_COLUMNS = {
         ("is_jira", "INTEGER NOT NULL DEFAULT 0"),
         ("jira_key", "TEXT"),
     ],
+    "runs": [
+        ("model", "TEXT"),
+    ],
 }
 
 
@@ -225,6 +252,88 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         for name, decl in columns:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def model_snapshot_for_run(agent_id, started_at, dispatched_at, created_at,
+                           fallback_model):
+    """Return the durable model identity for one Multica run.
+
+    The named agent is the only historical correction with evidence beyond the
+    current agent catalog: its first confirmed Opus 5 run started at
+    ``OPUS_TRANSITION_AT``.  A missing timestamp remains conservatively Opus
+    4.8, rather than allowing today's agent model to relabel unknown history.
+    Every other run uses the model observed while it is ingested.
+    """
+    if agent_id != OPUS_TRANSITION_AGENT_ID:
+        return fallback_model
+    event_at = started_at or dispatched_at or created_at
+    if event_at is not None and event_at >= OPUS_TRANSITION_AT:
+        return OPUS_5_MODEL
+    return OPUS_4_8_MODEL
+
+
+def _backfill_run_models(conn: sqlite3.Connection) -> None:
+    """Fill legacy ``runs.model`` once without changing existing snapshots."""
+    # Apply the evidence-backed cutoff before consulting the current catalog:
+    # this agent has both models on 2026-07-24, so a calendar-day migration
+    # would merge two real identities.
+    conn.execute(
+        """
+        UPDATE runs
+        SET model = CASE
+            WHEN COALESCE(started_at, dispatched_at, created_at) >= ? THEN ?
+            ELSE ?
+        END
+        WHERE model IS NULL AND agent_id = ?
+        """,
+        (OPUS_TRANSITION_AT, OPUS_5_MODEL, OPUS_4_8_MODEL,
+         OPUS_TRANSITION_AGENT_ID),
+    )
+    # The generic legacy case has no transition evidence.  Copy the current
+    # catalog once, but only when it actually supplies a non-null model.
+    conn.execute(
+        """
+        UPDATE runs
+        SET model = (SELECT a.model FROM agents a WHERE a.id = runs.agent_id)
+        WHERE model IS NULL
+          AND agent_id IS NOT NULL
+          AND agent_id != ?
+          AND EXISTS (
+              SELECT 1 FROM agents a
+              WHERE a.id = runs.agent_id AND a.model IS NOT NULL
+          )
+        """,
+        (OPUS_TRANSITION_AGENT_ID,),
+    )
+
+
+def schema_admission_error(conn: sqlite3.Connection):
+    """Why ``conn``'s database may not be served, or ``None`` when it may.
+
+    Fail-closed: any schema version outside the servable range — older valid
+    snapshots such as v4 as well as unknown future versions — or a physically
+    missing required column disqualifies the database before any aggregate SQL
+    can touch it. Works on a query-only connection; never mutates the database.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < MIN_SERVABLE_SCHEMA_VERSION or version > SCHEMA_VERSION:
+        return "unsupported schema version {}; server requires {}".format(
+            version, SCHEMA_VERSION
+        )
+    for table in sorted(REQUIRED_SERVABLE_COLUMNS):
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info({})".format(table))
+        }
+        missing = [
+            name
+            for name in REQUIRED_SERVABLE_COLUMNS[table]
+            if name not in existing
+        ]
+        if missing:
+            return "table {} is missing required columns: {}".format(
+                table, ", ".join(missing)
+            )
+    return None
 
 
 def utcnow_iso() -> str:
@@ -252,5 +361,6 @@ def connect_readonly(db_path: Union[str, Path]) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _add_missing_columns(conn)
+    _backfill_run_models(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

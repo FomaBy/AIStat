@@ -31,6 +31,7 @@ from conftest import (
     seed_aggregate_fixture,
     seed_model_less_fixture,
 )
+from test_security_snapshot import build_v4_database
 
 PASSWORD = "correct horse battery staple"
 SESSION_SECRET = "legacy-session-" + "s" * 48
@@ -200,6 +201,7 @@ def test_source_parses_as_python_36():
     # shared core must parse as 3.6 too.
     for path in (
         "aistat/aggregates.py",
+        "aistat/db.py",
         "aistat/endpoints.py",
         "aistat/handoff.py",
         "aistat/legacy_wsgi.py",
@@ -273,6 +275,114 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
     )
     assert post(fresh, base_ts + 20)[0] == "200 OK"
     assert daily_usage_max_date(owner_path) == "2026-01-03"
+
+
+def test_legacy_ingest_rejects_v4_snapshot_fail_closed(legacy, tmp_path):
+    """FAN-1734 on the production (legacy 3.6 CGI) contour: a real v4 snapshot
+    is refused with 422 before the journal/swap; tenant bytes, .previous,
+    staged temp files and the replay watermark stay untouched, and the
+    in-place-upgraded v5 snapshot is accepted at the very same timestamp."""
+    module = legacy
+    owner_id = migrate_owner_database(Config())["owner_user_id"]
+    owner_path = Config().tenant_db_path(owner_id)
+    before = owner_path.read_bytes()
+
+    src = tmp_path / "legacy-v4-src.db"
+    build_v4_database(src)
+    v4_payload = create_compressed_snapshot(src)
+    ts = int(time.time())
+
+    def post(payload, at):
+        return request(
+            module.application,
+            "/api/ingest/snapshot",
+            method="POST",
+            body=payload,
+            headers={
+                "Content-Type": "application/vnd.aistat.snapshot+gzip",
+                "X-AIStat-Timestamp": str(at),
+                "X-AIStat-Tenant": str(owner_id),
+                "X-AIStat-Signature": snapshot_signature(
+                    INGEST_SECRET, owner_id, at, payload
+                ),
+            },
+        )
+
+    status, _, body = post(v4_payload, ts)
+    assert status == "422 Unprocessable Entity"
+    assert json.loads(body.decode("utf-8")) == {"detail": "invalid snapshot"}
+    assert owner_path.read_bytes() == before
+    assert not (owner_path.parent / (owner_path.name + ".previous")).exists()
+    assert list(owner_path.parent.glob(".aistat-snapshot-*")) == []
+
+    conn = connect(src)
+    init_db(conn)
+    conn.close()
+    v5_payload = create_compressed_snapshot(src)
+    status, _, body = post(v5_payload, ts)
+    assert status == "200 OK"
+    echoed = json.loads(body.decode("utf-8"))
+    plain = gzip.decompress(v5_payload)
+    assert echoed["schema_version"] == SCHEMA_VERSION
+    assert echoed["sha256"] == hashlib.sha256(plain).hexdigest()
+    assert echoed["size_bytes"] == len(plain)
+    assert owner_path.read_bytes() == plain
+
+
+def test_legacy_installed_v4_tenant_db_returns_controlled_503(legacy, tmp_path):
+    """FAN-1734 on the production contour: an already-installed v4 tenant
+    database yields a controlled 503 on every aggregate endpoint — never an
+    OperationalError 500 or empty metrics — until a v5 snapshot is published."""
+    module = legacy
+    owner_id = migrate_owner_database(Config())["owner_user_id"]
+    owner_path = Config().tenant_db_path(owner_id)
+    src = tmp_path / "legacy-v4-installed.db"
+    build_v4_database(src)
+    owner_path.write_bytes(gzip.decompress(create_compressed_snapshot(src)))
+    before = owner_path.read_bytes()
+
+    cookies = login(module)
+    endpoints = (
+        "/api/meta", "/api/summary", "/api/daily", "/api/agents",
+        "/api/projects", "/api/efficiency", "/api/model-efficiency",
+        "/api/efficiency-breakdown", "/api/health", "/health", "/api/sync",
+    )
+    for endpoint in endpoints:
+        status, _, body = request(module.application, endpoint, cookie=cookies)
+        assert status == "503 Service Unavailable", endpoint
+        assert json.loads(body.decode("utf-8")) == {
+            "detail": "database schema upgrade required"
+        }, endpoint
+    status, _, _ = request(module.application, "/healthz")
+    assert status == "200 OK"
+    status, _, _ = request(module.application, "/api/session", cookie=cookies)
+    assert status == "200 OK"
+    assert owner_path.read_bytes() == before
+
+    # Republishing the upgraded v5 snapshot heals serving via the normal path.
+    conn = connect(src)
+    init_db(conn)
+    conn.close()
+    payload = create_compressed_snapshot(src)
+    ts = int(time.time())
+    status, _, _ = request(
+        module.application,
+        "/api/ingest/snapshot",
+        method="POST",
+        body=payload,
+        headers={
+            "Content-Type": "application/vnd.aistat.snapshot+gzip",
+            "X-AIStat-Timestamp": str(ts),
+            "X-AIStat-Tenant": str(owner_id),
+            "X-AIStat-Signature": snapshot_signature(
+                INGEST_SECRET, owner_id, ts, payload
+            ),
+        },
+    )
+    assert status == "200 OK"
+    status, _, body = request(module.application, "/api/summary", cookie=cookies)
+    assert status == "200 OK"
+    assert json.loads(body.decode("utf-8"))["total_tokens"] == 4_700_000
 
 
 class _FakeResponse:
