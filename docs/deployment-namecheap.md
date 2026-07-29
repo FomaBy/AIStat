@@ -55,16 +55,35 @@ curl -I https://aistat.app/
 не должен выдавать ошибку сертификата. HSTS включается приложением только на
 HTTPS-запросах.
 
-## 3. Развернуть приложение
+## 3. Развернуть приложение (только первичная установка)
 
-Собрать архив:
+Пакет всегда собирается из **заранее одобренной** пары full commit SHA +
+root tree SHA — той же, что проходит approval gate раздела 7 (шаг 2). Не
+вычислять значения из `origin/main` в момент сборки: вершина ветки к этому
+моменту могла уйти вперёд одобренного кандидата, и раздел 7 прямо запрещает
+подставлять текущий mutable `origin/main` вместо ожидаемой пары.
+
+Собрать архив из точного commit tree (рабочий каталог и untracked/ignored
+файлы источником не являются):
 
 ```bash
-./scripts/build_cpanel_package.sh
+EXPECTED_SHA=<40-символьный approved commit SHA>
+EXPECTED_TREE=<40-символьный approved root tree SHA>
+git fetch origin main
+./scripts/build_cpanel_package.sh "$EXPECTED_SHA" "$EXPECTED_TREE"
 ```
 
-Загрузить содержимое `dist/aistat-cpanel.zip` в `$HOME/aistat_app`.
-Дополнительные Python-пакеты не требуются.
+Ручная загрузка содержимого `dist/aistat-cpanel.zip` в `$HOME/aistat_app`
+допустима **только до первого выката по разделу 7**, пока этот путь — обычный
+каталог. После раздела 7 `$HOME/aistat_app` — **живой symlink** на каталог
+текущего release: запись «в него» проходит сквозь symlink внутрь живого
+release, загрязняет его и блокирует следующий deploy на проверке
+live-манифеста. Все обновления работающего сайта выполняются только
+процедурой раздела 7 (пиннинг approved-кандидата + `deploy/cpanel_deploy.sh`).
+
+Дополнительные Python-пакеты не требуются. В пакет входит
+`PACKAGE-MANIFEST.json`: полный commit/tree кандидата и отсортированные SHA-256,
+размеры и режимы всех payload-файлов.
 
 ### Вариант A: LiteSpeed CGI на Namecheap Shared Hosting
 
@@ -291,13 +310,65 @@ legacy-задание `com.aistat.sync` (его ставил retired-скрип�
 дублирующихся poller/publisher не остаётся. Путь обновления и отката описан
 в [runtime-supervisor.md](runtime-supervisor.md).
 
-## 7. Автообновление сайта через cPanel Git + cron (ежедневно в 05:00)
+## 7. Пиннинг и публикация approved-кандидата через cPanel Git + cron
 
-Прод обновляется раз в сутки без передачи каких-либо доступов: хостинг сам
-забирает код из **публичного** репозитория `FomaBy/AIStat`, а cron в 05:00
-собирает пакет и атомарно публикует его. Ни одного секрета на стороне
-CI / Mac / агента не появляется. Данные (`~/aistat-private`) и 5-минутный цикл
-публикации (runtime `com.aistat.runtime` на Mac) этот механизм не трогает.
+Прод принимает только заранее одобренную пару **full commit SHA + root tree
+SHA** из `main`. Скрипт никогда не подставляет текущий mutable `origin/main`
+вместо ожидаемого кандидата: собирается и публикуется ровно запиненный commit.
+«Одобренность» — это принадлежность истории `main`, а не совпадение с её
+вершиной, поэтому продвижение `main` вперёд не делает уже одобренного кандидата
+невыкатываемым. Cron раз в сутки проверяет и при необходимости публикует именно
+запиненную пару; уже работающий exact-кандидат даёт безопасный `ALREADY LIVE`
+с кодом возврата 0 и без строки `ERROR` в `deploy.log`.
+
+Fail-closed сохраняется для всего, что не является одобренным кандидатом. У
+gate шесть отказных ветвей; в `deploy.log` они различимы по сообщению (перед
+каждым стоит фаза — `pre-build` или `pre-publish`):
+
+- `fetch failed — keeping current release` — сам `git fetch origin main`
+  завершился ошибкой (сеть, хостинг, права); о кандидате ещё ничего не
+  известно;
+- `candidate commit missing after fetch: <sha>` — commit-объект отсутствует в
+  клоне даже после fetch (например, shallow-клон без истории до пина);
+- `candidate is not approved: <sha> is not contained in origin/main` —
+  настоящий отзыв одобрения: commit существует, но не содержится в
+  `origin/main` (force-push переписал ветку, либо кандидат в неё не попал);
+- `could not test candidate against origin/main (git exit N)` — проверку
+  принадлежности выполнить не удалось: это сломанный репозиторий (например,
+  `git exit 128` при отсутствующем tracking ref), а **не** отзыв одобрения —
+  чинить нужно клон, а не искать плохой кандидат;
+- `could not resolve candidate tree: <sha>` — у commit не резолвится root tree;
+- `tree drift: expected <tree>, candidate <tree>` — commit одобрен, но его
+  root tree не совпадает с ожидаемым из пары.
+
+Проверка выполняется дважды. На `pre-build` отказ происходит **до** reset
+checkout, сборки и staging. На `pre-publish` release уже собран, поэтому отказ
+происходит до commit-point: live-symlink остаётся прежним, а неопубликованный
+stage удаляется. Ни в одном случае действующая live-цель не меняется.
+
+Четыре следствия новой семантики, которые важно знать оператору:
+
+- **Revert на `main` не отзывает пин.** Отменённый commit остаётся достижимым из
+  `origin/main`, поэтому продолжает считаться одобренным. Чтобы прекратить
+  выкат плохого кандидата, нужно заменить пару SHA/tree в cron (при
+  необходимости — сделать rollback); одного revert недостаточно.
+- **Пин старого предка оставляет сам инструмент на старой версии.** Deploy
+  делает `git reset --hard` в `~/repositories/AIStat`, то есть следующий запуск
+  cron исполнит `cpanel_deploy.sh` и `build_cpanel_package.sh` из запиненного
+  commit. При откате пина далеко назад это возвращает и старое поведение
+  деплой-скриптов.
+- **Клон должен содержать историю до пина.** Fetch тянет только `main`; в
+  shallow-клоне старый предок будет отсутствовать, и gate откажет с
+  `candidate commit missing after fetch`.
+- **Клон `~/repositories/AIStat` управляется скриптом и не предназначен для
+  ручного редактирования.** Ежедневный `git reset --hard` на запиненный
+  кандидат выполняется **до** короткого замыкания `ALREADY LIVE`, то есть
+  срабатывает и в «тихие» дни без публикации. Любые локальные правки в этом
+  клоне стираются следующим запуском cron.
+
+Репозиторий публичный, поэтому fetch не требует production credentials. Секреты
+приложения, данные (`~/aistat-private`) и 5-минутный цикл публикации
+(`com.aistat.runtime` на Mac) механизм не читает и не меняет.
 
 ### Шаг 1. Клонировать репозиторий (cPanel → Git Version Control)
 
@@ -310,12 +381,36 @@ CI / Mac / агента не появляется. Данные (`~/aistat-priva
 
 Нажать **Create** — cPanel сделает начальный clone ветки `main`.
 
-### Шаг 2. Добавить cron-задачу (cPanel → Cron Jobs)
+### Шаг 2. Зафиксировать approved SHA/tree
+
+После independent QA взять из её evidence **полные** значения кандидата и
+проверить их в cPanel-клоне:
+
+```bash
+EXPECTED_SHA=<40-символьный approved commit SHA>
+EXPECTED_TREE=<40-символьный approved root tree SHA>
+git -C "$HOME/repositories/AIStat" fetch origin main \
+  && git -C "$HOME/repositories/AIStat" merge-base --is-ancestor "$EXPECTED_SHA" origin/main \
+  && test "$(git -C "$HOME/repositories/AIStat" rev-parse "${EXPECTED_SHA}^{tree}")" = "$EXPECTED_TREE" \
+  && echo "APPROVED $EXPECTED_SHA"
+```
+
+Обе проверки молчаливы при успехе, поэтому они соединены `&&` с финальным
+`echo`: единственный признак прохождения gate — строка `APPROVED`. Её
+отсутствие означает, что кандидат не одобрен, и продолжать нельзя.
+
+Проверяется принадлежность кандидата истории `main` и точное совпадение tree, а
+не равенство вершине: к моменту пиннинга `main` уже может уйти вперёд. Short
+SHA, имя ветки или автоматически вычисленное после fetch значение не заменяет
+этот approval gate.
+
+### Шаг 3. Добавить cron-задачу (cPanel → Cron Jobs)
 
 `cPanel → Advanced → Cron Jobs → Add New Cron Job`. Часовой пояс сервера
 Namecheap может отличаться от часового пояса владельца. Чтобы обновление всегда
 проходило в **05:00 Europe/Vilnius**, включая переходы на летнее и зимнее время,
-cron запускает лёгкую проверку каждый час:
+cron запускает лёгкую проверку времени каждый час, но сам deploy выполняется
+**один раз в сутки** — в единственный час, прошедший фильтр:
 
 - Minute `0`;
 - Hour `*`;
@@ -323,47 +418,215 @@ cron запускает лёгкую проверку каждый час:
 - Month `*`;
 - Weekday `*`.
 
-Command (одной строкой, `$HOME` cPanel подставит сам):
+Command (одной строкой; заменить оба placeholder точными approved-значениями,
+`$HOME` cPanel подставит сам):
 
 ```bash
-LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" >> "$HOME/aistat-private/deploy.log" 2>&1
+LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" deploy <FULL_COMMIT_SHA> <FULL_TREE_SHA> >> "$HOME/aistat-private/deploy.log" 2>&1
 ```
 
-Готово: каждый день в 05:00 по Вильнюсу сайт обновляется до последнего `main`,
-независимо от часового пояса cPanel-сервера.
+При принятии следующего кандидата заменить в cron **оба** значения одной
+операцией. До этого сайт остаётся на прежнем approved-кандидате независимо от
+движения `main`, а ежедневный запуск на уже живом кандидате остаётся тихим
+(`ALREADY LIVE`, exit 0). Строка `ERROR` в `deploy.log` означает реальную
+проблему, а не то, что `main` ушёл вперёд.
 
 ### Что делает `deploy/cpanel_deploy.sh`
 
-1. `git fetch` + `git reset --hard origin/main` в клоне;
-2. собирает dependency-free пакет (`scripts/build_cpanel_package.sh`, без `zip`);
-3. проверяет пакет через `python3 -m compileall` — при ошибке деплой **не
-   выполняется**;
-4. кладёт новую версию в `~/aistat_releases/<дата>-<sha>` и атомарно
-   переключает симлинк `~/aistat_app` на неё (`ln -sfn`);
-5. хранит последние релизы (по умолчанию 5) для отката.
+1. Берёт nonblocking host-local lock
+   `~/aistat-private/cpanel-deploy.lock`; concurrent deploy/rollback завершается
+   до fetch, staging и publish. Lock держится kernel `flock` через Python
+   `fcntl` и автоматически освобождается при exit/crash; оставшийся файл
+   удалять не нужно, строка `pid=...` в нём только диагностическая.
+2. Делает fetch и проверяет одобренность запиненного кандидата: commit
+   существует локально, содержится в `origin/main` и его root tree совпадает с
+   ожидаемым. Вершина `origin/main` при этом может быть любой.
+3. Сбрасывает checkout на точный commit и строит пакет только через
+   `git archive <expected-sha>`; tracked-правки, untracked и ignored файлы хоста
+   в release не попадают.
+4. Проверяет манифест в режиме `strict`, принудительно компилирует весь пакет,
+   отдельно `aistat.cgi` и `passenger_wsgi.py`, затем импортирует
+   Passenger-контур с временными `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH` и
+   `AISTAT_TENANTS_DIR`. Production DB/tenant paths в smoke не используются.
+5. Создаёт уникальный release и повторяет fetch + тот же approval gate
+   непосредственно перед publish. Продвижение `main` между двумя fetch
+   безопасно и публикацию не отменяет; отзыв одобрения (кандидат перестал
+   содержаться в `origin/main`) или расхождение tree оставляют live link
+   прежним и удаляют unpublished stage.
+6. Создаёт новый symlink рядом с `~/aistat_app`, затем делает один атомарный
+   `os.replace` на том же host filesystem. Перед commit-point прежняя live-цель
+   повторно сверяется: тот же exact target, валидной формы, прямым дочерним
+   каталогом `~/aistat_releases` и не исчезнувший во время проверки.
+7. Хранит live и exact previous target. `AISTAT_KEEP_RELEASES` — это **общее**
+   число оставляемых managed-release, **включая** live и previous: при default
+   `5` на диске остаётся 5 каталогов release всего, а не 5 сверх двух
+   защищённых. Принимается только `0` (не удалять релизы) или любое
+   каноническое целое `>=2` — как однозначное (`2`, `9`), так и многозначное
+   (`10`, `19`, `100`). Значение `1` запрещено именно из-за этой базы отсчёта:
+   live и exact previous не удаляются никогда, поэтому общий лимит `1` при
+   двух защищённых целях недостижим. Пустое значение
+   (`AISTAT_KEEP_RELEASES=""`) не отклоняется, а означает «не задано» и даёт
+   default `5` — до валидации формата оно не доходит. Значения `1`,
+   отрицательные, с ведущим нулём, дробные и нечисловые отклоняются до
+   каких-либо изменений на диске.
 
-Любой сбой на шагах 1–3 прекращает деплой **до** переключения симлинка — прод
-продолжает работать на прежнем релизе. CGI-вход перечитывает код на каждом
-запросе, поэтому перезапуск не нужен (для Passenger — Restart в Setup Python App).
+Любая ошибка до `os.replace` прекращает deploy без изменения live target.
+После switch cleanup retention является best-effort и никогда не удаляет live
+или exact previous release. CGI перечитывает код на каждом запросе; для
+Passenger после публикации нужен Restart в `Setup Python App`.
+
+Publish и rollback неделимы относительно `TERM`, `HUP` и `INT`: вокруг
+commit-point эти сигналы игнорируются, поэтому сигнал не разрывает rename
+пополам и не удаляет только что опубликованный release, а cleanup никогда не
+удаляет каталог, на который фактически указывает `~/aistat_app`. Deploy и
+rollback всегда оставляют валидную live-цель — прежнюю или новую.
+
+Проверка манифеста имеет два режима. `strict` — для свежесобранного package и
+для staged release до публикации: состав файлов должен совпадать с манифестом
+точно, без исключений. `runtime` — для release, который уже обслуживал трафик:
+текущая live-цель при следующем deploy и target при rollback; здесь допускаются
+ровно каталоги `__pycache__/` и файлы `*.pyc` внутри них, и больше ничего.
+
+Причина исключения: `aistat.cgi` работает как отдельный CGI-процесс на запрос
+под `#!/usr/bin/python3` (на хосте это CPython 3.6.8), поэтому интерпретатор
+пишет `__pycache__/*.cpython-36.pyc` рядом с исходниками — то есть через
+live-symlink внутрь опубликованного release. Это нормальная работа, а не
+повреждение пакета.
+
+Целостность при этом не ослаблена: sha256, размер и режим каждого файла из
+манифеста проверяются всегда и в обоих режимах. Любой другой лишний или
+пропавший путь по-прежнему fail-closed останавливает deploy/rollback, а ошибка
+перечисляет конкретные пути:
+`manifest payload set does not match package (unexpected paths: ...)`.
+
+Отдельно: каталог `data/` внутри release — это **ошибка, а не allowlist**. Он
+появляется, когда приватный env-файл `~/aistat-private/aistat.env` не задаёт
+`AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH` и `AISTAT_TENANTS_DIR`: тогда
+`aistat/legacy_wsgi.py` резолвит их по умолчанию в `<app_root>/data`, то есть
+внутрь release, и следующий deploy остановится. Лечение — задать все три
+переменные вне release в `~/aistat-private/aistat.env` (см. `.env.example` и
+раздел 4), перенести накопленные там базы в `~/aistat-private`, затем убрать
+созданный внутри release каталог `data/`.
+
+### Переменные окружения deploy-инструментов
+
+Все переменные ниже опциональны: в обычной cPanel-инсталляции ни одна не
+задаётся и работают значения по умолчанию.
+
+`deploy/cpanel_deploy.sh`:
+
+- `AISTAT_APP_ROOT` — путь live-symlink приложения; default `$HOME/aistat_app`.
+  Это не только деплойный, но и **runtime-knob**: `aistat.cgi` читает его на
+  каждом запросе, чтобы найти каталог приложения для импорта кода. Если менять
+  его для deploy, ту же переменную нужно задать и CGI-окружению — иначе сайт
+  продолжит обслуживаться из старого пути.
+- `AISTAT_RELEASES_DIR` — каталог managed-release; default
+  `$HOME/aistat_releases`. Только его прямые дочерние каталоги считаются
+  release-целями, и только внутри него работает retention.
+- `AISTAT_DEPLOY_LOCK_FILE` — host-local lock-файл deploy/rollback; default
+  `$HOME/aistat-private/cpanel-deploy.lock`.
+- `AISTAT_KEEP_RELEASES` — retention; default `5`. Семантика и база отсчёта —
+  в пункте 7 выше: это общее число хранимых release, включая live и previous.
+- `AISTAT_DEPLOY_LIB_ONLY` — непустое значение заставляет `source`-загрузку
+  скрипта отдать только чистые helper-функции, не выполняя deploy-логику.
+  Используется focused-тестами; оператору задавать не нужно.
+
+`scripts/build_cpanel_package.sh` (вызывается deploy-скриптами, но может
+запускаться и вручную, как в разделе 3):
+
+- `AISTAT_SOURCE_REPOSITORY` — git-репозиторий, из которого резолвится и
+  архивируется кандидат; default — корень репозитория, содержащего сам скрипт.
+- `AISTAT_EXPECTED_SHA`, `AISTAT_EXPECTED_TREE` — env-альтернатива двум
+  позиционным аргументам (full commit SHA и root tree SHA); default нет, пара
+  обязательна в том или ином виде, позиционные аргументы имеют приоритет.
+- `AISTAT_SKIP_ZIP` — значение `1` пропускает сборку `dist/aistat-cpanel.zip`
+  и оставляет только каталог `dist/aistat-cpanel`; default `0` (архив
+  собирается). Так работает ежедневный cPanel-deploy: ему нужен только
+  каталог, а `zip` на shared-хосте может отсутствовать.
 
 ### Как убедиться, что деплой прошёл
 
 ```bash
-tail -n 20 ~/aistat-private/deploy.log   # строки "PUBLISHED ... -> <релиз>" и "deploy complete: <sha>"
-ls -l ~/aistat_app                        # симлинк на ~/aistat_releases/<дата>-<sha>
-ls -1t ~/aistat_releases                  # список релизов, новейший сверху
-curl -I https://aistat.app/               # сайт отвечает (редирект на /login)
+tail -n 30 ~/aistat-private/deploy.log   # full commit/tree, previous/new target, manifest_sha256
+readlink ~/aistat_app                    # exact абсолютный live target
+python3 -m json.tool "$(readlink ~/aistat_app)/PACKAGE-MANIFEST.json" >/dev/null
+ls -1t ~/aistat_releases                # список релизов, новейший сверху
+curl -I https://aistat.app/             # сайт отвечает (редирект на /login)
 ```
+
+Успешная строка `PUBLISHED` содержит full commit SHA, tree SHA, exact previous
+и new release paths и SHA-256 самого manifest без секретов.
+
+### Первый переход с ручного каталога
+
+Обычный deploy намеренно **не** перемещает существующий реальный каталог
+`~/aistat_app`: заменить непустой directory на symlink одним переносимым
+atomic rename нельзя. Выполнить переход отдельно в объявленное maintenance-окно
+и заранее сохранить имя backup:
+
+```bash
+STAMP="$(date '+%Y%m%d-%H%M%S')"
+MANUAL_BACKUP="$HOME/aistat-manual-backup-$STAMP"
+mv "$HOME/aistat_app" "$MANUAL_BACKUP"
+/bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" deploy <FULL_COMMIT_SHA> <FULL_TREE_SHA>
+```
+
+Процедура не требует, чтобы approved-кандидат был вершиной `main` на момент
+выполнения: подойдёт любой одобренный commit, содержащийся в `origin/main`. По
+той же причине можно перевыпустить release после потери каталога, не сдвигая
+пин.
+
+Между `mv` и успешным deploy возможна краткая недоступность — поэтому это
+только maintenance procedure, не cron. Если deploy завершился ошибкой до
+создания `~/aistat_app`, немедленно вернуть ручную версию:
+
+```bash
+test -e "$HOME/aistat_app" || mv "$MANUAL_BACKUP" "$HOME/aistat_app"
+```
+
+После проверки нового exact release backup можно оставить до следующего
+maintenance-window или удалить вручную; deploy/retention его не трогает.
 
 ### Откат на предыдущую версию
 
 ```bash
-ls -1t ~/aistat_releases                  # выбрать предыдущий релиз
-ln -sfn ~/aistat_releases/<предыдущий> ~/aistat_app
+CURRENT="$(readlink "$HOME/aistat_app")"
+ls -1t "$HOME/aistat_releases"           # выбрать существующий previous exact release
+TARGET="$HOME/aistat_releases/<полное-имя-релиза>"
+/bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" rollback "$TARGET"
 ```
 
-При первом запуске существующий каталог `~/aistat_app` из ручной установки
-сохраняется как релиз `manual-<дата>` — на него тоже можно откатиться.
+Rollback принимает только существующий **absolute** direct-child target с
+валидным `PACKAGE-MANIFEST.json`, берёт тот же lock, повторно проверяет current
+target и использует тот же атомарный switch. Git fetch/build и retention при
+rollback не выполняются. Для аварийного возврата `MANUAL_BACKUP` используется
+отдельное maintenance-окно, описанное выше.
+
+### Восстановление «висящего» live-symlink
+
+Состояние: `~/aistat_app` существует как symlink, но каталог, на который он
+указывает, отсутствует (например, release удалили вручную) — сайт не работает.
+
+Сломанная **текущая** live-цель инструмент не блокирует. Проверяется только
+форма пути: absolute, без traversal, не symlink, прямой ребёнок
+`~/aistat_releases`. Отсутствие самого каталога допускается и логируется
+строкой `WARNING: live symlink points at a missing release: ...`. Отказ
+остаётся только для невалидного аргумента, переданного оператором, — например
+`rollback` на несуществующий target.
+
+Штатное восстановление — обычный rollback на существующий release:
+
+```bash
+readlink "$HOME/aistat_app"              # видно, что цель отсутствует
+ls -1t "$HOME/aistat_releases"           # выбрать существующий release
+TARGET="$HOME/aistat_releases/<полное-имя-релиза>"
+/bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" rollback "$TARGET"
+```
+
+Обычный `deploy` следующего кандидата из этого состояния тоже проходит и
+восстанавливает работу. Удалять сам symlink `~/aistat_app` вручную не нужно и
+не помогает: без него `rollback` откажет (`rollback requires an existing live
+symlink`), а deploy всё равно создаёт link заново.
 
 ## Защита данных
 

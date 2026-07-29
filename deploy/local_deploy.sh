@@ -277,10 +277,12 @@ cmd_release() {
   git -C "$mdir" fetch --quiet origin || die "fetch origin failed"
 
   # 1. Resolve the release candidate to an immutable SHA.
-  local candidate sha
+  local candidate sha tree
   if [ "$promote" = 1 ]; then candidate="$from"; else candidate="origin/main"; fi
   sha="$(git -C "$mdir" rev-parse --verify "${candidate}^{commit}" 2>/dev/null)" \
     || die "cannot resolve release candidate '$candidate'"
+  tree="$(git -C "$mdir" rev-parse "${sha}^{tree}" 2>/dev/null)" \
+    || die "cannot resolve release candidate tree '$candidate'"
   if [ "$promote" = 1 ] && [ "$force" != 1 ] \
      && git -C "$mdir" rev-parse --verify --quiet origin/main >/dev/null; then
     git -C "$mdir" merge-base --is-ancestor origin/main "$sha" \
@@ -295,19 +297,28 @@ cmd_release() {
   rm -rf "$stage"; mkdir -p "$stage"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage'" EXIT
-  log "staging + validating candidate $(git -C "$mdir" rev-parse --short "$sha")"
+  # Full commit+tree everywhere below: the cPanel approval gate (§7 of
+  # docs/deployment-namecheap.md) needs this exact pair, so the operator must
+  # be able to copy it straight from the release log.
+  log "staging + validating candidate commit=$sha tree=$tree"
   git -C "$mdir" archive "$sha" | tar -x -C "$stage" \
     || die "could not export candidate — nothing published, main untouched"
-  ( cd "$stage" && AISTAT_SKIP_ZIP=1 bash scripts/build_cpanel_package.sh >/dev/null ) \
+  ( cd "$stage" && \
+    AISTAT_SOURCE_REPOSITORY="$mdir" AISTAT_SKIP_ZIP=1 \
+      bash scripts/build_cpanel_package.sh "$sha" "$tree" >/dev/null ) \
     || die "package build failed for candidate — origin/main and main deployment left untouched"
-  python3 -m compileall -q -f "$stage/dist/aistat-cpanel/aistat" \
+  python3 -m compileall -q -f "$stage/dist/aistat-cpanel" \
     || die "candidate failed py_compile — origin/main and main deployment left untouched"
+  python3 -m py_compile \
+    "$stage/dist/aistat-cpanel/aistat.cgi" \
+    "$stage/dist/aistat-cpanel/passenger_wsgi.py" \
+    || die "candidate entry point failed py_compile — origin/main and main deployment left untouched"
   rm -rf "$stage"; trap - EXIT
   log "candidate validated"
 
   # 3. Only now publish: push the validated SHA to origin/main (if promoting).
   if [ "$promote" = 1 ]; then
-    log "promoting $from ($(git -C "$mdir" rev-parse --short "$sha")) -> origin/main"
+    log "promoting $from (commit=$sha tree=$tree) -> origin/main"
     if [ "$force" = 1 ]; then
       git -C "$mdir" push --force-with-lease origin "$sha:refs/heads/main" || die "push to origin/main failed"
     else
@@ -316,11 +327,11 @@ cmd_release() {
   fi
 
   # 4. Move the live main deployment to the validated commit and restart it.
-  log "updating main deployment to $(git -C "$mdir" rev-parse --short "$sha")"
+  log "updating main deployment to commit=$sha tree=$tree"
   git -C "$mdir" reset --hard --quiet "$sha"
   ensure_deps "$mdir"
   restart_agent main
-  log "release complete: origin/main at $(git -C "$mdir" rev-parse --short HEAD); dashboard http://127.0.0.1:$MAIN_PORT"
+  log "release complete: origin/main at commit=$(git -C "$mdir" rev-parse HEAD) tree=$(git -C "$mdir" rev-parse 'HEAD^{tree}'); dashboard http://127.0.0.1:$MAIN_PORT"
 }
 
 cmd_status() {
