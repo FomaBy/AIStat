@@ -112,7 +112,7 @@ def public_page():
         thread.start()
         cdp = launch_chrome(CHROME)
         try:
-            yield cdp, f"http://127.0.0.1:{port}"
+            yield cdp, f"http://127.0.0.1:{port}", config
         finally:
             cdp.close()
             server.shutdown()
@@ -141,6 +141,16 @@ def _search_params(cdp):
         "[...new URLSearchParams(location.search).entries()]")
 
 
+def _locale_preload(language):
+    return (
+        'Object.defineProperty(Navigator.prototype, "language", '
+        f'{{configurable: true, get: () => {json.dumps(language)}}}); '
+        'if (sessionStorage.getItem("aistat.test.locale-ready") !== "1") { '
+        'localStorage.removeItem("aistat.locale"); '
+        'sessionStorage.setItem("aistat.test.locale-ready", "1"); }'
+    )
+
+
 def test_open_page_navigates_the_attached_target(dashboard):
     """A fresh target must reach the requested page after its flat session
     is attached; creating a target alone is not sufficient evidence."""
@@ -163,17 +173,19 @@ def test_default_english_localizes_static_and_dynamic_dashboard_copy(dashboard):
     assert cdp.eval('document.querySelector(".connection-host").textContent') == "Official host: https://multica.ai"
     assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
     assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    assert cdp.eval('document.querySelector(".connection-host").textContent') == "Официальный хост: https://multica.ai"
+    assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
 
 
 def test_public_login_localizes_and_persists_browser_locale(public_page):
-    cdp, base = public_page
+    cdp, base, _ = public_page
     cdp.open_page(
         base + "/login",
-        preload_script=(
-            'Object.defineProperty(Navigator.prototype, "language", '
-            '{configurable: true, get: () => "ru-RU"}); '
-            'localStorage.removeItem("aistat.locale");'
-        ),
+        preload_script=_locale_preload("ru-RU"),
     )
     cdp.wait_for('document.getElementById("locale-switcher") !== null', timeout=10)
     assert cdp.eval("document.documentElement.lang") == "ru"
@@ -191,23 +203,78 @@ def test_public_login_localizes_and_persists_browser_locale(public_page):
     cdp.eval('document.getElementById("locale-switcher").focus()')
     _press_key(cdp, " ")
     cdp.wait_for('document.documentElement.lang === "en"')
-    cdp.eval('document.getElementById("locale-switcher").click()')
-    cdp.wait_for('document.documentElement.lang === "ru"')
-    cdp.eval("location.reload()")
-    cdp.wait_for('document.getElementById("locale-switcher") !== null')
-    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert cdp.eval('localStorage.getItem("aistat.locale")') == "en"
+    cdp.eval("window.__aistat_pre_reload = true; location.reload()")
+    cdp.wait_for(
+        'window.__aistat_pre_reload === undefined && '
+        'document.getElementById("locale-switcher") !== null'
+    )
+    assert cdp.eval("document.documentElement.lang") == "en"
+    assert cdp.eval('localStorage.getItem("aistat.locale")') == "en"
 
     cdp.open_page(
         base + "/login",
-        preload_script=(
-            'Object.defineProperty(Navigator.prototype, "language", '
-            '{configurable: true, get: () => "en-US"}); '
-            'localStorage.removeItem("aistat.locale");'
-        ),
+        preload_script=_locale_preload("en-US"),
     )
     cdp.wait_for('document.getElementById("locale-switcher") !== null')
     assert cdp.eval("document.documentElement.lang") == "en"
     assert cdp.eval("document.title") == "Sign in — AIStat"
+
+
+def test_public_registration_closed_localizes_both_languages(
+    public_page, monkeypatch
+):
+    cdp, base, config = public_page
+    config.oauth_providers = {"google": object()}
+
+    def reject_registration(*args, **kwargs):
+        raise public_wsgi_module.oauth.RegistrationClosedError(
+            "registration is closed"
+        )
+
+    monkeypatch.setattr(
+        public_wsgi_module.oauth, "finish", reject_registration
+    )
+    cdp.open_page(
+        base + "/auth/google/callback",
+        preload_script=_locale_preload("ru-RU"),
+    )
+    cdp.wait_for(
+        'typeof I18N === "object" && '
+        'document.getElementById("locale-switcher") !== null'
+    )
+    assert cdp.eval(
+        'performance.getEntriesByType("navigation")[0].responseStatus'
+    ) == 403
+    assert cdp.eval(
+        'performance.getEntriesByType("resource").some('
+        'entry => new URL(entry.name).pathname === "/i18n.js")'
+    ) is True
+    assert cdp.eval('document.querySelectorAll("#locale-switcher").length') == 1
+    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert cdp.eval("document.title") == "Регистрация закрыта — AIStat"
+    assert cdp.eval('document.querySelector(".subtitle").textContent') == (
+        "Регистрация сейчас закрыта. Чтобы получить доступ, "
+        "обратитесь к администратору."
+    )
+    assert cdp.eval('document.querySelector(".login-card p a").textContent') == (
+        "Вернуться ко входу"
+    )
+    assert cdp.eval('document.querySelector(".login-card p a").href') == (
+        base + "/login"
+    )
+
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+    assert cdp.eval("document.title") == "Registration closed — AIStat"
+    assert cdp.eval('document.querySelector(".subtitle").textContent') == (
+        "Registration is currently closed. Contact an administrator "
+        "to get access."
+    )
+    assert cdp.eval('document.querySelector(".login-card p a").textContent') == (
+        "Back to sign in"
+    )
+    assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
 
 
 def _press_key(cdp, key):
