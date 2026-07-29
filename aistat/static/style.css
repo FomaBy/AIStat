@@ -54,6 +54,18 @@ body {
   cursor: pointer;
 }
 .logout-button:hover { color: var(--ink); border-color: #cbd3e3; }
+.locale-switcher {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 9px;
+  color: var(--ink);
+  background: var(--panel);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.locale-switcher:focus-visible { outline: 3px solid rgba(79, 109, 245, 0.3); outline-offset: 2px; }
 
 .filters {
   display: flex;
@@ -264,6 +276,9 @@ tbody tr:hover { background: #f8faff; }
 }
 
 @media (max-width: 640px) {
+  .topbar { padding-left: 14px; padding-right: 14px; }
+  .filters, .grid, .footer { padding-left: 14px; padding-right: 14px; }
+  .status { width: 100%; justify-content: flex-end; }
   .connection-panel { margin-left: 14px; margin-right: 14px; padding: 16px; }
   .connection-heading { flex-direction: column; }
   .connection-details > div { flex-basis: 100%; }

@@ -117,6 +117,72 @@ def test_open_page_navigates_the_attached_target(dashboard):
     assert cdp.eval('document.getElementById("card-tokens") !== null') is True
 
 
+def test_default_english_localizes_static_and_dynamic_dashboard_copy(dashboard):
+    """A non-Russian browser starts in English without a page reload."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("document.documentElement.lang") == "en"
+    assert cdp.eval("document.title") == "AIStat — Multica token statistics"
+    assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Interface language: English"
+    assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+
+
+def _press_key(cdp, key):
+    cdp.eval("document.activeElement.dispatchEvent(new KeyboardEvent('keydown', %s))" %
+             json.dumps({"key": key, "bubbles": True}))
+
+
+def test_language_switcher_keyboard_persistence_and_state(dashboard):
+    """The native button keeps browser state while updating dynamic copy."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?project=P1")
+    cdp.wait_for(BOOTED_JS)
+    before = cdp.eval('document.getElementById("card-tokens").textContent')
+    cdp.eval('document.querySelector(".chart-data").open = true; document.getElementById("locale-switcher").focus()')
+    assert cdp.eval("document.activeElement.id") == "locale-switcher"
+
+    _press_key(cdp, "Enter")
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    assert cdp.eval("document.title") == "AIStat — статистика токенов Multica"
+    assert cdp.eval('localStorage.getItem("aistat.locale")') == "ru"
+    assert _selected(cdp, "filter-project") == ["P1"]
+    assert cdp.eval('document.querySelector(".chart-data").open') is True
+    assert cdp.eval('document.getElementById("card-tokens").textContent') == before
+    assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Язык интерфейса: Русский"
+
+    cdp.eval('document.getElementById("locale-switcher").focus()')
+    _press_key(cdp, " ")
+    cdp.wait_for('document.documentElement.lang === "en"')
+    cdp.wait_for('document.getElementById("efficiency-time-title").textContent.includes("Efficiency over time")')
+    assert _selected(cdp, "filter-project") == ["P1"]
+    assert cdp.eval('document.getElementById("card-tokens").textContent') == before
+
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    cdp.eval("location.reload()")
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert _selected(cdp, "filter-project") == ["P1"]
+
+
+def test_language_switcher_relocalizes_visible_filter_error(dashboard):
+    """An existing URL-state warning changes language without clearing state."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?group=bogus")
+    cdp.wait_for(BOOTED_JS)
+    if cdp.eval("document.documentElement.lang") != "ru":
+        cdp.eval('document.getElementById("locale-switcher").click()')
+        cdp.wait_for('document.documentElement.lang === "ru"')
+    assert "сброшены" in _filter_error(cdp)
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+    cdp.wait_for('document.getElementById("filter-error").textContent.includes("Invalid filter parameters")')
+    assert cdp.eval("location.search") == ""
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
+
+
 def test_navigation_timeout_includes_target_diagnostics(dashboard):
     """A bounded adapter failure identifies the page and flat session that
     failed instead of only reporting a generic CDP timeout."""

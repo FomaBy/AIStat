@@ -1058,6 +1058,17 @@ def test_login_page_shows_yandex_button(public_app):
     assert 'href="/auth/yandex/start?next=' in page
 
 
+def test_login_page_serves_shared_locale_switcher(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    page = client.get("/login", base_url="https://localhost").get_data(as_text=True)
+    asset = client.get("/i18n.js", base_url="https://localhost")
+    assert 'data-page="login"' in page
+    assert '<script src="/i18n.js"></script>' in page
+    assert asset.status_code == 200
+    assert "aistat.locale" in asset.get_data(as_text=True)
+
+
 def test_yandex_callback_registers_once_and_reuses_account(
     public_app, monkeypatch
 ):

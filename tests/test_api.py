@@ -404,7 +404,10 @@ def test_dashboard_breakdown_renderer_handles_empty_and_partial_data():
     assert "|| 0" not in render
     table = _js_function(app_js, "renderBreakdownTable")
     assert "—" in table           # a gap is an explicit dash, not a fake 0
-    assert "Нет данных" in table  # an empty selection is spelled out
+    assert 't("noData")' in table  # an empty selection is spelled out
+    i18n_js = (Path(server_module.__file__).parent / "static" / "i18n.js"
+               ).read_text(encoding="utf-8")
+    assert "Нет данных" in i18n_js
 
 
 def test_dashboard_validates_url_filter_state():
@@ -464,7 +467,12 @@ def test_connection_error_is_localized_and_names_the_workspace():
     # The workspace failure the incident hit is mapped with the typed label.
     assert '"the connection\'s workspace could not be resolved":' in app_js
     assert '"the connection\'s workspace label is ambiguous":' in app_js
-    assert "не найдено у этого PAT" in app_js
+    # Product copy lives in the shared locale catalog, so both RU and EN keep
+    # the same actionable workspace-specific diagnostic.
+    i18n_js = (Path(server_module.__file__).parent / "static" / "i18n.js"
+               ).read_text(encoding="utf-8")
+    assert "не найдено у этого PAT" in i18n_js
+    assert "was not found for this PAT" in i18n_js
     render = _js_function(app_js, "safeConnectionError")
     assert "CONNECTION_WORKSPACE_ERRORS" in render
     assert "CONNECTION_ERROR_MESSAGES" in render

@@ -5,6 +5,9 @@
 
 "use strict";
 
+I18N.init();
+const t = I18N.t;
+
 const PALETTE = [
   "#4f6df5", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6",
   "#06b6d4", "#ec4899", "#84cc16", "#64748b", "#f97316",
@@ -140,6 +143,7 @@ const state = {
   lastSyncMarker: null,
   syncPollTimer: null,
   focusSyncTimer: null,
+  filterError: null,
   connection: null,
   connectionSupported: true,
   connectionBusy: false,
@@ -156,38 +160,38 @@ const $ = (id) => document.getElementById(id);
 function fmtTokens(n) {
   if (n == null) return "—";
   const abs = Math.abs(n);
-  if (abs >= 1e9) return (n / 1e9).toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + " млрд";
-  if (abs >= 1e6) return (n / 1e6).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + " млн";
-  if (abs >= 1e3) return (n / 1e3).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + " тыс";
-  return n.toLocaleString("ru-RU");
+  if (abs >= 1e9) return (n / 1e9).toLocaleString(I18N.tag, { maximumFractionDigits: 2 }) + " " + t("billion");
+  if (abs >= 1e6) return (n / 1e6).toLocaleString(I18N.tag, { maximumFractionDigits: 1 }) + " " + t("million");
+  if (abs >= 1e3) return (n / 1e3).toLocaleString(I18N.tag, { maximumFractionDigits: 1 }) + " " + t("thousand");
+  return n.toLocaleString(I18N.tag);
 }
 
 function fmtUSD(n) {
   if (n == null) return "—";
-  return "$" + n.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return "$" + n.toLocaleString(I18N.tag, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function fmtCredits(n) {
   if (n == null) return "—";
-  return n.toLocaleString("ru-RU", { maximumFractionDigits: 2 });
+  return n.toLocaleString(I18N.tag, { maximumFractionDigits: 2 });
 }
 
 // Cost efficiency values (USD per SP, USD per hour per SP) can be well below a
 // cent, so keep up to 4 fraction digits while still reading as money.
 function fmtUSDFine(n) {
   if (n == null) return "—";
-  return "$" + n.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  return "$" + n.toLocaleString(I18N.tag, { minimumFractionDigits: 2, maximumFractionDigits: 4 });
 }
 
 function fmtNum(n) {
   if (n == null) return "—";
-  return n.toLocaleString("ru-RU", { maximumFractionDigits: 1 });
+  return n.toLocaleString(I18N.tag, { maximumFractionDigits: 1 });
 }
 
 function fmtDateTime(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
-  return d.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return d.toLocaleString(I18N.tag, { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 // Agent work-time comes from the API as whole seconds (the canonical value);
@@ -195,14 +199,14 @@ function fmtDateTime(iso) {
 function fmtDuration(seconds) {
   if (seconds == null) return "—";
   let s = Math.round(seconds);
-  if (s <= 0) return "0 с";
+  if (s <= 0) return "0 " + t("secondShort");
   const d = Math.floor(s / 86400); s -= d * 86400;
   const h = Math.floor(s / 3600); s -= h * 3600;
   const m = Math.floor(s / 60); s -= m * 60;
-  if (d > 0) return h > 0 ? `${d} дн ${h} ч` : `${d} дн`;
-  if (h > 0) return m > 0 ? `${h} ч ${m} мин` : `${h} ч`;
-  if (m > 0) return s > 0 ? `${m} мин ${s} с` : `${m} мин`;
-  return `${s} с`;
+  if (d > 0) return h > 0 ? `${d} ${t("dayShort")} ${h} ${t("hourShort")}` : `${d} ${t("dayShort")}`;
+  if (h > 0) return m > 0 ? `${h} ${t("hourShort")} ${m} ${t("minuteShort")}` : `${h} ${t("hourShort")}`;
+  if (m > 0) return s > 0 ? `${m} ${t("minuteShort")} ${s} ${t("secondShort")}` : `${m} ${t("minuteShort")}`;
+  return `${s} ${t("secondShort")}`;
 }
 
 // ---------- data access ----------
@@ -230,24 +234,16 @@ const CONNECTION_STATES = new Set([
   "error", "revocation_pending", "revoked",
 ]);
 const CONNECTION_STATE_LABELS = {
-  none: "не подключён",
-  disabled: "недоступно",
-  pending: "ожидает синхронизации",
-  replacement_pending: "замена ожидает синхронизации",
-  active: "подключено",
-  error: "ошибка синхронизации",
-  revocation_pending: "отключение выполняется",
-  revoked: "отозвано",
+  none: () => t("notConnected"), disabled: () => t("disabled"),
+  pending: () => t("pending"), replacement_pending: () => t("replacementPending"),
+  active: () => t("active"), error: () => t("syncError"),
+  revocation_pending: () => t("revoking"), revoked: () => t("revoked"),
 };
 const CONNECTION_STATE_TITLES = {
-  none: "Multica не подключён",
-  disabled: "Подключение Multica недоступно",
-  pending: "Подключение ожидает синхронизации",
-  replacement_pending: "Замена PAT ожидает синхронизации",
-  active: "Multica подключён",
-  error: "Не удалось синхронизировать Multica",
-  revocation_pending: "Отключение Multica выполняется",
-  revoked: "Подключение Multica отозвано",
+  none: () => t("multicaNotConnected"), disabled: () => t("connectionUnavailable"),
+  pending: () => t("waitingSync"), replacement_pending: () => t("replacementWaiting"),
+  active: () => t("multicaConnected"), error: () => t("couldNotSync"),
+  revocation_pending: () => t("disconnectingMultica"), revoked: () => t("connectionRevoked"),
 };
 // Every worker-reported status is an internal English allowlist code, never a
 // user-facing message. The cabinet renders a clear, actionable Russian message
@@ -259,47 +255,45 @@ const CONNECTION_STATE_TITLES = {
 // «X» не найдено".
 const CONNECTION_ERROR_MESSAGES = {
   "worker collection failed":
-    "Сбор статистики завершился с ошибкой. Попробуйте позже или переподключите PAT.",
+    () => t("workerFailed"),
   "authentication with the connection's token failed":
-    "PAT не прошёл авторизацию в Multica. Проверьте токен и переподключите его.",
+    () => t("patUnauthorized"),
   "official CLI login failed for the connection":
-    "Не удалось войти в Multica с этим PAT. Проверьте токен и переподключите его.",
+    () => t("patLoginFailed"),
   "could not list the connection's workspaces":
-    "Не удалось получить список рабочих пространств для этого PAT. Попробуйте переподключить его.",
+    () => t("workspaceListFailed"),
   "the connection's token has no accessible workspace":
-    "У этого PAT нет доступных рабочих пространств. Проверьте права токена в Multica.",
+    () => t("noWorkspace"),
   "the connection's token has multiple workspaces but none was selected":
-    "У PAT несколько рабочих пространств — укажите нужное в поле «Рабочее пространство» и переподключите PAT.",
+    () => t("workspaceRequired"),
   "workspace was not selected before polling":
-    "Рабочее пространство для подключения не выбрано. Переподключите PAT, указав название рабочего пространства.",
+    () => t("workspaceNotSelected"),
   "could not read the connection's workspace data":
-    "Не удалось прочитать данные рабочего пространства. Попробуйте позже или переподключите PAT.",
+    () => t("workspaceReadFailed"),
   "connection collection failed":
-    "Сбор статистики завершился с ошибкой. Попробуйте позже или переподключите PAT.",
+    () => t("workerFailed"),
   "polling the connection's data failed":
-    "Не удалось загрузить данные из Multica. Попробуйте позже.",
+    () => t("dataLoadFailed"),
   "publishing the connection's snapshot failed":
-    "Не удалось сохранить полученную статистику. Попробуйте позже.",
+    () => t("publishFailed"),
   "connection was revoked":
-    "Подключение было отозвано. Подключите новый PAT, если хотите продолжить синхронизацию.",
+    () => t("revokedPrompt"),
   "poll source failed":
-    "Источник данных Multica ответил ошибкой. Попробуйте позже.",
+    () => t("sourceFailed"),
   "issue details synchronization failed":
-    "Не удалось синхронизировать детали задач. Попробуйте позже.",
+    () => t("issueSyncFailed"),
 };
 
 // Codes whose message names the workspace label the owner typed.
 const CONNECTION_WORKSPACE_ERRORS = {
   "the connection's workspace could not be resolved": (ws) =>
-    "Рабочее пространство " + ws + " не найдено у этого PAT. Проверьте точное "
-    + "название рабочего пространства в Multica и переподключите PAT.",
+    t("namedWorkspaceMissing", { workspace: ws }),
   "the connection's workspace label is ambiguous": (ws) =>
-    "Название рабочего пространства " + ws + " подходит сразу нескольким. "
-    + "Уточните точное название и переподключите PAT.",
+    t("namedWorkspaceAmbiguous", { workspace: ws }),
 };
 
 const CONNECTION_ERROR_FALLBACK =
-  "Синхронизация Multica завершилась с ошибкой. Попробуйте подключить PAT ещё раз.";
+  () => t("syncFallback");
 
 function connectionSupportedSurface() {
   const cabinet = $("connection-cabinet");
@@ -319,10 +313,11 @@ function clearConnectionToken() {
 function safeConnectionError(value, label) {
   const code = typeof value === "string" ? value.trim() : "";
   const workspace = typeof label === "string" ? label.trim() : "";
-  const named = workspace ? "«" + workspace + "»" : "указанное";
+  const named = workspace ? "«" + workspace + "»" : t("specified");
   const withLabel = CONNECTION_WORKSPACE_ERRORS[code];
   if (withLabel) return withLabel(named);
-  return CONNECTION_ERROR_MESSAGES[code] || CONNECTION_ERROR_FALLBACK;
+  const message = CONNECTION_ERROR_MESSAGES[code] || CONNECTION_ERROR_FALLBACK;
+  return message();
 }
 
 function connectionRequestError(status) {
@@ -358,15 +353,11 @@ function showConnectionOperationError(error) {
   const note = $("connection-form-error");
   if (!note) return;
   const messages = {
-    400: "Сессия устарела или запрос не прошёл проверку. Обновите страницу.",
-    401: "Сессия истекла. Войдите снова.",
-    404: "Подключение не найдено. Обновите страницу.",
-    422: "Проверьте PAT и метку workspace.",
-    429: "Слишком много попыток. Повторите позже.",
-    503: "Подключение сейчас недоступно. Попробуйте позже.",
+    400: t("csrfError"), 401: t("sessionExpired"), 404: t("connectionMissing"),
+    422: t("checkPat"), 429: t("tooManyAttempts"), 503: t("connectionTemporarilyUnavailable"),
   };
   note.textContent = messages[error && error.status]
-    || "Не удалось изменить подключение. Попробуйте позже.";
+    || t("connectionError");
   note.hidden = false;
 }
 
@@ -403,13 +394,9 @@ function connectionStatusMessage(status, data) {
     );
   }
   const messages = {
-    none: "Подключите Multica, чтобы загрузить вашу статистику.",
-    disabled: "Администратор временно отключил ручное подключение.",
-    pending: "PAT принят. Ожидаем подтверждение защищённого worker-канала.",
-    replacement_pending: "Новая PAT принята. Ожидаем подтверждение замены.",
-    active: "Статистика будет обновляться автоматически.",
-    revocation_pending: "Запрос на отключение принят. Ожидаем удаления доступа worker-каналом.",
-    revoked: "Доступ удалён. Отзовите PAT в настройках Multica.",
+    none: t("connectPrompt"), disabled: t("manualDisabled"), pending: t("patAccepted"),
+    replacement_pending: t("newPatAccepted"), active: t("autoUpdates"),
+    revocation_pending: t("disconnectRequested"), revoked: t("accessRemoved"),
   };
   return messages[status] || messages.none;
 }
@@ -434,9 +421,9 @@ function renderConnection(data) {
   const message = $("connection-status-message");
   if (badge) {
     badge.dataset.state = status;
-    badge.textContent = CONNECTION_STATE_LABELS[status];
+    badge.textContent = CONNECTION_STATE_LABELS[status]();
   }
-  if (title) title.textContent = CONNECTION_STATE_TITLES[status];
+  if (title) title.textContent = CONNECTION_STATE_TITLES[status]();
   if (message) message.textContent = connectionStatusMessage(status, normalized);
 
   const details = $("connection-details");
@@ -456,8 +443,7 @@ function renderConnection(data) {
   const empty = $("connection-empty");
   if (empty) {
     empty.textContent = status === "revoked"
-      ? "Подключение отозвано. Подключите новый PAT, если хотите продолжить синхронизацию."
-      : "У вас пока нет подключения. Нажмите «Подключить» и вставьте PAT из Multica.";
+      ? t("revokedPrompt") : t("emptyConnection");
     empty.hidden = !["none", "revoked"].includes(status);
   }
   const error = $("connection-error");
@@ -478,7 +464,7 @@ function renderConnection(data) {
   const submit = $("connection-submit");
   if (submit) {
     submit.textContent = (status === "active" || status === "error" || state.connectionReplacing)
-      ? "Заменить PAT" : "Подключить";
+      ? t("replacePat") : t("connect");
     submit.disabled = state.connectionBusy || status === "disabled";
   }
   const confirm = $("connection-confirm");
@@ -501,7 +487,7 @@ async function refreshConnection() {
       return null;
     }
     const message = $("connection-status-message");
-    if (message) message.textContent = "Статус подключения временно недоступен.";
+    if (message) message.textContent = t("statusUnavailable");
     return null;
   }
 }
@@ -516,7 +502,7 @@ function startConnectionPolling(status) {
     if (Date.now() >= state.connectionPollDeadline) {
       const error = $("connection-error");
       if (error) {
-        error.textContent = "Синхронизация ещё не завершена. Обновите статус позже.";
+        error.textContent = t("syncNotFinished");
         error.hidden = false;
       }
       state.connectionPollTimer = null;
@@ -554,7 +540,7 @@ async function submitConnection(event) {
   if (!token.trim()) {
     const error = $("connection-form-error");
     if (error) {
-      error.textContent = "Введите PAT для подключения.";
+      error.textContent = t("enterPat");
       error.hidden = false;
     }
     return;
@@ -718,7 +704,7 @@ function stackedDailyConfig(rows, valueOf, valueFmt, group) {
         tooltip: {
           callbacks: {
             label: (ctx) => `${ctx.dataset.label}: ${valueFmt(ctx.parsed.y)}`,
-            footer: (items) => "Итого: " + valueFmt(items.reduce((s, it) => s + it.parsed.y, 0)),
+            footer: (items) => t("total") + ": " + valueFmt(items.reduce((s, it) => s + it.parsed.y, 0)),
           },
         },
       },
@@ -768,8 +754,9 @@ function renderAgentsTable(agents) {
   tbody.innerHTML = "";
   for (const a of agents) {
     const tr = document.createElement("tr");
+    const name = a.name === "(не атрибутировано)" ? t("unattributed") : a.name;
     tr.innerHTML = `
-      <td>${a.estimated ? "≈ " : ""}${esc(a.name)}</td>
+      <td>${a.estimated ? "≈ " : ""}${esc(name)}</td>
       <td>${esc(a.model || "—")}</td>
       <td class="num">${fmtTokens(a.total_tokens)}</td>
       <td class="num">${fmtUSD(a.cost_usd)}${a.has_unpriced ? " *" : ""}</td>
@@ -861,7 +848,7 @@ function renderModelEfficiency(data) {
   }
   if (!models.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="7" class="note">Нет задач со story points и загруженной статистикой для разреза по моделям.</td>`;
+    tr.innerHTML = `<td colspan="7" class="note">${t("noModelEfficiency")}</td>`;
     tbody.appendChild(tr);
   }
 }
@@ -884,7 +871,7 @@ function efficiencyBarConfig(rows, type) {
       maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: (ctx) => fmtTokens(ctx.parsed.x) + " токенов / SP" } },
+        tooltip: { callbacks: { label: (ctx) => fmtTokens(ctx.parsed.x) + " " + t("tokensPerSp") } },
       },
       scales: { x: { ticks: { callback: (v) => fmtTokens(v) } } },
     },
@@ -898,7 +885,7 @@ function renderBreakdownTable(id, rows) {
   tbody.innerHTML = "";
   if (!rows.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="2" class="note">Нет данных за выбранный период и фильтры.</td>`;
+    tr.innerHTML = `<td colspan="2" class="note">${t("noData")}</td>`;
     tbody.appendChild(tr);
     return;
   }
@@ -916,11 +903,11 @@ function renderEfficiencyBreakdown(data) {
   const models = (data && data.models) || [];
   const time = (data && data.time) || { granularity: "day", rows: [] };
   const rows = time.rows || [];
-  const granularity = time.granularity === "hour" ? "часам UTC" : "дням UTC";
+  const granularity = time.granularity === "hour" ? t("byHoursUtc") : t("byDaysUtc");
   $("efficiency-time-title").innerHTML =
-    `Эффективность во времени <span class="est-mark">≈ по ${granularity} · токены / SP · меньше — лучше</span>`;
+    `${t("efficiencyOverTime")} <span class="est-mark">${t("timeBy", { granularity })}</span>`;
   $("efficiency-time-data-label").textContent =
-    time.granularity === "hour" ? "Час (UTC)" : "День (UTC)";
+    time.granularity === "hour" ? t("hourUtc") : t("dayUtc");
   // A chart with nothing drawable is an unexplained blank canvas — cover it
   // with the no-data message instead (FAN-1242).
   const hasData = (rs) => rs.some((r) => r.tokens_per_sp != null);
@@ -937,7 +924,7 @@ function renderEfficiencyBreakdown(data) {
     data: {
       labels: rows.map((r) => r.label),
       datasets: [{
-        label: "Токены / SP",
+        label: t("tokensPerSp"),
         // A bucket without attributable SP stays null so the line breaks at
         // the gap (spanGaps: false) instead of inventing a zero.
         data: rows.map((r) => (r.tokens_per_sp == null ? null : r.tokens_per_sp)),
@@ -954,7 +941,7 @@ function renderEfficiencyBreakdown(data) {
       maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: (ctx) => fmtTokens(ctx.parsed.y) + " токенов / SP" } },
+        tooltip: { callbacks: { label: (ctx) => fmtTokens(ctx.parsed.y) + " " + t("tokensPerSp") } },
       },
       scales: { y: { ticks: { callback: (v) => fmtTokens(v) } } },
     },
@@ -964,16 +951,18 @@ function renderEfficiencyBreakdown(data) {
 function renderSummary(s) {
   const est = s.estimated ? "≈ " : "";
   $("card-tokens").textContent = est + fmtTokens(s.total_tokens);
-  $("card-tokens-sub").textContent =
-    `ввод ${fmtTokens(s.input_tokens)} · вывод ${fmtTokens(s.output_tokens)} · кеш ${fmtTokens(s.cache_read_tokens + s.cache_write_tokens)}`;
+  $("card-tokens-sub").textContent = t("inputOutputCache", {
+    input: fmtTokens(s.input_tokens), output: fmtTokens(s.output_tokens),
+    cache: fmtTokens(s.cache_read_tokens + s.cache_write_tokens),
+  });
   $("card-cost").textContent = est + fmtUSD(s.cost_usd);
-  $("card-cost-sub").textContent = s.has_unpriced ? "есть неоценённые модели!" : "по официальным тарифам";
+  $("card-cost-sub").textContent = s.has_unpriced ? t("unpricedModels") : t("officialRates");
   $("card-credits").textContent = est + fmtCredits(s.cost_credits);
   // SP and token efficiency are run-share attributions under agent/model/
   // period filters; their flags are separate from the token-card `estimated`.
   const spEst = s.sp_estimated ? "≈ " : "";
   $("card-sp").textContent = spEst + fmtNum(s.story_points);
-  $("card-sp-sub").textContent = `задач: ${s.issues} · с SP: ${s.issues_with_sp}`;
+  $("card-sp-sub").textContent = t("issuesWithSp", { issues: s.issues, withSp: s.issues_with_sp });
   const effEst = s.efficiency_estimated ? "≈ " : "";
   $("card-eff").textContent = s.tokens_per_sp == null ? "—" : effEst + fmtTokens(s.tokens_per_sp);
   // Cost/weighted efficiency lean on model attribution + pricing, so they are
@@ -987,12 +976,12 @@ function renderSummary(s) {
   // window, so they stand apart from the SP/usage-eligible efficiency cards.
   $("card-agent-count").textContent = fmtNum(s.agent_count == null ? 0 : s.agent_count);
   $("card-agent-time").textContent = fmtDuration(s.agent_work_seconds);
-  $("sync-label").textContent = "синхронизация: " +
-    (s.last_cycle ? fmtDateTime(s.last_cycle.finished_at) : "ещё не было");
+  $("sync-label").textContent = t("syncing", {
+    value: s.last_cycle ? fmtDateTime(s.last_cycle.finished_at) : t("notYet"),
+  });
   const unpriced = s.unpriced_models || [];
   $("footer-unpriced").textContent = unpriced.length
-    ? "⚠ без тарифа: " + unpriced.join(", ")
-    : "все модели с официальным тарифом";
+    ? t("unpriced", { models: unpriced.join(", ") }) : t("allPriced");
 }
 
 function esc(text) {
@@ -1042,10 +1031,9 @@ async function refreshAll() {
   badge.textContent = health.status;
   badge.className = "badge " + (health.status === "ok" ? "badge-ok" : "badge-warn");
   $("footer-span").textContent = health.daily_usage_span.first_date
-    ? `данные: ${health.daily_usage_span.first_date} — ${health.daily_usage_span.last_date}`
-    : "данных пока нет";
-  $("footer-credits").textContent =
-    `курс кредитов: ${health.pricing.credits_per_usd} за $1`;
+    ? t("dataRange", { first: health.daily_usage_span.first_date, last: health.daily_usage_span.last_date })
+    : t("noDataYet");
+  $("footer-credits").textContent = t("creditRate", { rate: health.pricing.credits_per_usd });
 }
 
 // ---------- live updates (SSE locally, polling on WSGI hosting) ----------
@@ -1065,14 +1053,14 @@ async function pollSync() {
   }
   state.lastSyncMarker = marker;
   if (sync.beat) {
-    $("sync-label").textContent = "синхронизация: " + fmtDateTime(sync.beat.at);
+    $("sync-label").textContent = t("syncing", { value: fmtDateTime(sync.beat.at) });
   }
 }
 
 function startSyncPolling() {
   if (state.syncPollTimer) return;
   $("live-dot").className = "dot dot-on";
-  $("live-label").textContent = "проверка каждые 30 с";
+  $("live-label").textContent = t("polling");
   pollSync().catch(console.error);
   state.syncPollTimer = setInterval(() => pollSync().catch(console.error), 30000);
 }
@@ -1124,7 +1112,7 @@ function connectEvents() {
         // The live phase lands between poll_cycles rows, so the beat
         // timestamp is fresher than summary.last_cycle written by refreshAll.
         if (sync.beat) {
-          $("sync-label").textContent = "синхронизация: " + fmtDateTime(sync.beat.at);
+          $("sync-label").textContent = t("syncing", { value: fmtDateTime(sync.beat.at) });
         }
       })
       .catch(console.error);
@@ -1171,8 +1159,8 @@ function populateMultiSelect(id, items, valueOf, labelOf, selected) {
   while (select.options.length) select.remove(0);
   const all = document.createElement("option");
   all.value = "";
-  all.textContent = id === "filter-project" ? "Все проекты"
-    : id === "filter-agent" ? "Все агенты" : "Все модели";
+  all.textContent = id === "filter-project" ? t("allProjects")
+    : id === "filter-agent" ? t("allAgents") : t("allModels");
   all.selected = !selected.length;
   select.appendChild(all);
   for (const item of items) {
@@ -1207,13 +1195,15 @@ function syncFiltersToUrl() {
   history.replaceState(null, "", qs ? "?" + qs : location.pathname);
 }
 
-function showFilterError(message) {
+function showFilterError(key, params) {
   const note = $("filter-error");
-  note.textContent = message;
+  state.filterError = { key, params };
+  note.textContent = t(key, params);
   note.hidden = false;
 }
 
 function clearFilterError() {
+  state.filterError = null;
   $("filter-error").hidden = true;
   $("filter-error").textContent = "";
 }
@@ -1250,7 +1240,7 @@ function readFiltersFromUrl() {
   if (!rangeIsOrdered(state.from, state.to)) {
     state.from = "";
     state.to = "";
-    dropped.push("диапазон from/to («С» должно быть раньше «По»)");
+    dropped.push(t("invalidRangeUrl"));
   }
   if (state.from || state.to) state.days = "custom";
   if (q.has("group")) {
@@ -1266,8 +1256,7 @@ function readFiltersFromUrl() {
   $("filter-to").value = state.to;
   if (dropped.length) {
     syncFiltersToUrl();
-    showFilterError("Некорректные параметры фильтров в ссылке сброшены: " +
-      dropped.join(", ") + ". Показаны данные по оставшимся фильтрам.");
+    showFilterError("invalidFilters", { items: dropped.join(", ") });
   } else {
     clearFilterError();
   }
@@ -1336,7 +1325,7 @@ async function boot() {
       if (!rangeIsOrdered(from, to)) {
         // A reverse/equal range never becomes active state: data, URL and a
         // future reload keep the last valid filters (FAN-1255).
-        showFilterError("«С (UTC)» должно быть раньше «По (UTC)»; диапазон не применён.");
+        showFilterError("invalidRange");
         return;
       }
       clearFilterError();
@@ -1361,5 +1350,11 @@ async function boot() {
 
 boot().catch((err) => {
   console.error(err);
-  $("live-label").textContent = "ошибка загрузки: " + err.message;
+  $("live-label").textContent = t("loadingError", { message: err.message });
+});
+
+document.addEventListener("aistat:localechange", () => {
+  if (state.connection) renderConnection(state.connection);
+  if (state.filterError) showFilterError(state.filterError.key, state.filterError.params);
+  if (state.lastDate) refreshMeta().then(refreshAll).catch(console.error);
 });

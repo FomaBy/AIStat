@@ -232,6 +232,7 @@ def test_flask_route_inventory_is_fully_classified(public_app):
     public = {
         "login",
         "login_css",
+        "i18n_js",
         "healthz",
         "ingest_snapshot",
         "oauth_start",

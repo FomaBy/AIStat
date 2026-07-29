@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AIStat — статистика токенов Multica</title>
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-page="dashboard">
   <header class="topbar">
     <div class="brand">
       <h1>AIStat</h1>
@@ -168,7 +168,7 @@
           <tbody></tbody>
         </table>
       </div>
-      <p class="note">Токены проектов — точные суммы по задачам (<code>multica issue usage</code>); стоимость ≈ оценена по моделям агентов, выполнявших задачи. Эффективность считается только по задачам со story points и загруженной статистикой.</p>
+      <p class="note" data-i18n="projectNote"></p>
     </section>
 
     <section class="panel">
@@ -235,7 +235,7 @@
           <tbody></tbody>
         </table>
       </div>
-      <p class="note">Разрез по моделям среди задач со story points и загруженной статистикой; SP и стоимость делятся между моделями по длительности их запусков. Сортировка — по стоимости на 1 SP, дешевле сверху. «Взвешенная» — стоимость в час на 1 SP; формула и обоснование: <code>docs/metrics-efficiency.md</code>.</p>
+      <p class="note" data-i18n="modelEfficiencyNote"></p>
     </section>
 
     <section class="panel panel-wide">
@@ -263,6 +263,7 @@
   </footer>
 
   <script src="vendor/chart.umd.min.js"></script>
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

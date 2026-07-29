@@ -1096,14 +1096,14 @@ def _render_login(csrf, next_url, error=None):
             oauth_buttons
         )
     return """<!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Вход — AIStat</title>
   <link rel="stylesheet" href="/login.css">
 </head>
-<body>
+<body data-page="login">
   <main class="login-shell">
     <section class="login-card" aria-labelledby="login-title">
       <div class="brand-mark" aria-hidden="true">AI</div>
@@ -1129,6 +1129,7 @@ def _render_login(csrf, next_url, error=None):
       </p>
     </section>
   </main>
+<script src="/i18n.js"></script>
 </body>
 </html>""".format(
         error=error_html,
@@ -1145,21 +1146,21 @@ def _render_registration_closed():
     a session.
     """
     return """<!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <title>Регистрация закрыта — AIStat</title>
   <link rel="stylesheet" href="/login.css">
 </head>
-<body>
+<body data-page="closed">
   <main class="login-shell">
     <section class="login-card">
       <h1>AIStat</h1>
-      <p class="subtitle">Регистрация сейчас закрыта. Чтобы получить доступ,
-      обратитесь к администратору.</p>
+      <p class="subtitle">Регистрация сейчас закрыта. Чтобы получить доступ, обратитесь к администратору.</p>
       <p><a href="/login">Вернуться ко входу</a></p>
     </section>
   </main>
+<script src="/i18n.js"></script>
 </body>
 </html>"""
 
@@ -1275,6 +1276,7 @@ def _serve_static(environ, start_response, name):
         "app.js",
         "style.css",
         "login.css",
+        "i18n.js",
         "vendor/chart.umd.min.js",
     }
     if name not in allowed:
@@ -1941,6 +1943,8 @@ def application(environ, start_response):
             return _login(environ, start_response)
         if path == "/login.css":
             return _serve_static(environ, start_response, "login.css")
+        if path == "/i18n.js":
+            return _serve_static(environ, start_response, "i18n.js")
         if path == "/api/ingest/snapshot":
             return _ingest(environ, start_response)
         if path == handoff.WORKER_PULL_PATH:
