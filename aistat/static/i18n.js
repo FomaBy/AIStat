@@ -25,7 +25,7 @@ const I18N = (() => {
     notConnected: ["не подключён", "not connected"], multicaNotConnected: ["Multica не подключён", "Multica is not connected"],
     connectPrompt: ["Подключите Multica, чтобы загрузить вашу статистику.", "Connect Multica to load your statistics."], multicaHost: ["Хост Multica", "Multica host"], workspace: ["Workspace", "Workspace"], lastSync: ["Последняя синхронизация", "Last sync"],
     emptyConnection: ["У вас пока нет подключения. Нажмите «Подключить» и вставьте PAT из Multica.", "You do not have a connection yet. Click Connect and paste a Multica PAT."],
-    workspaceLabel: ["Метка workspace", "Workspace label"], optional: ["необязательно", "optional"], officialHost: ["Официальный хост", "Official host"], connect: ["Подключить", "Connect"], replacePat: ["Заменить PAT", "Replace PAT"], disconnect: ["Отключить", "Disconnect"],
+    workspaceLabel: ["Метка workspace", "Workspace label"], optional: ["необязательно", "optional"], officialHost: ["Официальный хост:", "Official host:"], connect: ["Подключить", "Connect"], replacePat: ["Заменить PAT", "Replace PAT"], disconnect: ["Отключить", "Disconnect"],
     disconnectQuestion: ["Отключить Multica?", "Disconnect Multica?"], disconnectWarning: ["AIStat удалит доступ к этому подключению. После подтверждения отзовите PAT в Multica.", "AIStat will remove access to this connection. Revoke the PAT in Multica after confirming."],
     confirmDisconnect: ["Да, отключить", "Yes, disconnect"], cancel: ["Отмена", "Cancel"], revokeAdvice: ["После отключения отзовите этот PAT в настройках Multica.", "Revoke this PAT in Multica settings after disconnecting."],
     totalTokens: ["Всего токенов", "Total tokens"], cost: ["Стоимость", "Cost"], credits: ["Кредиты", "Credits"], storyPoints: ["Story Points", "Story Points"], tokenEfficiency: ["Эффективность токенов", "Token efficiency"], costEfficiency: ["Эффективность стоимости", "Cost efficiency"], weightedEfficiency: ["Взвешенная эффективность", "Weighted efficiency"],
@@ -144,3 +144,5 @@ const I18N = (() => {
   }
   return { init, setLocale, t, translateText, get locale() { return locale; }, get tag() { return locale === "ru" ? "ru-RU" : "en-US"; } };
 })();
+
+if (["login", "closed"].includes(document.body && document.body.dataset.page)) I18N.init();

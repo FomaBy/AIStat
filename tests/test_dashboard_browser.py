@@ -19,8 +19,11 @@ import time
 from pathlib import Path
 
 import pytest
+from werkzeug.security import generate_password_hash
+from werkzeug.serving import make_server
 
 import aistat.server as server_module
+import aistat.wsgi as public_wsgi_module
 from aistat.config import Config
 from aistat.db import connect, init_db
 from conftest import seed_aggregate_fixture
@@ -84,6 +87,38 @@ def dashboard():
         session.close()
 
 
+@pytest.fixture
+def public_page():
+    """The public Flask login page on a real HTTP port and headless Chrome."""
+    with tempfile.TemporaryDirectory(prefix="aistat-public-browser-") as path:
+        root = Path(path)
+        config = Config(
+            db_path=root / "public.db",
+            security_db_path=root / "security.db",
+            tenants_dir=root / "tenants",
+            auth_username="browser",
+            auth_password_hash=generate_password_hash(
+                "not-used", method="pbkdf2:sha256:600000"
+            ),
+            session_secret="session-" + "s" * 48,
+            ingest_secret="ingest-" + "i" * 48,
+            allowed_hosts=("127.0.0.1",),
+            force_https=False,
+        )
+        port = _free_port()
+        server = make_server("127.0.0.1", port,
+                             public_wsgi_module.create_app(config))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cdp = launch_chrome(CHROME)
+        try:
+            yield cdp, f"http://127.0.0.1:{port}"
+        finally:
+            cdp.close()
+            server.shutdown()
+            thread.join(timeout=10)
+
+
 def _element_value(cdp, element_id):
     return cdp.eval(f'document.getElementById("{element_id}").value')
 
@@ -125,7 +160,54 @@ def test_default_english_localizes_static_and_dynamic_dashboard_copy(dashboard):
     assert cdp.eval("document.documentElement.lang") == "en"
     assert cdp.eval("document.title") == "AIStat — Multica token statistics"
     assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Interface language: English"
+    assert cdp.eval('document.querySelector(".connection-host").textContent') == "Official host: https://multica.ai"
+    assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
     assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+
+
+def test_public_login_localizes_and_persists_browser_locale(public_page):
+    cdp, base = public_page
+    cdp.open_page(
+        base + "/login",
+        preload_script=(
+            'Object.defineProperty(Navigator.prototype, "language", '
+            '{configurable: true, get: () => "ru-RU"}); '
+            'localStorage.removeItem("aistat.locale");'
+        ),
+    )
+    cdp.wait_for('document.getElementById("locale-switcher") !== null', timeout=10)
+    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert cdp.eval("document.title") == "Вход — AIStat"
+    assert cdp.eval('document.querySelectorAll("#locale-switcher").length') == 1
+
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+    assert cdp.eval("document.title") == "Sign in — AIStat"
+    assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+
+    cdp.eval('document.getElementById("locale-switcher").focus()')
+    _press_key(cdp, "Enter")
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    cdp.eval('document.getElementById("locale-switcher").focus()')
+    _press_key(cdp, " ")
+    cdp.wait_for('document.documentElement.lang === "en"')
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    cdp.eval("location.reload()")
+    cdp.wait_for('document.getElementById("locale-switcher") !== null')
+    assert cdp.eval("document.documentElement.lang") == "ru"
+
+    cdp.open_page(
+        base + "/login",
+        preload_script=(
+            'Object.defineProperty(Navigator.prototype, "language", '
+            '{configurable: true, get: () => "en-US"}); '
+            'localStorage.removeItem("aistat.locale");'
+        ),
+    )
+    cdp.wait_for('document.getElementById("locale-switcher") !== null')
+    assert cdp.eval("document.documentElement.lang") == "en"
+    assert cdp.eval("document.title") == "Sign in — AIStat"
 
 
 def _press_key(cdp, key):
