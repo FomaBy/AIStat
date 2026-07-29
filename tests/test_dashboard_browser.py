@@ -19,8 +19,11 @@ import time
 from pathlib import Path
 
 import pytest
+from werkzeug.security import generate_password_hash
+from werkzeug.serving import make_server
 
 import aistat.server as server_module
+import aistat.wsgi as public_wsgi_module
 from aistat.config import Config
 from aistat.db import connect, init_db
 from conftest import seed_aggregate_fixture
@@ -84,6 +87,38 @@ def dashboard():
         session.close()
 
 
+@pytest.fixture
+def public_page():
+    """The public Flask login page on a real HTTP port and headless Chrome."""
+    with tempfile.TemporaryDirectory(prefix="aistat-public-browser-") as path:
+        root = Path(path)
+        config = Config(
+            db_path=root / "public.db",
+            security_db_path=root / "security.db",
+            tenants_dir=root / "tenants",
+            auth_username="browser",
+            auth_password_hash=generate_password_hash(
+                "not-used", method="pbkdf2:sha256:600000"
+            ),
+            session_secret="session-" + "s" * 48,
+            ingest_secret="ingest-" + "i" * 48,
+            allowed_hosts=("127.0.0.1",),
+            force_https=False,
+        )
+        port = _free_port()
+        server = make_server("127.0.0.1", port,
+                             public_wsgi_module.create_app(config))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cdp = launch_chrome(CHROME)
+        try:
+            yield cdp, f"http://127.0.0.1:{port}", config
+        finally:
+            cdp.close()
+            server.shutdown()
+            thread.join(timeout=10)
+
+
 def _element_value(cdp, element_id):
     return cdp.eval(f'document.getElementById("{element_id}").value')
 
@@ -106,6 +141,16 @@ def _search_params(cdp):
         "[...new URLSearchParams(location.search).entries()]")
 
 
+def _locale_preload(language):
+    return (
+        'Object.defineProperty(Navigator.prototype, "language", '
+        f'{{configurable: true, get: () => {json.dumps(language)}}}); '
+        'if (sessionStorage.getItem("aistat.test.locale-ready") !== "1") { '
+        'localStorage.removeItem("aistat.locale"); '
+        'sessionStorage.setItem("aistat.test.locale-ready", "1"); }'
+    )
+
+
 def test_open_page_navigates_the_attached_target(dashboard):
     """A fresh target must reach the requested page after its flat session
     is attached; creating a target alone is not sufficient evidence."""
@@ -115,6 +160,176 @@ def test_open_page_navigates_the_attached_target(dashboard):
     cdp.wait_for(BOOTED_JS)
     assert cdp.eval("location.href") == requested_url
     assert cdp.eval('document.getElementById("card-tokens") !== null') is True
+
+
+def test_default_english_localizes_static_and_dynamic_dashboard_copy(dashboard):
+    """A non-Russian browser starts in English without a page reload."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("document.documentElement.lang") == "en"
+    assert cdp.eval("document.title") == "AIStat — Multica token statistics"
+    assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Interface language: English"
+    assert cdp.eval('document.querySelector(".connection-host").textContent') == "Official host: https://multica.ai"
+    assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
+    assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    assert cdp.eval('document.querySelector(".connection-host").textContent') == "Официальный хост: https://multica.ai"
+    assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+
+
+def test_public_login_localizes_and_persists_browser_locale(public_page):
+    cdp, base, _ = public_page
+    cdp.open_page(
+        base + "/login",
+        preload_script=_locale_preload("ru-RU"),
+    )
+    cdp.wait_for('document.getElementById("locale-switcher") !== null', timeout=10)
+    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert cdp.eval("document.title") == "Вход — AIStat"
+    assert cdp.eval('document.querySelectorAll("#locale-switcher").length') == 1
+
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+    assert cdp.eval("document.title") == "Sign in — AIStat"
+    assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+
+    cdp.eval('document.getElementById("locale-switcher").focus()')
+    _press_key(cdp, "Enter")
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    cdp.eval('document.getElementById("locale-switcher").focus()')
+    _press_key(cdp, " ")
+    cdp.wait_for('document.documentElement.lang === "en"')
+    assert cdp.eval('localStorage.getItem("aistat.locale")') == "en"
+    cdp.eval("window.__aistat_pre_reload = true; location.reload()")
+    cdp.wait_for(
+        'window.__aistat_pre_reload === undefined && '
+        'document.getElementById("locale-switcher") !== null'
+    )
+    assert cdp.eval("document.documentElement.lang") == "en"
+    assert cdp.eval('localStorage.getItem("aistat.locale")') == "en"
+
+    cdp.open_page(
+        base + "/login",
+        preload_script=_locale_preload("en-US"),
+    )
+    cdp.wait_for('document.getElementById("locale-switcher") !== null')
+    assert cdp.eval("document.documentElement.lang") == "en"
+    assert cdp.eval("document.title") == "Sign in — AIStat"
+
+
+def test_public_registration_closed_localizes_both_languages(
+    public_page, monkeypatch
+):
+    cdp, base, config = public_page
+    config.oauth_providers = {"google": object()}
+
+    def reject_registration(*args, **kwargs):
+        raise public_wsgi_module.oauth.RegistrationClosedError(
+            "registration is closed"
+        )
+
+    monkeypatch.setattr(
+        public_wsgi_module.oauth, "finish", reject_registration
+    )
+    cdp.open_page(
+        base + "/auth/google/callback",
+        preload_script=_locale_preload("ru-RU"),
+    )
+    cdp.wait_for(
+        'typeof I18N === "object" && '
+        'document.getElementById("locale-switcher") !== null'
+    )
+    assert cdp.eval(
+        'performance.getEntriesByType("navigation")[0].responseStatus'
+    ) == 403
+    assert cdp.eval(
+        'performance.getEntriesByType("resource").some('
+        'entry => new URL(entry.name).pathname === "/i18n.js")'
+    ) is True
+    assert cdp.eval('document.querySelectorAll("#locale-switcher").length') == 1
+    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert cdp.eval("document.title") == "Регистрация закрыта — AIStat"
+    assert cdp.eval('document.querySelector(".subtitle").textContent') == (
+        "Регистрация сейчас закрыта. Чтобы получить доступ, "
+        "обратитесь к администратору."
+    )
+    assert cdp.eval('document.querySelector(".login-card p a").textContent') == (
+        "Вернуться ко входу"
+    )
+    assert cdp.eval('document.querySelector(".login-card p a").href') == (
+        base + "/login"
+    )
+
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+    assert cdp.eval("document.title") == "Registration closed — AIStat"
+    assert cdp.eval('document.querySelector(".subtitle").textContent') == (
+        "Registration is currently closed. Contact an administrator "
+        "to get access."
+    )
+    assert cdp.eval('document.querySelector(".login-card p a").textContent') == (
+        "Back to sign in"
+    )
+    assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
+
+
+def _press_key(cdp, key):
+    cdp.eval("document.activeElement.dispatchEvent(new KeyboardEvent('keydown', %s))" %
+             json.dumps({"key": key, "bubbles": True}))
+
+
+def test_language_switcher_keyboard_persistence_and_state(dashboard):
+    """The native button keeps browser state while updating dynamic copy."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?project=P1")
+    cdp.wait_for(BOOTED_JS)
+    before = cdp.eval('document.getElementById("card-tokens").textContent')
+    cdp.eval('document.querySelector(".chart-data").open = true; document.getElementById("locale-switcher").focus()')
+    assert cdp.eval("document.activeElement.id") == "locale-switcher"
+
+    _press_key(cdp, "Enter")
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    assert cdp.eval("document.title") == "AIStat — статистика токенов Multica"
+    assert cdp.eval('localStorage.getItem("aistat.locale")') == "ru"
+    assert _selected(cdp, "filter-project") == ["P1"]
+    assert cdp.eval('document.querySelector(".chart-data").open') is True
+    assert cdp.eval('document.getElementById("card-tokens").textContent') == before
+    assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Язык интерфейса: Русский"
+
+    cdp.eval('document.getElementById("locale-switcher").focus()')
+    _press_key(cdp, " ")
+    cdp.wait_for('document.documentElement.lang === "en"')
+    cdp.wait_for('document.getElementById("efficiency-time-title").textContent.includes("Efficiency over time")')
+    assert _selected(cdp, "filter-project") == ["P1"]
+    assert cdp.eval('document.getElementById("card-tokens").textContent') == before
+
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
+    cdp.eval("location.reload()")
+    cdp.wait_for(BOOTED_JS)
+    assert cdp.eval("document.documentElement.lang") == "ru"
+    assert _selected(cdp, "filter-project") == ["P1"]
+
+
+def test_language_switcher_relocalizes_visible_filter_error(dashboard):
+    """An existing URL-state warning changes language without clearing state."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/?group=bogus")
+    cdp.wait_for(BOOTED_JS)
+    if cdp.eval("document.documentElement.lang") != "ru":
+        cdp.eval('document.getElementById("locale-switcher").click()')
+        cdp.wait_for('document.documentElement.lang === "ru"')
+    assert "сброшены" in _filter_error(cdp)
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "en"')
+    cdp.wait_for('document.getElementById("filter-error").textContent.includes("Invalid filter parameters")')
+    assert cdp.eval("location.search") == ""
+    cdp.eval('document.getElementById("locale-switcher").click()')
+    cdp.wait_for('document.documentElement.lang === "ru"')
 
 
 def test_navigation_timeout_includes_target_diagnostics(dashboard):

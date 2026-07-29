@@ -1214,6 +1214,16 @@ def test_login_page_shows_yandex_button(legacy):
     assert "/auth/yandex/start?next=" in page
 
 
+def test_login_page_serves_shared_locale_switcher(legacy):
+    status, _, page = request(legacy.application, "/login")
+    asset_status, _, asset = request(legacy.application, "/i18n.js")
+    assert status == "200 OK"
+    assert b'data-page="login"' in page
+    assert b'<script src="/i18n.js"></script>' in page
+    assert asset_status == "200 OK"
+    assert b"aistat.locale" in asset
+
+
 def yandex_oauth_login(module, monkeypatch, identity, next_url="/", cookie=None):
     """Drive a full mock-provider Yandex login through the real legacy app.
 

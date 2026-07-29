@@ -103,6 +103,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
     public_endpoints = {
         "login",
         "login_css",
+        "i18n_js",
         "healthz",
         "ingest_snapshot",
         "oauth_start",
@@ -424,6 +425,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
     def login_css():
         return send_from_directory(STATIC_DIR, "login.css")
 
+    @app.get("/i18n.js")
+    def i18n_js():
+        return send_from_directory(STATIC_DIR, "i18n.js")
+
     def registration_closed():
         """Non-secret page shown when a new user may not register.
 
@@ -431,14 +436,14 @@ def create_app(config: Optional[Config] = None) -> Flask:
         is not permitted; a rejected new subject never reaches a session.
         """
         body = (
-            "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<title>Регистрация закрыта — AIStat</title>"
-            "<link rel=\"stylesheet\" href=\"/login.css\"></head><body>"
+            "<link rel=\"stylesheet\" href=\"/login.css\"></head><body data-page=\"closed\">"
             "<main class=\"login-shell\"><section class=\"login-card\">"
             "<h1>AIStat</h1><p class=\"subtitle\">Регистрация сейчас закрыта. "
             "Чтобы получить доступ, обратитесь к администратору.</p>"
             "<p><a href=\"/login\">Вернуться ко входу</a></p>"
-            "</section></main></body></html>"
+            "</section></main><script src=\"/i18n.js\"></script></body></html>"
         )
         return body, 403
 

@@ -113,6 +113,16 @@ button {
 
 button:hover { background: #405ddd; }
 button:focus-visible { outline: 3px solid rgba(79, 109, 245, 0.3); }
+.locale-switcher {
+  width: auto;
+  margin: 0 0 16px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: #fff;
+  font-size: 12px;
+}
+.locale-switcher:hover { background: #f5f7ff; }
 
 .oauth-divider {
   display: flex;
