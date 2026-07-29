@@ -1170,6 +1170,7 @@ function populateMultiSelect(id, items, valueOf, labelOf, selected) {
     option.selected = selected.includes(option.value);
     select.appendChild(option);
   }
+  select.size = select.options.length;
 }
 
 function selectedValues(id) {

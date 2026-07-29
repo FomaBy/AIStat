@@ -13,6 +13,7 @@ const I18N = (() => {
     loginSubtitle: ["Закрытая статистика использования Multica", "Private Multica usage statistics"],
     liveUpdates: ["Live-обновления", "Live updates"], connecting: ["подключение…", "connecting…"],
     sync: ["синхронизация", "sync"], logout: ["Выйти", "Sign out"],
+    filters: ["Фильтры", "Filters"],
     projects: ["Проекты", "Projects"], agents: ["Агенты", "Agents"], models: ["Модели", "Models"],
     allProjects: ["Все проекты", "All projects"], allAgents: ["Все агенты", "All agents"], allModels: ["Все модели", "All models"],
     period: ["Период", "Period"], days: ["{count} дней", "{count} days"], allTime: ["Всё время", "All time"], customRange: ["Свой диапазон", "Custom range"],

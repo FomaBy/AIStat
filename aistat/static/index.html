@@ -22,19 +22,20 @@
     </div>
   </header>
 
-  <section class="filters">
+  <div class="dashboard-layout">
+  <aside class="filters" aria-label="Фильтры">
     <label>Проекты
-      <select id="filter-project" multiple size="3">
+      <select id="filter-project" multiple size="1">
         <option value="">Все проекты</option>
       </select>
     </label>
     <label>Агенты
-      <select id="filter-agent" multiple size="3">
+      <select id="filter-agent" multiple size="1">
         <option value="">Все агенты</option>
       </select>
     </label>
     <label>Модели
-      <select id="filter-model" multiple size="3">
+      <select id="filter-model" multiple size="1">
         <option value="">Все модели</option>
       </select>
     </label>
@@ -64,7 +65,9 @@
     <button id="filter-reset" class="filter-reset" type="button" title="Вернуть все фильтры к значениям по умолчанию">Сбросить фильтры</button>
     <span id="filter-error" class="note filter-error" role="alert" hidden></span>
     <span id="estimate-note" class="note" hidden>≈ значения по агентам/моделям/проектам и неполным дням распределены по фактическим интервалам запусков задач.</span>
-  </section>
+  </aside>
+
+  <div class="dashboard-content">
 
   <section class="connection-panel" id="connection-cabinet" aria-labelledby="connection-title">
     <div class="connection-heading">
@@ -261,6 +264,8 @@
     <span id="footer-unpriced"></span>
     <a href="/health" target="_blank" rel="noopener">health</a>
   </footer>
+  </div>
+  </div>
 
   <script src="vendor/chart.umd.min.js"></script>
   <script src="i18n.js"></script>

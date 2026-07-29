@@ -170,15 +170,123 @@ def test_default_english_localizes_static_and_dynamic_dashboard_copy(dashboard):
     assert cdp.eval("document.documentElement.lang") == "en"
     assert cdp.eval("document.title") == "AIStat — Multica token statistics"
     assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Interface language: English"
+    assert cdp.eval('document.querySelector(".filters").getAttribute("aria-label")') == "Filters"
     assert cdp.eval('document.querySelector(".connection-host").textContent') == "Official host: https://multica.ai"
     assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
     assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
     cdp.eval('document.getElementById("locale-switcher").click()')
     cdp.wait_for('document.documentElement.lang === "ru"')
+    assert cdp.eval('document.querySelector(".filters").getAttribute("aria-label")') == "Фильтры"
     assert cdp.eval('document.querySelector(".connection-host").textContent') == "Официальный хост: https://multica.ai"
     assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
     cdp.eval('document.getElementById("locale-switcher").click()')
     cdp.wait_for('document.documentElement.lang === "en"')
+
+
+def test_filter_panel_resizes_multiselects_and_stacks_without_overflow(dashboard):
+    """The sidebar stays beside content on desktop, then stacks cleanly.
+
+    The synthetic meta payload deliberately gives every multi-select more than
+    its former three rows; the second payload arrives through the production
+    SSE handler.
+    """
+    cdp, base = dashboard
+    preload_script = r'''(() => {
+      const originalFetch = window.fetch;
+      window.__aistat_meta_phase = 0;
+      const meta = () => {
+        const count = window.__aistat_meta_phase ? 5 : 4;
+        const items = (prefix) => Array.from(
+          {length: count}, (_, index) => `${prefix}-${index + 1}`);
+        return {
+          projects: items("project").map((id) => ({id, title: id})),
+          agents: items("agent").map((id) => ({id, name: id})),
+          models: items("model"),
+          date_span: {first: "2026-01-01", last: "2026-01-02"},
+        };
+      };
+      window.fetch = (...args) => {
+        const url = String(args[0] && args[0].url || args[0]);
+        if (new URL(url, location.href).pathname === "/api/meta") {
+          return Promise.resolve(new Response(JSON.stringify(meta()), {
+            headers: {"Content-Type": "application/json"},
+          }));
+        }
+        return originalFetch(...args);
+      };
+      class TestEventSource {
+        constructor() {
+          this.listeners = {};
+          window.__aistat_events = this;
+          queueMicrotask(() => this.onopen && this.onopen());
+        }
+        addEventListener(type, listener) { this.listeners[type] = listener; }
+        emit(type, data) { this.listeners[type]({data}); }
+      }
+      window.EventSource = TestEventSource;
+    })();'''
+    snapshot = '''(() => {
+      const box = (node) => {
+        const rect = node.getBoundingClientRect();
+        return {left: rect.left, right: rect.right, top: rect.top,
+                bottom: rect.bottom, width: rect.width, height: rect.height};
+      };
+      const filters = document.querySelector(".filters");
+      return {
+        filters: box(filters),
+        content: box(document.querySelector(".dashboard-content")),
+        scrollWidth: document.documentElement.scrollWidth,
+        viewportWidth: window.innerWidth,
+        selects: [...filters.querySelectorAll("select[multiple]")].map((select) => ({
+          options: select.options.length, size: select.size,
+          scrollHeight: select.scrollHeight, clientHeight: select.clientHeight,
+          scrollWidth: select.scrollWidth, clientWidth: select.clientWidth,
+        })),
+        controls: [...filters.querySelectorAll("select, input, button")].map(box),
+        filterScrollHeight: filters.scrollHeight,
+        filterClientHeight: filters.clientHeight,
+      };
+    })()'''
+    try:
+        for width in (1440, 900, 390):
+            cdp.open_page(base + "/", preload_script=preload_script)
+            cdp.call("Emulation.setDeviceMetricsOverride", {
+                "width": width, "height": 900, "deviceScaleFactor": 1,
+                "mobile": False,
+            })
+            cdp.wait_for(BOOTED_JS)
+            layout = cdp.eval(snapshot)
+            assert layout["scrollWidth"] <= layout["viewportWidth"]
+            assert layout["filterScrollHeight"] <= layout["filterClientHeight"]
+            assert all(item["options"] == item["size"] == 5
+                       for item in layout["selects"])
+            assert all(item["scrollHeight"] <= item["clientHeight"] and
+                       item["scrollWidth"] <= item["clientWidth"]
+                       for item in layout["selects"])
+            assert all(item["left"] >= 0 and
+                       item["right"] <= layout["viewportWidth"]
+                       for item in layout["controls"])
+            if width == 1440:
+                assert layout["filters"]["right"] < layout["content"]["left"]
+            else:
+                assert layout["filters"]["bottom"] <= layout["content"]["top"]
+
+        cdp.eval('''window.__aistat_meta_phase = 1;
+          window.__aistat_events.emit("update", JSON.stringify({
+            beat: {seq: 2, at: "2026-01-02T00:00:00Z"},
+            cycle: {id: "meta-refresh"},
+          }));''')
+        cdp.wait_for(
+            'state.lastSyncMarker === "2:meta-refresh" && '
+            '[...document.querySelectorAll(".filters select[multiple]")]'
+            '.every((select) => select.options.length === 6 && select.size === 6)'
+        )
+        layout = cdp.eval(snapshot)
+        assert all(item["scrollHeight"] <= item["clientHeight"] and
+                   item["scrollWidth"] <= item["clientWidth"]
+                   for item in layout["selects"])
+    finally:
+        cdp.call("Emulation.clearDeviceMetricsOverride")
 
 
 def test_public_login_localizes_and_persists_browser_locale(public_page):
