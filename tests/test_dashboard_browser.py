@@ -390,30 +390,46 @@ def _press_key(cdp, key):
              json.dumps({"key": key, "bubbles": True}))
 
 
+def _settled_card_tokens(cdp, lang, unit):
+    """The token card text once a locale swap has fully landed.
+
+    ``aistat:localechange`` flips ``html[lang]`` synchronously but rebuilds the
+    cards asynchronously (``refreshMeta().then(refreshAll)``), and ``fmtTokens``
+    formats through ``I18N.tag`` — so the localized unit is the signal that the
+    dynamic re-render finished, and the returned text is compared against the
+    exact representation expected for ``lang`` (never against another locale).
+    """
+    cdp.wait_for(f'document.documentElement.lang === "{lang}" && '
+                 'document.getElementById("card-tokens").textContent'
+                 f'.includes({json.dumps(unit)})')
+    return cdp.eval('document.getElementById("card-tokens").textContent')
+
+
 def test_language_switcher_keyboard_persistence_and_state(dashboard):
     """The native button keeps browser state while updating dynamic copy."""
     cdp, base = dashboard
-    cdp.open_page(base + "/?project=P1")
+    # A deterministic English start: the same seeded 3.4 M total for P1 reads
+    # as "≈ 3.4 M" in English and "≈ 3,4 млн" in Russian.
+    cdp.open_page(base + "/?project=P1",
+                  preload_script=_locale_preload("en-US"))
     cdp.wait_for(BOOTED_JS)
-    before = cdp.eval('document.getElementById("card-tokens").textContent')
+    assert _settled_card_tokens(cdp, "en", " M") == "≈ 3.4 M"
     cdp.eval('document.querySelector(".chart-data").open = true; document.getElementById("locale-switcher").focus()')
     assert cdp.eval("document.activeElement.id") == "locale-switcher"
 
     _press_key(cdp, "Enter")
-    cdp.wait_for('document.documentElement.lang === "ru"')
+    assert _settled_card_tokens(cdp, "ru", "млн") == "≈ 3,4 млн"
     assert cdp.eval("document.title") == "AIStat — статистика токенов Multica"
     assert cdp.eval('localStorage.getItem("aistat.locale")') == "ru"
     assert _selected(cdp, "filter-project") == ["P1"]
     assert cdp.eval('document.querySelector(".chart-data").open') is True
-    assert cdp.eval('document.getElementById("card-tokens").textContent') == before
     assert cdp.eval('document.getElementById("locale-switcher").getAttribute("aria-label")') == "Язык интерфейса: Русский"
 
     cdp.eval('document.getElementById("locale-switcher").focus()')
     _press_key(cdp, " ")
-    cdp.wait_for('document.documentElement.lang === "en"')
+    assert _settled_card_tokens(cdp, "en", " M") == "≈ 3.4 M"
     cdp.wait_for('document.getElementById("efficiency-time-title").textContent.includes("Efficiency over time")')
     assert _selected(cdp, "filter-project") == ["P1"]
-    assert cdp.eval('document.getElementById("card-tokens").textContent') == before
 
     cdp.eval('document.getElementById("locale-switcher").click()')
     cdp.wait_for('document.documentElement.lang === "ru"')
