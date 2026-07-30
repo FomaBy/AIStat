@@ -433,8 +433,16 @@ def test_language_switcher_keyboard_persistence_and_state(dashboard):
 
     cdp.eval('document.getElementById("locale-switcher").click()')
     cdp.wait_for('document.documentElement.lang === "ru"')
-    cdp.eval("location.reload()")
-    cdp.wait_for(BOOTED_JS)
+    # The marker dies with the old document, so the booted condition below can
+    # only match the freshly reloaded page — plain BOOTED_JS also holds on the
+    # pre-reload document and races the new boot (QA-FAN1938-01).
+    cdp.eval("window.__pre_reload = true; location.reload()")
+    cdp.wait_for(f'window.__pre_reload === undefined && ({BOOTED_JS})')
+    # Then wait for the restored state itself before asserting exact values.
+    cdp.wait_for('document.documentElement.lang === "ru" && '
+                 '[...document.getElementById("filter-project").selectedOptions]'
+                 '.map((o) => o.value).join(",") === "P1"')
+    assert _settled_card_tokens(cdp, "ru", "млн") == "≈ 3,4 млн"
     assert cdp.eval("document.documentElement.lang") == "ru"
     assert _selected(cdp, "filter-project") == ["P1"]
 
