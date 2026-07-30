@@ -112,6 +112,32 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         finally:
             conn.close()
 
+    @app.get("/api/chart-catalog")
+    def api_chart_catalog():
+        return aggregates.chart_catalog()
+
+    @app.get("/api/chart")
+    def api_chart(
+        dimension: str = Query(""),
+        measure: str = Query(""),
+        date_from: Optional[str] = Query(None, alias="from"),
+        date_to: Optional[str] = Query(None, alias="to"),
+        project: Optional[List[str]] = Query(None),
+        agent: Optional[List[str]] = Query(None),
+        model: Optional[List[str]] = Query(None),
+    ):
+        conn = db()
+        try:
+            return aggregates.configurable_chart(
+                conn, dimension, measure,
+                filters=request_filters(date_from, date_to, project, agent, model),
+                credits_per_usd=config.credits_per_usd,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        finally:
+            conn.close()
+
     @app.get("/api/summary")
     def api_summary(
         date_from: Optional[str] = Query(None, alias="from"),

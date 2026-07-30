@@ -92,6 +92,33 @@
       <div class="chart-box"><canvas id="chart-daily-cost"></canvas></div>
     </section>
 
+    <section id="configurable-chart-panel" class="panel panel-wide configurable-chart-panel" aria-busy="true">
+      <h2 data-i18n="configurableChart">Настраиваемый график</h2>
+      <div class="chart-controls">
+        <label for="chart-dimension"><span data-i18n="chartDimension">Ось X</span>
+          <select id="chart-dimension"></select>
+        </label>
+        <label for="chart-measure"><span data-i18n="chartMeasure">Ось Y</span>
+          <select id="chart-measure" aria-describedby="chart-compatibility"></select>
+        </label>
+      </div>
+      <p id="chart-compatibility" class="note" data-i18n="chartUnavailableHelp">Недоступные метрики отключены: для выбранного измерения нет надёжных данных.</p>
+      <p id="configurable-chart-status" class="note" role="status" aria-live="polite" hidden></p>
+      <div class="chart-box">
+        <canvas id="chart-configurable" role="img" aria-label="Настраиваемый график">Значения графика — в таблице «Данные таблицей» ниже.</canvas>
+        <p id="empty-configurable-chart" class="chart-empty" hidden data-i18n="noData">Нет данных за выбранный период и фильтры.</p>
+      </div>
+      <details class="chart-data">
+        <summary data-i18n="dataTable">Данные таблицей</summary>
+        <div class="table-wrap">
+          <table id="table-configurable-chart" aria-label="Данные настраиваемого графика">
+            <thead><tr><th id="configurable-chart-label" data-i18n="chartDimension">Ось X</th><th id="configurable-chart-value" class="num" data-i18n="chartMeasure">Ось Y</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
     <section class="panel">
       <h2>Токены по агентам <span class="est-mark">за период</span></h2>
       <div class="chart-box chart-box-small"><canvas id="chart-agents"></canvas></div>

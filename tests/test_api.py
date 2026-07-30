@@ -39,6 +39,74 @@ def test_meta(api):
     assert meta["date_span"] == {"first": "2026-01-01", "last": "2026-01-02"}
 
 
+def test_configurable_chart_catalog_and_all_allowed_pairs(api):
+    client, _ = api
+    catalog = client.get("/api/chart-catalog").json()
+    assert catalog["version"] == "v1"
+    assert [item["id"] for item in catalog["dimensions"]] == [
+        "time", "project", "agent", "model", "issue",
+    ]
+    assert {item["id"] for item in catalog["measures"]} == {
+        "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens", "total_tokens", "cost_usd", "cost_credits",
+        "story_points", "task_count", "run_count", "agent_work_seconds",
+        "tokens_per_sp", "cost_per_sp", "weighted_efficiency",
+    }
+    for dimension in catalog["dimensions"]:
+        for measure in catalog["measures"]:
+            pair = catalog["compatibility"][dimension["id"]][measure["id"]]
+            response = client.get("/api/chart", params={
+                "dimension": dimension["id"], "measure": measure["id"],
+            })
+            if pair["supported"]:
+                assert response.status_code == 200, (dimension, measure)
+                data = response.json()
+                assert data["version"] == "v1"
+                assert data["chart_type"] == dimension["chart_type"]
+                assert all(set(row) == {
+                    "id", "label", "value", "estimated", "has_unpriced",
+                } for row in data["rows"])
+            else:
+                assert pair["reason"] == "unavailable_for_dimension"
+                assert response.status_code == 422
+                assert response.json()["detail"] == (
+                    "unsupported chart combination: %s × %s" % (
+                        dimension["id"], measure["id"],
+                    )
+                )
+
+
+def test_configurable_chart_preserves_ratio_null_estimate_and_filters(api):
+    client, _ = api
+    project = client.get("/api/chart", params={
+        "dimension": "project", "measure": "tokens_per_sp",
+    }).json()
+    beta = next(row for row in project["rows"] if row["id"] == "P2")
+    assert beta["value"] is None
+
+    ratio = client.get("/api/chart", params={
+        "dimension": "agent", "measure": "tokens_per_sp",
+        "from": "2026-01-01T10:00Z", "to": "2026-01-01T11:00Z",
+        "project": "P1", "agent": "A2", "model": "m-shared",
+    }).json()
+    assert ratio["estimated"] is True
+    assert ratio["rows"] == [{
+        "id": "A2", "label": "Dev Shared", "value": 300.0,
+        "estimated": True, "has_unpriced": False,
+    }]
+
+    assert client.get("/api/chart", params={
+        "dimension": "unknown", "measure": "total_tokens",
+    }).json() == {"detail": "unsupported chart dimension: unknown"}
+    invalid = client.get("/api/chart", params={
+        "dimension": "agent", "measure": "task_count",
+    })
+    assert invalid.status_code == 422
+    assert invalid.json() == {
+        "detail": "unsupported chart combination: agent × task_count",
+    }
+
+
 def test_opus_5_api_models_filters_and_efficiency_stay_separate(api):
     client, conn = api
     seed_opus_transition_fixture(conn)

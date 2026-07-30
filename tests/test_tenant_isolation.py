@@ -36,6 +36,8 @@ from test_legacy_wsgi import (
 # without them.
 DETERMINISTIC_DATA_ROUTES = (
     "/api/meta",
+    "/api/chart-catalog",
+    "/api/chart?dimension=project&measure=total_tokens",
     "/api/summary",
     "/api/daily",
     "/api/agents",
@@ -243,9 +245,11 @@ def test_flask_route_inventory_is_fully_classified(public_app):
     # Session-authenticated (data or session-bound action).
     session_scoped = {
         "logout",
-        "api_session",
-        "api_meta",
-        "api_summary",
+            "api_session",
+            "api_meta",
+            "api_chart_catalog",
+            "api_chart",
+            "api_summary",
         "api_daily",
         "api_agents",
         "api_projects",

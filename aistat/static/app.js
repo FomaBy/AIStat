@@ -137,6 +137,9 @@ const state = {
   from: "",      // UTC datetime-local value
   to: "",        // UTC datetime-local value
   group: "model",
+  chartCatalog: null,
+  chartDimension: "time",
+  chartMeasure: "total_tokens",
   lastDate: null, // max date present in daily_usage (from /api/meta)
   charts: {},
   csrf: null,
@@ -723,16 +726,160 @@ function query(params) {
   return s ? "?" + s : "";
 }
 
+function chartPair(dimension, measure) {
+  return state.chartCatalog && state.chartCatalog.compatibility[dimension]
+    && state.chartCatalog.compatibility[dimension][measure];
+}
+
+function chartSupported(dimension, measure) {
+  return Boolean(chartPair(dimension, measure) && chartPair(dimension, measure).supported);
+}
+
+function firstChartMeasure(dimension) {
+  const measure = state.chartCatalog.measures.find((item) => chartSupported(dimension, item.id));
+  return measure ? measure.id : "";
+}
+
+function chartItemLabel(item) {
+  return t(item.label_key);
+}
+
+function populateChartControls() {
+  if (!state.chartCatalog) return;
+  const dimensions = $("chart-dimension");
+  const measures = $("chart-measure");
+  dimensions.replaceChildren(...state.chartCatalog.dimensions.map((item) => {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = chartItemLabel(item);
+    return option;
+  }));
+  measures.replaceChildren(...state.chartCatalog.measures.map((item) => {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = chartItemLabel(item);
+    option.disabled = !chartSupported(state.chartDimension, item.id);
+    if (option.disabled) option.title = t("chartUnavailableHelp");
+    return option;
+  }));
+  dimensions.value = state.chartDimension;
+  measures.value = state.chartMeasure;
+  $("chart-compatibility").textContent = t("chartUnavailableHelp");
+}
+
+async function refreshChartCatalog() {
+  state.chartCatalog = await fetchJSON("/api/chart-catalog");
+  if (!chartSupported(state.chartDimension, state.chartMeasure)) {
+    state.chartMeasure = firstChartMeasure(state.chartDimension);
+  }
+  populateChartControls();
+}
+
+function formatChartValue(unit, value) {
+  if (unit === "tokens" || unit === "tokens_per_sp") return fmtTokens(value);
+  if (unit === "usd" || unit === "usd_per_sp" || unit === "usd_per_hour_per_sp") return fmtUSDFine(value);
+  if (unit === "credits" || unit === "story_points") return fmtNum(value);
+  if (unit === "seconds") return fmtDuration(value);
+  return fmtNum(value);
+}
+
+function chartDescription(data) {
+  const dimension = state.chartCatalog.dimensions.find((item) => item.id === data.dimension);
+  const measure = state.chartCatalog.measures.find((item) => item.id === data.measure);
+  return {
+    dimension: dimension ? chartItemLabel(dimension) : data.dimension,
+    measure: measure ? chartItemLabel(measure) : data.measure,
+  };
+}
+
+function chartRowLabel(row) {
+  if (row.label === "(не атрибутировано)") return t("unattributed");
+  return row.label || t("unknown");
+}
+
+function renderConfigurableChartTable(data, description) {
+  const table = $("table-configurable-chart");
+  const tbody = table.querySelector("tbody");
+  tbody.innerHTML = "";
+  $("configurable-chart-label").textContent = description.dimension;
+  $("configurable-chart-value").textContent = description.measure;
+  table.setAttribute("aria-label", t("chartConfigTable", description));
+  if (!data.rows.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="2" class="note">${t("noData")}</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const row of data.rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="wrap">${esc(chartRowLabel(row))}</td><td class="num">${row.estimated ? "≈ " : ""}${formatChartValue(data.unit, row.value)}${row.has_unpriced ? " *" : ""}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function renderConfigurableChart(data) {
+  const panel = $("configurable-chart-panel");
+  const status = $("configurable-chart-status");
+  const description = chartDescription(data);
+  panel.setAttribute("aria-busy", "false");
+  status.hidden = true;
+  status.textContent = "";
+  $("chart-configurable").setAttribute("aria-label", t("chartConfigCanvas", description));
+  renderConfigurableChartTable(data, description);
+  const hasData = data.rows.some((row) => row.value != null);
+  $("empty-configurable-chart").hidden = hasData;
+  const values = data.rows.map((row) => row.value == null ? null : row.value);
+  const line = data.chart_type === "line";
+  upsertChart("chart-configurable", {
+    type: line ? "line" : "bar",
+    data: {
+      labels: data.rows.map(chartRowLabel),
+      datasets: [{
+        label: description.measure,
+        data: values,
+        borderColor: SINGLE_SERIES_COLOR,
+        backgroundColor: line ? SINGLE_SERIES_COLOR : data.rows.map(
+          (row) => entityColor(data.dimension, row.id)
+        ),
+        borderWidth: line ? 2 : 0,
+        pointRadius: line ? 3 : 0,
+        pointHoverRadius: line ? 5 : 0,
+        maxBarThickness: 42,
+        tension: 0.2,
+        spanGaps: false,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => formatChartValue(data.unit, ctx.parsed.y) } },
+      },
+      scales: { y: { ticks: { callback: (value) => formatChartValue(data.unit, value) } } },
+    },
+  });
+}
+
+function renderConfigurableChartError() {
+  const panel = $("configurable-chart-panel");
+  panel.setAttribute("aria-busy", "false");
+  $("configurable-chart-status").textContent = t("chartLoadError");
+  $("configurable-chart-status").hidden = false;
+  $("empty-configurable-chart").hidden = true;
+}
+
 // ---------- charts ----------
 
 function upsertChart(id, config) {
   const existing = state.charts[id];
-  if (existing) {
+  if (existing && existing.config.type === config.type) {
     existing.data = config.data;
     existing.options = config.options;
     existing.update();
     return existing;
   }
+  if (existing) existing.destroy();
   const chart = new Chart($(id).getContext("2d"), config);
   state.charts[id] = chart;
   return chart;
@@ -1063,7 +1210,13 @@ function esc(text) {
 // ---------- refresh ----------
 
 async function refreshAll() {
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health] = await Promise.all([
+  $("configurable-chart-panel").setAttribute("aria-busy", "true");
+  $("configurable-chart-status").textContent = t("chartLoading");
+  $("configurable-chart-status").hidden = false;
+  const chart = fetchJSON("/api/chart" + query({
+    dimension: state.chartDimension, measure: state.chartMeasure,
+  })).catch(() => null);
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
@@ -1072,6 +1225,7 @@ async function refreshAll() {
     fetchJSON("/api/model-efficiency" + query()),
     fetchJSON("/api/efficiency-breakdown" + query()),
     fetchJSON("/api/health"),
+    chart,
   ]);
   // The ≈-note legends the token-attribution markers. Drive it from the real
   // API flags, not merely from the presence of a filter: a unique-agent
@@ -1095,6 +1249,8 @@ async function refreshAll() {
   renderEfficiency(efficiency.issues);
   renderModelEfficiency(modelEfficiency);
   renderEfficiencyBreakdown(efficiencyBreakdown);
+  if (chartData) renderConfigurableChart(chartData);
+  else renderConfigurableChartError();
 
   const badge = $("health-badge");
   badge.hidden = false;
@@ -1262,6 +1418,8 @@ function syncFiltersToUrl() {
   if (state.from) q.set("from", state.from);
   if (state.to) q.set("to", state.to);
   if (state.group !== "model") q.set("group", state.group);
+  if (state.chartDimension !== "time") q.set("chart_x", state.chartDimension);
+  if (state.chartMeasure !== "total_tokens") q.set("chart_y", state.chartMeasure);
   const qs = q.toString();
   history.replaceState(null, "", qs ? "?" + qs : location.pathname);
 }
@@ -1318,6 +1476,25 @@ function readFiltersFromUrl() {
     if (GROUP_VALUES.has(q.get("group"))) state.group = q.get("group");
     else dropped.push("group");
   }
+  if (q.has("chart_x")) {
+    const dimension = q.get("chart_x");
+    if (state.chartCatalog.dimensions.some((item) => item.id === dimension)) {
+      state.chartDimension = dimension;
+    } else {
+      dropped.push("chart_x");
+    }
+  }
+  if (q.has("chart_y")) {
+    const measure = q.get("chart_y");
+    if (chartSupported(state.chartDimension, measure)) {
+      state.chartMeasure = measure;
+    } else {
+      dropped.push("chart_y");
+    }
+  }
+  if (!chartSupported(state.chartDimension, state.chartMeasure)) {
+    state.chartMeasure = firstChartMeasure(state.chartDimension);
+  }
   setSelectedValues("filter-project", state.projects);
   setSelectedValues("filter-agent", state.agents);
   setSelectedValues("filter-model", state.models);
@@ -1325,6 +1502,7 @@ function readFiltersFromUrl() {
   $("filter-group").value = state.group;
   $("filter-from").value = state.from;
   $("filter-to").value = state.to;
+  populateChartControls();
   if (dropped.length) {
     syncFiltersToUrl();
     showFilterError("invalidFilters", { items: dropped.join(", ") });
@@ -1343,6 +1521,8 @@ function resetFilters() {
   state.from = "";
   state.to = "";
   state.group = "model";
+  state.chartDimension = "time";
+  state.chartMeasure = "total_tokens";
   setSelectedValues("filter-project", []);
   setSelectedValues("filter-agent", []);
   setSelectedValues("filter-model", []);
@@ -1350,6 +1530,7 @@ function resetFilters() {
   $("filter-from").value = "";
   $("filter-to").value = "";
   $("filter-group").value = state.group;
+  populateChartControls();
   clearFilterError();
   syncFiltersToUrl();
   refreshAll().catch(console.error);
@@ -1361,6 +1542,7 @@ async function boot() {
   const connection = await refreshConnection();
   if (connection) startConnectionPolling(connection.status);
   await refreshMeta();
+  await refreshChartCatalog();
   readFiltersFromUrl();
   $("filter-project").addEventListener("change", () => {
     state.projects = selectedValues("filter-project");
@@ -1413,6 +1595,21 @@ async function boot() {
     syncFiltersToUrl();
     refreshAll().catch(console.error);
   });
+  $("chart-dimension").addEventListener("change", (e) => {
+    state.chartDimension = e.target.value;
+    if (!chartSupported(state.chartDimension, state.chartMeasure)) {
+      state.chartMeasure = firstChartMeasure(state.chartDimension);
+    }
+    populateChartControls();
+    syncFiltersToUrl();
+    refreshAll().catch(console.error);
+  });
+  $("chart-measure").addEventListener("change", (e) => {
+    if (!chartSupported(state.chartDimension, e.target.value)) return;
+    state.chartMeasure = e.target.value;
+    syncFiltersToUrl();
+    refreshAll().catch(console.error);
+  });
   $("filter-reset").addEventListener("click", resetFilters);
   await refreshAll();
   connectEvents();
@@ -1427,5 +1624,8 @@ boot().catch((err) => {
 document.addEventListener("aistat:localechange", () => {
   if (state.connection) renderConnection(state.connection);
   if (state.filterError) showFilterError(state.filterError.key, state.filterError.params);
-  if (state.lastDate) refreshMeta().then(refreshAll).catch(console.error);
+  if (state.lastDate) refreshMeta().then(() => {
+    populateChartControls();
+    return refreshAll();
+  }).catch(console.error);
 });

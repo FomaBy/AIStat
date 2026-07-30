@@ -248,6 +248,11 @@ body {
 .panel-wide { grid-column: 1 / -1; }
 .panel h2 { margin: 0 0 10px; font-size: 15px; font-weight: 650; }
 .est-mark { color: var(--muted); font-weight: 500; font-size: 12px; }
+.chart-controls { display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 8px; }
+.chart-controls label { display: flex; flex-direction: column; gap: 4px; min-width: min(100%, 220px); color: var(--muted); font-size: 13px; }
+.chart-controls select { min-height: 34px; font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+.chart-controls select:focus-visible { outline: 3px solid rgba(79, 109, 245, 0.3); outline-offset: 2px; }
+.configurable-chart-panel[aria-busy="true"] { opacity: 0.78; }
 
 .chart-box { position: relative; height: 320px; }
 .chart-box-small { height: 260px; }
