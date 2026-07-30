@@ -545,6 +545,29 @@ def create_app(config: Optional[Config] = None) -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/chart-catalog")
+    def api_chart_catalog():
+        return jsonify(aggregates.chart_catalog())
+
+    @app.get("/api/chart")
+    def api_chart():
+        try:
+            filters = query_filters()
+            dimension = request.args.get("dimension", "")
+            measure = request.args.get("measure", "")
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(aggregates.configurable_chart(
+                conn, dimension, measure, filters=filters,
+                credits_per_usd=config.credits_per_usd,
+            ))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        finally:
+            conn.close()
+
     @app.get("/api/summary")
     def api_summary():
         try:

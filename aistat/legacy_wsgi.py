@@ -1848,6 +1848,18 @@ def _api(environ, start_response, path):
     try:
         if path == "/api/meta":
             data = aggregates.meta(conn)
+        elif path == "/api/chart-catalog":
+            data = aggregates.chart_catalog()
+        elif path == "/api/chart":
+            try:
+                data = aggregates.configurable_chart(
+                    conn, _first(query, "dimension", ""), _first(query, "measure", ""),
+                    filters=filters, credits_per_usd=CREDITS_PER_USD,
+                )
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity", {"detail": str(exc)}
+                )
         elif path == "/api/summary":
             data = aggregates.summary(
                 conn,

@@ -363,7 +363,7 @@ def test_legacy_installed_v4_tenant_db_returns_controlled_503(legacy, tmp_path):
 
     cookies = login(module)
     endpoints = (
-        "/api/meta", "/api/summary", "/api/daily", "/api/agents",
+        "/api/meta", "/api/chart", "/api/summary", "/api/daily", "/api/agents",
         "/api/projects", "/api/efficiency", "/api/model-efficiency",
         "/api/efficiency-breakdown", "/api/health", "/health", "/api/sync",
     )
@@ -572,6 +572,38 @@ def test_efficiency_breakdown_endpoint(legacy):
     data = legacy.json.loads(body.decode("utf-8"))
     assert data["time"]["granularity"] == "hour"
     assert data["time"]["rows"][0]["total_tokens"] == 375
+
+
+def test_legacy_configurable_chart_uses_the_shared_contract(legacy):
+    cookies = login(legacy)
+    status, _, body = request(legacy.application, "/api/chart-catalog", cookie=cookies)
+    assert status == "200 OK"
+    catalog = legacy.json.loads(body.decode("utf-8"))
+    for dimension in catalog["dimensions"]:
+        for measure in catalog["measures"]:
+            status, _, _ = request(
+                legacy.application,
+                "/api/chart?dimension=%s&measure=%s" % (dimension["id"], measure["id"]),
+                cookie=cookies,
+            )
+            supported = catalog["compatibility"][dimension["id"]][measure["id"]]["supported"]
+            assert status == ("200 OK" if supported else "422 Unprocessable Entity")
+    status, _, body = request(
+        legacy.application,
+        "/api/chart?dimension=agent&measure=agent_work_seconds",
+        cookie=cookies,
+    )
+    assert status == "200 OK"
+    assert legacy.json.loads(body.decode("utf-8"))["version"] == catalog["version"] == "v1"
+    status, _, body = request(
+        legacy.application,
+        "/api/chart?dimension=agent&measure=task_count",
+        cookie=cookies,
+    )
+    assert status == "422 Unprocessable Entity"
+    assert legacy.json.loads(body.decode("utf-8")) == {
+        "detail": "unsupported chart combination: agent × task_count",
+    }
 
 
 def test_projects_filtered_cost_matches_model_efficiency(legacy):

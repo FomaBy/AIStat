@@ -31,6 +31,45 @@ from typing import Any, Dict, List, Optional, Tuple
 
 TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
+# The configurable chart is deliberately a closed contract.  These keys are
+# also the only values that can reach the aggregation dispatch below, so a
+# query parameter can never turn into a SQL identifier or expression.
+CHART_CONTRACT_VERSION = "v1"
+CHART_DIMENSIONS = (
+    ("time", "line"), ("project", "bar"), ("agent", "bar"),
+    ("model", "bar"), ("issue", "bar"),
+)
+CHART_MEASURES = (
+    ("input_tokens", "tokens"), ("output_tokens", "tokens"),
+    ("cache_read_tokens", "tokens"), ("cache_write_tokens", "tokens"),
+    ("total_tokens", "tokens"), ("cost_usd", "usd"),
+    ("cost_credits", "credits"), ("story_points", "story_points"),
+    ("task_count", "count"), ("run_count", "count"),
+    ("agent_work_seconds", "seconds"), ("tokens_per_sp", "tokens_per_sp"),
+    ("cost_per_sp", "usd_per_sp"),
+    ("weighted_efficiency", "usd_per_hour_per_sp"),
+)
+_CHART_RAW_MEASURES = frozenset(
+    ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+     "total_tokens", "cost_usd", "cost_credits")
+)
+_CHART_COMPATIBILITY = {
+    "time": frozenset(_CHART_RAW_MEASURES | {"story_points", "tokens_per_sp"}),
+    "project": frozenset(_CHART_RAW_MEASURES | {
+        "story_points", "task_count", "tokens_per_sp",
+    }),
+    "agent": frozenset(_CHART_RAW_MEASURES | {
+        "story_points", "run_count", "agent_work_seconds", "tokens_per_sp",
+    }),
+    "model": frozenset(_CHART_RAW_MEASURES | {
+        "story_points", "tokens_per_sp", "cost_per_sp", "weighted_efficiency",
+    }),
+    "issue": frozenset({
+        "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+        "total_tokens", "story_points", "task_count", "tokens_per_sp",
+    }),
+}
+
 # Run durations come out of SQLite's julianday() in days; efficiency reports
 # money-per-hour, so durations are converted to hours with this factor.
 HOURS_PER_DAY = 24.0
@@ -919,6 +958,7 @@ def projects_overview(conn: sqlite3.Connection,
         with_usage = 0
         statuses: Dict[str, int] = {}
         sp_sum = 0.0
+        task_count = 0.0
         sp_issues = 0
         eff_tokens = 0
         eff_sp = 0.0
@@ -937,6 +977,8 @@ def projects_overview(conn: sqlite3.Connection,
             if row["story_points"] is not None:
                 sp_sum += row["story_points"] * factor
                 sp_issues += 1
+            if row["task_count"] is not None:
+                task_count += row["task_count"] * factor
             if not row["has_usage"]:
                 continue
             with_usage += 1
@@ -976,6 +1018,7 @@ def projects_overview(conn: sqlite3.Connection,
             "cost_unattributed_issues": unattributed,
             "unpriced_tokens": unpriced_tokens,
             "story_points": sp_sum,
+            "task_count": task_count,
             "issues_with_sp": sp_issues,
             "efficiency_tokens": eff_tokens,
             "efficiency_sp": eff_sp,
@@ -1613,4 +1656,186 @@ def meta(conn: sqlite3.Connection) -> Dict[str, Any]:
             "SELECT DISTINCT model FROM daily_usage ORDER BY model"
         )],
         "date_span": {"first": span[0], "last": span[1]},
+    }
+
+
+# -- configurable chart ---------------------------------------------------------
+
+
+def chart_catalog() -> Dict[str, Any]:
+    """Published v1 allowlist for the configurable chart selectors."""
+    return {
+        "version": CHART_CONTRACT_VERSION,
+        "dimensions": [
+            {"id": key, "chart_type": chart_type, "label_key": "chartDimension" + key.title()}
+            for key, chart_type in CHART_DIMENSIONS
+        ],
+        "measures": [
+            {"id": key, "unit": unit, "label_key": "chartMeasure" + "".join(
+                part.title() for part in key.split("_")
+            )}
+            for key, unit in CHART_MEASURES
+        ],
+        "compatibility": {
+            dimension: {
+                measure: {
+                    "supported": measure in _CHART_COMPATIBILITY[dimension],
+                    "reason": None if measure in _CHART_COMPATIBILITY[dimension]
+                    else "unavailable_for_dimension",
+                }
+                for measure, _unit in CHART_MEASURES
+            }
+            for dimension, _chart_type in CHART_DIMENSIONS
+        },
+    }
+
+
+def _chart_request(dimension: str, measure: str) -> None:
+    dimensions = {key for key, _chart_type in CHART_DIMENSIONS}
+    measures = {key for key, _unit in CHART_MEASURES}
+    if dimension not in dimensions:
+        raise ValueError("unsupported chart dimension: %s" % dimension)
+    if measure not in measures:
+        raise ValueError("unsupported chart measure: %s" % measure)
+    if measure not in _CHART_COMPATIBILITY[dimension]:
+        raise ValueError("unsupported chart combination: %s × %s" % (dimension, measure))
+
+
+def _chart_value(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
+    values = [row.get(key) for row in rows if row.get(key) is not None]
+    return sum(values) if values else None
+
+
+def _chart_issue_rows(conn: sqlite3.Connection, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Issue facts with the same run-share filter semantics as dashboard cuts."""
+    needs_run_filter, selection = _run_filter_selection(conn, filters)
+    params: List[Any] = []
+    where = "i.is_jira = 0"
+    where += _where_values("i.project_id", filters["projects"], params)
+    rows = conn.execute(
+        """
+        SELECT i.id, i.identifier, i.title, i.story_points,
+               u.task_count, u.total_input_tokens, u.total_output_tokens,
+               u.total_cache_read_tokens, u.total_cache_write_tokens
+        FROM issues i LEFT JOIN issue_usage u ON u.issue_id = i.id
+        WHERE %s ORDER BY COALESCE(i.identifier, i.id)
+        """ % where,
+        params,
+    ).fetchall()
+    output = []
+    for row in rows:
+        factor = selection.get(row["id"], {}).get("fraction", 0.0) if needs_run_filter else 1.0
+        if factor <= 0:
+            continue
+        values = {
+            kind: ((row["total_" + kind] * factor) if row["total_" + kind] is not None else None)
+            for kind in TOKEN_KINDS
+        }
+        total = sum(value for value in values.values() if value is not None) if any(
+            value is not None for value in values.values()
+        ) else None
+        story_points = row["story_points"] * factor if row["story_points"] is not None else None
+        output.append({
+            "id": row["id"], "label": row["identifier"] or row["title"] or row["id"],
+            **values, "total_tokens": total,
+            "story_points": story_points,
+            "task_count": row["task_count"] * factor if row["task_count"] is not None else None,
+            "tokens_per_sp": (total / story_points)
+            if total is not None and story_points is not None and story_points > 0 else None,
+            "estimated": needs_run_filter, "has_unpriced": False,
+        })
+    return output
+
+
+def _chart_raw_rows(conn: sqlite3.Connection, dimension: str,
+                    filters: Dict[str, Any], credits_per_usd: float) -> List[Dict[str, Any]]:
+    if dimension in ("time", "model"):
+        daily = daily_series(conn, "model", filters=filters)
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in daily["rows"]:
+            key = row["date"] if dimension == "time" else row["id"]
+            grouped.setdefault(key, []).append(row)
+        if dimension == "time" and grouped:
+            # Chart.js only draws a gap when it receives an explicit null.
+            # Preserve missing UTC days instead of joining two unrelated data
+            # points with a fabricated continuous line.
+            cursor = datetime.strptime(min(grouped), "%Y-%m-%d")
+            last = datetime.strptime(max(grouped), "%Y-%m-%d")
+            while cursor <= last:
+                grouped.setdefault(cursor.date().isoformat(), [])
+                cursor += timedelta(days=1)
+        return [{
+            "id": key, "label": key,
+            **{measure: _chart_value(rows, measure) for measure in _CHART_RAW_MEASURES},
+            "estimated": daily["estimated"] or any(row["estimated"] for row in rows),
+            "has_unpriced": any(row["has_unpriced"] for row in rows),
+        } for key, rows in sorted(grouped.items())]
+    if dimension == "agent":
+        return [{
+            "id": row["agent_id"], "label": row["name"],
+            **{measure: row.get(measure) for measure in _CHART_RAW_MEASURES},
+            "run_count": row["runs"], "agent_work_seconds": row["work_seconds"],
+            "estimated": row["estimated"], "has_unpriced": row["has_unpriced"],
+        } for row in agent_totals(conn, filters=filters)]
+    if dimension == "project":
+        return [{
+            "id": row["project_id"], "label": row["title"],
+            **{measure: row.get(measure) for measure in _CHART_RAW_MEASURES},
+            "task_count": row["task_count"],
+            "estimated": row["estimated"],
+            "has_unpriced": bool(row["unpriced_tokens"]),
+        } for row in projects_overview(conn, credits_per_usd, filters)]
+    return _chart_issue_rows(conn, filters)
+
+
+def _chart_efficiency_rows(conn: sqlite3.Connection, dimension: str,
+                           filters: Dict[str, Any], measure: str,
+                           credits_per_usd: float) -> List[Dict[str, Any]]:
+    if dimension == "project":
+        return [{
+            "id": row["project_id"], "label": row["title"],
+            "story_points": row["story_points"], "tokens_per_sp": row["tokens_per_sp"],
+            "estimated": row["estimated"], "has_unpriced": bool(row["unpriced_tokens"]),
+        } for row in projects_overview(conn, credits_per_usd, filters)]
+    if dimension == "issue":
+        return _chart_issue_rows(conn, filters)
+    if dimension == "model" and measure in ("cost_per_sp", "weighted_efficiency"):
+        return [{
+            "id": row["model"] or "", "label": row["model"] or "",
+            "cost_per_sp": row["cost_per_sp"],
+            "weighted_efficiency": row["weighted_efficiency"],
+            "estimated": True, "has_unpriced": row["has_unpriced"],
+        } for row in efficiency_breakdown(conn, filters=filters)["models"]]
+    breakdown = efficiency_chart_breakdown(conn, filters=filters)
+    source = breakdown["time"]["rows"] if dimension == "time" else breakdown[dimension + "s"]
+    return [{
+        "id": row["key"], "label": row["label"],
+        "story_points": row["story_points"], "tokens_per_sp": row["tokens_per_sp"],
+        "estimated": row["estimated"], "has_unpriced": False,
+    } for row in source]
+
+
+def configurable_chart(conn: sqlite3.Connection, dimension: str, measure: str,
+                       filters: Optional[Dict[str, Any]] = None,
+                       credits_per_usd: float = 1.0) -> Dict[str, Any]:
+    """One allowlisted dimension × measure chart using dashboard filter semantics."""
+    _chart_request(dimension, measure)
+    filters = _coerce_filters(filters=filters)
+    if measure in _CHART_RAW_MEASURES or measure in ("task_count", "run_count", "agent_work_seconds"):
+        rows = _chart_raw_rows(conn, dimension, filters, credits_per_usd)
+    else:
+        rows = _chart_efficiency_rows(conn, dimension, filters, measure, credits_per_usd)
+    unit = dict(CHART_MEASURES)[measure]
+    return {
+        "version": CHART_CONTRACT_VERSION,
+        "dimension": dimension,
+        "measure": measure,
+        "chart_type": "line" if dimension == "time" else "bar",
+        "unit": unit,
+        "estimated": any(row["estimated"] for row in rows),
+        "has_unpriced": any(row["has_unpriced"] for row in rows),
+        "rows": [{
+            "id": row["id"], "label": row["label"], "value": row.get(measure),
+            "estimated": row["estimated"], "has_unpriced": row["has_unpriced"],
+        } for row in rows],
     }

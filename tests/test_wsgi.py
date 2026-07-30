@@ -459,6 +459,40 @@ def test_wsgi_hour_filters_accept_repeated_dimensions(public_app):
     assert response.get_json()["total_tokens"] == 600_000
 
 
+def test_wsgi_configurable_chart_uses_the_shared_contract(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert login(client).status_code == 303
+    catalog = client.get("/api/chart-catalog", base_url="https://localhost")
+    assert catalog.status_code == 200
+    contract = catalog.get_json()
+    for dimension in contract["dimensions"]:
+        for measure in contract["measures"]:
+            response = client.get(
+                "/api/chart",
+                query_string={"dimension": dimension["id"], "measure": measure["id"]},
+                base_url="https://localhost",
+            )
+            supported = contract["compatibility"][dimension["id"]][measure["id"]]["supported"]
+            assert response.status_code == (200 if supported else 422)
+    response = client.get(
+        "/api/chart",
+        query_string={"dimension": "agent", "measure": "agent_work_seconds"},
+        base_url="https://localhost",
+    )
+    assert response.status_code == 200
+    assert response.get_json()["version"] == contract["version"] == "v1"
+    invalid = client.get(
+        "/api/chart",
+        query_string={"dimension": "agent", "measure": "task_count"},
+        base_url="https://localhost",
+    )
+    assert invalid.status_code == 422
+    assert invalid.get_json() == {
+        "detail": "unsupported chart combination: agent × task_count",
+    }
+
+
 def test_wsgi_agents_count_only_overlapping_hour_runs(public_app):
     app, _ = public_app
     client = app.test_client()
@@ -731,7 +765,7 @@ def test_installed_v4_tenant_db_returns_controlled_503(public_app, tmp_path):
     client = app.test_client()
     assert login(client).status_code == 303
     endpoints = (
-        "/api/meta", "/api/summary", "/api/daily", "/api/agents",
+        "/api/meta", "/api/chart", "/api/summary", "/api/daily", "/api/agents",
         "/api/projects", "/api/efficiency", "/api/model-efficiency",
         "/api/efficiency-breakdown", "/api/health", "/health", "/api/sync",
     )

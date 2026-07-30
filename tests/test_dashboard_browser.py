@@ -785,6 +785,70 @@ def test_restores_valid_url_state_and_survives_reload(dashboard):
     assert _selected(cdp, "filter-project") == ["P1", "P2"]
 
 
+def test_configurable_chart_catalog_selection_url_and_accessible_table(dashboard):
+    cdp, base = dashboard
+    cdp.open_page(base + "/?chart_x=agent&chart_y=agent_work_seconds")
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('Boolean(state.charts["chart-configurable"])')
+    assert _element_value(cdp, "chart-dimension") == "agent"
+    assert _element_value(cdp, "chart-measure") == "agent_work_seconds"
+    catalog = cdp.eval('''(() => ({
+      dimensions: [...document.getElementById("chart-dimension").options].map((o) => o.value),
+      measures: [...document.getElementById("chart-measure").options].map((o) => [o.value, o.disabled]),
+      type: state.charts["chart-configurable"].config.type,
+      canvas: document.getElementById("chart-configurable").getAttribute("aria-label"),
+    }))()''')
+    assert catalog["dimensions"] == ["time", "project", "agent", "model", "issue"]
+    assert len(catalog["measures"]) == 14
+    assert dict(catalog["measures"])["task_count"] is True
+    assert catalog["type"] == "bar"
+    assert ("Агент" in catalog["canvas"] and "Время работы" in catalog["canvas"]) or (
+        "Agent" in catalog["canvas"] and "Agent work time" in catalog["canvas"]
+    )
+
+    cdp.eval('''(() => {
+      const select = document.getElementById("chart-dimension");
+      select.value = "time";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('state.chartDimension === "time" && state.charts["chart-configurable"].config.type === "line"')
+    cdp.eval('''(() => {
+      const select = document.getElementById("chart-measure");
+      select.value = "tokens_per_sp";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('!location.search.includes("chart_x") && location.search.includes("chart_y=tokens_per_sp")')
+    cdp.eval('document.querySelector("#configurable-chart-panel details").open = true')
+    assert cdp.eval('document.querySelectorAll("#table-configurable-chart tbody tr").length') > 0
+
+    cdp.eval("window.__chart_reload = true; location.reload()")
+    cdp.wait_for(f'window.__chart_reload === undefined && ({BOOTED_JS})')
+    assert _element_value(cdp, "chart-dimension") == "time"
+    assert _element_value(cdp, "chart-measure") == "tokens_per_sp"
+
+    cdp.eval('''(() => {
+      const select = document.getElementById("filter-project");
+      for (const option of select.options) option.selected = option.value === "P2";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('!document.getElementById("empty-configurable-chart").hidden')
+
+    cdp.eval('''(() => {
+      const original = window.fetch.bind(window);
+      window.fetch = (input, options) => {
+        const url = new URL(typeof input === "string" ? input : input.url, location.href);
+        if (url.pathname === "/api/chart") return Promise.resolve(new Response("", {status: 500}));
+        return original(input, options);
+      };
+      const select = document.getElementById("chart-measure");
+      select.value = "total_tokens";
+      select.dispatchEvent(new Event("change"));
+    })()''')
+    cdp.wait_for('!document.getElementById("configurable-chart-status").hidden')
+    assert any(word in cdp.eval('document.getElementById("configurable-chart-status").textContent').lower()
+               for word in ("загруз", "load"))
+
+
 def test_recovers_from_malformed_url_state(dashboard):
     """The QA reproduction: bogus from/group plus an unknown agent and an
     out-of-range days must not strand the dashboard — invalid parts are
