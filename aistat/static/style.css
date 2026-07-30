@@ -34,7 +34,7 @@ body {
 .brand h1 { margin: 0; font-size: 22px; letter-spacing: 0.2px; }
 .subtitle { color: var(--muted); font-size: 13px; }
 
-.status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.status { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 13px; }
 .sep { opacity: 0.5; }
 
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
@@ -75,7 +75,6 @@ body {
   padding: 6px 28px 24px;
 }
 .dashboard-content { min-width: 0; }
-.dashboard-content > .connection-panel { margin: 10px 0 12px; }
 .dashboard-content > .cards { padding-left: 0; padding-right: 0; }
 .dashboard-content > .grid { padding-left: 0; padding-right: 0; }
 .dashboard-content > .footer { padding: 4px 0 0; }
@@ -120,13 +119,24 @@ body {
 .filter-error { color: var(--bad); }
 .filter-error[hidden] { display: none; }
 
+.connection-dialog {
+  width: min(620px, calc(100vw - 28px));
+  max-width: none;
+  max-height: calc(100dvh - 28px);
+  margin: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+}
+.connection-dialog::backdrop { background: rgba(30, 36, 48, 0.42); }
 .connection-panel {
-  margin: 10px 28px 12px;
   padding: 18px 20px;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
+  overflow: auto;
 }
 .connection-heading {
   display: flex;
@@ -136,6 +146,7 @@ body {
 }
 .connection-heading h2 { margin: 0; font-size: 17px; }
 .connection-intro { max-width: 720px; margin: 5px 0 0; color: var(--muted); }
+.connection-close { flex: 0 0 auto; }
 .connection-badge {
   flex: 0 0 auto;
   padding: 4px 10px;
@@ -300,7 +311,7 @@ tbody tr:hover { background: #f8faff; }
   .topbar { padding-left: 14px; padding-right: 14px; }
   .dashboard-layout { padding-left: 14px; padding-right: 14px; }
   .status { width: 100%; justify-content: flex-end; }
-  .connection-panel { margin-left: 14px; margin-right: 14px; padding: 16px; }
+  .connection-panel { padding: 16px; }
   .connection-heading { flex-direction: column; }
   .connection-details > div { flex-basis: 100%; }
 }

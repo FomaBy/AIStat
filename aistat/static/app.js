@@ -297,7 +297,56 @@ const CONNECTION_ERROR_FALLBACK =
 
 function connectionSupportedSurface() {
   const cabinet = $("connection-cabinet");
-  return cabinet && !cabinet.hidden && state.connectionSupported;
+  return cabinet && state.connectionSupported;
+}
+
+function focusConnectionDialog() {
+  const form = $("connection-form");
+  const token = $("connection-token");
+  const replace = $("connection-replace");
+  const close = $("connection-close");
+  if (form && !form.hidden && token && !token.disabled) token.focus();
+  else if (replace && !replace.hidden && !replace.disabled) replace.focus();
+  else if (close) close.focus();
+}
+
+function trapConnectionFocus(event) {
+  if (event.key !== "Tab") return;
+  const cabinet = $("connection-cabinet");
+  if (!cabinet || !cabinet.open) return;
+  const focusable = [...cabinet.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((element) => !element.hidden && !element.closest("[hidden]"));
+  if (!focusable.length) return;
+  const current = focusable.indexOf(document.activeElement);
+  const next = (current + (event.shiftKey ? focusable.length - 1 : 1)) % focusable.length;
+  event.preventDefault();
+  focusable[next].focus();
+}
+
+function openConnectionDialog() {
+  const cabinet = $("connection-cabinet");
+  if (!cabinet || !connectionSupportedSurface() || cabinet.open) return;
+  cabinet.hidden = false;
+  cabinet.showModal();
+  focusConnectionDialog();
+}
+
+function closeConnectionDialog(returnFocus = true) {
+  const cabinet = $("connection-cabinet");
+  const trigger = $("connection-trigger");
+  const wasReplacing = state.connectionReplacing;
+  state.connectionReplacing = false;
+  if (wasReplacing && state.connection) renderConnection(state.connection);
+  clearConnectionOperationError();
+  clearConnectionToken();
+  const confirm = $("connection-confirm");
+  if (confirm) confirm.hidden = true;
+  if (cabinet && cabinet.open) cabinet.close();
+  if (cabinet) cabinet.hidden = true;
+  if (returnFocus && trigger && !trigger.hidden && state.connectionSupported) {
+    trigger.focus();
+  }
 }
 
 function clearConnectionToken() {
@@ -416,6 +465,9 @@ function renderConnection(data) {
   const normalized = Object.assign({}, data || {}, { status });
   state.connection = normalized;
 
+  const trigger = $("connection-trigger");
+  if (trigger) trigger.hidden = !state.connectionSupported;
+
   const badge = $("connection-status-badge");
   const title = $("connection-status-title");
   const message = $("connection-status-message");
@@ -482,6 +534,9 @@ async function refreshConnection() {
     if (error && error.status === 404) {
       state.connectionSupported = false;
       const cabinet = $("connection-cabinet");
+      const trigger = $("connection-trigger");
+      if (trigger) trigger.hidden = true;
+      closeConnectionDialog(false);
       if (cabinet) cabinet.hidden = true;
       stopConnectionPolling();
       return null;
@@ -586,6 +641,13 @@ async function revokeConnection() {
 function setupConnection() {
   const cabinet = $("connection-cabinet");
   if (!cabinet) return;
+  $("connection-trigger").addEventListener("click", openConnectionDialog);
+  $("connection-close").addEventListener("click", () => closeConnectionDialog());
+  cabinet.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeConnectionDialog();
+  });
+  cabinet.addEventListener("keydown", trapConnectionFocus);
   $("connection-form").addEventListener("submit", submitConnection);
   $("connection-replace").addEventListener("click", () => {
     state.connectionReplacing = true;
@@ -594,10 +656,14 @@ function setupConnection() {
     $("connection-token").focus();
   });
   $("connection-disconnect").addEventListener("click", () => {
-    if (!state.connectionBusy) $("connection-confirm").hidden = false;
+    if (!state.connectionBusy) {
+      $("connection-confirm").hidden = false;
+      $("connection-confirm-no").focus();
+    }
   });
   $("connection-confirm-no").addEventListener("click", () => {
     $("connection-confirm").hidden = true;
+    $("connection-disconnect").focus();
   });
   $("connection-confirm-yes").addEventListener("click", revokeConnection);
 }

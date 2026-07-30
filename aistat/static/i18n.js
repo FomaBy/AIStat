@@ -22,6 +22,8 @@ const I18N = (() => {
     resetFilters: ["Сбросить фильтры", "Reset filters"], resetFiltersTitle: ["Вернуть все фильтры к значениям по умолчанию", "Restore all filters to their defaults"],
     estimateNote: ["≈ значения по агентам/моделям/проектам и неполным дням распределены по фактическим интервалам запусков задач.", "≈ values for agents, models, projects, and partial days are allocated by actual task-run intervals."],
     connectMultica: ["Подключить свой Multica", "Connect your Multica"],
+    openConnection: ["Подключить Multica", "Connect Multica"], close: ["Закрыть", "Close"],
+    openConnectionLabel: ["Открыть подключение Multica", "Open Multica connection"],
     connectionIntro: ["AIStat получает статистику из вашего Multica через защищённый worker-канал. PAT нужен только для подключения и не показывается после отправки.", "AIStat collects statistics from your Multica through a secure worker channel. The PAT is only used to connect and is not shown after submission."],
     notConnected: ["не подключён", "not connected"], multicaNotConnected: ["Multica не подключён", "Multica is not connected"],
     connectPrompt: ["Подключите Multica, чтобы загрузить вашу статистику.", "Connect Multica to load your statistics."], multicaHost: ["Хост Multica", "Multica host"], workspace: ["Workspace", "Workspace"], lastSync: ["Последняя синхронизация", "Last sync"],

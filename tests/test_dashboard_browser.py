@@ -151,6 +151,47 @@ def _locale_preload(language):
     )
 
 
+def _connection_preload(status="none", unsupported=False):
+    """Keep the real dashboard while making the connection lifecycle explicit."""
+    response = "return new Response('', {status: 404});" if unsupported else (
+        "return new Response(JSON.stringify({status: %s}), {headers: "
+        "{'Content-Type': 'application/json'}});" % json.dumps(status)
+    )
+    return r'''(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.__aistat_connection_gets = 0;
+      window.__aistat_connection_posts = 0;
+      window.fetch = (input, options = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url, location.href);
+        if (url.pathname === "/api/connection") {
+          if ((options.method || "GET") !== "GET") {
+            window.__aistat_connection_posts += 1;
+            return Promise.resolve(new Response(JSON.stringify({status: "pending"}), {
+              headers: {"Content-Type": "application/json"},
+            }));
+          }
+          window.__aistat_connection_gets += 1;
+          %s
+        }
+        if (url.pathname === "/api/connection/revoke") {
+          return Promise.resolve(new Response(JSON.stringify({status: "revocation_pending"}), {
+            headers: {"Content-Type": "application/json"},
+          }));
+        }
+        return originalFetch(input, options);
+      };
+    })();''' % response
+
+
+def _browser_key(cdp, key, code, key_code, modifiers=0):
+    params = {
+        "key": key, "code": code, "windowsVirtualKeyCode": key_code,
+        "nativeVirtualKeyCode": key_code, "modifiers": modifiers,
+    }
+    cdp.call("Input.dispatchKeyEvent", dict(params, type="keyDown"))
+    cdp.call("Input.dispatchKeyEvent", dict(params, type="keyUp"))
+
+
 def test_open_page_navigates_the_attached_target(dashboard):
     """A fresh target must reach the requested page after its flat session
     is attached; creating a target alone is not sufficient evidence."""
@@ -181,6 +222,96 @@ def test_default_english_localizes_static_and_dynamic_dashboard_copy(dashboard):
     assert cdp.eval('document.querySelector(".connection-host a").href') == "https://multica.ai/"
     cdp.eval('document.getElementById("locale-switcher").click()')
     cdp.wait_for('document.documentElement.lang === "en"')
+
+
+def test_connection_dialog_is_accessible_and_resets_unsent_pat(dashboard):
+    cdp, base = dashboard
+    cdp.open_page(base + "/", preload_script=_connection_preload())
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('!document.getElementById("connection-trigger").hidden')
+    assert cdp.eval('document.getElementById("connection-cabinet").open') is False
+
+    cdp.eval('document.getElementById("connection-trigger").click()')
+    cdp.wait_for('document.getElementById("connection-cabinet").open')
+    assert cdp.eval('document.activeElement.id') == "connection-token"
+    assert cdp.eval('document.getElementById("connection-cabinet").getAttribute("aria-modal")') == "true"
+    _press_key(cdp, "Tab", shiftKey=True)
+    assert cdp.eval('document.getElementById("connection-cabinet").contains(document.activeElement)') is True
+    _press_key(cdp, "Tab")
+    assert cdp.eval('document.activeElement.id') == "connection-token"
+
+    cdp.eval('document.getElementById("connection-form").requestSubmit()')
+    cdp.wait_for('!document.getElementById("connection-form-error").hidden')
+    assert cdp.eval('window.__aistat_connection_posts') == 0
+
+    cdp.eval('document.getElementById("connection-token").value = "unsent-test-pat"')
+    _browser_key(cdp, "Escape", "Escape", 27)
+    cdp.wait_for('!document.getElementById("connection-cabinet").open')
+    assert cdp.eval('document.getElementById("connection-cabinet").hidden') is True
+    assert cdp.eval('document.activeElement.id') == "connection-trigger"
+    assert cdp.eval('document.getElementById("connection-token").value') == ""
+
+    try:
+        for width in (390, 900, 1440):
+            cdp.call("Emulation.setDeviceMetricsOverride", {
+                "width": width, "height": 900, "deviceScaleFactor": 1,
+                "mobile": False,
+            })
+            cdp.eval('document.getElementById("connection-trigger").click()')
+            box = cdp.eval('''(() => {
+              const dialog = document.getElementById("connection-cabinet");
+              const rect = dialog.getBoundingClientRect();
+              return {left: rect.left, right: rect.right, width: rect.width,
+                      scrollWidth: dialog.scrollWidth,
+                      clientWidth: dialog.clientWidth,
+                      viewportWidth: window.innerWidth};
+            })()''')
+            assert box["left"] >= 0
+            assert box["right"] <= box["viewportWidth"]
+            assert box["scrollWidth"] <= box["clientWidth"]
+            cdp.eval('document.getElementById("connection-close").click()')
+    finally:
+        cdp.call("Emulation.clearDeviceMetricsOverride")
+
+
+def test_connection_dialog_manages_active_and_pending_states(dashboard):
+    cdp, base = dashboard
+    cdp.open_page(base + "/", preload_script=_connection_preload("active"))
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('!document.getElementById("connection-trigger").hidden')
+    cdp.eval('document.getElementById("connection-trigger").click()')
+    cdp.wait_for('document.getElementById("connection-cabinet").open')
+    assert cdp.eval('document.activeElement.id') == "connection-replace"
+
+    cdp.eval('document.getElementById("connection-replace").click()')
+    cdp.wait_for('!document.getElementById("connection-form").hidden')
+    assert cdp.eval('document.activeElement.id') == "connection-token"
+    cdp.eval('document.getElementById("connection-close").click()')
+    cdp.wait_for('!document.getElementById("connection-cabinet").open')
+
+    cdp.eval('document.getElementById("connection-trigger").click()')
+    cdp.wait_for('!document.getElementById("connection-actions").hidden')
+    cdp.eval('document.getElementById("connection-disconnect").click()')
+    cdp.wait_for('!document.getElementById("connection-confirm").hidden')
+    assert cdp.eval('document.activeElement.id') == "connection-confirm-no"
+    cdp.eval('document.getElementById("connection-confirm-no").click()')
+    assert cdp.eval('document.getElementById("connection-confirm").hidden') is True
+    assert cdp.eval('document.activeElement.id') == "connection-disconnect"
+
+    cdp.open_page(base + "/", preload_script=_connection_preload("pending"))
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('window.__aistat_connection_gets > 1')
+    assert cdp.eval('document.getElementById("connection-cabinet").open') is False
+    assert cdp.eval('state.connection.status') == "pending"
+
+
+def test_connection_dialog_hides_unsupported_surface(dashboard):
+    cdp, base = dashboard
+    cdp.open_page(base + "/", preload_script=_connection_preload(unsupported=True))
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('state.connectionSupported === false')
+    assert cdp.eval('document.getElementById("connection-trigger").hidden') is True
+    assert cdp.eval('document.getElementById("connection-cabinet").hidden') is True
 
 
 def test_filter_panel_resizes_multiselects_and_stacks_without_overflow(dashboard):
@@ -385,9 +516,11 @@ def test_public_registration_closed_localizes_both_languages(
     assert cdp.eval('document.body.innerText.match(/[А-Яа-яЁё]/g) || []') == []
 
 
-def _press_key(cdp, key):
+def _press_key(cdp, key, **options):
+    event = {"key": key, "bubbles": True, "cancelable": True}
+    event.update(options)
     cdp.eval("document.activeElement.dispatchEvent(new KeyboardEvent('keydown', %s))" %
-             json.dumps({"key": key, "bubbles": True}))
+             json.dumps(event))
 
 
 def _settled_card_tokens(cdp, lang, unit):
