@@ -3,12 +3,12 @@
   "currency": "USD",
   "unit": "per_1m_tokens",
   "cache_write_tier": "5m",
-  "description": "Official per-1M-token rates for every model seen in Multica runtime usage. Rates come ONLY from vendor pricing pages; each carries its source URL and capture date. cache_write is the default (5-minute) cache-write rate; cache_write_1h is kept for reference. Edit this file (or point AISTAT_PRICING_OVERRIDES at a second JSON with the same shape) to add or override models without code changes. A model that has no official public rate must be listed with \"unpriced\": true and a note — never priced at 0. An optional per-model \"credits\" block gives the OpenAI Codex rate-card credit rates (credits per 1M tokens: input / cache_read / output); when present, cost_credits is computed from it instead of the flat usd*AISTAT_CREDITS_PER_USD conversion. Claude models carry the mapped Codex-tier credit rates (Fable 5 = GPT-5.6 Sol; Opus 4.8 and Opus 5 = GPT-5.6 Terra) per owner directives FAN-1427 and FAN-1715.",
+  "description": "Official per-1M-token rates for every model seen in Multica runtime usage. Rates come ONLY from vendor pricing pages; each carries its source URL and capture date. cache_write is the default (5-minute) cache-write rate; cache_write_1h is kept for reference. Edit this file (or point AISTAT_PRICING_OVERRIDES at a second JSON with the same shape) to add or override models without code changes. A model that has no official public rate must be listed with \"unpriced\": true and a note — never priced at 0. An optional per-model \"credits\" block gives the OpenAI Codex rate-card credit rates (credits per 1M tokens: input / cache_read / output); when present, cost_credits is computed from it instead of the flat usd*AISTAT_CREDITS_PER_USD conversion. Claude models carry the mapped Codex-tier credit rates (Fable 5 = GPT-5.6 Sol; Opus 4.8 and Opus 5 = GPT-5.6 Terra) per owner directives FAN-1427 and FAN-1715. GPT-5.6 rates are Standard / short-context rates; usage has no service-tier or context-length discriminator for Fast or long-context pricing.",
   "assumptions": [
     "Multica runtime usage reports four token counts per (runtime, model, day): input / output / cache_read / cache_write. input_tokens is the uncached remainder, so total cost = input*input + output*output + cache_read*cache_read + cache_write*cache_write, all per 1M tokens.",
     "cache_write tokens are priced at the vendor's default 5-minute cache-write rate (Anthropic 1.25x input; OpenAI gpt-5.6 1.25x input). Agents use the default ephemeral (5m) cache, so the 5m rate is the correct default; the 1h rate is recorded for reference/override.",
     "cache_read tokens are priced at the vendor cache-hit rate (Anthropic 0.1x input; OpenAI cached-input 0.1x input).",
-    "credits (OpenAI Codex rate card, https://help.openai.com/en/articles/20001106-codex-rate-card, captured 2026-07-20) are per 1M tokens and cover input / cached input (cache_read) / output only; cache_write is not part of the credit card. Credit cost = (input*credits.input + cache_read*credits.cache_read + output*credits.output) / 1e6. Codex reports cache_write_tokens=0, so this is exact for codex runtimes."
+    "credits (OpenAI Codex rate card, https://help.openai.com/en/articles/20001106-codex-rate-card, captured 2026-07-30) are per 1M tokens and cover input / cached input (cache_read) / output only; cache_write is not part of the credit card. Credit cost = (input*credits.input + cache_read*credits.cache_read + output*credits.output) / 1e6."
   ],
   "models": {
     "claude-opus-4-8": {
@@ -23,11 +23,11 @@
       "captured_at": "2026-07-15",
       "notes": "Claude Opus 4.8. 5m cache write = 1.25x input; 1h = 2x; cache read (hit) = 0.1x input.",
       "credits": {
-        "input": 62.5,
-        "cache_read": 6.25,
-        "output": 375,
+        "input": 50,
+        "cache_read": 5,
+        "output": 300,
         "source": "OpenAI Codex rate card (GPT-5.6 Terra)",
-        "captured_at": "2026-07-20",
+        "captured_at": "2026-07-30",
         "notes": "Credits billed as GPT-5.6 Terra per owner directive FAN-1427."
       }
     },
@@ -43,11 +43,11 @@
       "captured_at": "2026-07-15",
       "notes": "Claude Opus 5. Uses the same 5m/1h cache and cache-read rates as Claude Opus 4.8 by owner directive FAN-1715; the model ID remains distinct.",
       "credits": {
-        "input": 62.5,
-        "cache_read": 6.25,
-        "output": 375,
+        "input": 50,
+        "cache_read": 5,
+        "output": 300,
         "source": "OpenAI Codex rate card (GPT-5.6 Terra)",
-        "captured_at": "2026-07-20",
+        "captured_at": "2026-07-30",
         "notes": "Credits billed as GPT-5.6 Terra, matching Claude Opus 4.8, per owner directive FAN-1715."
       }
     },
@@ -91,50 +91,53 @@
       "cache_write": 6.25,
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
-      "captured_at": "2026-07-15",
-      "notes": "GPT-5.6 Sol. cached input (cache_read) = 10% of input; cache write = 1.25x input. Multica reports cache_write_tokens=0 for codex runtimes, so the cache-write rate does not affect current cost but is recorded for completeness.",
+      "captured_at": "2026-07-30",
+      "notes": "GPT-5.6 Sol Standard / short-context API rates. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator.",
       "credits": {
         "input": 125,
         "cache_read": 12.5,
         "output": 750,
         "source": "OpenAI Codex rate card (GPT-5.6 Sol)",
-        "captured_at": "2026-07-20"
+        "captured_at": "2026-07-30",
+        "notes": "Token-based Codex rate card; cache writes are excluded."
       }
     },
     "gpt-5.6-terra": {
       "vendor": "OpenAI",
-      "input": 2.5,
-      "output": 15.0,
-      "cache_read": 0.25,
-      "cache_write": 3.125,
+      "input": 2.0,
+      "output": 12.0,
+      "cache_read": 0.2,
+      "cache_write": 2.5,
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
-      "captured_at": "2026-07-15",
-      "notes": "GPT-5.6 Terra. cached input (cache_read) = 10% of input; cache write = 1.25x input. Multica reports cache_write_tokens=0 for codex runtimes.",
+      "captured_at": "2026-07-30",
+      "notes": "GPT-5.6 Terra Standard / short-context API rates. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator.",
       "credits": {
-        "input": 62.5,
-        "cache_read": 6.25,
-        "output": 375,
+        "input": 50,
+        "cache_read": 5,
+        "output": 300,
         "source": "OpenAI Codex rate card (GPT-5.6 Terra)",
-        "captured_at": "2026-07-20"
+        "captured_at": "2026-07-30",
+        "notes": "Token-based Codex rate card; cache writes are excluded."
       }
     },
     "gpt-5.6-luna": {
       "vendor": "OpenAI",
-      "input": 1.0,
-      "output": 6.0,
-      "cache_read": 0.1,
-      "cache_write": 1.25,
+      "input": 0.2,
+      "output": 1.2,
+      "cache_read": 0.02,
+      "cache_write": 0.25,
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
-      "captured_at": "2026-07-21",
-      "notes": "GPT-5.6 Luna (smallest GPT-5.6 tier, used by Codex Dev Luna). cached input (cache_read) = 10% of input; cache write = 1.25x input. Multica reports cache_write_tokens=0 for codex runtimes, so the cache-write rate does not affect current cost but is recorded for completeness.",
+      "captured_at": "2026-07-30",
+      "notes": "GPT-5.6 Luna Standard / short-context API rates. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator.",
       "credits": {
-        "input": 25,
-        "cache_read": 2.5,
-        "output": 150,
+        "input": 5,
+        "cache_read": 0.5,
+        "output": 30,
         "source": "OpenAI Codex rate card (GPT-5.6 Luna)",
-        "captured_at": "2026-07-21"
+        "captured_at": "2026-07-30",
+        "notes": "Token-based Codex rate card; cache writes are excluded."
       }
     }
   }

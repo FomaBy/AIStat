@@ -494,7 +494,11 @@ python3 -m aistat.migrate
 за 1M токенов раздельно по четырём видам (`input` / `output` / `cache_read` /
 `cache_write`), валюта (USD), URL официального источника и дата снятия.
 
-Источники (сняты **2026-07-15**):
+Ставки GPT-5.6 Standard / short context и Codex credit rate card сверены
+**2026-07-30** по [таблице API pricing](https://developers.openai.com/api/docs/pricing),
+[анонсу OpenAI](https://openai.com/index/advancing-the-price-performance-frontier-with-gpt-5-6/)
+и [Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card).
+Для остальных моделей точная дата снятия указана в `pricing.json`.
 
 | Модель | Вендор | input | output | cache read | cache write (5m) | Источник |
 |---|---|---|---|---|---|---|
@@ -503,7 +507,8 @@ python3 -m aistat.migrate
 | `claude-fable-5` | Anthropic | $10 | $50 | $1.00 | $12.50 | docs.claude.com/pricing |
 | `claude-haiku-4-5-20251001` | Anthropic | $1 | $5 | $0.10 | $1.25 | docs.claude.com/pricing |
 | `gpt-5.6-sol` | OpenAI | $5 | $30 | $0.50 | $6.25 | developers.openai.com/api/docs/pricing |
-| `gpt-5.6-terra` | OpenAI | $2.50 | $15 | $0.25 | $3.125 | developers.openai.com/api/docs/pricing |
+| `gpt-5.6-terra` | OpenAI | $2 | $12 | $0.20 | $2.50 | developers.openai.com/api/docs/pricing |
+| `gpt-5.6-luna` | OpenAI | $0.20 | $1.20 | $0.02 | $0.25 | developers.openai.com/api/docs/pricing |
 
 Точные URL и даты для каждой ставки — в `pricing.json` и в таблице
 `model_pricing` (видна в health, поле `pricing.rates`). Все модели из реальной
@@ -532,6 +537,10 @@ gpt-5.6 это 1.25× input — дефолтный ephemeral-кеш, котор�
 Multica отдаёт `cache_write_tokens = 0`, поэтому ставка кеш-записи OpenAI на
 текущую стоимость не влияет.
 
+AIStat не получает service tier или длину контекста каждого запроса, поэтому для
+обычных агрегированных строк применяются только Standard / short-context ставки.
+Fast mode и long-context ставки не выводятся и не подставляются.
+
 Стоимость (`cost_usd`) и кредиты (`cost_credits`) пишутся рядом с usage-строками
 в таблицу `daily_usage` и пересчитываются идемпотентно каждый цикл поллера
 (источник `pricing` в health). Агрегации по дням/агентам/проектам — этап 3.
@@ -541,6 +550,10 @@ Opus) Credit считается напрямую по ставкам input/cache
 в Credit не входит. Для остальных моделей без такой карты действует
 конфигурируемый fallback `credits_per_usd` (env `AISTAT_CREDITS_PER_USD`, по
 умолчанию **1.0** → 1 кредит = $1): Credits = стоимость USD × курс.
+
+Стоимость подписки и размер её quota budget не являются тарифами AIStat и не
+меняются в этом расчёте. По анонсу OpenAI они остаются прежними, а Luna и Terra
+расходуют меньше Codex credits на те же типы токенов по обновлённой rate card.
 
 **Переопределение тарифов без изменения кода.** Правьте `pricing.json`
 напрямую, либо укажите `AISTAT_PRICING_OVERRIDES=/path/to/overrides.json` —

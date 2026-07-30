@@ -7,6 +7,7 @@ import pytest
 
 from aistat import pricing
 from aistat.db import utcnow_iso
+from aistat.health import snapshot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PRICING_JSON = REPO_ROOT / "pricing.json"
@@ -113,7 +114,7 @@ def test_repo_pricing_json_maps_claude_to_codex_credit_tiers():
     assert (fable.input, fable.cache_read, fable.output) == (125.0, 12.5, 750.0)
     assert (fable.input, fable.cache_read, fable.output) == \
            (sol.input, sol.cache_read, sol.output)
-    assert (opus.input, opus.cache_read, opus.output) == (62.5, 6.25, 375.0)
+    assert (opus.input, opus.cache_read, opus.output) == (50.0, 5.0, 300.0)
     assert (opus.input, opus.cache_read, opus.output) == \
            (terra.input, terra.cache_read, terra.output)
 
@@ -129,7 +130,7 @@ def test_opus_5_is_a_distinct_id_with_opus_4_8_rates_and_credits():
     assert (opus_5.credits.input, opus_5.credits.cache_read,
             opus_5.credits.output) == \
         (opus_4_8.credits.input, opus_4_8.credits.cache_read,
-         opus_4_8.credits.output) == (62.5, 6.25, 375.0)
+         opus_4_8.credits.output) == (50.0, 5.0, 300.0)
 
     # 1M input + cache read + output + cache write: cache write is USD-only.
     for rate in (opus_4_8, opus_5):
@@ -138,7 +139,7 @@ def test_opus_5_is_a_distinct_id_with_opus_4_8_rates_and_credits():
         ).usd == pytest.approx(36.75)
         assert pricing.compute_credit_cost(
             1_000_000, 1_000_000, 1_000_000, rate
-        ) == pytest.approx(443.75)
+        ) == pytest.approx(355.0)
 
 
 def test_credits_block_must_be_numeric(tmp_path):
@@ -157,7 +158,8 @@ def test_credits_block_must_be_numeric(tmp_path):
 def test_load_repo_pricing_json_has_official_rates_and_sources():
     rates = pricing.load_pricing(PRICING_JSON)
     for model in ("claude-opus-4-8", "claude-fable-5",
-                  "claude-haiku-4-5-20251001", "gpt-5.6-sol", "gpt-5.6-terra"):
+                  "claude-haiku-4-5-20251001", "gpt-5.6-sol", "gpt-5.6-terra",
+                  "gpt-5.6-luna"):
         assert model in rates, model
         rate = rates[model]
         assert not rate.unpriced
@@ -168,6 +170,35 @@ def test_load_repo_pricing_json_has_official_rates_and_sources():
     assert (opus.input, opus.output, opus.cache_read, opus.cache_write) == (5.0, 25.0, 0.5, 6.25)
     sol = rates["gpt-5.6-sol"]
     assert (sol.input, sol.output, sol.cache_read) == (5.0, 30.0, 0.5)
+
+
+def test_repo_gpt_5_6_standard_rates_and_credits_are_current():
+    rates = pricing.load_pricing(PRICING_JSON)
+    expected = {
+        "gpt-5.6-luna": ((0.2, 1.2, 0.02, 0.25), (5.0, 0.5, 30.0)),
+        "gpt-5.6-terra": ((2.0, 12.0, 0.2, 2.5), (50.0, 5.0, 300.0)),
+        "gpt-5.6-sol": ((5.0, 30.0, 0.5, 6.25), (125.0, 12.5, 750.0)),
+    }
+    for model, (usd, credits) in expected.items():
+        rate = rates[model]
+        assert (rate.input, rate.output, rate.cache_read, rate.cache_write) == usd
+        assert (rate.credits.input, rate.credits.cache_read, rate.credits.output) == credits
+        assert rate.captured_at == rate.credits.captured_at == "2026-07-30"
+
+
+def test_health_mirrors_current_gpt_5_6_rates(conn):
+    rates = pricing.load_pricing(PRICING_JSON)
+    pricing.upsert_model_pricing(conn, rates)
+    health_rates = {rate["model"]: rate for rate in snapshot(conn)["pricing"]["rates"]}
+    for model, expected in {
+        "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
+        "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
+        "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+    }.items():
+        rate = health_rates[model]
+        assert (rate["input_rate"], rate["output_rate"],
+                rate["cache_read_rate"], rate["cache_write_rate"]) == expected
+        assert rate["captured_at"] == "2026-07-30"
 
 
 def test_load_pricing_override_extends_and_replaces(tmp_path):
@@ -244,8 +275,8 @@ def test_recompute_daily_costs_prices_known_and_flags_unknown(conn):
     assert opus["cost_priced"] == 1
     assert opus["cost_usd"] == pytest.approx(0.56125)
     # Credits now come from the GPT-5.6 Terra rate card, NOT usd*mult:
-    # (1000*62.5 + 2000*375 + 1_000_000*6.25) / 1e6. cache_write excluded.
-    assert opus["cost_credits"] == pytest.approx(7.0625)
+    # (1000*50 + 2000*300 + 1_000_000*5) / 1e6. cache_write excluded.
+    assert opus["cost_credits"] == pytest.approx(5.65)
 
     # Model without a credit card keeps the legacy usd*credits_per_usd behaviour.
     haiku = conn.execute(
@@ -284,18 +315,28 @@ def test_mixed_opus_day_keeps_two_priced_rows(conn):
     assert [row["model"] for row in rows] == ["claude-opus-4-8", "claude-opus-5"]
     assert all(row["cost_priced"] == 1 for row in rows)
     assert all(row["cost_usd"] == pytest.approx(36.75) for row in rows)
-    assert all(row["cost_credits"] == pytest.approx(443.75) for row in rows)
+    assert all(row["cost_credits"] == pytest.approx(355.0) for row in rows)
     assert pricing.unpriced_models_in_usage(conn, rates) == []
 
 
-def test_recompute_is_idempotent(conn):
-    _insert_usage(conn, "rt1", "gpt-5.6-sol", "2026-07-14", 1_000_000, 0, 0, 0)
+def test_recompute_current_luna_cost_is_idempotent(conn):
+    _insert_usage(
+        conn, "rt1", "gpt-5.6-luna", "2026-07-14",
+        1_000_000, 1_000_000, 1_000_000, 1_000_000,
+    )
     rates = pricing.load_pricing(PRICING_JSON)
     pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0)
-    first = conn.execute("SELECT cost_usd FROM daily_usage").fetchone()[0]
+    first = conn.execute(
+        "SELECT cost_usd, cost_credits, cost_priced FROM daily_usage"
+    ).fetchone()
     pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0)
-    second = conn.execute("SELECT cost_usd FROM daily_usage").fetchone()[0]
-    assert first == second == pytest.approx(5.0)  # 1M input * $5/M
+    second = conn.execute(
+        "SELECT cost_usd, cost_credits, cost_priced FROM daily_usage"
+    ).fetchone()
+    assert tuple(first) == tuple(second)
+    assert first["cost_usd"] == pytest.approx(1.67)
+    assert first["cost_credits"] == pytest.approx(35.5)
+    assert first["cost_priced"] == 1
 
 
 def test_upsert_model_pricing_idempotent(conn):
