@@ -153,9 +153,10 @@ def _locale_preload(language):
 
 def _connection_preload(status="none", unsupported=False):
     """Keep the real dashboard while making the connection lifecycle explicit."""
+    payload = {"status": status} if isinstance(status, str) else status
     response = "return new Response('', {status: 404});" if unsupported else (
-        "return new Response(JSON.stringify({status: %s}), {headers: "
-        "{'Content-Type': 'application/json'}});" % json.dumps(status)
+        "return new Response(JSON.stringify(%s), {headers: "
+        "{'Content-Type': 'application/json'}});" % json.dumps(payload)
     )
     return r'''(() => {
       const originalFetch = window.fetch.bind(window);
@@ -190,6 +191,48 @@ def _browser_key(cdp, key, code, key_code, modifiers=0):
     }
     cdp.call("Input.dispatchKeyEvent", dict(params, type="keyDown"))
     cdp.call("Input.dispatchKeyEvent", dict(params, type="keyUp"))
+
+
+def _connection_focus(cdp):
+    return cdp.eval('''(() => {
+      const dialog = document.getElementById("connection-cabinet");
+      const active = document.activeElement;
+      const style = getComputedStyle(active);
+      const rect = active.getBoundingClientRect();
+      return {contained: dialog.contains(active), disabled: !!active.disabled,
+              hidden: active.hidden || !!active.closest("[hidden]"),
+              display: style.display, visibility: style.visibility,
+              width: rect.width, height: rect.height};
+    })()''')
+
+
+def _visible_connection_elements(cdp):
+    return cdp.eval('''(() => {
+      const dialog = document.getElementById("connection-cabinet");
+      const visible = (id) => {
+        const element = document.getElementById(id);
+        const rect = element.getBoundingClientRect();
+        return getComputedStyle(element).display !== "none"
+          && rect.width > 0 && rect.height > 0;
+      };
+      const hidden = [...dialog.querySelectorAll("[hidden]")];
+      return {
+        elements: Object.fromEntries([
+          "connection-form", "connection-actions", "connection-empty",
+          "connection-error", "connection-advice", "connection-workspace-detail",
+          "connection-synced-detail"
+        ].map((id) => [id, visible(id)])),
+        hidden: hidden.map((element) => ({
+          display: getComputedStyle(element).display,
+          boxes: element.getClientRects().length,
+        })),
+        concealed: [...dialog.querySelectorAll("*")]
+          .filter((element) => element.closest("[hidden]"))
+          .map((element) => ({
+            boxes: element.getClientRects().length,
+          })),
+      };
+    })()''')
 
 
 def test_open_page_navigates_the_attached_target(dashboard):
@@ -278,6 +321,7 @@ def test_connection_dialog_manages_active_and_pending_states(dashboard):
     cdp, base = dashboard
     cdp.open_page(base + "/", preload_script=_connection_preload("active"))
     cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('state.connection.status === "active"')
     cdp.wait_for('!document.getElementById("connection-trigger").hidden')
     cdp.eval('document.getElementById("connection-trigger").click()')
     cdp.wait_for('document.getElementById("connection-cabinet").open')
@@ -303,6 +347,102 @@ def test_connection_dialog_manages_active_and_pending_states(dashboard):
     cdp.wait_for('window.__aistat_connection_gets > 1')
     assert cdp.eval('document.getElementById("connection-cabinet").open') is False
     assert cdp.eval('state.connection.status') == "pending"
+
+
+def test_connection_dialog_focus_and_visibility_cover_all_states(dashboard):
+    cdp, base = dashboard
+    states = (
+        ("none", True, False, True, False, False, False, False),
+        ("disabled", True, False, False, False, False, False, False),
+        ("pending", False, False, False, False, False, False, False),
+        ("replacement_pending", False, False, False, False, False, False, False),
+        ({"status": "active", "workspace_label": "Main", "last_synced_at": 1},
+         False, True, False, False, False, True, True),
+        ("error", False, True, False, True, False, False, False),
+        ("revocation_pending", False, False, False, False, True, False, False),
+        ("revoked", True, False, True, False, True, False, False),
+    )
+    for status, form, actions, empty, error, advice, workspace, synced in states:
+        cdp.open_page(base + "/", preload_script=_connection_preload(status))
+        cdp.wait_for(BOOTED_JS)
+        current = status if isinstance(status, str) else status["status"]
+        cdp.wait_for('state.connection.status === %s' % json.dumps(current))
+        cdp.eval('document.getElementById("connection-trigger").click()')
+        cdp.wait_for('document.getElementById("connection-cabinet").open')
+        focus = _connection_focus(cdp)
+        assert focus["contained"] is True
+        assert focus["disabled"] is False
+        assert focus["hidden"] is False
+        assert focus["display"] != "none"
+        assert focus["visibility"] == "visible"
+        assert focus["width"] > 0
+        assert focus["height"] > 0
+        visibility = _visible_connection_elements(cdp)
+        assert visibility["elements"] == {
+            "connection-form": form,
+            "connection-actions": actions,
+            "connection-empty": empty,
+            "connection-error": error,
+            "connection-advice": advice,
+            "connection-workspace-detail": workspace,
+            "connection-synced-detail": synced,
+        }
+        assert all(item["display"] == "none" and item["boxes"] == 0
+                   for item in visibility["hidden"])
+        assert all(item["boxes"] == 0 for item in visibility["concealed"])
+
+
+def test_connection_dialog_keeps_focus_during_connection_operations(dashboard):
+    cdp, base = dashboard
+    operations = (
+        ("none", "/api/connection", "pending", "connect"),
+        ("active", "/api/connection", "replacement_pending", "replace"),
+        ("active", "/api/connection/revoke", "revocation_pending", "revoke"),
+    )
+    for initial, path, pending, operation in operations:
+        cdp.open_page(base + "/", preload_script=_connection_preload(initial))
+        cdp.wait_for(BOOTED_JS)
+        cdp.wait_for('state.connection.status === %s' % json.dumps(initial))
+        cdp.eval('''(() => {
+          const originalFetch = window.fetch;
+          window.fetch = (input, options = {}) => {
+            const url = new URL(typeof input === "string" ? input : input.url, location.href);
+            if (url.pathname === "/api/connection" && window.__connection_post_status
+                && (options.method || "GET") === "GET") {
+              return Promise.resolve(new Response(JSON.stringify({status: window.__connection_post_status}), {
+                headers: {"Content-Type": "application/json"},
+              }));
+            }
+            if (url.pathname === %s && (options.method || "GET") === "POST") {
+              return new Promise((resolve) => {
+                window.__resolve_connection_post = () => {
+                  window.__connection_post_status = %s;
+                  resolve(new Response(JSON.stringify({status: %s}),
+                    {headers: {"Content-Type": "application/json"}}));
+                };
+              });
+            }
+            return originalFetch(input, options);
+          };
+        })()''' % (json.dumps(path), json.dumps(pending), json.dumps(pending)))
+        cdp.eval('document.getElementById("connection-trigger").click()')
+        cdp.wait_for('document.getElementById("connection-cabinet").open')
+        if operation == "replace":
+            cdp.eval('document.getElementById("connection-replace").click()')
+        if operation == "revoke":
+            cdp.eval('document.getElementById("connection-disconnect").click()')
+            cdp.eval('document.getElementById("connection-confirm-yes").click()')
+        else:
+            cdp.eval('document.getElementById("connection-token").value = "test-pat"')
+            cdp.eval('document.getElementById("connection-form").requestSubmit()')
+        cdp.wait_for('state.connectionBusy')
+        assert _connection_focus(cdp)["contained"] is True
+        assert cdp.eval('document.activeElement.id') == "connection-close"
+        cdp.eval('window.__resolve_connection_post()')
+        cdp.wait_for('!state.connectionBusy && state.connection.status === %s'
+                     % json.dumps(pending))
+        assert _connection_focus(cdp)["contained"] is True
+        assert cdp.eval('document.activeElement.id') == "connection-close"
 
 
 def test_connection_dialog_hides_unsupported_surface(dashboard):

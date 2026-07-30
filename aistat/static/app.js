@@ -301,13 +301,15 @@ function connectionSupportedSurface() {
 }
 
 function focusConnectionDialog() {
-  const form = $("connection-form");
-  const token = $("connection-token");
-  const replace = $("connection-replace");
-  const close = $("connection-close");
-  if (form && !form.hidden && token && !token.disabled) token.focus();
-  else if (replace && !replace.hidden && !replace.disabled) replace.focus();
-  else if (close) close.focus();
+  const cabinet = $("connection-cabinet");
+  if (!cabinet || !cabinet.open) return;
+  for (const id of ["connection-token", "connection-replace", "connection-close"]) {
+    const control = $(id);
+    if (control && !control.disabled && !control.hidden && !control.closest("[hidden]")) {
+      control.focus();
+      return;
+    }
+  }
 }
 
 function trapConnectionFocus(event) {
@@ -434,6 +436,7 @@ function setConnectionBusy(busy) {
     const button = $(id);
     if (button) button.disabled = busy;
   }
+  focusConnectionDialog();
 }
 
 function connectionStatusMessage(status, data) {
@@ -521,6 +524,7 @@ function renderConnection(data) {
   }
   const confirm = $("connection-confirm");
   if (confirm && status !== "active" && status !== "error") confirm.hidden = true;
+  focusConnectionDialog();
   if (!CONNECTION_PENDING_STATES.has(status)) stopConnectionPolling();
 }
 
