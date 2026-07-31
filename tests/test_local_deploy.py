@@ -191,6 +191,31 @@ def test_branch_guard_rejects_unknown_deployment(tmp_path):
     assert "unknown deployment 'preview' (expected: dev | main)" in result.stderr
 
 
+def test_dashboard_plist_cannot_start_a_multica_poller(tmp_path):
+    home = tmp_path / "home"
+    local_root = tmp_path / "local"
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            'source "$1"; write_server_plist dev; cat "$HOME/Library/LaunchAgents/com.aistat.local.dev.plist"',
+            "test-local-deploy", str(SCRIPT),
+        ],
+        env=dict(
+            os.environ,
+            HOME=str(home),
+            AISTAT_LOCAL_ROOT=str(local_root),
+            AISTAT_DEV_PORT="19788",
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "run.sh" in result.stdout
+    assert "AISTAT_POLL_INTERVAL_SECONDS" not in result.stdout
+    assert "AISTAT_CLI_BIN" not in result.stdout
+
+
 def test_release_logs_full_commit_and_tree(tmp_path):
     harness = ReleaseHarness(tmp_path)
     result = harness.release()

@@ -13,7 +13,7 @@ and runtime root (no hard-coded username), then atomically swaps ``code/`` and
 (re)bootstraps a single supervisor job. Any failure after the swap restores the
 previous ``code/`` and re-bootstraps it, so a broken update can never leave the
 machine without a working runtime. ``data/`` — the worker key, encrypted store,
-tenant databases, owner database and logs — is on a separate path and is never
+tenant databases, the retired direct database and logs — is on a separate path and is never
 touched by an update; only ``--purge`` uninstall removes it.
 
 The plist never carries a secret: it points at an owner-only env file
@@ -112,7 +112,7 @@ def runtime_env(runtime_root: Path, env_file: Path) -> Dict[str, str]:
     """Non-secret environment baked into the plist.
 
     Data paths are pinned under ``<root>/data`` (never ``<root>/code/data``)
-    so a code swap can never disturb the owner database, encrypted store or
+    so a code swap can never disturb the retired direct database, encrypted store or
     tenant snapshots.
     """
     root = Path(runtime_root)

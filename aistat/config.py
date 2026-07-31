@@ -161,7 +161,7 @@ class Config:
             if cli_timeout_seconds is _UNSET
             else cli_timeout_seconds
         )
-        # Durable credential for the owner poller's `multica` CLI calls. When set,
+        # Compatibility credential for an explicitly invoked direct poller. When set,
         # the poller scrubs the ambient MULTICA_* identity and authenticates with
         # this long-lived PAT instead, so collection no longer depends on an
         # interactive `multica login` session that silently expires (FAN-1442).
@@ -171,7 +171,7 @@ class Config:
             if multica_token is _UNSET
             else multica_token
         )
-        # Host + workspace the durable owner credential authenticates against.
+        # Host + workspace the compatibility direct credential authenticates against.
         # server_url defaults to the CLI's own default when unset; workspace_id
         # falls back to the ambient MULTICA_WORKSPACE_ID so an existing runtime
         # env keeps working unchanged.
@@ -292,8 +292,8 @@ class Config:
             if max_snapshot_bytes is _UNSET
             else max_snapshot_bytes
         )
-        # Optional local publisher. When configured, run.sh starts it alongside
-        # the Multica poller and sends a fresh snapshot at most every five minutes.
+        # Optional direct publisher settings, retained for explicit maintenance
+        # commands. The canonical runtime publishes through the per-user collector.
         self.publish_url = (
             (os.environ.get("AISTAT_PUBLISH_URL") or None)
             if publish_url is _UNSET
@@ -438,7 +438,7 @@ class Config:
         )
 
     def poller_cli_env(self) -> Optional[Dict[str, str]]:
-        """Environment for the owner poller's ``multica`` CLI subprocesses.
+        """Environment for an explicitly invoked direct poller's CLI subprocesses.
 
         Returns ``None`` to inherit the ambient environment — the historical
         behaviour, kept for tests and for installs that still rely on an
@@ -446,7 +446,7 @@ class Config:
 
         When ``AISTAT_MULTICA_TOKEN`` is configured, returns a copy of the
         environment with every ambient ``MULTICA_*`` key scrubbed and only the
-        configured durable credential re-injected. The poller then authenticates
+        configured compatibility credential re-injected. The poller then authenticates
         with a long-lived PAT instead of an interactive session that expires and
         silently freezes collection (FAN-1442). ``PATH``/``HOME`` are preserved
         so the CLI binary resolves and reads its own profile directory.

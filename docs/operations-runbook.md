@@ -155,8 +155,8 @@ curl -s http://127.0.0.1:8000/health | python -m json.tool | less
 Все сообщения об ошибках проходят через фиксированный безопасный словарь
 `aistat.handoff.safe_sync_error`, поэтому в `last_error` не попадают токены,
 пути или произвольный текст исключений. Сырые логи контуров лежат в
-`data/<контур>.log` (`poller.log`, `publisher.log`, `worker_sync.log`,
-`collector.log`) — это дополнение к health, а не замена.
+`data/<контур>.log` (`worker_sync.log`, `collector.log`) — это дополнение к
+health, а не замена.
 
 ## Гигиена секретов и логов
 

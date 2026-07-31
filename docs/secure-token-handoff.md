@@ -204,7 +204,8 @@ per-user данных — отдельный этап, FAN-1221).
 старого деплоя, она должна быть byte-exact `https://multica.ai`, иначе процесс
 fail-closed не запускает connection lifecycle.
 
-Локальная машина (рядом с publisher'ом в `~/.config/aistat/production.env`):
+Локальная машина (в private runtime env-файле
+`~/.config/aistat/production.env`):
 `AISTAT_WORKER_SYNC_URL=https://aistat.app`, тот же `AISTAT_WORKER_SECRET`,
 опционально `AISTAT_WORKER_KEY_PATH` (по умолчанию
 `~/.config/aistat/worker.key`), `AISTAT_WORKER_STORE_PATH` (по умолчанию

@@ -1,10 +1,8 @@
 """Fail-fast supervisor for the trusted local AIStat runtime.
 
 One launchd job runs ``python -m aistat.supervisor``. The supervisor keeps
-exactly one instance of each long-running contour alive:
+exactly one instance of each canonical long-running contour alive:
 
-* owner poller        — ``python -m aistat.poller``
-* owner publisher     — ``python -m aistat.publish --watch``
 * PAT worker sync     — ``python -m aistat.worker_sync --watch``
 * per-user collector  — ``python -m aistat.collector``
 
@@ -61,8 +59,6 @@ class Contour:
 def default_contours(python: Optional[str] = None) -> List[Contour]:
     py = python or sys.executable
     return [
-        Contour("poller", (py, "-m", "aistat.poller")),
-        Contour("publisher", (py, "-m", "aistat.publish", "--watch")),
         Contour("worker_sync", (py, "-m", "aistat.worker_sync", "--watch")),
         Contour("collector", (py, "-m", "aistat.collector")),
     ]

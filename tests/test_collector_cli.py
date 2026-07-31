@@ -54,3 +54,14 @@ def test_collector_watch_flag_is_not_supported():
     with pytest.raises(SystemExit) as exc_info:
         collector.main(["--watch"])
     assert exc_info.value.code == 2
+
+
+def test_collector_env_file_is_validated_before_collection(monkeypatch, tmp_path):
+    env_file = tmp_path / "production.env"
+    env_file.write_text("bad line\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setattr(collector, "Config", lambda: (_ for _ in ()).throw(
+        AssertionError("Config must not be built after an invalid env file")
+    ))
+
+    assert collector.main(["--once", "--env-file", str(env_file)]) == 1

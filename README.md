@@ -7,7 +7,7 @@ story point, стоимости на story point и «взвешенной» (с
 
 Данные поступают **только** через аутентифицированный CLI `multica`
 (subprocess, `--output json`) — без токенов/ключей в коде и без прямых
-HTTP-вызовов к серверу. Локальный поллер пишет один source-файл SQLite;
+HTTP-вызовов к серверу. Доверенный per-user worker пишет отдельную staging-БД;
 публичный WSGI хранит изолированный `data/tenants/<user_id>.db` для каждого
 пользователя.
 
@@ -19,7 +19,7 @@ HTTP-вызовов к серверу. Локальный поллер пише�
 ## Требования
 
 - macOS / Linux, Python ≥ 3.9 (проверено на системном 3.9.6)
-- Авторизованный CLI `multica` в `PATH`
+- Авторизованный CLI `multica` в `PATH` только на доверенной машине worker'а
 
 ## Запуск (одна команда)
 
@@ -28,16 +28,11 @@ HTTP-вызовов к серверу. Локальный поллер пише�
 # → дашборд: http://localhost:8787
 ```
 
-Скрипт сам создаёт venv и ставит зависимости при первом запуске, поднимает
-поллер в фоне (лог в `data/poller.log`) и uvicorn с API + дашбордом.
+Скрипт сам создаёт venv и ставит зависимости при первом запуске, затем запускает
+uvicorn с API + дашбордом. Он не собирает и не публикует данные: это делает
+единственный доверенный per-user worker.
 Порт меняется переменной `AISTAT_PORT` (`AISTAT_PORT=9000 ./run.sh`).
-Остановка — Ctrl-C (поллер гасится автоматически).
-
-Если настроены `AISTAT_PUBLISH_URL`, `AISTAT_INGEST_SECRET` и
-`AISTAT_TENANT_ID`, `run.sh`
-дополнительно запускает publisher: не чаще раза в 5 минут он отправляет на
-публичный сайт подписанный snapshot SQLite. Multica credential при этом
-никогда не покидает локальный компьютер.
+Остановка — Ctrl-C.
 
 ## Постоянные локальные развёртки dev / main
 
@@ -55,11 +50,13 @@ deploy/local_deploy.sh status      # состояние, HEAD, health по по�
 Полная инструкция (обновление dev, релиз в main, логи, удаление, настройка):
 [`docs/deployment-local.md`](docs/deployment-local.md).
 
-## Автономный локальный рантайм (poller + publisher + worker + collector)
+## Автономный локальный рантайм (per-user worker + collector)
 
-Для доверенной машины, которая постоянно держит все четыре контура (owner
-poller, owner publisher, `worker_sync --watch` и per-user collector), есть один
-fail-fast supervisor под launchd. Управление — [`deploy/aistat_runtime.sh`](deploy/aistat_runtime.sh):
+Для доверенной машины есть один fail-fast supervisor под launchd. Он держит
+ровно два контура: `worker_sync --watch` и per-user collector. Это единственный
+канонический polling/publish path; dashboard-процессы `dev` и `main` не имеют
+Multica credentials и не создают snapshot'ы. Управление —
+[`deploy/aistat_runtime.sh`](deploy/aistat_runtime.sh):
 
 ```bash
 deploy/aistat_runtime.sh preflight   # проверить конфиг до установки
@@ -70,21 +67,24 @@ deploy/aistat_runtime.sh uninstall   # снять (данные сохраняю
 ```
 
 Secrets только в приватном env-файле `~/.config/aistat/production.env` (права
-`0600`), не в plist. `AISTAT_SESSION_SECRET`, `AISTAT_INGEST_SECRET` и
-`AISTAT_WORKER_SECRET` обязательны, не короче 32 байт и попарно различаются.
+`0600`), не в plist. `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET`
+обязательны, не короче 32 байт и различаются.
 Полная инструкция, контракт приватной активации и раскладка рантайма:
 [`docs/runtime-supervisor.md`](docs/runtime-supervisor.md).
 
 ## Запуск по частям
 
-Поллер (фоновая синхронизация; новый цикл стартует каждые 45 с по умолчанию,
-отсчёт от старта до старта — см. «Как работает ингест»):
+Ручной цикл по уже подключённым пользователям (путь к private env-файлу не
+является секретом; его содержимое валидируется и не выводится):
 
 ```bash
-.venv/bin/python -m aistat.poller            # бесконечный цикл
-.venv/bin/python -m aistat.poller --once     # один цикл и выход (exit 1 при ошибках)
-.venv/bin/python -m aistat.poller --once --detail-budget 200   # ускоренный бэкфилл деталей
+.venv/bin/python -m aistat.worker_sync --env-file ~/.config/aistat/production.env
+.venv/bin/python -m aistat.collector --once --env-file ~/.config/aistat/production.env
 ```
+
+Непрерывный worker запускает supervisor; отдельно нужны только диагностика и
+ручной backfill. Прямой `aistat.poller`/`aistat.publish` сохранён для явного
+maintenance-сценария, но не является scheduled или standard manual path.
 
 Сбор статистики по подключённым пользователям (worker):
 
@@ -293,8 +293,6 @@ metadata задачи, а не по проекту).
 | `AISTAT_TENANTS_DIR` | `./data/tenants` | каталог изолированных публичных БД `<user_id>.db` |
 | `AISTAT_ADMIN_EMAIL` | — | email владельца; новый OAuth-subject (Google/Яндекс) с этим email привязывается к существующему владельцу (владелец остаётся единственным админом и сохраняет вход по паролю и свой tenant) |
 | `AISTAT_OAUTH_ALLOWED_EMAILS` | — | allowlist регистрации (через запятую, регистронезависимо). Пусто = **открытая** регистрация: любой verified OAuth-пользователь (Google/Яндекс) получает свой аккаунт и пустой tenant. Непусто = регистрация только для перечисленных email. Гейт применяется только к **новой** регистрации subject и никогда не блокирует уже зарегистрированный аккаунт |
-| `AISTAT_TENANT_ID` | — | внутренний `users.id`, к которому publisher привязывает snapshot и HMAC-подпись |
-| `AISTAT_POLL_INTERVAL_SECONDS` | `45` | интервал между стартами циклов поллера (от старта до старта); он же — дедлайн, по которому бэкфилл деталей откладывается на следующий цикл |
 | `AISTAT_USAGE_DAYS` | `90` | окно `runtime usage --days N` (макс. 365) |
 | `AISTAT_DETAIL_BUDGET` | `40` | максимум issue, чьи детали (usage+runs) обновляются за цикл |
 | `AISTAT_ISSUE_PAGE_LIMIT` | `100` | размер страницы `issue list` |
@@ -467,8 +465,8 @@ python3 -m aistat.migrate
 ```
 
 Команда идемпотентна, использует согласованную SQLite-копию, сохраняет rollback
-копию `<AISTAT_DB_PATH>.migrated` и печатает `owner_user_id`, который нужно
-задать локальному publisher как `AISTAT_TENANT_ID`.
+копию `<AISTAT_DB_PATH>.migrated` и печатает `owner_user_id`, которому принадлежит
+перенесённая историческая tenant-БД.
 
 - **Измерения**: `runtimes`, `agents` (модель, runtime), `projects`,
   `issues` (+ `story_points` из metadata с фолбэком на лейбл `SP:N`,

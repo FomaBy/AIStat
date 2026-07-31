@@ -569,3 +569,14 @@ def test_worker_sync_config_validation(tmp_path, monkeypatch):
     config = worker_config(tmp_path, worker_pull_interval_seconds=10)
     with pytest.raises(WorkerSyncError):
         pull_once(config, opener=dummy_opener)
+
+
+def test_worker_sync_env_file_is_validated_before_config(monkeypatch, tmp_path):
+    env_file = tmp_path / "production.env"
+    env_file.write_text("bad line\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setattr(worker_sync_module, "Config", lambda: (_ for _ in ()).throw(
+        AssertionError("Config must not be built after an invalid env file")
+    ))
+
+    assert worker_sync_module.main(["--env-file", str(env_file)]) == 1
