@@ -31,15 +31,13 @@ from .endpoints import https_endpoint_error
 logger = logging.getLogger("aistat.preflight")
 
 # Long-poll network cadences that must never dip below one minute, so a
-# misconfigured runtime cannot hammer the public host or the owner's Multica.
+# misconfigured runtime cannot hammer the public host or Multica.
 MIN_INTERVAL_SECONDS = 60
 
-# The four contour entry modules must import cleanly (this also proves their
+# The two canonical contour entry modules must import cleanly (this also proves their
 # third-party dependencies, e.g. ``cryptography`` for the worker store, resolve
 # in the runtime interpreter).
 CONTOUR_MODULES = (
-    "aistat.poller",
-    "aistat.publish",
     "aistat.worker_sync",
     "aistat.collector",
 )
@@ -254,13 +252,9 @@ def run_preflight(config: Config, *, check_imports: bool = True,
     """
     checks: List[Check] = []
 
-    # Owner publisher: tenant identity is required and its snapshot secret must
-    # be present and long enough to be a real HMAC key.
-    checks.append(Check(
-        "tenant_id", config.publish_tenant_id is not None,
-        "AISTAT_TENANT_ID configured" if config.publish_tenant_id is not None
-        else "AISTAT_TENANT_ID is required",
-    ))
+    # The collector supplies the tenant identity from each authenticated
+    # connection. The runtime itself therefore needs only the shared signed
+    # ingest endpoint and its HMAC secret, never an owner tenant selector.
     checks.append(check_https_endpoint(
         "AISTAT_PUBLISH_URL", config.publish_url
     ))
@@ -280,30 +274,17 @@ def run_preflight(config: Config, *, check_imports: bool = True,
         else "AISTAT_WORKER_SECRET must contain at least 32 bytes",
     ))
 
-    # The runtime needs the hosted session key as well: without its real value
-    # it cannot prove that the two transport keys are independent from it.
-    checks.append(Check(
-        "session_secret", _secret_ok(config.session_secret),
-        "AISTAT_SESSION_SECRET present" if _secret_ok(config.session_secret)
-        else "AISTAT_SESSION_SECRET must contain at least 32 bytes",
-    ))
-
-    # The three HMAC keys must be mutually independent so compromising one
-    # transport cannot forge another.
-    independent = not (
-        _same_secret(config.ingest_secret, config.worker_secret)
-        or _same_secret(config.ingest_secret, config.session_secret)
-        or _same_secret(config.worker_secret, config.session_secret)
-    )
+    # These two transport keys must remain independent: compromising the
+    # worker channel cannot forge a tenant snapshot, or vice versa.
+    independent = not _same_secret(config.ingest_secret, config.worker_secret)
     checks.append(Check(
         "secret_independence", independent,
-        "ingest/worker/session secrets are independent" if independent
-        else "ingest, worker and session secrets must all differ",
+        "ingest and worker secrets are independent" if independent
+        else "ingest and worker secrets must differ",
     ))
 
-    # Host-facing cadences must stay at or above one minute.
+    # Canonical worker cadences must stay at or above one minute.
     for name, value in (
-        ("AISTAT_PUBLISH_INTERVAL_SECONDS", config.publish_interval_seconds),
         ("AISTAT_WORKER_PULL_INTERVAL_SECONDS", config.worker_pull_interval_seconds),
         ("AISTAT_WORKER_COLLECT_INTERVAL_SECONDS",
          config.worker_collect_interval_seconds),

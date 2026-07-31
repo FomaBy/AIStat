@@ -759,7 +759,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
             except SnapshotError:
                 return jsonify({"detail": "invalid snapshot"}), 422
             # Data-freshness guard: never let a stale or degraded snapshot move
-            # this tenant's usage backwards in time (e.g. a lapsed owner poller
+            # this tenant's usage backwards in time (e.g. a lapsed direct poller
             # overwriting a newer connected-collector snapshot). Independent of
             # the timestamp replay check above, which only bounds the signature.
             report = freshness_report(staged_path, target_path)

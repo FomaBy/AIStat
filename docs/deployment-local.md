@@ -20,9 +20,9 @@
   развёртки живут отдельно. Клоны намеренно лежат **вне** защищённого macOS
   каталога `~/Documents`, иначе launchd не смог бы их читать (та же причина, что
   у runtime-supervisor'а, см. `docs/runtime-supervisor.md`).
-- Каждая развёртка запускает штатный `./run.sh` (поллер Multica + API +
-  дашборд) со своим `AISTAT_PORT` и своей базой SQLite (`data/aistat.db` внутри
-  своего клона) — ветки не делят состояние.
+- Каждая развёртка запускает штатный `./run.sh` (API + дашборд) со своим
+  `AISTAT_PORT` и своей SQLite-БД (`data/aistat.db` внутри своего клона) — ветки
+  не делят состояние и не запускают Multica poller/publisher.
 - Управляется тремя агентами launchd (домен `gui/<uid>`):
   - `com.aistat.local.dev` — сервер ветки `dev` (`KeepAlive` — всегда поднят,
     переживает перезагрузку и падения);
@@ -49,8 +49,7 @@ foreground — первый старт launchd мгновенный), генер
 launchd-агента. Команда идемпотентна — повторный `install` просто обновляет
 клоны и перезагружает агенты.
 
-Требования: авторизованный CLI `multica` в `PATH` (нужен поллеру каждой
-развёртки), `python3`, `git`. Ветка `dev` должна существовать на `origin`.
+Требования: `python3`, `git`. Ветка `dev` должна существовать на `origin`.
 
 ## Обновление `dev`
 
@@ -106,7 +105,6 @@ deploy/local_deploy.sh start dev|main          # запустить снова
 
 - `~/Library/Application Support/AIStat/local/logs/{dev,main}.out.log` / `.err.log`
 - `.../logs/dev-update.out.log` / `.err.log`
-- поллер каждой развёртки — `.../local/{dev,main}/data/poller.log`
 
 ## Удаление
 
@@ -123,18 +121,13 @@ deploy/local_deploy.sh uninstall --purge   # выгрузить агенты и 
 | `AISTAT_REPO_URL` | origin рабочей копии | откуда клонировать развёртки |
 | `AISTAT_DEV_PORT` | `8788` | порт развёртки `dev` |
 | `AISTAT_MAIN_PORT` | `8789` | порт развёртки `main` |
-| `AISTAT_LOCAL_POLL_INTERVAL_SECONDS` | `180` | интервал поллера внутри каждой развёртки |
 | `AISTAT_DEV_UPDATE_INTERVAL_SECONDS` | `120` | как часто таймер проверяет `origin/dev` |
-| `AISTAT_CLI_BIN` | найденный `multica` | бинарь CLI для поллеров |
 
 Значения задаются **при `install`** (запекаются в plist'ы). Чтобы поменять порт
-или интервал — измените env и выполните `install` заново.
+или интервал обновления — измените env и выполните `install` заново.
 
 ## Про нагрузку
 
-Каждая развёртка держит свой поллер, который каждые
-`AISTAT_LOCAL_POLL_INTERVAL_SECONDS` (по умолчанию 180 с) обращается к CLI
-`multica`. То есть после установки на машине работают до трёх поллеров: ручной
-`./run.sh` (если запущен) плюс `dev` и `main`. Токены LLM они не тратят (только
-data-эндпоинты CLI), но если нужно снизить нагрузку — увеличьте интервал и
-переустановите, либо временно остановите ненужную развёртку (`stop`).
+`dev` и `main` не обращаются к CLI Multica и не публикуют snapshots. Сбором
+занимается только `com.aistat.runtime`; поэтому обновление или перезапуск
+дашбордов не влияет на tenant DB, watermark или ingestion cadence.

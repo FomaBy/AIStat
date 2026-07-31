@@ -1,16 +1,14 @@
 # Автономный локальный рантайм AIStat (supervisor)
 
-Доверенная локальная машина держит постоянно поднятыми ровно **четыре**
+Доверенная локальная машина держит постоянно поднятыми ровно **два**
 долгоживущих контура:
 
 | Контур | Команда | Что делает |
 |---|---|---|
-| owner poller | `python -m aistat.poller` | синхронизирует Multica владельца в локальную БД |
-| owner publisher | `python -m aistat.publish --watch` | подписанный snapshot владельца → публичный хост |
 | PAT worker | `python -m aistat.worker_sync --watch` | тянет пользовательские токены в зашифрованный store |
 | per-user collector | `python -m aistat.collector` | собирает статистику по подключениям и публикует per-tenant |
 
-Всеми четырьмя управляет один **fail-fast supervisor**
+Ими управляет один **fail-fast supervisor**
 (`aistat/supervisor.py`), которого поднимает один launchd-агент
 `com.aistat.runtime`. Supervisor:
 
@@ -38,8 +36,8 @@
   .venv/       виртуальное окружение рантайма
 ```
 
-`data/` лежит **вне** `code/`, поэтому обновление кода никогда не трогает БД
-владельца, зашифрованный store, tenant-снимки и логи. Ключ шифрования по
+`data/` лежит **вне** `code/`, поэтому обновление кода никогда не трогает
+зашифрованный store, tenant-снимки и логи. Ключ шифрования по
 умолчанию `~/.config/aistat/worker.key` — вообще вне рантайм-рута.
 
 ## Контракт приватной активации (без значений секретов)
@@ -72,28 +70,25 @@ launchd. `uninstall` и `status` остаются доступны без фай
 Минимальный набор для рантайма (значения задаёт владелец, здесь только имена):
 
 ```
-AISTAT_TENANT_ID=            # внутренний users.id владельца (из aistat.migrate)
-AISTAT_PUBLISH_URL=          # https://… — куда publisher шлёт snapshot
-AISTAT_SESSION_SECRET=       # ≥32 байта, HMAC сессий; тот же, что на public host
-AISTAT_INGEST_SECRET=        # ≥32 байта, независимый HMAC для snapshot
+AISTAT_PUBLISH_URL=          # https://… — куда collector шлёт tenant snapshot
+AISTAT_INGEST_SECRET=        # ≥32 байта, HMAC для tenant snapshot
 AISTAT_WORKER_SYNC_URL=      # https://… — откуда worker тянет токены
 AISTAT_WORKER_SECRET=        # ≥32 байта, независимый HMAC для worker-канала
 ```
 
 Требования, которые проверяет preflight (`python -m aistat.preflight`):
 
-- задан `AISTAT_TENANT_ID`;
 - `AISTAT_PUBLISH_URL` и `AISTAT_WORKER_SYNC_URL` — HTTPS;
-- `AISTAT_SESSION_SECRET`, `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET`
-  обязательны, не короче 32 байт и **попарно различаются**;
-- интервалы publish/worker-pull/worker-collect ≥ 60 секунд;
+- `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET` обязательны, не короче
+  32 байт и различаются;
+- интервалы worker-pull/worker-collect ≥ 60 секунд;
 - ключ шифрования лежит **не** в каталоге store; ключ/store — owner-only
   (`0600`), каталоги — `0700`;
 - все контуры и зависимость `cryptography` импортируются.
 
 Каждый host-side secret генерируется отдельно командой
 `python -m aistat.security generate-secret`; в private runtime env копируются
-те же три значения, чтобы preflight проверял реальную попарную независимость.
+эти два значения, чтобы preflight проверял реальную независимость.
 
 > **Fail-closed intake.** Хост не сохраняет новый PAT, пока не увидит свежий
 > подписанный heartbeat worker'а: до первого успешного `worker_sync` intake
@@ -193,7 +188,7 @@ install`, который выполняет миграцию автоматич�
 ## Логи и статус
 
 - `data/runtime.stdout.log`, `data/runtime.stderr.log` — вывод supervisor;
-- `data/<contour>.log` — вывод каждого контура (poller/publisher/…);
+- `data/<contour>.log` — вывод каждого контура (`worker_sync`/`collector`);
 - `run/supervisor.status.json` — текущие PID/перезапуски по контурам (без
   секретов), права `0600`.
 

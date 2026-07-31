@@ -274,22 +274,17 @@ supervisor `com.aistat.runtime`
 нужен только для ручной проверки ниже):
 
 ```text
-AISTAT_TENANT_ID=<owner_user_id из aistat.migrate>
 AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot
-AISTAT_SESSION_SECRET=<≥32 байта, тот же, что на хосте>
 AISTAT_INGEST_SECRET=<тот же ingest secret, что на хосте>
 AISTAT_WORKER_SYNC_URL=https://aistat.app
 AISTAT_WORKER_SECRET=<≥32 байта, тот же, что на хосте>
 ```
 
-Первичная ручная проверка:
+Первичная ручная проверка уже подключённого пользователя:
 
 ```bash
-AISTAT_INGEST_SECRET="$(security find-generic-password \
-  -a "$USER" -s 'aistat.app ingest' -w)" \
-  AISTAT_PUBLISH_URL=https://aistat.app/api/ingest/snapshot \
-  AISTAT_TENANT_ID=<owner_user_id> \
-  .venv/bin/python -m aistat.publish
+.venv/bin/python -m aistat.worker_sync --env-file ~/.config/aistat/production.env
+.venv/bin/python -m aistat.collector --once --env-file ~/.config/aistat/production.env
 ```
 
 Для автозапуска установить рантайм вне защищённого macOS каталога
@@ -307,7 +302,7 @@ launchd-задание `com.aistat.runtime`. Если на машине ещё �
 legacy-задание `com.aistat.sync` (его ставил retired-скрипт
 `scripts/install_launchd_sync.sh`), install автоматически снимает его **до**
 запуска нового supervisor'а и продолжает работать на тех же данных —
-дублирующихся poller/publisher не остаётся. Путь обновления и отката описан
+старые direct poller/publisher не остаются. Путь обновления и отката описан
 в [runtime-supervisor.md](runtime-supervisor.md).
 
 ## 7. Пиннинг и публикация approved-кандидата через cPanel Git + cron

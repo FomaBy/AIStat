@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install and manage the trusted local AIStat runtime supervisor (one launchd
-# job keeping owner poller, owner publisher, worker_sync --watch and the
-# per-user collector alive). Runtime root and every plist path derive from the
+# job keeping worker_sync --watch and the per-user collector alive). Runtime
+# root and every plist path derive from the
 # real $HOME — no hard-coded username. Secrets live only in the persistent
 # owner-only env file (required for install/preflight/restart/rollback) and
 # never touch the plist, argv or this script's output.

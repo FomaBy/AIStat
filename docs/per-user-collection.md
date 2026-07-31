@@ -58,8 +58,8 @@ residue удаляется без CLI/logout-вызова.
 `ConnectionCliProfile` не даёт per-user вызову «свалиться» на identity владельца:
 
 - **Scrubbed environment.** Из окружения дочернего процесса вырезаются **все**
-  `MULTICA_*` переменные (в т.ч. `MULTICA_TOKEN`, `MULTICA_SERVER_URL`,
-  `MULTICA_WORKSPACE_ID`, которые runtime владельца инжектит в ambient env).
+  `MULTICA_*` переменные (в т.ч. `MULTICA_TOKEN`, `MULTICA_SERVER_URL` и
+  унаследованный `MULTICA_WORKSPACE_ID`).
   Без этого неаутентифицированный профиль молча использовал бы токен владельца;
   со scrub — он честно fail-closed («No server configured»).
 - **Task-owned HOME.** Официальный CLI хранит конфиг в `$HOME/.multica/...`, поэтому
@@ -123,12 +123,32 @@ Worker-процесс (только доверенная машина), рядо
 ```
 python -m aistat.collector               # непрерывный цикл по всем подключениям
 python -m aistat.collector --once        # один цикл, JSON-сводка (без токенов/путей)
+python -m aistat.collector --once --env-file ~/.config/aistat/production.env
 ```
 
 Требует настроенных `AISTAT_PUBLISH_URL` + `AISTAT_INGEST_SECRET` (для публикации) и
 `AISTAT_WORKER_STORE_PATH` + `AISTAT_WORKER_KEY_PATH` (хранилище токенов). `HOME`
 per-user CLI берётся из `AISTAT_CLI_PROFILES_DIR`, staging tenant-БД — из
 `AISTAT_WORKER_TENANTS_DIR`.
+
+### Ручной backfill и проверка
+
+Для уже сохранённого подключения сначала заберите актуальное состояние handoff,
+затем выполните collection-cycle через тот же per-user profile. `--env-file`
+принимает только путь, проверяет права `0600` и парсит файл без выполнения или
+печати значений.
+
+```
+python -m aistat.worker_sync --env-file ~/.config/aistat/production.env
+AISTAT_USAGE_DAYS=90 python -m aistat.collector --once \
+  --env-file ~/.config/aistat/production.env
+python -m aistat.health --db "$HOME/Library/Application Support/AIStat/data/worker_tenants/<user_id>.db"
+```
+
+`AISTAT_USAGE_DAYS=90` покрывает 20–22 июля и текущую дату; повторный запуск
+идемпотентен. Для готовности нужны два последовательных результата `status: ok`,
+`last_cycle.sources_failed: 0` и неизменные либо возрастающие счётчики; health
+читает staging-БД именно этого пользователя, а не dashboard DB `dev`/`main`.
 
 ## Residual risk
 

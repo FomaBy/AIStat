@@ -277,11 +277,6 @@ def test_preflight_failure_leaves_old_runtime_untouched(tmp_path):
 @pytest.mark.parametrize(
     "case",
     [
-        "session-missing",
-        "session-empty",
-        "session-31-bytes",
-        "session-ingest",
-        "session-worker",
         "ingest-worker",
     ],
 )
