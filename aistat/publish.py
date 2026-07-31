@@ -20,7 +20,11 @@ from typing import Any, Callable, Dict, Optional
 from .config import Config
 from .endpoints import https_endpoint_error
 from .security import snapshot_signature
-from .snapshot import SnapshotError, create_compressed_snapshot
+from .snapshot import (
+    FRESHNESS_REJECTION_REASONS,
+    SnapshotError,
+    create_compressed_snapshot,
+)
 from .tenant import canonical_tenant_id
 
 logger = logging.getLogger("aistat.publish")
@@ -75,6 +79,25 @@ def current_marker(db_path: Path) -> Optional[str]:
         return None
 
 
+def _freshness_rejection_reason(error: urllib.error.HTTPError) -> Optional[str]:
+    """Return only an allowlisted freshness reason from a rejected response."""
+    if error.code != 409:
+        return None
+    try:
+        result = json.loads(error.read(4096).decode("utf-8"))
+    except (OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(result, dict):
+        return None
+    reason = result.get("reason")
+    if (
+        result.get("detail") != "snapshot freshness rejected"
+        or reason not in FRESHNESS_REJECTION_REASONS
+    ):
+        return None
+    return reason
+
+
 def publish_snapshot(
     config: Config,
     db_path: Path,
@@ -124,6 +147,11 @@ def publish_snapshot(
             body = response.read(64 * 1024)
             status = getattr(response, "status", response.getcode())
     except urllib.error.HTTPError as exc:
+        reason = _freshness_rejection_reason(exc)
+        if reason is not None:
+            raise PublishError(
+                "host rejected snapshot freshness: {}".format(reason)
+            ) from exc
         raise PublishError(f"host rejected snapshot with HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise PublishError(f"cannot reach public host: {exc.reason}") from exc

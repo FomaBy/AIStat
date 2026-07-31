@@ -104,6 +104,30 @@ Restore никогда не доверяет путям внутри маниф�
 текущей конфигурации, поэтому подделанный manifest не может записать данные вне
 `data/`.
 
+## Безопасная диагностика HTTP 409 freshness
+
+Если подписанная отправка snapshot получила `HTTP 409`, сначала сохраните обе
+стороны как проверенные отдельные copies/backups: candidate copy с доверенной
+машины и current copy с хоста. Не запускайте проверку на живой tenant DB и не
+подменяйте ни одну из сторон. Единственный безопасный следующий шаг:
+
+```
+python -m aistat.snapshot /verified/incoming-copy.db /verified/current-copy.db
+```
+
+Команда открывает обе SQLite copies только для чтения и печатает JSON только с
+`verdict`, `reason` и агрегированными количествами строк; она возвращает `0`
+для `accept` и `1` для `reject`. Возможные `reason`: `incoming_older_day`,
+`incoming_empty_over_populated`, `missing_same_day_rows`,
+`decreased_same_day_counters`, `incoming_unreadable`, `target_unreadable`.
+Сохраните обе копии и backups, затем верните PM только код `reason` и verdict
+для отдельного решения.
+
+Запрещено удалять tenant DB, делать принудительный upload/retry с обходом
+защиты, ослаблять freshness guard или выбирать source of truth без отдельного
+решения и резервной копии. Эта диагностика не изменяет watermark, схему,
+snapshot, `.previous` или production data.
+
 ## Наблюдаемость: здоровье и ошибки синхронизации
 
 Ошибки приложения и синхронизации диагностируются **без ручного чтения базы** —

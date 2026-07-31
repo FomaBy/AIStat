@@ -657,6 +657,34 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
     assert post(build(), base_ts).status_code == 200
     assert daily_usage_max_date(owner_path) == "2026-01-02"
     baseline = owner_path.read_bytes()
+    previous = owner_path.with_name(owner_path.name + ".previous")
+    previous_baseline = previous.read_bytes()
+    watermark_baseline = _watermark(config)
+
+    def assert_rejected(response, reason):
+        assert response.status_code == 409
+        report = response.get_json()
+        assert report["detail"] == "snapshot freshness rejected"
+        assert report["reason"] == reason
+        assert set(report["summary"]) == {
+            "incoming_latest_rows",
+            "target_latest_rows",
+            "missing_same_day_rows",
+            "decreased_same_day_rows",
+        }
+        rendered = json.dumps(report, sort_keys=True)
+        for forbidden in (
+            "R1",
+            "m-claude",
+            "2026-01-02",
+            "input_tokens",
+            str(owner_path),
+            INGEST_SECRET,
+        ):
+            assert forbidden not in rendered
+        assert owner_path.read_bytes() == baseline
+        assert previous.read_bytes() == previous_baseline
+        assert _watermark(config) == watermark_baseline
 
     # Same latest day but one runtime/model row missing: rejecting it must not
     # touch the tenant database.
@@ -665,8 +693,7 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "AND model = 'm-mystery' AND date = '2026-01-02';"
     )
     rejected = post(degraded, base_ts + 10)
-    assert rejected.status_code == 409
-    assert owner_path.read_bytes() == baseline
+    assert_rejected(rejected, "missing_same_day_rows")
 
     lower = build(
         "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
@@ -674,18 +701,17 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "AND date = '2026-01-02';"
     )
     rejected = post(lower, base_ts + 20)
-    assert rejected.status_code == 409
-    assert owner_path.read_bytes() == baseline
+    assert_rejected(rejected, "decreased_same_day_counters")
+
+    empty = build("DELETE FROM daily_usage;")
+    rejected = post(empty, base_ts + 25)
+    assert_rejected(rejected, "incoming_empty_over_populated")
 
     # Stale snapshot (older max date) with a strictly newer timestamp: it clears
     # the replay guard but must be refused by the data-freshness guard.
     stale = build("DELETE FROM daily_usage WHERE date = '2026-01-02';")
     rejected = post(stale, base_ts + 30)
-    assert rejected.status_code == 409
-    assert rejected.get_json()["detail"] == (
-        "snapshot older than current data rejected"
-    )
-    assert owner_path.read_bytes() == baseline
+    assert_rejected(rejected, "incoming_older_day")
 
     # A genuinely newer snapshot still installs.
     fresh = build(

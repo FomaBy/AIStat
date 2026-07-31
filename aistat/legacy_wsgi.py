@@ -1540,13 +1540,18 @@ def _ingest(environ, start_response):
             # this tenant's usage backwards in time (e.g. a lapsed owner poller
             # overwriting a newer connected-collector snapshot). Independent of
             # the timestamp replay check above, which only bounds the signature.
-            if not snapshot.snapshot_is_fresh_enough(staged_path, target_path):
+            report = snapshot.freshness_report(staged_path, target_path)
+            if report["verdict"] != "accept":
                 snapshot_recovery.cleanup_staged_file(staged_path)
                 return _json_response(
                     environ,
                     start_response,
                     "409 Conflict",
-                    {"detail": "snapshot older than current data rejected"},
+                    {
+                        "detail": "snapshot freshness rejected",
+                        "reason": report["reason"],
+                        "summary": report["summary"],
+                    },
                 )
             # Journal the intent before touching the tenant database so a crash
             # between the file swap and the watermark update recovers to a

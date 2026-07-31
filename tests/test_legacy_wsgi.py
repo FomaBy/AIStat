@@ -259,6 +259,38 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
     assert post(build(), base_ts)[0] == "200 OK"
     assert daily_usage_max_date(owner_path) == "2026-01-02"
     baseline = owner_path.read_bytes()
+    previous_path = str(owner_path) + ".previous"
+    with open(previous_path, "rb") as handle:
+        previous_baseline = handle.read()
+    watermark_baseline = _legacy_watermark(module, owner_id)
+
+    def assert_rejected(result, reason):
+        status, _, body = result
+        assert status == "409 Conflict"
+        report = json.loads(body.decode("utf-8"))
+        assert report["detail"] == "snapshot freshness rejected"
+        assert report["reason"] == reason
+        assert set(report["summary"]) == {
+            "incoming_latest_rows",
+            "target_latest_rows",
+            "missing_same_day_rows",
+            "decreased_same_day_rows",
+        }
+        rendered = json.dumps(report, sort_keys=True)
+        for forbidden in (
+            "R1",
+            "m-claude",
+            "2026-01-02",
+            "input_tokens",
+            str(owner_path),
+            INGEST_SECRET,
+        ):
+            assert forbidden not in rendered
+        with open(owner_path, "rb") as handle:
+            assert handle.read() == baseline
+        with open(previous_path, "rb") as handle:
+            assert handle.read() == previous_baseline
+        assert _legacy_watermark(module, owner_id) == watermark_baseline
 
     # Same latest day but one runtime/model row missing: rejecting it must not
     # touch the tenant database.
@@ -266,24 +298,21 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
         "DELETE FROM daily_usage WHERE runtime_id = 'R2' "
         "AND model = 'm-mystery' AND date = '2026-01-02';"
     )
-    status, _, _ = post(degraded, base_ts + 10)
-    assert status == "409 Conflict"
-    assert owner_path.read_bytes() == baseline
+    assert_rejected(post(degraded, base_ts + 10), "missing_same_day_rows")
 
     lower = build(
         "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
         "WHERE runtime_id = 'R4' AND model = 'm-claude' "
         "AND date = '2026-01-02';"
     )
-    status, _, _ = post(lower, base_ts + 20)
-    assert status == "409 Conflict"
-    assert owner_path.read_bytes() == baseline
+    assert_rejected(post(lower, base_ts + 20), "decreased_same_day_counters")
+
+    empty = build("DELETE FROM daily_usage;")
+    assert_rejected(post(empty, base_ts + 25), "incoming_empty_over_populated")
 
     # Stale snapshot (older max date) with a strictly newer timestamp: rejected.
     stale = build("DELETE FROM daily_usage WHERE date = '2026-01-02';")
-    status, _, _ = post(stale, base_ts + 30)
-    assert status == "409 Conflict"
-    assert owner_path.read_bytes() == baseline
+    assert_rejected(post(stale, base_ts + 30), "incoming_older_day")
 
     # A genuinely newer snapshot still installs.
     fresh = build(

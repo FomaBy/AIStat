@@ -2,9 +2,11 @@
 
 import gzip
 import hashlib
+import io
 import json
 import sqlite3
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,7 @@ from aistat.snapshot import (
     cleanup_orphan_snapshot_sidecars,
     create_compressed_snapshot,
     daily_usage_max_date,
+    freshness_report,
     install_compressed_snapshot,
     snapshot_is_fresh_enough,
     validate_snapshot,
@@ -334,6 +337,72 @@ def test_snapshot_is_fresh_enough_fails_closed_on_read_errors(tmp_path):
     assert snapshot_is_fresh_enough(valid, tableless) is False
 
 
+def test_freshness_report_classifies_rejections_without_telemetry(tmp_path, capsys):
+    target = tmp_path / "target.db"
+    _monotonic_usage_db(
+        target,
+        [
+            ("R1", "m1", "2026-07-22", 10, 20, 30, 40),
+            ("R2", "m2", "2026-07-22", 50, 60, 70, 80),
+        ],
+    )
+    older = tmp_path / "older.db"
+    _monotonic_usage_db(
+        older, [("R1", "m1", "2026-07-21", 10, 20, 30, 40)]
+    )
+    empty = tmp_path / "empty.db"
+    _monotonic_usage_db(empty, [])
+    missing = tmp_path / "missing.db"
+    _monotonic_usage_db(
+        missing, [("R1", "m1", "2026-07-22", 10, 20, 30, 40)]
+    )
+    decreased = tmp_path / "decreased.db"
+    _monotonic_usage_db(
+        decreased,
+        [
+            ("R1", "m1", "2026-07-22", 9, 20, 30, 40),
+            ("R2", "m2", "2026-07-22", 50, 60, 70, 80),
+        ],
+    )
+    invalid = tmp_path / "invalid.db"
+    invalid.write_bytes(b"not sqlite")
+
+    for incoming, current, reason in (
+        (older, target, "incoming_older_day"),
+        (empty, target, "incoming_empty_over_populated"),
+        (missing, target, "missing_same_day_rows"),
+        (decreased, target, "decreased_same_day_counters"),
+        (invalid, target, "incoming_unreadable"),
+        (older, invalid, "target_unreadable"),
+    ):
+        report = freshness_report(incoming, current)
+        assert report["verdict"] == "reject"
+        assert report["reason"] == reason
+        assert set(report["summary"]) == {
+            "incoming_latest_rows",
+            "target_latest_rows",
+            "missing_same_day_rows",
+            "decreased_same_day_rows",
+        }
+        assert all(isinstance(value, int) for value in report["summary"].values())
+        assert snapshot_is_fresh_enough(incoming, current) is False
+
+    incoming_before = decreased.read_bytes()
+    target_before = target.read_bytes()
+    assert snapshot_module.main([str(decreased), str(target)]) == 1
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered)["reason"] == "decreased_same_day_counters"
+    assert decreased.read_bytes() == incoming_before
+    assert target.read_bytes() == target_before
+    assert not list(tmp_path.glob("*.db-*"))
+    for forbidden in ("R1", "m1", "2026-07-22", "input_tokens", SECRET):
+        assert forbidden not in rendered
+    for unsafe_flag in ("--force", "--downgrade"):
+        with pytest.raises(SystemExit) as excinfo:
+            snapshot_module.main([str(decreased), str(target), unsafe_flag])
+        assert excinfo.value.code == 2
+
+
 def test_snapshot_round_trip_and_size_limit(tmp_path):
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
@@ -609,6 +678,57 @@ def test_publisher_rejects_http_even_with_insecure_env(
     with pytest.raises(PublishError, match="must use HTTPS"):
         publish_once(config, opener=opener)
     assert opener_calls == []
+
+
+def test_publisher_reports_only_allowlisted_freshness_reason(tmp_path):
+    db_path = tmp_path / "source.db"
+    seeded_db(db_path)
+    config = Config()
+    config.db_path = db_path
+    config.publish_url = "https://localhost/api/ingest/snapshot"
+    config.ingest_secret = SECRET
+    config.publish_tenant_id = TENANT_ID
+
+    def rejected(body):
+        def opener(_request, timeout):
+            assert timeout == config.publish_timeout_seconds
+            raise urllib.error.HTTPError(
+                config.publish_url,
+                409,
+                "Conflict",
+                None,
+                io.BytesIO(body),
+            )
+
+        return opener
+
+    response = json.dumps(
+        {
+            "detail": "snapshot freshness rejected",
+            "reason": "incoming_older_day",
+            "summary": {"incoming_latest_rows": 1},
+            "runtime_id": "R1",
+            "model": "secret-model",
+            "hmac": SECRET,
+        }
+    ).encode("utf-8")
+    with pytest.raises(PublishError) as excinfo:
+        publish_once(config, opener=rejected(response), now=1234)
+    assert str(excinfo.value) == (
+        "host rejected snapshot freshness: incoming_older_day"
+    )
+
+    with pytest.raises(PublishError) as excinfo:
+        publish_once(
+            config,
+            opener=rejected(
+                b'{"detail":"snapshot freshness rejected",'
+                b'"reason":"force","secret":"' + SECRET.encode("utf-8") + b'"}'
+            ),
+            now=1234,
+        )
+    assert str(excinfo.value) == "host rejected snapshot with HTTP 409"
+    assert SECRET not in str(excinfo.value)
 
 
 def test_publisher_rejects_mismatched_host_confirmation(tmp_path):

@@ -1,8 +1,10 @@
 """Create, validate and atomically install AIStat SQLite snapshots."""
 
+import argparse
 import gzip
 import hashlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -52,6 +54,16 @@ _DAILY_USAGE_COUNTERS = (
     "cache_write_tokens",
 )
 _UNREADABLE_DAILY_USAGE = object()
+FRESHNESS_REJECTION_REASONS = frozenset(
+    (
+        "incoming_older_day",
+        "incoming_empty_over_populated",
+        "missing_same_day_rows",
+        "decreased_same_day_counters",
+        "incoming_unreadable",
+        "target_unreadable",
+    )
+)
 
 
 def _temp_path(parent: Path, suffix: str) -> Path:
@@ -369,59 +381,113 @@ def _daily_usage_state(path: Path):
     return latest, usage
 
 
-def snapshot_is_fresh_enough(staged_path: Path, target_path: Path) -> bool:
-    """Whether installing ``staged_path`` over ``target_path`` keeps usage moving forward.
+def freshness_report(incoming_path: Path, target_path: Path):
+    """Classify whether replacing ``target_path`` with ``incoming_path`` is safe.
 
-    The host already rejects timestamp *replays* (a snapshot whose signed
-    timestamp is not newer than the last accepted one). This adds an orthogonal
-    guard on the *data*: a snapshot must never move a tenant's daily usage
-    backwards in time. It protects against a stale or degraded publisher — e.g.
-    an owner poller whose CLI session lapsed and now emits freshly-timestamped
-    but old-dated snapshots — overwriting a tenant database that a healthier
-    publisher has already advanced to a newer day.
-
-    Accepts a valid first ingest, an empty target, a newer latest day, or a
-    same-day snapshot in which every existing ``(runtime_id, model, date)`` row
-    remains present and all four token counters stay equal or grow. New rows are
-    allowed. Rejects older/empty-over-populated data, missing or decreased
-    same-day rows, and every read/type error. This is deliberately fail-closed
-    for an existing target: only a genuinely absent target means first ingest.
+    The report contains only a verdict, a stable reason code, and aggregate row
+    counts. Both SQLite files are opened read-only; no snapshot, sidecar,
+    migration, or watermark is created or changed.
     """
-    incoming_state = _daily_usage_state(staged_path)
+    summary = {
+        "incoming_latest_rows": 0,
+        "target_latest_rows": 0,
+        "missing_same_day_rows": 0,
+        "decreased_same_day_rows": 0,
+    }
+    incoming_state = _daily_usage_state(incoming_path)
     if incoming_state is _UNREADABLE_DAILY_USAGE:
-        return False
+        return {
+            "verdict": "reject",
+            "reason": "incoming_unreadable",
+            "summary": summary,
+        }
     incoming_date, incoming_rows = incoming_state
+    summary["incoming_latest_rows"] = len(incoming_rows)
 
     target_path = Path(target_path)
     try:
         if not target_path.exists():
-            return True
+            return {"verdict": "accept", "reason": None, "summary": summary}
     except OSError:
-        return False
+        return {
+            "verdict": "reject",
+            "reason": "target_unreadable",
+            "summary": summary,
+        }
 
     current_state = _daily_usage_state(target_path)
     if current_state is _UNREADABLE_DAILY_USAGE:
-        return False
+        return {
+            "verdict": "reject",
+            "reason": "target_unreadable",
+            "summary": summary,
+        }
     current_date, current_rows = current_state
+    summary["target_latest_rows"] = len(current_rows)
     if current_date is None:
-        return True
-    if incoming_date is None or incoming_date < current_date:
-        return False
+        return {"verdict": "accept", "reason": None, "summary": summary}
+    if incoming_date is None:
+        return {
+            "verdict": "reject",
+            "reason": "incoming_empty_over_populated",
+            "summary": summary,
+        }
+    if incoming_date < current_date:
+        return {
+            "verdict": "reject",
+            "reason": "incoming_older_day",
+            "summary": summary,
+        }
     if incoming_date > current_date:
-        return True
+        return {"verdict": "accept", "reason": None, "summary": summary}
 
+    missing_rows = 0
+    decreased_rows = 0
     for key, current_counters in current_rows.items():
         incoming_counters = incoming_rows.get(key)
         if incoming_counters is None:
-            return False
-        if any(
+            missing_rows += 1
+        elif any(
             incoming_value < current_value
             for incoming_value, current_value in zip(
                 incoming_counters, current_counters
             )
         ):
-            return False
-    return True
+            decreased_rows += 1
+    summary["missing_same_day_rows"] = missing_rows
+    summary["decreased_same_day_rows"] = decreased_rows
+    if missing_rows:
+        return {
+            "verdict": "reject",
+            "reason": "missing_same_day_rows",
+            "summary": summary,
+        }
+    if decreased_rows:
+        return {
+            "verdict": "reject",
+            "reason": "decreased_same_day_counters",
+            "summary": summary,
+        }
+    return {"verdict": "accept", "reason": None, "summary": summary}
+
+
+def snapshot_is_fresh_enough(staged_path: Path, target_path: Path) -> bool:
+    """Return the existing fail-closed freshness verdict."""
+    return freshness_report(staged_path, target_path)["verdict"] == "accept"
+
+
+def main(argv=None) -> int:
+    """Print a safe, read-only freshness report for two SQLite copies."""
+    parser = argparse.ArgumentParser(
+        prog="python -m aistat.snapshot",
+        description="Compare two AIStat SQLite copies without modifying either.",
+    )
+    parser.add_argument("incoming", help="candidate SQLite copy")
+    parser.add_argument("target", help="current SQLite copy")
+    args = parser.parse_args(argv)
+    report = freshness_report(Path(args.incoming), Path(args.target))
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["verdict"] == "accept" else 1
 
 
 def stage_compressed_snapshot(
@@ -473,3 +539,7 @@ def install_compressed_snapshot(
     finally:
         _cleanup_snapshot_temp_files(staged_path)
     return info
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -50,7 +50,7 @@ from .security import (
 )
 from .snapshot import (
     SnapshotError,
-    snapshot_is_fresh_enough,
+    freshness_report,
     stage_compressed_snapshot,
 )
 from .snapshot_recovery import cleanup_staged_file, swap_staged_into_place
@@ -762,10 +762,15 @@ def create_app(config: Optional[Config] = None) -> Flask:
             # this tenant's usage backwards in time (e.g. a lapsed owner poller
             # overwriting a newer connected-collector snapshot). Independent of
             # the timestamp replay check above, which only bounds the signature.
-            if not snapshot_is_fresh_enough(staged_path, target_path):
+            report = freshness_report(staged_path, target_path)
+            if report["verdict"] != "accept":
                 cleanup_staged_file(staged_path)
                 return jsonify(
-                    {"detail": "snapshot older than current data rejected"}
+                    {
+                        "detail": "snapshot freshness rejected",
+                        "reason": report["reason"],
+                        "summary": report["summary"],
+                    }
                 ), 409
             # Journal the intent before touching the tenant database so a crash
             # between the file swap and the watermark update recovers to a
