@@ -116,9 +116,13 @@ def make_installer(tmp_path, controller, preflight_fn=ok_preflight,
     )
 
 
-def active_marker(installer):
-    text = (installer.paths.code / "aistat" / "__init__.py").read_text()
+def marker_at(code_dir):
+    text = (Path(code_dir) / "aistat" / "__init__.py").read_text()
     return text.split("=", 1)[1].strip().strip("'\"")
+
+
+def active_marker(installer):
+    return marker_at(installer.paths.code)
 
 
 def valid_preflight_config(tmp_path):
@@ -489,19 +493,117 @@ def test_rollback_refuses_a_generation_that_fails_its_own_preflight(tmp_path):
     assert controller.calls == calls_before
 
 
+# ---- a rejected rollback gives the generation it replaced back -----------
+# (FAN-2038: rollback consumed code.prev before the health gate, so a target
+# that never reported healthy stayed active while the known-good generation it
+# replaced had already been deleted.)
+
+def failing_health(fail_times=1):
+    """Health gate rejecting the first ``fail_times`` generations it sees."""
+    def health(previous_pid=None):
+        health.calls.append(previous_pid)
+        if len(health.calls) <= fail_times:
+            raise ri.LaunchError("no healthy supervisor")
+
+    health.calls = []
+    return health
+
+
 def test_rollback_fails_when_the_restored_supervisor_never_reports_healthy(
     tmp_path,
 ):
-    def unhealthy(previous_pid=None):
-        raise ri.LaunchError("no healthy supervisor")
-
     controller = FakeController()
-    installer = make_installer(tmp_path, controller, health_fn=unhealthy)
+    health = failing_health()
+    installer = make_installer(tmp_path, controller, health_fn=health)
     installer.install(make_stage(tmp_path, "stage1", "v1"))
     installer.install(make_stage(tmp_path, "stage2", "v2"))
+    before = snapshot_state(installer.paths.runtime_root,
+                            installer.paths.plist_dir)
+    calls_before = len(controller.calls)
 
     with pytest.raises(ri.LaunchError):
         installer.rollback()
+
+    # The working v2 generation is back byte-for-byte, the rejected v1 stays
+    # in code.prev for diagnosis and nothing is left parked — the whole state
+    # equals the one before the rollback.
+    assert active_marker(installer) == "v2"
+    assert marker_at(installer.paths.code_prev) == "v1"
+    assert not installer.paths.code_hold.exists()
+    assert snapshot_state(installer.paths.runtime_root,
+                          installer.paths.plist_dir) == before
+    # Exactly one runtime: the rejected target's job was booted out and the
+    # restored generation re-bootstrapped, then health-checked in its turn.
+    assert controller.calls[calls_before:] == [
+        ("bootout", ri.LABEL), ("bootstrap", str(installer.paths.plist)),
+        ("bootout", ri.LABEL), ("bootstrap", str(installer.paths.plist)),
+    ]
+    assert len(health.calls) == 2
+    assert controller.loaded
+
+
+def test_rollback_recovery_failure_is_terminal_and_keeps_both_generations(
+    tmp_path,
+):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller,
+                               health_fn=failing_health(fail_times=2))
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    with pytest.raises(ri.RollbackRecoveryError) as exc_info:
+        installer.rollback()
+
+    # Its own terminal error, no healthy claim, and both generations survive
+    # for diagnosis: the one that was working back in code/, the rejected one
+    # in code.prev/.
+    assert "no runtime is proven healthy" in str(exc_info.value)
+    assert active_marker(installer) == "v2"
+    assert marker_at(installer.paths.code_prev) == "v1"
+    assert not installer.paths.code_hold.exists()
+
+
+def test_successful_rollback_drops_the_parked_copy_only_after_health(tmp_path):
+    parked = {}
+
+    def health(previous_pid=None):
+        parked["exists"] = installer.paths.code_hold.exists()
+        parked["marker"] = marker_at(installer.paths.code_hold)
+
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller, health_fn=health)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    installer.rollback()
+
+    # The generation being replaced is still on disk while the restored one
+    # proves itself, and is dropped only once it has.
+    assert parked == {"exists": True, "marker": "v2"}
+    assert active_marker(installer) == "v1"
+    assert not installer.paths.code_hold.exists()
+    assert not installer.paths.code_prev.exists()
+
+
+def test_rollback_refuses_to_start_with_a_parked_generation(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+    # What a rollback killed between its two renames leaves behind: the copy
+    # to keep is a manual decision, not something a retry may overwrite.
+    installer.paths.code_hold.mkdir()
+    before = snapshot_state(installer.paths.runtime_root,
+                            installer.paths.plist_dir)
+    calls_before = list(controller.calls)
+
+    with pytest.raises(ri.RuntimeInstallError) as exc_info:
+        installer.rollback()
+
+    assert "did not finish" in str(exc_info.value)
+    assert snapshot_state(installer.paths.runtime_root,
+                          installer.paths.plist_dir) == before
+    assert controller.calls == calls_before
 
 
 def test_install_recovery_leaves_an_unstartable_previous_generation_stopped(
@@ -880,6 +982,32 @@ def test_cli_rollback_valid_env_preflights_once_then_restores(
     marker = (root / "code" / "aistat" / "__init__.py").read_text()
     assert "previous" in marker
     assert not (root / "code.prev").exists()
+
+
+def test_cli_rollback_bootstrap_failure_restores_the_working_runtime(
+    tmp_path, monkeypatch, capsys, clean_env
+):
+    # End to end through the CLI with the real post-health check: the target
+    # generation never bootstraps, so the recovery has to put the working one
+    # back and wait for the status file its supervisor publishes.
+    root, plist_dir = make_installed_runtime(tmp_path)
+    env_file = tmp_path / "production.env"
+    write_env_file(env_file, env_file_values(tmp_path))
+    controllers = patch_cli_controller(monkeypatch, loaded=True,
+                                       fail_bootstraps=1, status_root=root)
+
+    rc = run_cli("rollback", root, plist_dir, env_file)
+
+    assert rc == 1
+    assert marker_at(root / "code") == "active"
+    assert marker_at(root / "code.prev") == "previous"
+    assert not (root / "code.rollback").exists()
+    assert (root / "data" / "aistat.db").read_bytes() == b"owner-data"
+    assert controllers[0].loaded
+    err = capsys.readouterr().err
+    assert "bootstrap refused" in err
+    for sentinel in SENTINELS:
+        assert sentinel not in err
 
 
 def test_cli_rollback_without_previous_stays_side_effect_free(
@@ -1495,6 +1623,25 @@ def test_rollback_retires_resurrected_legacy(tmp_path):
     assert active_marker(installer) == "v1"
     assert controller.loaded
     assert LEGACY not in controller.loaded_labels
+    assert not installer.paths.legacy_plist.exists()
+    assert legacy_data_intact(installer)
+
+
+def test_rejected_rollback_recovers_without_resurrecting_legacy(tmp_path):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller,
+                               health_fn=failing_health())
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+    install_legacy_generation(installer, controller)
+
+    with pytest.raises(ri.LaunchError):
+        installer.rollback()
+
+    # Exactly one runtime after the recovery: the restored v2 supervisor. The
+    # legacy job the rollback had already retired does not come back.
+    assert active_marker(installer) == "v2"
+    assert controller.loaded_labels == {ri.LABEL}
     assert not installer.paths.legacy_plist.exists()
     assert legacy_data_intact(installer)
 

@@ -37,7 +37,11 @@ runs *its own* preflight before the commit point, and the restored supervisor
 must report healthy afterwards. A generation that cannot start under the
 effective configuration is refused with the live runtime untouched; the same
 check keeps a failed install's recovery from bootstrapping a copy that would
-only crash-loop.
+only crash-loop. The generation being replaced is *parked* in ``code.rollback``
+until that health gate passes, so a target rejected after the swap is undone
+byte-for-byte: the working generation comes back and must prove its own fresh
+health, the rejected copy is kept in ``code.prev`` for diagnosis, and only a
+recovery that fails too is terminal — with both generations still on disk.
 
 A machine may still run the *legacy* ``com.aistat.sync`` generation — the
 pre-supervisor launchd job that kept ``aistat.poller`` and ``aistat.publish
@@ -111,6 +115,15 @@ class PreflightFailed(RuntimeInstallError):
 
 class LaunchError(RuntimeInstallError):
     pass
+
+
+class RollbackRecoveryError(RuntimeInstallError):
+    """A rollback was rejected *and* the generation it replaced stayed down.
+
+    The one state this module cannot repair on its own, so it is reported as
+    its own terminal error: both code generations are kept on disk and no
+    runtime is claimed healthy.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +269,12 @@ class InstallPaths:
     @property
     def code_prev(self) -> Path:
         return self.runtime_root / "code.prev"
+
+    @property
+    def code_hold(self) -> Path:
+        # Where rollback parks the generation it is replacing until the
+        # restored one proves healthy.
+        return self.runtime_root / "code.rollback"
 
     @property
     def data(self) -> Path:
@@ -448,7 +467,8 @@ class Installer:
         for plist in (legacy_plist, self.paths.plist):
             if plist.exists():
                 plist.unlink()
-        for path in (self.paths.code, self.paths.code_prev):
+        for path in (self.paths.code, self.paths.code_prev,
+                     self.paths.code_hold):
             if path.exists():
                 shutil.rmtree(path)
         self._purge_legacy_artifacts()
@@ -466,7 +486,20 @@ class Installer:
         under the effective configuration therefore fails closed with the
         current runtime untouched, instead of crash-looping — or, on an old
         enough copy, resurrecting the retired owner poller and publisher.
+
+        The copy being replaced is parked, never deleted, so the post-health
+        gate has something to fail back to: a target that does not come up
+        healthy is undone byte-for-byte and its rejected copy is kept in
+        ``code.prev``. Only a rollback that passes its health gate drops the
+        parked generation.
         """
+        if self.paths.code_hold.exists():
+            raise RuntimeInstallError(
+                "a previous rollback did not finish: {} still holds a code "
+                "generation. Both generations are on disk — move the one to "
+                "keep into code/ before rolling back again".format(
+                    self.paths.code_hold)
+            )
         if not self.paths.code_prev.exists():
             raise RuntimeInstallError("no previous code copy to roll back to")
         self._require_preflight()
@@ -476,9 +509,20 @@ class Installer:
         # generation is not supported — rollback stays within code.prev.
         self._retire_legacy(self._capture_legacy())
         previous_pid = (self._read_supervisor_status() or {}).get("pid")
-        self._restore_previous(True, preflighted=True)
-        self._postflight()
-        self._health_fn(previous_pid)
+        self._activate_previous()
+        try:
+            self._bootstrap_active()
+            self._postflight()
+            self._health_fn(previous_pid)
+        except Exception as exc:
+            logger.error("rollback failed (%s); restoring the generation it "
+                         "replaced", type(exc).__name__)
+            self._restore_parked_generation(exc)
+            raise
+        # Commit: the restored generation is live and healthy, so the copy it
+        # replaced is no longer needed.
+        if self.paths.code_hold.exists():
+            shutil.rmtree(str(self.paths.code_hold))
         return self.status()
 
     def restart(self) -> Dict:
@@ -592,15 +636,14 @@ class Installer:
             os.replace(str(self.paths.code), str(self.paths.code_prev))
         shutil.move(str(stage_dir), str(self.paths.code))
 
-    def _restore_previous(self, had_previous_code: bool, *,
-                          preflighted: bool = False) -> None:
+    def _restore_previous(self, had_previous_code: bool) -> None:
         # Remove the half-installed code and put the previous copy back.
         if self.paths.code.exists():
             shutil.rmtree(self.paths.code)
         if not (had_previous_code and self.paths.code_prev.exists()):
             return
         os.replace(str(self.paths.code_prev), str(self.paths.code))
-        if not preflighted and self._generation_failure(self.paths.code):
+        if self._generation_failure(self.paths.code):
             # Recovery from a failed install: the restored copy is back on
             # disk, but starting a generation that fails its own preflight
             # would crash-loop and, on an old copy, re-run the retired owner
@@ -609,12 +652,51 @@ class Installer:
                          "the runtime stays stopped")
             return
         try:
-            self._write_plist(render_plist(
-                self.paths.runtime_root, self.python, self.env_file))
-            self.controller.bootout(LABEL, self.paths.plist)
-            self.controller.bootstrap(self.paths.plist)
+            self._bootstrap_active()
         except Exception:
             logger.error("could not re-bootstrap the restored runtime")
+
+    def _activate_previous(self) -> None:
+        """Park the running generation, then move ``code.prev`` into place.
+
+        Renames, never copies: ``code.rollback`` holds the exact bytes that
+        were running, so a rejected rollback can be undone byte-for-byte.
+        """
+        if self.paths.code.exists():
+            os.replace(str(self.paths.code), str(self.paths.code_hold))
+        os.replace(str(self.paths.code_prev), str(self.paths.code))
+
+    def _restore_parked_generation(self, failure: Exception) -> None:
+        """Undo a rejected rollback and prove the parked generation healthy.
+
+        The rejected target is kept in ``code.prev`` for diagnosis and the
+        generation it replaced goes back to ``code`` unchanged — and has to
+        report a fresh healthy supervisor of its own, because a rollback that
+        left the machine without a running runtime is not a state the operator
+        may hear about only as "rollback failed".
+        """
+        try:
+            os.replace(str(self.paths.code), str(self.paths.code_prev))
+            os.replace(str(self.paths.code_hold), str(self.paths.code))
+            rejected_pid = (self._read_supervisor_status() or {}).get("pid")
+            self._bootstrap_active()
+            self._postflight()
+            self._health_fn(rejected_pid)
+        except Exception as exc:
+            raise RollbackRecoveryError(
+                "rollback failed ({}: {}) and the generation it replaced could "
+                "not be restored ({}: {}); both code generations are kept "
+                "under {} and no runtime is proven healthy".format(
+                    type(failure).__name__, failure,
+                    type(exc).__name__, exc, self.paths.runtime_root)
+            )
+
+    def _bootstrap_active(self) -> None:
+        """Re-render the plist and (re)bootstrap the job on ``code/``."""
+        self._write_plist(render_plist(
+            self.paths.runtime_root, self.python, self.env_file))
+        self.controller.bootout(LABEL, self.paths.plist)
+        self.controller.bootstrap(self.paths.plist)
 
     def _write_plist(self, text: str) -> None:
         self.paths.plist.parent.mkdir(parents=True, exist_ok=True)
