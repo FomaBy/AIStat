@@ -106,10 +106,14 @@ def test_restore_roundtrip_keeps_pre_restore_copy(cfg):
     conn.commit()
     conn.close()
     assert _issue_count(cfg.db_path) == 0
+    pre_restore_bytes = cfg.db_path.read_bytes()
 
     report = restore_backup(cfg, "latest", dry_run=False)
     assert any(m["label"] == "aistat.db" for m in report["restored"])
-    assert (cfg.db_path.parent / "aistat.db.pre-restore").is_file()
+    previous = cfg.db_path.parent / "aistat.db.pre-restore"
+    assert previous.read_bytes() == pre_restore_bytes
+    assert stat.S_IMODE(previous.stat().st_mode) == 0o600
+    assert stat.S_IMODE(cfg.db_path.stat().st_mode) == 0o600
     assert _issue_count(cfg.db_path) == 5
 
 
@@ -235,14 +239,28 @@ def test_restore_recreates_a_missing_worker_store_owner_only(cfg):
     assert stat.S_IMODE(cfg.worker_tenants_dir.stat().st_mode) == 0o700
 
 
-def test_symlinked_tenant_database_is_never_backed_up(cfg, tmp_path):
+def test_create_refuses_a_symlinked_tenant_database(cfg, tmp_path):
     outside = tmp_path / "outside.db"
     _tenant_db(outside, rows=1)
     cfg.worker_tenants_dir.mkdir(parents=True, exist_ok=True)
     (cfg.worker_tenants_dir / "9.db").symlink_to(outside)
+    before = outside.read_bytes()
 
-    labels = {m["label"] for m in backup.load_manifest(create_backup(cfg))["members"]}
-    assert not any(label.startswith("worker_tenants/") for label in labels)
+    with pytest.raises(BackupError, match="symlink"):
+        create_backup(cfg)
+    assert outside.read_bytes() == before
+
+
+def test_create_refuses_a_symlinked_tenant_store(cfg, tmp_path):
+    outside = tmp_path / "outside"
+    _tenant_db(outside / "9.db", rows=1)
+    cfg.worker_tenants_dir.symlink_to(outside, target_is_directory=True)
+    before = (outside / "9.db").read_bytes()
+
+    with pytest.raises(BackupError, match="symlink"):
+        create_backup(cfg)
+    assert (outside / "9.db").read_bytes() == before
+    assert not list(cfg.backup_dir.glob("aistat-*"))
 
 
 @pytest.mark.parametrize(
@@ -273,12 +291,154 @@ def test_legacy_bare_tenant_label_still_restores_into_tenants(cfg):
     # A generation written before the stores were labelled: bare basename.
     for member in manifest["members"]:
         if member["label"] == "tenants/7.db":
+            old_source = gen / member["file"]
             member["label"] = "7.db"
+            member["file"] = "7.db.gz"
+            old_source.rename(gen / member["file"])
     (gen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     report = restore_backup(cfg, gen.name, dry_run=True)
     targets = {m["label"]: m["target"] for m in report["would_restore"]}
     assert targets["7.db"] == str(cfg.tenants_dir / "7.db")
+
+
+def test_manifest_file_cannot_escape_the_generation(cfg, tmp_path):
+    gen = create_backup(cfg)
+    manifest = backup.load_manifest(gen)
+    member = manifest["members"][0]
+    source = gen / member["file"]
+    outside = tmp_path / "outside.gz"
+    source.rename(outside)
+    before = outside.read_bytes()
+    member["file"] = str(outside)
+    (gen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BackupError, match="archive file"):
+        verify_backup(cfg, gen.name)
+    assert outside.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["verify", "restore", "self-test"])
+def test_all_backup_consumers_share_manifest_path_validation(
+    cfg, monkeypatch, operation
+):
+    gen = create_backup(cfg)
+    manifest = backup.load_manifest(gen)
+    manifest["members"][0]["file"] = "../aistat.db.gz"
+    (gen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    if operation == "verify":
+        call = lambda: verify_backup(cfg, gen.name)
+    elif operation == "restore":
+        call = lambda: restore_backup(cfg, gen.name, dry_run=True)
+    else:
+        monkeypatch.setattr(backup, "create_backup", lambda *_args, **_kwargs: gen)
+        call = lambda: self_test(cfg)
+    with pytest.raises(BackupError, match="archive file"):
+        call()
+
+
+def test_verify_refuses_duplicate_manifest_members(cfg):
+    gen = create_backup(cfg)
+    manifest = backup.load_manifest(gen)
+    manifest["members"].append(dict(manifest["members"][0]))
+    (gen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BackupError, match="duplicate"):
+        verify_backup(cfg, gen.name)
+
+
+def test_verify_refuses_a_symlinked_archive_member(cfg, tmp_path):
+    gen = create_backup(cfg)
+    manifest = backup.load_manifest(gen)
+    source = gen / manifest["members"][0]["file"]
+    outside = tmp_path / source.name
+    source.rename(outside)
+    source.symlink_to(outside)
+    before = outside.read_bytes()
+
+    with pytest.raises(BackupError, match="non-symlink"):
+        verify_backup(cfg, gen.name)
+    assert outside.read_bytes() == before
+
+
+def test_restore_preflights_all_pre_restore_paths(cfg, tmp_path):
+    _tenant_db(cfg.worker_tenants_dir / "7.db", rows=1)
+    gen = create_backup(cfg)
+    conn = connect(cfg.db_path)
+    conn.execute("DELETE FROM issues")
+    conn.commit()
+    conn.close()
+    live_main = cfg.db_path.read_bytes()
+    outside = tmp_path / "outside.db"
+    outside.write_bytes(b"external")
+    previous = cfg.worker_tenants_dir / "7.db.pre-restore"
+    previous.symlink_to(outside)
+
+    with pytest.raises(BackupError, match="symlink"):
+        restore_backup(cfg, gen.name)
+    assert cfg.db_path.read_bytes() == live_main
+    assert outside.read_bytes() == b"external"
+
+
+def test_restore_refuses_a_symlinked_target_parent(cfg, tmp_path):
+    _tenant_db(cfg.worker_tenants_dir / "7.db", rows=1)
+    gen = create_backup(cfg)
+    shutil.rmtree(str(cfg.worker_tenants_dir))
+    outside = tmp_path / "outside"
+    _tenant_db(outside / "7.db", rows=8)
+    cfg.worker_tenants_dir.symlink_to(outside, target_is_directory=True)
+    before = (outside / "7.db").read_bytes()
+
+    with pytest.raises(BackupError, match="symlink"):
+        restore_backup(cfg, gen.name)
+    assert (outside / "7.db").read_bytes() == before
+
+
+def test_multi_member_restore_rolls_back_exact_state(cfg, monkeypatch):
+    _make_generic_db(cfg.security_db_path)
+    _make_generic_db(cfg.worker_store_path)
+    gen = create_backup(cfg)
+
+    conn = connect(cfg.db_path)
+    conn.execute("DELETE FROM issues")
+    conn.commit()
+    conn.close()
+    cfg.security_db_path.unlink()
+    cfg.worker_store_path.write_bytes(b"untouched worker")
+    os_mode = 0o640
+    cfg.db_path.chmod(os_mode)
+    previous = cfg.db_path.with_name(cfg.db_path.name + ".pre-restore")
+    previous.write_bytes(b"older pre-restore")
+    previous.chmod(0o620)
+    wal = Path(str(cfg.db_path) + "-wal")
+    shm = Path(str(cfg.db_path) + "-shm")
+    wal.write_bytes(b"original wal")
+    shm.write_bytes(b"original shm")
+    before = {
+        path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for path in (cfg.db_path, previous, wal, shm, cfg.worker_store_path)
+    }
+
+    real_install = backup._atomic_install
+    calls = []
+
+    def fail_after_first_install(scratch, target):
+        calls.append(target)
+        real_install(scratch, target)
+        if len(calls) == 2:
+            raise OSError("injected second-member failure")
+
+    monkeypatch.setattr(backup, "_atomic_install", fail_after_first_install)
+    with pytest.raises(OSError, match="injected"):
+        restore_backup(cfg, gen.name)
+
+    assert len(calls) == 2
+    for path, (content, mode) in before.items():
+        assert path.read_bytes() == content
+        assert stat.S_IMODE(path.stat().st_mode) == mode
+    assert not cfg.security_db_path.exists()
+    assert not cfg.security_db_path.with_name("security.db.pre-restore").exists()
 
 
 def test_clean_removes_orphan_snapshot_sidecar(cfg):
