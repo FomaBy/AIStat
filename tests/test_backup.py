@@ -1,7 +1,11 @@
 """Backup, verify, restore and self-test of AIStat's SQLite data (FAN-1185)."""
 
 import gzip
+import hashlib
+import json
+import shutil
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -55,6 +59,7 @@ def cfg(tmp_path):
         security_db_path=data / "security.db",
         worker_store_path=data / "worker_connections.db",
         tenants_dir=data / "tenants",
+        worker_tenants_dir=data / "worker_tenants",
         backup_dir=data / "backups",
         backup_retention=14,
     )
@@ -157,10 +162,123 @@ def test_no_databases_is_an_error(tmp_path):
         security_db_path=data / "security.db",
         worker_store_path=data / "worker_connections.db",
         tenants_dir=data / "tenants",
+        worker_tenants_dir=data / "worker_tenants",
         backup_dir=data / "backups",
     )
     with pytest.raises(BackupError):
         create_backup(cfg)
+
+
+# ---- per-tenant stores (FAN-2031) ----------------------------------------
+
+def _tenant_db(path: Path, rows: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE runtimes (id INTEGER)")
+    conn.executemany("INSERT INTO runtimes VALUES (?)", [(i,) for i in range(rows)])
+    conn.commit()
+    conn.close()
+
+
+def _row_count(path: Path) -> int:
+    conn = sqlite3.connect(str(path))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM runtimes").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_backs_up_both_tenant_stores_without_basename_collision(cfg):
+    # The collector writes worker_tenants/<user>.db; the ingest side keeps
+    # tenants/<user>.db. One user id => the same basename in both stores.
+    _tenant_db(cfg.tenants_dir / "7.db", rows=2)
+    _tenant_db(cfg.worker_tenants_dir / "7.db", rows=9)
+
+    gen = create_backup(cfg)
+    members = {m["label"]: m for m in backup.load_manifest(gen)["members"]}
+    assert {"tenants/7.db", "worker_tenants/7.db"} <= set(members)
+
+    # Wipe both live databases, then prove each one restores into its own
+    # store, byte-for-byte as captured, instead of one overwriting the other.
+    (cfg.worker_tenants_dir / "7.db").write_bytes(b"")
+    (cfg.tenants_dir / "7.db").write_bytes(b"")
+
+    report = restore_backup(cfg, gen.name, dry_run=False)
+    restored = {m["label"]: m["target"] for m in report["restored"]}
+    assert restored["worker_tenants/7.db"] == str(cfg.worker_tenants_dir / "7.db")
+    assert restored["tenants/7.db"] == str(cfg.tenants_dir / "7.db")
+    for label, path in (
+        ("worker_tenants/7.db", cfg.worker_tenants_dir / "7.db"),
+        ("tenants/7.db", cfg.tenants_dir / "7.db"),
+    ):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert digest == members[label]["sha256"]
+    assert _row_count(cfg.worker_tenants_dir / "7.db") == 9
+    assert _row_count(cfg.tenants_dir / "7.db") == 2
+
+
+def test_self_test_covers_the_worker_tenant_store(cfg):
+    _tenant_db(cfg.worker_tenants_dir / "42.db", rows=3)
+
+    report = self_test(cfg)
+    members = {m["label"]: m for m in report["members"]}
+    assert members["worker_tenants/42.db"]["row_counts"] == {"runtimes": 3}
+
+
+def test_restore_recreates_a_missing_worker_store_owner_only(cfg):
+    _tenant_db(cfg.worker_tenants_dir / "7.db", rows=1)
+    gen = create_backup(cfg)
+    shutil.rmtree(str(cfg.worker_tenants_dir))
+
+    restore_backup(cfg, gen.name, dry_run=False)
+    assert _row_count(cfg.worker_tenants_dir / "7.db") == 1
+    assert stat.S_IMODE(cfg.worker_tenants_dir.stat().st_mode) == 0o700
+
+
+def test_symlinked_tenant_database_is_never_backed_up(cfg, tmp_path):
+    outside = tmp_path / "outside.db"
+    _tenant_db(outside, rows=1)
+    cfg.worker_tenants_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.worker_tenants_dir / "9.db").symlink_to(outside)
+
+    labels = {m["label"] for m in backup.load_manifest(create_backup(cfg))["members"]}
+    assert not any(label.startswith("worker_tenants/") for label in labels)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "worker_tenants/../../escape.db",
+        "worker_tenants//7.db",
+        "worker_tenants/nested/7.db",
+        "unknown_store/7.db",
+        "worker_tenants/.env",
+        "../escape.db",
+    ],
+)
+def test_restore_refuses_a_tampered_member_label(cfg, label):
+    gen = create_backup(cfg)
+    manifest = backup.load_manifest(gen)
+    manifest["members"][0]["label"] = label
+    (gen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BackupError):
+        restore_backup(cfg, gen.name, dry_run=True)
+
+
+def test_legacy_bare_tenant_label_still_restores_into_tenants(cfg):
+    _tenant_db(cfg.tenants_dir / "7.db", rows=4)
+    gen = create_backup(cfg)
+    manifest = backup.load_manifest(gen)
+    # A generation written before the stores were labelled: bare basename.
+    for member in manifest["members"]:
+        if member["label"] == "tenants/7.db":
+            member["label"] = "7.db"
+    (gen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = restore_backup(cfg, gen.name, dry_run=True)
+    targets = {m["label"]: m["target"] for m in report["would_restore"]}
+    assert targets["7.db"] == str(cfg.tenants_dir / "7.db")
 
 
 def test_clean_removes_orphan_snapshot_sidecar(cfg):

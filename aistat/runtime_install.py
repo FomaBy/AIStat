@@ -31,6 +31,14 @@ would have no configuration to reload. Only ``uninstall`` (and ``status``/
 ``render``) stays available as a fail-safe path when the configuration is
 invalid or absent.
 
+``rollback`` adds two gates of its own, because the copy in ``code.prev`` may
+carry a different configuration contract than the code it replaces: that copy
+runs *its own* preflight before the commit point, and the restored supervisor
+must report healthy afterwards. A generation that cannot start under the
+effective configuration is refused with the live runtime untouched; the same
+check keeps a failed install's recovery from bootstrapping a copy that would
+only crash-loop.
+
 A machine may still run the *legacy* ``com.aistat.sync`` generation — the
 pre-supervisor launchd job that kept ``aistat.poller`` and ``aistat.publish
 --watch`` alive via ``sync_to_host.sh`` on the same runtime root and data.
@@ -53,6 +61,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -271,6 +280,10 @@ class Installer:
         *,
         plist_dir: Optional[Path] = None,
         preflight_fn: Optional[Callable[[], "preflight.PreflightReport"]] = None,
+        generation_preflight_fn: Optional[Callable[[Path], object]] = None,
+        health_fn: Optional[Callable[[Optional[int]], None]] = None,
+        health_timeout: float = 20.0,
+        health_interval: float = 0.5,
     ):
         self.python = str(python)
         self.env_file = Path(env_file)
@@ -280,6 +293,12 @@ class Installer:
             Path(runtime_root), Path(plist_dir) if plist_dir else home_agents
         )
         self._preflight_fn = preflight_fn or self._default_preflight
+        self._generation_preflight_fn = (
+            generation_preflight_fn or self._default_generation_preflight
+        )
+        self._health_fn = health_fn or self._await_supervisor_health
+        self.health_timeout = health_timeout
+        self.health_interval = health_interval
 
     def _load_effective_env(self) -> Optional["preflight.Check"]:
         """Validate and load the required persistent env file, supervisor-style.
@@ -313,6 +332,44 @@ class Installer:
         report = self._preflight_fn()
         if not report.ok:
             raise PreflightFailed(report)
+
+    def _default_generation_preflight(self, code_dir: Path):
+        """Run one code generation's *own* preflight, as launchd would start it.
+
+        The generation is validated by the preflight module it ships, from its
+        own directory and with the plist environment — exactly what the shell
+        wrapper does for a staged install. A generation whose configuration
+        contract differs from the running one (an older copy still requiring an
+        owner tenant id and session secret, say) is therefore judged by its own
+        rules instead of by the rules of the code being replaced. Preflight
+        prints variable names and verdicts only, never a secret value.
+        """
+        env = dict(os.environ)
+        env.update(runtime_env(self.paths.runtime_root, self.env_file))
+        return subprocess.run(
+            [self.python, "-m", "aistat.preflight",
+             "--env-file", str(self.env_file)],
+            cwd=str(code_dir), env=env, capture_output=True, text=True,
+        )
+
+    def _generation_failure(self, code_dir: Path) -> Optional[str]:
+        """Return why ``code_dir`` cannot start, or ``None`` when it passes."""
+        try:
+            result = self._generation_preflight_fn(Path(code_dir))
+        except OSError as exc:
+            return "could not run its preflight ({})".format(type(exc).__name__)
+        if result.returncode == 0:
+            return None
+        detail = ((result.stdout or "") + (result.stderr or "")).strip()
+        return detail[-500:] or "preflight exited {}".format(result.returncode)
+
+    def _require_generation_preflight(self, code_dir: Path) -> None:
+        failure = self._generation_failure(code_dir)
+        if failure is not None:
+            raise RuntimeInstallError(
+                "the {} generation failed its own preflight; the runtime was "
+                "left untouched:\n{}".format(Path(code_dir).name, failure)
+            )
 
     # ---- public commands ------------------------------------------------
 
@@ -401,20 +458,27 @@ class Installer:
                 "data_preserved": self.paths.data.exists()}
 
     def rollback(self) -> Dict:
-        """Preflight, then restore the previous code copy and re-bootstrap it.
+        """Preflight the generation being restored, put it back, prove it runs.
 
-        The gate covers only this public/manual entry point; the internal
-        post-swap recovery in :meth:`install` calls ``_restore_previous``
-        directly after an already-passed preflight and must keep restoring.
+        Two gates, both on the copy in ``code.prev`` rather than on the code it
+        replaces: its own preflight before the commit point, and a supervisor
+        post-health check after the bootstrap. A generation that cannot start
+        under the effective configuration therefore fails closed with the
+        current runtime untouched, instead of crash-looping — or, on an old
+        enough copy, resurrecting the retired owner poller and publisher.
         """
         if not self.paths.code_prev.exists():
             raise RuntimeInstallError("no previous code copy to roll back to")
         self._require_preflight()
+        self._require_generation_preflight(self.paths.code_prev)
         # A resurrected legacy job would duplicate the restored contours;
         # retire it before re-bootstrapping. Rolling back *to* the legacy
         # generation is not supported — rollback stays within code.prev.
         self._retire_legacy(self._capture_legacy())
-        self._restore_previous(True)
+        previous_pid = (self._read_supervisor_status() or {}).get("pid")
+        self._restore_previous(True, preflighted=True)
+        self._postflight()
+        self._health_fn(previous_pid)
         return self.status()
 
     def restart(self) -> Dict:
@@ -433,13 +497,7 @@ class Installer:
         return self.status()
 
     def status(self) -> Dict:
-        status_file = self.paths.data.parent / "run" / "supervisor.status.json"
-        supervisor = None
-        if status_file.exists():
-            try:
-                supervisor = json.loads(status_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                supervisor = None
+        supervisor = self._read_supervisor_status()
         return {
             "label": LABEL,
             "loaded": self.controller.is_loaded(LABEL),
@@ -534,19 +592,29 @@ class Installer:
             os.replace(str(self.paths.code), str(self.paths.code_prev))
         shutil.move(str(stage_dir), str(self.paths.code))
 
-    def _restore_previous(self, had_previous_code: bool) -> None:
+    def _restore_previous(self, had_previous_code: bool, *,
+                          preflighted: bool = False) -> None:
         # Remove the half-installed code and put the previous copy back.
         if self.paths.code.exists():
             shutil.rmtree(self.paths.code)
-        if had_previous_code and self.paths.code_prev.exists():
-            os.replace(str(self.paths.code_prev), str(self.paths.code))
-            try:
-                self._write_plist(render_plist(
-                    self.paths.runtime_root, self.python, self.env_file))
-                self.controller.bootout(LABEL, self.paths.plist)
-                self.controller.bootstrap(self.paths.plist)
-            except Exception:
-                logger.error("could not re-bootstrap the restored runtime")
+        if not (had_previous_code and self.paths.code_prev.exists()):
+            return
+        os.replace(str(self.paths.code_prev), str(self.paths.code))
+        if not preflighted and self._generation_failure(self.paths.code):
+            # Recovery from a failed install: the restored copy is back on
+            # disk, but starting a generation that fails its own preflight
+            # would crash-loop and, on an old copy, re-run the retired owner
+            # poller/publisher. Leave it installed and stopped instead.
+            logger.error("the restored generation failed its own preflight; "
+                         "the runtime stays stopped")
+            return
+        try:
+            self._write_plist(render_plist(
+                self.paths.runtime_root, self.python, self.env_file))
+            self.controller.bootout(LABEL, self.paths.plist)
+            self.controller.bootstrap(self.paths.plist)
+        except Exception:
+            logger.error("could not re-bootstrap the restored runtime")
 
     def _write_plist(self, text: str) -> None:
         self.paths.plist.parent.mkdir(parents=True, exist_ok=True)
@@ -559,6 +627,45 @@ class Installer:
     def _postflight(self) -> None:
         if not self.controller.is_loaded(LABEL):
             raise LaunchError("supervisor job did not load after bootstrap")
+
+    def _read_supervisor_status(self) -> Optional[Dict]:
+        status_file = self.paths.runtime_root / "run" / "supervisor.status.json"
+        try:
+            return json.loads(status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _status_is_healthy(status: Optional[Dict],
+                           previous_pid: Optional[int]) -> bool:
+        if not status or status.get("stopping"):
+            return False
+        pid = status.get("pid")
+        if pid is None or pid == previous_pid:
+            # Still the status left by the supervisor that was just replaced.
+            return False
+        contours = status.get("contours") or []
+        return bool(contours) and all(c.get("running") for c in contours)
+
+    def _await_supervisor_health(self, previous_pid: Optional[int]) -> None:
+        """Wait for the restored generation to report a live supervisor.
+
+        launchd keeps a crash-looping job "loaded", so a loaded label proves
+        nothing on its own: the restored supervisor must publish a status file
+        of its own with every contour running before a rollback may be called
+        successful.
+        """
+        deadline = time.monotonic() + self.health_timeout
+        while True:
+            if self._status_is_healthy(self._read_supervisor_status(),
+                                       previous_pid):
+                return
+            if time.monotonic() >= deadline:
+                raise LaunchError(
+                    "the restored runtime did not report a healthy supervisor "
+                    "within {:.0f}s".format(self.health_timeout)
+                )
+            time.sleep(self.health_interval)
 
 
 # --------------------------------------------------------------------------

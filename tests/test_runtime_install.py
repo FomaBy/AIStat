@@ -1,8 +1,10 @@
 """Transactional runtime install/rollback and plist rendering (FAN-1404)."""
 
+import json
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import plistlib
@@ -65,17 +67,43 @@ def ok_preflight():
     return PreflightReport([Check("stub", True, "ok")])
 
 
-def make_stage(tmp_path, name, marker):
+# A generation's own preflight is a subprocess of its own code (see
+# ``_default_generation_preflight``); the fakes below stand in for it while
+# launchd itself is faked. ``GENERATION_PREFLIGHT`` is the module a real
+# generation ships, reduced to the only thing these tests read: its exit code.
+GENERATION_PREFLIGHT = """import sys
+sys.exit({code})
+"""
+
+
+def generation_preflight(returncode=0, detail="preflight OK\\n", seen=None):
+    def run(code_dir):
+        if seen is not None:
+            seen.append(Path(code_dir))
+        return subprocess.CompletedProcess([], returncode, detail, "")
+
+    return run
+
+
+def noop_health(previous_pid=None):
+    """launchd is faked in these tests, so no supervisor publishes a status."""
+
+
+def make_stage(tmp_path, name, marker, preflight_code=0):
     stage = tmp_path / name
     (stage / "aistat").mkdir(parents=True)
     (stage / "aistat" / "__init__.py").write_text(
         "MARKER = {!r}\n".format(marker), encoding="utf-8"
     )
+    (stage / "aistat" / "preflight.py").write_text(
+        GENERATION_PREFLIGHT.format(code=preflight_code), encoding="utf-8"
+    )
     (stage / "requirements.txt").write_text("cryptography\n", encoding="utf-8")
     return stage
 
 
-def make_installer(tmp_path, controller, preflight_fn=ok_preflight):
+def make_installer(tmp_path, controller, preflight_fn=ok_preflight,
+                   generation_preflight_fn=None, health_fn=noop_health):
     return ri.Installer(
         tmp_path / "runtime",
         "/runtime/.venv/bin/python",
@@ -83,6 +111,8 @@ def make_installer(tmp_path, controller, preflight_fn=ok_preflight):
         controller,
         plist_dir=tmp_path / "LaunchAgents",
         preflight_fn=preflight_fn,
+        generation_preflight_fn=generation_preflight_fn or generation_preflight(),
+        health_fn=health_fn,
     )
 
 
@@ -412,6 +442,159 @@ def test_rollback_without_previous_errors(tmp_path):
         installer.rollback()
 
 
+# ---- the restored generation is validated, not the one it replaces -------
+# (FAN-2031: a rollback used to preflight the *running* code and re-bootstrap
+# code.prev unchecked, so an incompatible previous generation came back as a
+# crash-looping runtime with its own poller/publisher.)
+
+def test_rollback_preflights_the_restored_generation_before_the_swap(tmp_path):
+    seen = []
+    controller = FakeController()
+    installer = make_installer(
+        tmp_path, controller,
+        generation_preflight_fn=generation_preflight(seen=seen),
+    )
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    installer.rollback()
+
+    # The copy about to be restored, judged while it is still code.prev.
+    assert seen == [installer.paths.code_prev]
+    assert active_marker(installer) == "v1"
+
+
+def test_rollback_refuses_a_generation_that_fails_its_own_preflight(tmp_path):
+    controller = FakeController()
+    installer = make_installer(
+        tmp_path, controller,
+        generation_preflight_fn=generation_preflight(
+            returncode=1, detail="FAIL session_secret: missing\n"),
+    )
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+    before = snapshot_state(installer.paths.runtime_root,
+                            installer.paths.plist_dir)
+    calls_before = list(controller.calls)
+
+    with pytest.raises(ri.RuntimeInstallError) as exc_info:
+        installer.rollback()
+
+    # Fail closed: the running generation keeps running, nothing was swapped
+    # and launchd was never touched.
+    assert "failed its own preflight" in str(exc_info.value)
+    assert active_marker(installer) == "v2"
+    assert snapshot_state(installer.paths.runtime_root,
+                          installer.paths.plist_dir) == before
+    assert controller.calls == calls_before
+
+
+def test_rollback_fails_when_the_restored_supervisor_never_reports_healthy(
+    tmp_path,
+):
+    def unhealthy(previous_pid=None):
+        raise ri.LaunchError("no healthy supervisor")
+
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller, health_fn=unhealthy)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    with pytest.raises(ri.LaunchError):
+        installer.rollback()
+
+
+def test_install_recovery_leaves_an_unstartable_previous_generation_stopped(
+    tmp_path, caplog
+):
+    controller = FakeController()
+    installer = make_installer(tmp_path, controller)
+    installer.install(make_stage(tmp_path, "stage1", "v1"))
+    # The v1 copy stops satisfying its own preflight, then a v2 install fails
+    # after the swap: recovery must not start a generation that would only
+    # crash-loop (and, on an old copy, re-run the retired poller).
+    installer._generation_preflight_fn = generation_preflight(returncode=1)
+    controller.fail_bootstraps = 1
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(ri.LaunchError):
+            installer.install(make_stage(tmp_path, "stage2", "v2"))
+
+    assert active_marker(installer) == "v1"
+    assert not controller.loaded
+    assert "failed its own preflight" in caplog.text
+
+
+def test_default_generation_preflight_runs_the_generations_own_module(tmp_path):
+    """The subprocess really executes the copy's own aistat.preflight."""
+    installer = ri.Installer(
+        tmp_path / "runtime", sys.executable, tmp_path / "production.env",
+        FakeController(), plist_dir=tmp_path / "LaunchAgents",
+    )
+    generation = tmp_path / "generation"
+    (generation / "aistat").mkdir(parents=True)
+    (generation / "aistat" / "__init__.py").write_text("", encoding="utf-8")
+    (generation / "aistat" / "preflight.py").write_text(
+        "import os, sys\n"
+        "print('runtime_root=' + os.environ['AISTAT_RUNTIME_ROOT'])\n"
+        "print('argv=' + ' '.join(sys.argv[1:]))\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+
+    result = installer._default_generation_preflight(generation)
+
+    assert result.returncode == 3
+    # Started from the generation's own directory, with the plist environment
+    # and the private env file it must validate.
+    assert "runtime_root=" + str(tmp_path / "runtime") in result.stdout
+    assert "--env-file " + str(tmp_path / "production.env") in result.stdout
+    assert "runtime_root=" in installer._generation_failure(generation)
+
+
+HEALTHY_STATUS = {
+    "pid": 501,
+    "stopping": False,
+    "contours": [{"name": "worker_sync", "running": True},
+                 {"name": "collector", "running": True}],
+}
+
+
+@pytest.mark.parametrize(
+    "status,previous_pid,healthy",
+    [
+        (HEALTHY_STATUS, None, True),
+        (HEALTHY_STATUS, 400, True),
+        # The status the replaced supervisor left behind is not evidence.
+        (HEALTHY_STATUS, 501, False),
+        (None, None, False),
+        (dict(HEALTHY_STATUS, stopping=True), None, False),
+        (dict(HEALTHY_STATUS, contours=[]), None, False),
+        (
+            dict(HEALTHY_STATUS,
+                 contours=[{"name": "collector", "running": False}]),
+            None,
+            False,
+        ),
+    ],
+)
+def test_supervisor_health_reads_a_fresh_live_status(tmp_path, status,
+                                                     previous_pid, healthy):
+    installer = make_installer(tmp_path, FakeController(), health_fn=None)
+    installer.health_timeout = 0.0
+    if status is not None:
+        run_dir = installer.paths.runtime_root / "run"
+        run_dir.mkdir(parents=True)
+        (run_dir / "supervisor.status.json").write_text(
+            json.dumps(status), encoding="utf-8")
+
+    if healthy:
+        installer._await_supervisor_health(previous_pid)
+    else:
+        with pytest.raises(ri.LaunchError):
+            installer._await_supervisor_health(previous_pid)
+
+
 def test_restart_kickstarts_when_loaded(tmp_path):
     controller = FakeController()
     installer = make_installer(tmp_path, controller)
@@ -441,20 +624,45 @@ def clean_env():
 
 
 class RecordingController(FakeController):
-    """Label-aware fake that also records is_loaded probes and named events."""
+    """Label-aware fake that also records is_loaded probes and named events.
 
-    def __init__(self, loaded=False, fail_bootstraps=0, events=None, **kwargs):
+    ``status_root`` models the supervisor that a bootstrap actually starts: it
+    publishes a fresh ``run/supervisor.status.json`` with live contours, which
+    is what the rollback post-health check waits for.
+    """
+
+    def __init__(self, loaded=False, fail_bootstraps=0, events=None,
+                 status_root=None, **kwargs):
         super().__init__(fail_bootstraps=fail_bootstraps, loaded=loaded,
                          **kwargs)
         self.events = events
+        self.status_root = Path(status_root) if status_root else None
+        self.supervisor_pid = 4100
 
     def _note(self, name):
         if self.events is not None:
             self.events.append(name)
 
+    def _publish_status(self):
+        if self.status_root is None:
+            return
+        run_dir = self.status_root / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.supervisor_pid += 1
+        (run_dir / "supervisor.status.json").write_text(
+            json.dumps({
+                "pid": self.supervisor_pid,
+                "stopping": False,
+                "contours": [{"name": "worker_sync", "running": True},
+                             {"name": "collector", "running": True}],
+            }),
+            encoding="utf-8",
+        )
+
     def bootstrap(self, plist_path):
         self._note("bootstrap")
         super().bootstrap(plist_path)
+        self._publish_status()
 
     def bootout(self, label, plist_path=None):
         self._note("bootout")
@@ -471,12 +679,13 @@ class RecordingController(FakeController):
 
 
 def patch_cli_controller(monkeypatch, *, loaded=False, fail_bootstraps=0,
-                         events=None):
+                         events=None, status_root=None):
     controllers = []
 
     def factory():
         controller = RecordingController(
-            loaded=loaded, fail_bootstraps=fail_bootstraps, events=events)
+            loaded=loaded, fail_bootstraps=fail_bootstraps, events=events,
+            status_root=status_root)
         controllers.append(controller)
         return controller
 
@@ -508,16 +717,26 @@ def write_env_file(path, values, mode=0o600):
     path.chmod(mode)
 
 
-def make_installed_runtime(tmp_path, *, with_previous=True):
-    """A fake installed runtime: active code, previous code, data, plist."""
+def make_installed_runtime(tmp_path, *, with_previous=True,
+                           previous_preflight_code=0):
+    """A fake installed runtime: active code, previous code, data, plist.
+
+    Each generation ships its own ``aistat.preflight`` module, because that is
+    what a rollback runs against the copy it is about to restore.
+    """
     root = tmp_path / "runtime"
     (root / "code" / "aistat").mkdir(parents=True)
     (root / "code" / "aistat" / "__init__.py").write_text(
         "MARKER = 'active'\n", encoding="utf-8")
+    (root / "code" / "aistat" / "preflight.py").write_text(
+        GENERATION_PREFLIGHT.format(code=0), encoding="utf-8")
     if with_previous:
         (root / "code.prev" / "aistat").mkdir(parents=True)
         (root / "code.prev" / "aistat" / "__init__.py").write_text(
             "MARKER = 'previous'\n", encoding="utf-8")
+        (root / "code.prev" / "aistat" / "preflight.py").write_text(
+            GENERATION_PREFLIGHT.format(code=previous_preflight_code),
+            encoding="utf-8")
     (root / "data").mkdir()
     (root / "data" / "aistat.db").write_bytes(b"owner-data")
     plist_dir = tmp_path / "LaunchAgents"
@@ -648,15 +867,16 @@ def test_cli_rollback_valid_env_preflights_once_then_restores(
         return real_run_preflight(*args, **kwargs)
 
     monkeypatch.setattr(ri.preflight, "run_preflight", counting_run_preflight)
-    patch_cli_controller(monkeypatch, loaded=True, events=events)
+    patch_cli_controller(monkeypatch, loaded=True, events=events,
+                         status_root=root)
 
     rc = run_cli("rollback", root, plist_dir, env_file)
 
     assert rc == 0
-    # The is_loaded probes: legacy capture before restore, then the two
-    # status probes after it.
+    # The is_loaded probes: legacy capture before restore, the postflight
+    # after the bootstrap, then the two status probes.
     assert events == ["preflight", "is_loaded", "bootout", "bootstrap",
-                      "is_loaded", "is_loaded"]
+                      "is_loaded", "is_loaded", "is_loaded"]
     marker = (root / "code" / "aistat" / "__init__.py").read_text()
     assert "previous" in marker
     assert not (root / "code.prev").exists()
@@ -861,7 +1081,9 @@ def test_install_recovery_after_swap_is_not_blocked_by_gate(
     write_env_file(env_file, env_file_values(tmp_path))
     controller = RecordingController()
     installer = ri.Installer(
-        tmp_path / "runtime", "/rt/python", env_file, controller,
+        # A real interpreter: the recovery runs the restored generation's own
+        # preflight module, which the staged copies below ship.
+        tmp_path / "runtime", sys.executable, env_file, controller,
         plist_dir=tmp_path / "LaunchAgents",
     )
     installer.install(make_stage(tmp_path, "stage1", "v1"))
@@ -882,9 +1104,10 @@ def test_install_recovery_after_swap_is_not_blocked_by_gate(
     with pytest.raises(ri.LaunchError):
         installer.install(make_stage(tmp_path, "stage2", "v2"))
 
-    # One preflight for the whole failed install; the internal transactional
-    # recovery restored and re-bootstrapped the previous code without a
-    # second gate. Persistent data survives the failed cutover untouched.
+    # One env-file preflight for the whole failed install; the internal
+    # transactional recovery restored and re-bootstrapped the previous code
+    # without repeating that gate (it validates the restored generation
+    # itself). Persistent data survives the failed cutover untouched.
     assert events == ["preflight"]
     assert active_marker(installer) == "v1"
     assert controller.loaded

@@ -6,8 +6,10 @@
 #   * dev  — auto-updates from origin/dev on a timer   → http://127.0.0.1:8788
 #   * main — release-on-request (see `release`)        → http://127.0.0.1:8789
 #
-# Both run the app's own ./run.sh (API + dashboard) with their own port and
-# SQLite DB. Collection belongs solely to com.aistat.runtime.
+# Both serve the app's dashboard (API + UI) with their own port and SQLite DB
+# through this script's own `serve` subcommand — never the checkout's ./run.sh,
+# which on an older branch also starts a poller/publisher. Collection belongs
+# solely to com.aistat.runtime.
 #
 # The operator's working copy (this repo in ~/Documents/AIStat) is never
 # touched: each deployment is a dedicated clone under
@@ -17,6 +19,8 @@
 #
 # Subcommands:
 #   install                       clone/prepare both deployments and load launchd agents
+#   serve <dev|main>              run one deployment's dashboard in the foreground
+#                                 (what the launchd agents execute; not for manual use)
 #   uninstall [--purge]           unload agents (--purge also removes checkouts + data)
 #   sync <dev|main> [--ref R] [--force]
 #                                 fetch + reset a deployment to origin/<branch> (or R),
@@ -109,6 +113,33 @@ prepare_checkout() {
   mkdir -p "$dir/data"
 }
 
+# The dashboard entry point, owned by this script instead of by the checkout.
+# A deployment tracks a branch, and an older branch's ./run.sh also starts
+# `aistat.poller` (plus the publisher when configured) next to the dashboard —
+# extra writers that would duplicate the canonical com.aistat.runtime collector.
+# Running the dashboard from here keeps exactly one automatic polling/publish
+# path no matter how old the tracked branch is.
+cmd_serve() {
+  local branch="${1:-}" dir port
+  branch_guard "$branch"
+  dir="$(deploy_dir "$branch")"
+  port="${AISTAT_PORT:-$(port_for "$branch")}"
+  [ -d "$dir/.git" ] || die "$branch deployment not installed; run: local_deploy.sh install"
+  ensure_deps "$dir"
+  mkdir -p "$dir/data"
+  cd "$dir"
+  # Optional local application settings, exactly as the app's own run.sh reads
+  # them. Collection stays with the runtime supervisor whatever the file says.
+  if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+  fi
+  log "$branch dashboard → http://127.0.0.1:$port"
+  exec "$dir/.venv/bin/uvicorn" aistat.server:app --host 127.0.0.1 --port "$port"
+}
+
 write_server_plist() {
   local branch="$1" dir port label plist
   branch_guard "$branch"
@@ -126,13 +157,17 @@ write_server_plist() {
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$dir/run.sh</string>
+    <string>/bin/bash</string>
+    <string>$SELF_INSTALLED</string>
+    <string>serve</string>
+    <string>$branch</string>
   </array>
   <key>WorkingDirectory</key><string>$dir</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>AISTAT_PORT</key><string>$port</string>
+    <key>AISTAT_LOCAL_ROOT</key><string>$LOCAL_ROOT</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -358,6 +393,7 @@ main() {
   local cmd="${1:-status}"; shift || true
   case "$cmd" in
     install)   cmd_install "$@";;
+    serve)     cmd_serve "$@";;
     uninstall) cmd_uninstall "$@";;
     sync)      cmd_sync "$@";;
     release)   cmd_release "$@";;
@@ -365,7 +401,7 @@ main() {
     start)     cmd_start "$@";;
     stop)      cmd_stop "$@";;
     restart)   branch_guard "${1:-}"; restart_agent "$1"; log "$1 restarted";;
-    *) die "unknown command '$cmd' (install|uninstall|sync|release|status|start|stop|restart)";;
+    *) die "unknown command '$cmd' (install|serve|uninstall|sync|release|status|start|stop|restart)";;
   esac
 }
 

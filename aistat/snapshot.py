@@ -58,10 +58,14 @@ FRESHNESS_REJECTION_REASONS = frozenset(
     (
         "incoming_older_day",
         "incoming_empty_over_populated",
-        "missing_same_day_rows",
-        "decreased_same_day_counters",
+        "missing_rows",
+        "decreased_counters",
         "incoming_unreadable",
         "target_unreadable",
+        # A host still running the previous generation reports the same two
+        # verdicts under their old, latest-day-only names.
+        "missing_same_day_rows",
+        "decreased_same_day_counters",
     )
 )
 
@@ -335,7 +339,11 @@ def daily_usage_max_date(path: Path):
 
 
 def _daily_usage_state(path: Path):
-    """Return the latest day and its keyed token counters, or unreadable.
+    """Return the latest day and every keyed token counter, or unreadable.
+
+    The whole history is read, not just the latest day: usage already recorded
+    for an older date must never disappear or shrink either, and a snapshot
+    that drops it is as damaging as one that rewinds today.
 
     Cost and sync columns are deliberately excluded: costs are derived from
     pricing and may be recomputed, while sync timestamps describe collection
@@ -358,10 +366,7 @@ def _daily_usage_state(path: Path):
             if not row or row[0] is None:
                 return None, {}
             latest = str(row[0])
-            rows = conn.execute(
-                "SELECT %s FROM daily_usage WHERE date = ?" % columns,
-                (latest,),
-            ).fetchall()
+            rows = conn.execute("SELECT %s FROM daily_usage" % columns).fetchall()
         finally:
             conn.close()
     except (OSError, sqlite3.Error):
@@ -389,10 +394,10 @@ def freshness_report(incoming_path: Path, target_path: Path):
     migration, or watermark is created or changed.
     """
     summary = {
-        "incoming_latest_rows": 0,
-        "target_latest_rows": 0,
-        "missing_same_day_rows": 0,
-        "decreased_same_day_rows": 0,
+        "incoming_rows": 0,
+        "target_rows": 0,
+        "missing_rows": 0,
+        "decreased_rows": 0,
     }
     incoming_state = _daily_usage_state(incoming_path)
     if incoming_state is _UNREADABLE_DAILY_USAGE:
@@ -402,7 +407,7 @@ def freshness_report(incoming_path: Path, target_path: Path):
             "summary": summary,
         }
     incoming_date, incoming_rows = incoming_state
-    summary["incoming_latest_rows"] = len(incoming_rows)
+    summary["incoming_rows"] = len(incoming_rows)
 
     target_path = Path(target_path)
     try:
@@ -423,7 +428,7 @@ def freshness_report(incoming_path: Path, target_path: Path):
             "summary": summary,
         }
     current_date, current_rows = current_state
-    summary["target_latest_rows"] = len(current_rows)
+    summary["target_rows"] = len(current_rows)
     if current_date is None:
         return {"verdict": "accept", "reason": None, "summary": summary}
     if incoming_date is None:
@@ -438,9 +443,9 @@ def freshness_report(incoming_path: Path, target_path: Path):
             "reason": "incoming_older_day",
             "summary": summary,
         }
-    if incoming_date > current_date:
-        return {"verdict": "accept", "reason": None, "summary": summary}
 
+    # Every row the target already holds must survive, whatever its date: a
+    # newer latest day is no licence to drop or lower recorded history.
     missing_rows = 0
     decreased_rows = 0
     for key, current_counters in current_rows.items():
@@ -454,18 +459,18 @@ def freshness_report(incoming_path: Path, target_path: Path):
             )
         ):
             decreased_rows += 1
-    summary["missing_same_day_rows"] = missing_rows
-    summary["decreased_same_day_rows"] = decreased_rows
+    summary["missing_rows"] = missing_rows
+    summary["decreased_rows"] = decreased_rows
     if missing_rows:
         return {
             "verdict": "reject",
-            "reason": "missing_same_day_rows",
+            "reason": "missing_rows",
             "summary": summary,
         }
     if decreased_rows:
         return {
             "verdict": "reject",
-            "reason": "decreased_same_day_counters",
+            "reason": "decreased_counters",
             "summary": summary,
         }
     return {"verdict": "accept", "reason": None, "summary": summary}
