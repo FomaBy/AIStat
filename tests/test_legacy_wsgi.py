@@ -272,10 +272,10 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
         assert report["detail"] == "snapshot freshness rejected"
         assert report["reason"] == reason
         assert set(report["summary"]) == {
-            "incoming_latest_rows",
-            "target_latest_rows",
-            "missing_same_day_rows",
-            "decreased_same_day_rows",
+            "incoming_rows",
+            "target_rows",
+            "missing_rows",
+            "decreased_rows",
         }
         rendered = json.dumps(report, sort_keys=True)
         for forbidden in (
@@ -299,14 +299,25 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
         "DELETE FROM daily_usage WHERE runtime_id = 'R2' "
         "AND model = 'm-mystery' AND date = '2026-01-02';"
     )
-    assert_rejected(post(degraded, base_ts + 10), "missing_same_day_rows")
+    assert_rejected(post(degraded, base_ts + 10), "missing_rows")
 
     lower = build(
         "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
         "WHERE runtime_id = 'R4' AND model = 'm-claude' "
         "AND date = '2026-01-02';"
     )
-    assert_rejected(post(lower, base_ts + 20), "decreased_same_day_counters")
+    assert_rejected(post(lower, base_ts + 20), "decreased_counters")
+
+    # FAN-2031: the legacy 3.6 contour enforces the same all-history contract —
+    # a rewritten *earlier* day is rejected even though the latest day matches.
+    lower_history = build(
+        "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
+        "WHERE date = '2026-01-01';"
+    )
+    assert_rejected(post(lower_history, base_ts + 21), "decreased_counters")
+
+    dropped_history = build("DELETE FROM daily_usage WHERE date = '2026-01-01';")
+    assert_rejected(post(dropped_history, base_ts + 22), "missing_rows")
 
     empty = build("DELETE FROM daily_usage;")
     assert_rejected(post(empty, base_ts + 25), "incoming_empty_over_populated")

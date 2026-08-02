@@ -31,7 +31,13 @@
 - `data/worker_connections.db` — **зашифрованный** store токенов (ключ живёт вне
   `data/`, в `~/.config/aistat/worker.key`, и в копию не попадает — без ключа
   копия бесполезна);
-- каждый `*.db` из `data/tenants/`.
+- каждый `*.db` из `data/tenants/` — snapshot'ы, которые отдаются подключённому
+  tenant'у (в манифесте помечаются как `tenants/<файл>.db`);
+- каждый `*.db` из `data/worker_tenants/` — **канонические** БД per-user
+  сборщика, куда пишет collector (в манифесте — `worker_tenants/<файл>.db`).
+  Оба каталога ключуются по id пользователя, поэтому один и тот же basename
+  законно встречается в обоих; префикс в метке разводит их и при `restore`
+  каждая база возвращается в свой каталог.
 
 Каждая база копируется через SQLite backup API (коэрентно даже при активном WAL),
 сжимается gzip, проверяется полным `PRAGMA integrity_check`, а `aistat.db`
@@ -46,7 +52,7 @@
 
 Пути и ретенция переопределяются переменными окружения `AISTAT_BACKUP_DIR`,
 `AISTAT_BACKUP_RETENTION`, `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH`,
-`AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`.
+`AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`, `AISTAT_WORKER_TENANTS_DIR`.
 
 ### Расписание
 
@@ -118,8 +124,13 @@ python -m aistat.snapshot /verified/incoming-copy.db /verified/current-copy.db
 Команда открывает обе SQLite copies только для чтения и печатает JSON только с
 `verdict`, `reason` и агрегированными количествами строк; она возвращает `0`
 для `accept` и `1` для `reject`. Возможные `reason`: `incoming_older_day`,
-`incoming_empty_over_populated`, `missing_same_day_rows`,
-`decreased_same_day_counters`, `incoming_unreadable`, `target_unreadable`.
+`incoming_empty_over_populated`, `missing_rows`, `decreased_counters`,
+`incoming_unreadable`, `target_unreadable`. Проверка охватывает **всю**
+историю: `missing_rows`/`decreased_counters` означают, что incoming потерял
+или уменьшил уже записанную строку `(runtime_id, model, date)` на любой дате,
+даже если последний день совпадает. Хост предыдущего поколения возвращает те же
+два вердикта под старыми именами `missing_same_day_rows` и
+`decreased_same_day_counters`.
 Сохраните обе копии и backups, затем верните PM только код `reason` и verdict
 для отдельного решения.
 

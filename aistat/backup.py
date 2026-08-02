@@ -61,12 +61,26 @@ class BackupError(Exception):
 # --------------------------------------------------------------------------- #
 # Discovery of the durable databases
 # --------------------------------------------------------------------------- #
+def _tenant_stores(cfg: Config) -> List[Tuple[str, Path]]:
+    """The two per-tenant database directories, by manifest label prefix.
+
+    ``tenants`` holds the snapshots served to a connected tenant; the collector
+    writes each connection's own database into ``worker_tenants``. Both are
+    keyed by user id, so the *same* basename legitimately exists in both.
+    """
+    return [
+        ("tenants", Path(cfg.tenants_dir)),
+        ("worker_tenants", Path(cfg.worker_tenants_dir)),
+    ]
+
+
 def _canonical_targets(cfg: Config) -> Dict[str, Path]:
-    """Map each backup member basename to the live path it restores to.
+    """Map each top-level backup member label to the live path it restores to.
 
     Restore never trusts a path recorded inside a manifest: it looks the member
-    up in this map (derived only from the current config), so a tampered
-    manifest can never redirect ``os.replace`` outside the data directory.
+    up here or in :func:`_tenant_stores` (both derived only from the current
+    config), so a tampered manifest can never redirect ``os.replace`` outside
+    the data directory.
     """
     targets: Dict[str, Path] = {
         cfg.db_path.name: cfg.db_path,
@@ -76,29 +90,71 @@ def _canonical_targets(cfg: Config) -> Dict[str, Path]:
     return targets
 
 
-def _durable_databases(cfg: Config) -> List[Tuple[str, Path]]:
-    """Return ``(basename, path)`` for every durable database that exists now.
+def _member_stem(label: str) -> str:
+    """Flat, collision-free file stem for a member label inside a generation."""
+    return label.replace("/", "__")
 
-    The three top-level stores plus every ``*.db`` file directly inside the
-    tenants directory. Basenames are unique across these sources by
-    construction; a duplicate is skipped rather than silently overwritten.
+
+def _is_tenant_db_name(name: str) -> bool:
+    """True for a plain ``*.db`` basename — never a path or a traversal step."""
+    return (
+        bool(name)
+        and name.endswith(".db")
+        and name == os.path.basename(name)
+        and "\\" not in name
+        and name not in (".", "..")
+    )
+
+
+def _restore_target(cfg: Config, label: str) -> Path:
+    """Resolve a manifest label to the live path it may be restored to.
+
+    A top-level label resolves through the canonical map and a
+    ``<store>/<basename>`` label through that store's configured directory. A
+    bare unknown label keeps generations written before the stores were
+    labelled restorable (they only ever held ``tenants`` members). Anything
+    else — an unknown store, a nested path, a traversal step — fails closed.
+    """
+    targets = _canonical_targets(cfg)
+    if label in targets:
+        return targets[label]
+    store, separator, name = label.partition("/")
+    if not separator:
+        store, name = "tenants", label
+    directory = dict(_tenant_stores(cfg)).get(store)
+    if directory is None or not _is_tenant_db_name(name):
+        raise BackupError(
+            "member %s has no known restore target in this config" % label
+        )
+    return directory / name
+
+
+def _durable_databases(cfg: Config) -> List[Tuple[str, Path]]:
+    """Return ``(label, path)`` for every durable database that exists now.
+
+    The three top-level stores plus every ``*.db`` file directly inside each
+    tenant store. Tenant labels carry their store prefix because one user id
+    yields the same basename in both stores — an unprefixed label would drop
+    one of the two databases from the generation.
     """
     seen: Dict[str, Path] = {}
-    candidates: List[Path] = [
-        cfg.db_path,
-        cfg.security_db_path,
-        cfg.worker_store_path,
+    candidates: List[Tuple[str, Path]] = [
+        (path.name, path)
+        for path in (cfg.db_path, cfg.security_db_path, cfg.worker_store_path)
     ]
-    if cfg.tenants_dir.is_dir():
-        candidates.extend(sorted(cfg.tenants_dir.glob("*.db")))
-    for path in candidates:
+    for store, directory in _tenant_stores(cfg):
+        if directory.is_dir():
+            candidates.extend(
+                (store + "/" + path.name, path)
+                for path in sorted(directory.glob("*.db"))
+            )
+    for label, path in candidates:
         if not path.is_file() or path.is_symlink():
             continue
-        name = path.name
-        if name in seen:
-            logger.warning("skipping duplicate backup member name: %s", name)
+        if label in seen:
+            logger.warning("skipping duplicate backup member name: %s", label)
             continue
-        seen[name] = path
+        seen[label] = path
     return list(seen.items())
 
 
@@ -200,7 +256,7 @@ def create_backup(cfg: Config, *, now_iso: Optional[str] = None) -> Path:
         members = []
         for name, path in databases:
             gz_bytes = create_compressed_snapshot(path)
-            member_file = staging / (name + ".gz")
+            member_file = staging / (_member_stem(name) + ".gz")
             member_file.write_bytes(gz_bytes)
             try:
                 os.chmod(member_file, 0o600)
@@ -209,7 +265,7 @@ def create_backup(cfg: Config, *, now_iso: Optional[str] = None) -> Path:
             # Decompress into a scratch file and prove it restores cleanly
             # *before* the generation is published — a backup that fails its
             # own integrity check is worse than none.
-            scratch = staging / (name + ".check")
+            scratch = staging / (_member_stem(name) + ".check")
             _decompress_member(member_file, scratch)
             try:
                 schema_version = _verify_db_file(
@@ -323,7 +379,7 @@ def verify_backup(cfg: Config, ref: str) -> dict:
             gz_path = generation / member["file"]
             if not gz_path.is_file():
                 raise BackupError("missing member file: %s" % member["file"])
-            scratch = tmp_dir / member["label"]
+            scratch = tmp_dir / _member_stem(member["label"])
             _decompress_member(gz_path, scratch)
             digest = hashlib.sha256(scratch.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
@@ -346,7 +402,14 @@ def _atomic_install(scratch: Path, target: Path) -> None:
     everything after it is best-effort. A caught error therefore always means
     the live database was not touched.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.parent.is_dir():
+        # A restore onto a fresh machine recreates a missing store directory
+        # (e.g. data/worker_tenants) owner-only, like the runtime itself does.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target.parent, 0o700)
+        except OSError:
+            pass
     if target.is_symlink():
         raise BackupError("restore target must not be a symlink: %s" % target)
     previous = target.with_name(target.name + ".pre-restore")
@@ -380,11 +443,10 @@ def restore_backup(
 
     Every member is decompressed, integrity-checked and checksum-matched before
     anything live is touched; the replaced file is preserved as ``.pre-restore``.
-    ``only`` limits the restore to a single member basename.
+    ``only`` limits the restore to a single member label.
     """
     generation = resolve_backup(cfg, ref)
     manifest = load_manifest(generation)
-    targets = _canonical_targets(cfg)
     planned = []
     restored = []
     with tempfile.TemporaryDirectory(
@@ -395,18 +457,11 @@ def restore_backup(
             label = member["label"]
             if only and label != only:
                 continue
-            target = targets.get(label)
-            if target is None and cfg.tenants_dir.is_dir():
-                # A tenant member restores back into the tenants directory only.
-                target = cfg.tenants_dir / label
-            if target is None:
-                raise BackupError(
-                    "member %s has no known restore target in this config" % label
-                )
+            target = _restore_target(cfg, label)
             gz_path = generation / member["file"]
             if not gz_path.is_file():
                 raise BackupError("missing member file: %s" % member["file"])
-            scratch = tmp_dir / label
+            scratch = tmp_dir / _member_stem(label)
             _decompress_member(gz_path, scratch)
             digest = hashlib.sha256(scratch.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
@@ -449,7 +504,7 @@ def self_test(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
         for member in members:
             label = member["label"]
             gz_path = generation / member["file"]
-            restored = tmp_dir / label
+            restored = tmp_dir / _member_stem(label)
             _decompress_member(gz_path, restored)
             digest = hashlib.sha256(restored.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
@@ -539,7 +594,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_verify.add_argument("ref", nargs="?", default="latest")
     p_restore = sub.add_parser("restore", help="restore a generation into data/")
     p_restore.add_argument("ref", nargs="?", default="latest")
-    p_restore.add_argument("--only", help="restore a single member basename")
+    p_restore.add_argument(
+        "--only", help="restore a single member label (e.g. worker_tenants/7.db)"
+    )
     p_restore.add_argument(
         "--dry-run", action="store_true", help="show what would be restored"
     )
