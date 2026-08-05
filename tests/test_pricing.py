@@ -186,6 +186,29 @@ def test_repo_gpt_5_6_standard_rates_and_credits_are_current():
         assert rate.captured_at == rate.credits.captured_at == "2026-07-30"
 
 
+def test_repo_sonnet_rates_match_official_table():
+    # FAN-2161: Sonnet rows from the official Anthropic pricing table.
+    # Sonnet 5 carries introductory pricing through 2026-08-31 ($3/$15 after);
+    # the other Sonnet models are at standard rates. No Sonnet model has a
+    # credits block (no owner directive maps Sonnet to a Codex credit tier),
+    # so cost_credits falls back to usd*AISTAT_CREDITS_PER_USD.
+    rates = pricing.load_pricing(PRICING_JSON)
+    expected = {
+        "claude-sonnet-5": (2.0, 10.0, 0.2, 2.5, 4.0),
+        "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75, 6.0),
+        "claude-sonnet-4-5-20250929": (3.0, 15.0, 0.3, 3.75, 6.0),
+        "claude-sonnet-4-20250514": (3.0, 15.0, 0.3, 3.75, 6.0),
+    }
+    for model, usd in expected.items():
+        rate = rates[model]
+        assert not rate.unpriced
+        assert (rate.input, rate.output, rate.cache_read,
+                rate.cache_write, rate.cache_write_1h) == usd, model
+        assert rate.credits is None, model
+        assert rate.source_url.startswith("https://platform.claude.com/")
+        assert rate.captured_at == "2026-08-05"
+
+
 def test_health_mirrors_current_gpt_5_6_rates(conn):
     rates = pricing.load_pricing(PRICING_JSON)
     pricing.upsert_model_pricing(conn, rates)
