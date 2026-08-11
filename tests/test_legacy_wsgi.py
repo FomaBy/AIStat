@@ -203,6 +203,7 @@ def test_source_parses_as_python_36():
         "aistat/aggregates.py",
         "aistat/db.py",
         "aistat/endpoints.py",
+        "aistat/global_stats.py",
         "aistat/handoff.py",
         "aistat/legacy_wsgi.py",
         "aistat/migrate.py",

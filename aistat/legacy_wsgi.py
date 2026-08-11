@@ -28,7 +28,15 @@ import traceback
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import __version__, aggregates, handoff, oauth, snapshot, snapshot_recovery
+from . import (
+    __version__,
+    aggregates,
+    global_stats,
+    handoff,
+    oauth,
+    snapshot,
+    snapshot_recovery,
+)
 from .db import SCHEMA_VERSION, init_db, schema_admission_error
 from .tenant import (
     canonical_tenant_id,
@@ -237,6 +245,7 @@ def _bootstrap():
         )
         conn.executescript(handoff.CONNECTIONS_SCHEMA)
         conn.executescript(snapshot_recovery.INSTALL_JOURNAL_SCHEMA)
+        conn.executescript(global_stats.GLOBAL_STATS_SCHEMA)
         # Serialize the inspect-and-alter migration across WSGI workers.
         conn.execute("BEGIN IMMEDIATE")
         columns = {
@@ -322,6 +331,10 @@ def _recover_snapshot_installs():
         conn = _security_connection()
         try:
             snapshot_recovery.recover_pending_installs(conn, TENANTS_DIR)
+            # Aggregate any installed snapshot the anonymized cross-tenant
+            # stats do not reflect yet (pre-feature tenants, or a crash
+            # between snapshot install and aggregation) — FAN-2392.
+            global_stats.sync_tenants(conn, TENANTS_DIR)
         finally:
             conn.close()
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1581,6 +1594,21 @@ def _ingest(environ, start_response):
                     "500 Internal Server Error",
                     {"detail": "snapshot install failed"},
                 )
+            # Best-effort: the snapshot is already installed, so an aggregation
+            # failure must not fail the ingest. The boot-time sync self-heals
+            # via the recorded snapshot sha (FAN-2392).
+            try:
+                stats_conn = _security_connection()
+                try:
+                    global_stats.refresh_tenant(
+                        stats_conn, tenant_id, target_path, info["sha256"]
+                    )
+                finally:
+                    stats_conn.close()
+            except Exception:
+                error_stream = environ.get("wsgi.errors")
+                if error_stream is not None:
+                    traceback.print_exc(file=error_stream)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     info["status"] = "ok"
@@ -1832,6 +1860,15 @@ def _api(environ, start_response, path):
                 "csrf": session["csrf"],
             },
         )
+    if path == "/api/global-model-efficiency":
+        # Anonymized sums across every tenant (FAN-2392): no filters, no
+        # per-tenant breakdown, only cost-relevant fields.
+        conn = _security_connection()
+        try:
+            data = global_stats.model_efficiency(conn)
+        finally:
+            conn.close()
+        return _json_response(environ, start_response, "200 OK", data)
     try:
         filters = aggregates.make_filters(
             _first(query, "from"), _first(query, "to"),

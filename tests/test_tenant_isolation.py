@@ -44,6 +44,7 @@ DETERMINISTIC_DATA_ROUTES = (
     "/api/projects",
     "/api/efficiency",
     "/api/model-efficiency",
+    "/api/global-model-efficiency",
     "/api/efficiency-breakdown",
     "/api/sync",
 )
@@ -255,6 +256,7 @@ def test_flask_route_inventory_is_fully_classified(public_app):
         "api_projects",
         "api_efficiency",
         "api_model_efficiency",
+        "api_global_model_efficiency",
         "api_efficiency_breakdown",
         "api_health",
         "api_sync",

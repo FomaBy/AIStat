@@ -1070,6 +1070,62 @@ function renderModelEfficiency(data) {
   }
 }
 
+// Anonymized cross-tenant "Efficiency by models" (FAN-2392): cost per SP over
+// every AIStat user's data. The endpoint only exists on the hosted multi-user
+// surfaces, so a missing/failed response hides the panel instead of erroring.
+function renderGlobalModelEfficiency(data) {
+  const panel = $("global-models-panel");
+  if (!data || !Array.isArray(data.models)) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const models = data.models;
+  const label = (m) => (m.model == null ? t("unattributed") : m.model);
+  $("empty-global-models").hidden = models.some((m) => m.cost_per_sp != null);
+  const tbody = $("table-global-models-data").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const m of models) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(label(m))}${m.has_unpriced ? " *" : ""}</td>
+      <td class="num">${fmtNum(m.story_points)}</td>
+      <td class="num">${fmtTokens(m.total_tokens)}</td>
+      <td class="num">${m.cost_usd == null ? "—" : fmtUSDFine(m.cost_usd)}</td>
+      <td class="num">${m.cost_per_sp == null ? "—" : fmtUSDFine(m.cost_per_sp)}</td>
+      <td class="num">${m.tenant_count == null ? "—" : m.tenant_count}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!models.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="6" class="note">${t("noGlobalModels")}</td>`;
+    tbody.appendChild(tr);
+  }
+  const priced = models.filter((m) => m.cost_per_sp != null);
+  upsertChart("chart-global-models", {
+    type: "bar",
+    data: {
+      labels: priced.map(label),
+      datasets: [{
+        data: priced.map((m) => m.cost_per_sp),
+        backgroundColor: priced.map((m) => entityColor("model", m.model)),
+        borderWidth: 0,
+        maxBarThickness: 36,
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => fmtUSDFine(ctx.parsed.x) + " / SP" } },
+      },
+      scales: { x: { ticks: { callback: (v) => fmtUSDFine(v) } } },
+    },
+  });
+}
+
 function efficiencyBarConfig(rows, type) {
   return {
     type: "bar",
@@ -1216,7 +1272,7 @@ async function refreshAll() {
   const chart = fetchJSON("/api/chart" + query({
     dimension: state.chartDimension, measure: state.chartMeasure,
   })).catch(() => null);
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
@@ -1226,6 +1282,7 @@ async function refreshAll() {
     fetchJSON("/api/efficiency-breakdown" + query()),
     fetchJSON("/api/health"),
     chart,
+    fetchJSON("/api/global-model-efficiency").catch(() => null),
   ]);
   // The ≈-note legends the token-attribution markers. Drive it from the real
   // API flags, not merely from the presence of a filter: a unique-agent
@@ -1248,6 +1305,7 @@ async function refreshAll() {
   renderProjects(projects.projects);
   renderEfficiency(efficiency.issues);
   renderModelEfficiency(modelEfficiency);
+  renderGlobalModelEfficiency(globalModels);
   renderEfficiencyBreakdown(efficiencyBreakdown);
   if (chartData) renderConfigurableChart(chartData);
   else renderConfigurableChartError();

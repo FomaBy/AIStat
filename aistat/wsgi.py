@@ -299,9 +299,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     # Reconcile any snapshot install a crash left half-applied before this
     # worker serves a request. Under the ingest lock so it cannot race a live
-    # ingest or another worker's recovery pass.
+    # ingest or another worker's recovery pass. The global-stats sync then
+    # aggregates any installed snapshot the anonymized cross-tenant rows do
+    # not reflect yet (pre-feature tenants, or a crash mid-refresh).
     with ingest_lock():
         security_store.recover_snapshot_installs(config.tenants_dir)
+        security_store.sync_global_stats(config.tenants_dir)
 
     def last_sync_state() -> dict:
         conn = data_connection()
@@ -678,6 +681,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/global-model-efficiency")
+    def api_global_model_efficiency():
+        # Anonymized sums across every tenant (FAN-2392): no filters, no
+        # per-tenant breakdown, only cost-relevant fields.
+        return jsonify(security_store.global_model_efficiency())
+
     @app.get("/api/efficiency-breakdown")
     def api_efficiency_breakdown():
         try:
@@ -795,6 +804,17 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 # already swapped, so a stuck watermark here is a broken
                 # invariant, not a replay — surface it loudly.
                 return jsonify({"detail": "snapshot install failed"}), 500
+            # Best-effort: the snapshot is already installed, so an aggregation
+            # failure must not fail the ingest. The boot-time sync self-heals
+            # via the recorded snapshot sha (FAN-2392).
+            try:
+                security_store.refresh_global_stats(
+                    tenant_id, target_path, info.sha256
+                )
+            except Exception:
+                app.logger.exception(
+                    "global stats refresh failed for tenant %s", tenant_id
+                )
         return jsonify(
             {
                 "status": "ok",

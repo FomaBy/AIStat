@@ -25,6 +25,7 @@ from typing import List, Optional
 
 from urllib.parse import urlsplit
 
+from . import global_stats
 from . import handoff
 from . import snapshot_recovery
 from .config import Config
@@ -328,6 +329,7 @@ class SecurityStore:
             )
             conn.executescript(handoff.CONNECTIONS_SCHEMA)
             conn.executescript(snapshot_recovery.INSTALL_JOURNAL_SCHEMA)
+            conn.executescript(global_stats.GLOBAL_STATS_SCHEMA)
             # Serialize the inspect-and-alter migration across WSGI workers.
             # Without the write lock, concurrent first starts can both observe
             # the old schema and one loses the ALTER race with a duplicate
@@ -760,6 +762,39 @@ class SecurityStore:
         finally:
             conn.close()
 
+    def refresh_global_stats(
+        self,
+        user_id: int,
+        tenant_db_file,
+        snapshot_sha256: Optional[str] = None,
+    ) -> bool:
+        """Re-derive one tenant's anonymized per-model cost rows (FAN-2392)."""
+        conn = self._connect()
+        try:
+            return global_stats.refresh_tenant(
+                conn, user_id, tenant_db_file, snapshot_sha256
+            )
+        finally:
+            conn.close()
+
+    def sync_global_stats(self, tenants_dir) -> int:
+        """Aggregate installed snapshots the stats do not yet reflect.
+
+        Callers must hold the ingest lock, like recover_snapshot_installs.
+        """
+        conn = self._connect()
+        try:
+            return global_stats.sync_tenants(conn, tenants_dir)
+        finally:
+            conn.close()
+
+    def global_model_efficiency(self) -> dict:
+        conn = self._connect()
+        try:
+            return global_stats.model_efficiency(conn)
+        finally:
+            conn.close()
+
     def delete_user(self, user_id: int, now: Optional[int] = None) -> dict:
         """Purge a non-owner user and every trace of their data (FAN-1183).
 
@@ -844,6 +879,9 @@ class SecurityStore:
                 (user_id,),
             )
             conn.execute("DELETE FROM tenants WHERE user_id = ?", (user_id,))
+            # The anonymized cross-tenant stats keyed by this internal id must
+            # not outlive the account (FAN-2392).
+            global_stats.delete_tenant(conn, user_id)
             if teardown != "pending":
                 conn.execute(
                     "DELETE FROM connections WHERE user_id = ?", (user_id,)

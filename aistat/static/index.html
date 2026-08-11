@@ -225,6 +225,28 @@
       <p class="note" data-i18n="modelEfficiencyNote"></p>
     </section>
 
+    <section id="global-models-panel" class="panel panel-wide" hidden>
+      <h2>Эффективность по моделям — все пользователи <span class="est-mark">≈ стоимость на 1 SP · меньше — лучше</span></h2>
+      <div class="chart-box chart-box-small">
+        <canvas id="chart-global-models" role="img" aria-label="График: эффективность по моделям на данных всех пользователей, стоимость на 1 story point">Значения графика — в таблице «Данные таблицей» ниже.</canvas>
+        <p class="chart-empty" id="empty-global-models" hidden>Пока нет данных от пользователей.</p>
+      </div>
+      <details class="chart-data">
+        <summary>Данные таблицей</summary>
+        <div class="table-wrap">
+          <table id="table-global-models-data" aria-label="Эффективность по моделям, все пользователи">
+            <thead><tr>
+              <th>Модель</th><th class="num">SP</th><th class="num">Токены</th>
+              <th class="num">Стоимость ≈</th><th class="num">Стоимость / SP ≈</th>
+              <th class="num">Пользователи</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+      <p class="note" data-i18n="globalModelsNote"></p>
+    </section>
+
     <section class="panel panel-wide">
       <h2>Эффективность по задачам <span class="est-mark">токены ÷ SP · меньше — лучше</span></h2>
       <div class="table-wrap">
