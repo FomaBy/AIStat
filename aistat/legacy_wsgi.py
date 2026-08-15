@@ -1862,7 +1862,9 @@ def _api(environ, start_response, path):
         )
     if path == "/api/global-model-efficiency":
         # Anonymized sums across every tenant (FAN-2392): no filters, no
-        # per-tenant breakdown, only cost-relevant fields.
+        # per-tenant breakdown, only cost-relevant fields. Cohorts under the
+        # k>=5 minimum are suppressed and no contributor count is exposed, so
+        # the store's result is served verbatim (FAN-2397).
         conn = _security_connection()
         try:
             data = global_stats.model_efficiency(conn)

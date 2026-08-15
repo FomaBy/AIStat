@@ -1,10 +1,24 @@
-"""Anonymized cross-tenant "Efficiency by models" aggregates (FAN-2392).
+"""Cross-tenant "Efficiency by models" aggregates (FAN-2392, FAN-2397).
 
 The host materializes, per tenant and model, only the fields needed to price
 work — token counts by kind, the model's story-point share and its estimated
 cost — into ``global_model_stats`` inside security.db. No issue, project,
 agent, account or timing data is stored, and the API surface exposes only
 sums across every tenant, so one user can never read another user's rows.
+
+Two different privacy claims apply, and they must not be conflated:
+
+* the **stored rows are pseudonymous**, not anonymous — they are keyed by the
+  internal numeric tenant id, so a host-side reader could still attribute a
+  row to an account;
+* only the **published aggregate is anonymized**, because
+  :func:`model_efficiency` drops every model cohort carried by fewer than
+  :data:`MIN_TENANTS` distinct tenants, so no returned figure can describe a
+  single identifiable tenant's usage.
+
+Suppression fails closed: a cohort below the threshold is omitted entirely and
+never degrades to a smaller-cohort or single-tenant value. A fully suppressed
+result is a normal empty result.
 
 Rows are keyed by the internal numeric tenant id purely so a tenant's next
 snapshot replaces its own contribution idempotently; deleting the user
@@ -26,6 +40,11 @@ import time
 from . import aggregates
 from .db import connect_readonly, schema_admission_error
 from .tenant import canonical_tenant_id, tenant_db_path
+
+# Minimum distinct tenants a model cohort needs before its sums may be
+# published. Below it the whole cohort is dropped, so no published figure can
+# be read back as one identifiable tenant's usage (FAN-2397).
+MIN_TENANTS = 5
 
 GLOBAL_STATS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS global_model_stats (
@@ -153,7 +172,12 @@ def delete_tenant(conn, tenant_id):
 
 
 def model_efficiency(conn):
-    """Per-model efficiency summed over every tenant's stored rows.
+    """Anonymized per-model efficiency summed over every tenant's stored rows.
+
+    Only cohorts carried by at least :data:`MIN_TENANTS` distinct tenants are
+    returned; the ``HAVING`` drops the rest before any figure is computed, so a
+    rare cohort is never published in reduced form and no contributor count is
+    derivable from the result. An all-suppressed store yields ``models == []``.
 
     Follows the FAN-1188 pairing rule: ``cost_per_sp`` divides priced cost by
     the story points of those same priced shares only, so an unpriced tenant
@@ -170,11 +194,12 @@ def model_efficiency(conn):
                SUM(story_points) AS story_points,
                SUM(CASE WHEN priced = 1 THEN cost_usd ELSE 0 END) AS priced_cost,
                SUM(CASE WHEN priced = 1 THEN story_points ELSE 0 END) AS priced_sp,
-               MAX(CASE WHEN priced = 0 THEN 1 ELSE 0 END) AS has_unpriced,
-               COUNT(DISTINCT tenant_id) AS tenant_count
+               MAX(CASE WHEN priced = 0 THEN 1 ELSE 0 END) AS has_unpriced
         FROM global_model_stats
         GROUP BY model
-        """
+        HAVING COUNT(DISTINCT tenant_id) >= ?
+        """,
+        (MIN_TENANTS,),
     ).fetchall()
     models = []
     for row in rows:
@@ -200,11 +225,7 @@ def model_efficiency(conn):
                 row["priced_cost"] / row["priced_sp"] if priced else None
             ),
             "has_unpriced": bool(row["has_unpriced"]),
-            "tenant_count": row["tenant_count"],
         })
     # Cheapest cost per story point first; unpriced models sink to the bottom.
     models.sort(key=lambda m: (m["cost_per_sp"] is None, m["cost_per_sp"] or 0.0))
-    tenant_count = conn.execute(
-        "SELECT COUNT(DISTINCT tenant_id) FROM global_model_stats"
-    ).fetchone()[0]
-    return {"estimated": True, "models": models, "tenant_count": tenant_count}
+    return {"estimated": True, "models": models}

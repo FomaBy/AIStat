@@ -684,7 +684,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
     @app.get("/api/global-model-efficiency")
     def api_global_model_efficiency():
         # Anonymized sums across every tenant (FAN-2392): no filters, no
-        # per-tenant breakdown, only cost-relevant fields.
+        # per-tenant breakdown, only cost-relevant fields. Cohorts under the
+        # k>=5 minimum are suppressed and no contributor count is exposed, so
+        # the store's result is served verbatim (FAN-2397).
         return jsonify(security_store.global_model_efficiency())
 
     @app.get("/api/efficiency-breakdown")

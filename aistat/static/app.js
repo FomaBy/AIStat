@@ -1073,6 +1073,9 @@ function renderModelEfficiency(data) {
 // Anonymized cross-tenant "Efficiency by models" (FAN-2392): cost per SP over
 // every AIStat user's data. The endpoint only exists on the hosted multi-user
 // surfaces, so a missing/failed response hides the panel instead of erroring.
+// The API already suppressed every model cohort under k>=5 and exposes no
+// contributor count, so this renders exactly what it is given — it must never
+// re-introduce a per-model user count column (FAN-2397).
 function renderGlobalModelEfficiency(data) {
   const panel = $("global-models-panel");
   if (!data || !Array.isArray(data.models)) {
@@ -1092,13 +1095,12 @@ function renderGlobalModelEfficiency(data) {
       <td class="num">${fmtNum(m.story_points)}</td>
       <td class="num">${fmtTokens(m.total_tokens)}</td>
       <td class="num">${m.cost_usd == null ? "—" : fmtUSDFine(m.cost_usd)}</td>
-      <td class="num">${m.cost_per_sp == null ? "—" : fmtUSDFine(m.cost_per_sp)}</td>
-      <td class="num">${m.tenant_count == null ? "—" : m.tenant_count}</td>`;
+      <td class="num">${m.cost_per_sp == null ? "—" : fmtUSDFine(m.cost_per_sp)}</td>`;
     tbody.appendChild(tr);
   }
   if (!models.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="6" class="note">${t("noGlobalModels")}</td>`;
+    tr.innerHTML = `<td colspan="5" class="note">${t("noGlobalModels")}</td>`;
     tbody.appendChild(tr);
   }
   const priced = models.filter((m) => m.cost_per_sp != null);
