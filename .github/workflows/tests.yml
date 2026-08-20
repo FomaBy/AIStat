@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Smoke-test FastAPI and dependency-free WSGI entrypoint
+        run: |
+          python -c "from fastapi import FastAPI; assert FastAPI"
+          AISTAT_PASSWORD_HASH=ci-smoke-placeholder \
+          AISTAT_SESSION_SECRET=ci-smoke-session-secret-000000000000000000000000 \
+          AISTAT_INGEST_SECRET=ci-smoke-ingest-secret-111111111111111111111111 \
+          AISTAT_DB_PATH="$RUNNER_TEMP/aistat.db" \
+          AISTAT_SECURITY_DB_PATH="$RUNNER_TEMP/security.db" \
+          AISTAT_TENANTS_DIR="$RUNNER_TEMP/tenants" \
+          python -S -c "import passenger_wsgi; assert callable(passenger_wsgi.application)"
+
+      - name: Run full pytest suite
+        run: python -m pytest tests/ -q
