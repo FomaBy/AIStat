@@ -10,8 +10,8 @@ from the owner's own CLI identity and from every other connection, one
 * a deterministic ``--profile aistat-conn-<internal_user_id>`` derived only
   from the trusted internal numeric id (never from user input);
 * a **scrubbed environment** with every ``MULTICA_*`` variable removed, so an
-  ambient ``MULTICA_TOKEN`` / ``MULTICA_WORKSPACE_ID`` (the owner identity the
-  runtime injects) cannot silently authenticate the call;
+  ambient ``MULTICA_TOKEN`` / ``MULTICA_WORKSPACE_ID`` (an inherited identity)
+  cannot silently authenticate the call;
 * the official host re-pinned on every invocation via ``--server-url``; the
   stored/user-supplied ``server_url`` is never trusted;
 * an explicit ``--workspace-id`` chosen for this connection, so the owner's
@@ -342,7 +342,7 @@ class ConnectionCliProfile:
         """A ``Poller``-compatible runner bound to this connection's identity.
 
         Every data call re-pins the official host and the explicitly selected
-        workspace, so no ambient MULTICA_* value and no owner default can
+        workspace, so no ambient MULTICA_* value or inherited default can
         redirect the read.
         """
         if self._workspace_id is None:

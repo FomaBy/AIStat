@@ -6,8 +6,10 @@
 #   * dev  — auto-updates from origin/dev on a timer   → http://127.0.0.1:8788
 #   * main — release-on-request (see `release`)        → http://127.0.0.1:8789
 #
-# Both run the app's own ./run.sh (poller + API + dashboard) with their own
-# port and their own SQLite DB, so the two branches never share state.
+# Both serve the app's dashboard (API + UI) with their own port and SQLite DB
+# through this script's own `serve` subcommand — never the checkout's ./run.sh,
+# which on an older branch also starts a poller/publisher. Collection belongs
+# solely to com.aistat.runtime.
 #
 # The operator's working copy (this repo in ~/Documents/AIStat) is never
 # touched: each deployment is a dedicated clone under
@@ -17,6 +19,8 @@
 #
 # Subcommands:
 #   install                       clone/prepare both deployments and load launchd agents
+#   serve <dev|main>              run one deployment's dashboard in the foreground
+#                                 (what the launchd agents execute; not for manual use)
 #   uninstall [--purge]           unload agents (--purge also removes checkouts + data)
 #   sync <dev|main> [--ref R] [--force]
 #                                 fetch + reset a deployment to origin/<branch> (or R),
@@ -32,9 +36,7 @@
 #   AISTAT_REPO_URL                      origin URL of this repo
 #   AISTAT_DEV_PORT                      8788
 #   AISTAT_MAIN_PORT                     8789
-#   AISTAT_LOCAL_POLL_INTERVAL_SECONDS   180   (poller cadence inside each deployment)
 #   AISTAT_DEV_UPDATE_INTERVAL_SECONDS   120   (how often the dev timer checks origin/dev)
-#   AISTAT_CLI_BIN                       resolved `multica` (needed by each poller)
 #
 set -euo pipefail
 
@@ -42,7 +44,6 @@ SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_ROOT="${AISTAT_LOCAL_ROOT:-$HOME/Library/Application Support/AIStat/local}"
 DEV_PORT="${AISTAT_DEV_PORT:-8788}"
 MAIN_PORT="${AISTAT_MAIN_PORT:-8789}"
-POLL_INTERVAL="${AISTAT_LOCAL_POLL_INTERVAL_SECONDS:-180}"
 DEV_UPDATE_INTERVAL="${AISTAT_DEV_UPDATE_INTERVAL_SECONDS:-120}"
 
 LA_DIR="$HOME/Library/LaunchAgents"
@@ -59,12 +60,6 @@ resolve_repo_url() {
   if [ -n "${AISTAT_REPO_URL:-}" ]; then printf '%s' "$AISTAT_REPO_URL"; return; fi
   git -C "$SOURCE_ROOT" remote get-url origin 2>/dev/null \
     || die "cannot determine repo URL; set AISTAT_REPO_URL"
-}
-
-resolve_multica() {
-  local bin="${AISTAT_CLI_BIN:-}"
-  [ -n "$bin" ] || bin="$(command -v multica 2>/dev/null || true)"
-  printf '%s' "$bin"
 }
 
 branch_guard() {
@@ -118,14 +113,39 @@ prepare_checkout() {
   mkdir -p "$dir/data"
 }
 
+# The dashboard entry point, owned by this script instead of by the checkout.
+# A deployment tracks a branch, and an older branch's ./run.sh also starts
+# `aistat.poller` (plus the publisher when configured) next to the dashboard —
+# extra writers that would duplicate the canonical com.aistat.runtime collector.
+# Running the dashboard from here keeps exactly one automatic polling/publish
+# path no matter how old the tracked branch is.
+cmd_serve() {
+  local branch="${1:-}" dir port
+  branch_guard "$branch"
+  dir="$(deploy_dir "$branch")"
+  port="${AISTAT_PORT:-$(port_for "$branch")}"
+  [ -d "$dir/.git" ] || die "$branch deployment not installed; run: local_deploy.sh install"
+  ensure_deps "$dir"
+  mkdir -p "$dir/data"
+  cd "$dir"
+  # Optional local application settings, exactly as the app's own run.sh reads
+  # them. Collection stays with the runtime supervisor whatever the file says.
+  if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+  fi
+  log "$branch dashboard → http://127.0.0.1:$port"
+  exec "$dir/.venv/bin/uvicorn" aistat.server:app --host 127.0.0.1 --port "$port"
+}
+
 write_server_plist() {
-  local branch="$1" dir port label multica multica_dir plist
+  local branch="$1" dir port label plist
   branch_guard "$branch"
   dir="$(deploy_dir "$branch")"
   port="$(port_for "$branch")"
   label="$(label_for "$branch")"
-  multica="$(resolve_multica)"
-  multica_dir="$(dirname "$multica")"
   plist="$LA_DIR/$label.plist"
   mkdir -p "$LA_DIR" "$LOG_DIR"
   cat > "$plist" <<PLIST
@@ -137,15 +157,17 @@ write_server_plist() {
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$dir/run.sh</string>
+    <string>/bin/bash</string>
+    <string>$SELF_INSTALLED</string>
+    <string>serve</string>
+    <string>$branch</string>
   </array>
   <key>WorkingDirectory</key><string>$dir</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$multica_dir:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>AISTAT_PORT</key><string>$port</string>
-    <key>AISTAT_POLL_INTERVAL_SECONDS</key><string>$POLL_INTERVAL</string>
-    <key>AISTAT_CLI_BIN</key><string>$multica</string>
+    <key>AISTAT_LOCAL_ROOT</key><string>$LOCAL_ROOT</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -193,9 +215,6 @@ PLIST
 }
 
 cmd_install() {
-  local multica; multica="$(resolve_multica)"
-  [ -n "$multica" ]  || die "multica CLI not found in PATH; install/authenticate it or set AISTAT_CLI_BIN"
-  [ -x "$multica" ]  || die "AISTAT_CLI_BIN '$multica' is not executable"
   mkdir -p "$LOCAL_ROOT" "$LOG_DIR"
   # Copy this script OUTSIDE ~/Documents so the launchd dev-update timer can run
   # it (launchd cannot read macOS-protected ~/Documents).
@@ -374,6 +393,7 @@ main() {
   local cmd="${1:-status}"; shift || true
   case "$cmd" in
     install)   cmd_install "$@";;
+    serve)     cmd_serve "$@";;
     uninstall) cmd_uninstall "$@";;
     sync)      cmd_sync "$@";;
     release)   cmd_release "$@";;
@@ -381,7 +401,7 @@ main() {
     start)     cmd_start "$@";;
     stop)      cmd_stop "$@";;
     restart)   branch_guard "${1:-}"; restart_agent "$1"; log "$1 restarted";;
-    *) die "unknown command '$cmd' (install|uninstall|sync|release|status|start|stop|restart)";;
+    *) die "unknown command '$cmd' (install|serve|uninstall|sync|release|status|start|stop|restart)";;
   esac
 }
 

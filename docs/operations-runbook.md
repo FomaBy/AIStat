@@ -31,7 +31,13 @@
 - `data/worker_connections.db` — **зашифрованный** store токенов (ключ живёт вне
   `data/`, в `~/.config/aistat/worker.key`, и в копию не попадает — без ключа
   копия бесполезна);
-- каждый `*.db` из `data/tenants/`.
+- каждый `*.db` из `data/tenants/` — snapshot'ы, которые отдаются подключённому
+  tenant'у (в манифесте помечаются как `tenants/<файл>.db`);
+- каждый `*.db` из `data/worker_tenants/` — **канонические** БД per-user
+  сборщика, куда пишет collector (в манифесте — `worker_tenants/<файл>.db`).
+  Оба каталога ключуются по id пользователя, поэтому один и тот же basename
+  законно встречается в обоих; префикс в метке разводит их и при `restore`
+  каждая база возвращается в свой каталог.
 
 Каждая база копируется через SQLite backup API (коэрентно даже при активном WAL),
 сжимается gzip, проверяется полным `PRAGMA integrity_check`, а `aistat.db`
@@ -41,12 +47,16 @@
 `data/backups/aistat-<UTC>/` с файлами `*.db.gz` и `manifest.json` (sha256, размер,
 версия схемы, счётчики строк по каждой таблице).
 
+`create` завершается с ошибкой до чтения tenant DB, если настроенный tenant-store
+или любой компонент управляемого пути является symlink. Такой путь нельзя
+использовать для включения внешней базы в backup.
+
 Каталог `data/backups/` лежит внутри `data/`, поэтому он **gitignored** и никогда
 не попадает в репозиторий или в cPanel-пакет. Права — owner-only (`0700`/`0600`).
 
 Пути и ретенция переопределяются переменными окружения `AISTAT_BACKUP_DIR`,
 `AISTAT_BACKUP_RETENTION`, `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH`,
-`AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`.
+`AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`, `AISTAT_WORKER_TENANTS_DIR`.
 
 ### Расписание
 
@@ -92,7 +102,13 @@ python -m aistat.backup self-test
 `--dry-run` показывает план, ничего не меняя). Перед подменой каждый член
 поколения разжимается, проверяется на целостность и сверяется по sha256; текущая
 живая база **сохраняется рядом как `<имя>.pre-restore`**, и лишь затем атомарно
-подменяется. Ошибка на любом шаге оставляет живые данные нетронутыми.
+подменяется. До первой live mutation проверяются все source и target paths,
+включая ancestors и `.pre-restore`. При синхронной ошибке после начала
+multi-member commit compensating rollback возвращает каждый затронутый файл,
+sidecar, права и состояние существования к значениям до команды. Эта гарантия
+не является crash/power-loss транзакцией между несколькими файлами: после
+аварийного завершения или потери питания требуется проверить generation и live
+данные вручную.
 
 ```
 python -m aistat.backup restore latest --dry-run        # предпросмотр
@@ -100,9 +116,11 @@ python -m aistat.backup restore latest --yes            # восстановит
 python -m aistat.backup restore latest --only aistat.db --yes  # одну базу
 ```
 
-Restore никогда не доверяет путям внутри манифеста: цель выводится только из
-текущей конфигурации, поэтому подделанный manifest не может записать данные вне
-`data/`.
+`verify`, `restore` и `self-test` принимают только ожидаемый обычный файл —
+не symlink — непосредственно внутри generation; absolute, traversal, вложенные
+и дублирующиеся `label`/`file` отклоняются до чтения данных. Restore-цель
+выводится только из текущей конфигурации, поэтому подделанный manifest не может
+читать archive member или записать live DB через внешний путь.
 
 ## Безопасная диагностика HTTP 409 freshness
 
@@ -118,8 +136,13 @@ python -m aistat.snapshot /verified/incoming-copy.db /verified/current-copy.db
 Команда открывает обе SQLite copies только для чтения и печатает JSON только с
 `verdict`, `reason` и агрегированными количествами строк; она возвращает `0`
 для `accept` и `1` для `reject`. Возможные `reason`: `incoming_older_day`,
-`incoming_empty_over_populated`, `missing_same_day_rows`,
-`decreased_same_day_counters`, `incoming_unreadable`, `target_unreadable`.
+`incoming_empty_over_populated`, `missing_rows`, `decreased_counters`,
+`incoming_unreadable`, `target_unreadable`. Проверка охватывает **всю**
+историю: `missing_rows`/`decreased_counters` означают, что incoming потерял
+или уменьшил уже записанную строку `(runtime_id, model, date)` на любой дате,
+даже если последний день совпадает. Хост предыдущего поколения возвращает те же
+два вердикта под старыми именами `missing_same_day_rows` и
+`decreased_same_day_counters`.
 Сохраните обе копии и backups, затем верните PM только код `reason` и verdict
 для отдельного решения.
 
@@ -155,8 +178,8 @@ curl -s http://127.0.0.1:8000/health | python -m json.tool | less
 Все сообщения об ошибках проходят через фиксированный безопасный словарь
 `aistat.handoff.safe_sync_error`, поэтому в `last_error` не попадают токены,
 пути или произвольный текст исключений. Сырые логи контуров лежат в
-`data/<контур>.log` (`poller.log`, `publisher.log`, `worker_sync.log`,
-`collector.log`) — это дополнение к health, а не замена.
+`data/<контур>.log` (`worker_sync.log`, `collector.log`) — это дополнение к
+health, а не замена.
 
 ## Гигиена секретов и логов
 

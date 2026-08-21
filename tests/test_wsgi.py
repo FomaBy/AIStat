@@ -667,10 +667,10 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         assert report["detail"] == "snapshot freshness rejected"
         assert report["reason"] == reason
         assert set(report["summary"]) == {
-            "incoming_latest_rows",
-            "target_latest_rows",
-            "missing_same_day_rows",
-            "decreased_same_day_rows",
+            "incoming_rows",
+            "target_rows",
+            "missing_rows",
+            "decreased_rows",
         }
         rendered = json.dumps(report, sort_keys=True)
         for forbidden in (
@@ -693,7 +693,7 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "AND model = 'm-mystery' AND date = '2026-01-02';"
     )
     rejected = post(degraded, base_ts + 10)
-    assert_rejected(rejected, "missing_same_day_rows")
+    assert_rejected(rejected, "missing_rows")
 
     lower = build(
         "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
@@ -701,7 +701,18 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "AND date = '2026-01-02';"
     )
     rejected = post(lower, base_ts + 20)
-    assert_rejected(rejected, "decreased_same_day_counters")
+    assert_rejected(rejected, "decreased_counters")
+
+    # FAN-2031: a rewritten *earlier* day is rejected too — the latest day
+    # matching the target is no longer enough to pass the guard.
+    lower_history = build(
+        "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
+        "WHERE date = '2026-01-01';"
+    )
+    assert_rejected(post(lower_history, base_ts + 21), "decreased_counters")
+
+    dropped_history = build("DELETE FROM daily_usage WHERE date = '2026-01-01';")
+    assert_rejected(post(dropped_history, base_ts + 22), "missing_rows")
 
     empty = build("DELETE FROM daily_usage;")
     rejected = post(empty, base_ts + 25)

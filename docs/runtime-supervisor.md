@@ -1,16 +1,14 @@
 # Автономный локальный рантайм AIStat (supervisor)
 
-Доверенная локальная машина держит постоянно поднятыми ровно **четыре**
+Доверенная локальная машина держит постоянно поднятыми ровно **два**
 долгоживущих контура:
 
 | Контур | Команда | Что делает |
 |---|---|---|
-| owner poller | `python -m aistat.poller` | синхронизирует Multica владельца в локальную БД |
-| owner publisher | `python -m aistat.publish --watch` | подписанный snapshot владельца → публичный хост |
 | PAT worker | `python -m aistat.worker_sync --watch` | тянет пользовательские токены в зашифрованный store |
 | per-user collector | `python -m aistat.collector` | собирает статистику по подключениям и публикует per-tenant |
 
-Всеми четырьмя управляет один **fail-fast supervisor**
+Ими управляет один **fail-fast supervisor**
 (`aistat/supervisor.py`), которого поднимает один launchd-агент
 `com.aistat.runtime`. Supervisor:
 
@@ -34,12 +32,13 @@
 <runtime-root>/
   code/        активная копия кода (пакет aistat + манифесты)
   code.prev/   предыдущая копия — для rollback
+  code.rollback/  копия, припаркованная на время отката (см. «Откат»)
   data/        постоянное состояние: БД, зашифрованный store, tenants, логи
   .venv/       виртуальное окружение рантайма
 ```
 
-`data/` лежит **вне** `code/`, поэтому обновление кода никогда не трогает БД
-владельца, зашифрованный store, tenant-снимки и логи. Ключ шифрования по
+`data/` лежит **вне** `code/`, поэтому обновление кода никогда не трогает
+зашифрованный store, tenant-снимки и логи. Ключ шифрования по
 умолчанию `~/.config/aistat/worker.key` — вообще вне рантайм-рута.
 
 ## Контракт приватной активации (без значений секретов)
@@ -72,28 +71,25 @@ launchd. `uninstall` и `status` остаются доступны без фай
 Минимальный набор для рантайма (значения задаёт владелец, здесь только имена):
 
 ```
-AISTAT_TENANT_ID=            # внутренний users.id владельца (из aistat.migrate)
-AISTAT_PUBLISH_URL=          # https://… — куда publisher шлёт snapshot
-AISTAT_SESSION_SECRET=       # ≥32 байта, HMAC сессий; тот же, что на public host
-AISTAT_INGEST_SECRET=        # ≥32 байта, независимый HMAC для snapshot
+AISTAT_PUBLISH_URL=          # https://… — куда collector шлёт tenant snapshot
+AISTAT_INGEST_SECRET=        # ≥32 байта, HMAC для tenant snapshot
 AISTAT_WORKER_SYNC_URL=      # https://… — откуда worker тянет токены
 AISTAT_WORKER_SECRET=        # ≥32 байта, независимый HMAC для worker-канала
 ```
 
 Требования, которые проверяет preflight (`python -m aistat.preflight`):
 
-- задан `AISTAT_TENANT_ID`;
 - `AISTAT_PUBLISH_URL` и `AISTAT_WORKER_SYNC_URL` — HTTPS;
-- `AISTAT_SESSION_SECRET`, `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET`
-  обязательны, не короче 32 байт и **попарно различаются**;
-- интервалы publish/worker-pull/worker-collect ≥ 60 секунд;
+- `AISTAT_INGEST_SECRET` и `AISTAT_WORKER_SECRET` обязательны, не короче
+  32 байт и различаются;
+- интервалы worker-pull/worker-collect ≥ 60 секунд;
 - ключ шифрования лежит **не** в каталоге store; ключ/store — owner-only
   (`0600`), каталоги — `0700`;
 - все контуры и зависимость `cryptography` импортируются.
 
 Каждый host-side secret генерируется отдельно командой
 `python -m aistat.security generate-secret`; в private runtime env копируются
-те же три значения, чтобы preflight проверял реальную попарную независимость.
+эти два значения, чтобы preflight проверял реальную независимость.
 
 > **Fail-closed intake.** Хост не сохраняет новый PAT, пока не увидит свежий
 > подписанный heartbeat worker'а: до первого успешного `worker_sync` intake
@@ -130,8 +126,10 @@ deploy/aistat_runtime.sh uninstall --purge    # снять рантайм и у�
 5. `launchctl bootout` старого + `bootstrap` нового задания, postflight.
 
 Если что-то падает после swap — предыдущая копия автоматически
-восстанавливается из `code.prev/` и снова bootstrap'ится. Неудачная установка
-никогда не оставляет машину без рабочего рантайма и не удаляет `data/`.
+восстанавливается из `code.prev/`. Она bootstrap'ится только если проходит
+**собственный** preflight (см. «Откат»); иначе код возвращён на место, но
+рантайм остаётся остановленным — падающий в цикле supervisor и второй
+poller/publisher были бы хуже. Неудачная установка никогда не удаляет `data/`.
 Повторный `install` идемпотентен.
 
 ### Откат
@@ -139,6 +137,31 @@ deploy/aistat_runtime.sh uninstall --purge    # снять рантайм и у�
 ```bash
 deploy/aistat_runtime.sh rollback     # code.prev/ → code/, повторный bootstrap
 ```
+
+У поколения в `code.prev/` может быть свой контракт конфигурации (например,
+старая копия всё ещё требует owner tenant id и session secret). Поэтому
+`rollback` проверяет именно **восстанавливаемую** копию, а не работающую:
+
+1. guard персистентного env-файла, как у `restart`;
+2. `python -m aistat.preflight` из каталога `code.prev/` с окружением plist —
+   до точки коммита. Провал = откат отклонён, живой рантайм не тронут;
+3. swap: работающая копия **паркуется** в `code.rollback/` (rename, не
+   копирование), `code.prev/ → code/`, затем `bootout` + `bootstrap`;
+4. post-health: восстановленный supervisor должен опубликовать свежий
+   `run/supervisor.status.json` с живыми контурами. Задание, «загруженное» и
+   падающее в цикле, успешным откатом не считается;
+5. только после пройденного health-гейта припаркованная копия удаляется.
+
+Провал bootstrap, postflight или health отменяет откат целиком: отклонённое
+поколение остаётся в `code.prev/` для диагностики, припаркованная рабочая
+копия возвращается в `code/` байт-в-байт, поднимается заново и сама проходит
+health-проверку. Команда завершается ненулевым кодом, `data/` не трогается.
+Если не удалось и восстановление, это отдельная терминальная ошибка
+(`RollbackRecoveryError`): **оба** поколения остаются на диске и ни одно не
+объявляется здоровым — единственное состояние, которое чинится вручную.
+Уцелевший `code.rollback/` (например, после kill между двумя rename)
+блокирует следующий `rollback` до ручного разбора: какую копию оставить —
+решение оператора, а не повторной попытки.
 
 ### Удаление
 
@@ -193,7 +216,7 @@ install`, который выполняет миграцию автоматич�
 ## Логи и статус
 
 - `data/runtime.stdout.log`, `data/runtime.stderr.log` — вывод supervisor;
-- `data/<contour>.log` — вывод каждого контура (poller/publisher/…);
+- `data/<contour>.log` — вывод каждого контура (`worker_sync`/`collector`);
 - `run/supervisor.status.json` — текущие PID/перезапуски по контурам (без
   секретов), права `0600`.
 

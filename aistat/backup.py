@@ -27,7 +27,9 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -58,15 +60,66 @@ class BackupError(Exception):
     """A backup could not be created, verified or restored safely."""
 
 
+def _assert_no_symlink_components(path: Path, description: str) -> None:
+    """Reject symlinks anywhere in a managed filesystem path."""
+    raw = Path(path)
+    if ".." in raw.parts:
+        raise BackupError("%s contains a parent traversal: %s" % (description, path))
+    absolute = Path(os.path.abspath(str(raw)))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(str(current)).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise BackupError("cannot inspect %s %s: %s" % (description, path, exc))
+        if stat.S_ISLNK(mode):
+            raise BackupError("%s must not contain a symlink: %s" % (description, current))
+        if current != absolute and not stat.S_ISDIR(mode):
+            raise BackupError(
+                "%s has a non-directory ancestor: %s" % (description, current)
+            )
+
+
+def _lstat_regular_or_missing(path: Path, description: str) -> bool:
+    """Validate a managed path and return whether a regular file exists."""
+    _assert_no_symlink_components(path, description)
+    try:
+        mode = os.lstat(str(path)).st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise BackupError("cannot inspect %s %s: %s" % (description, path, exc))
+    if not stat.S_ISREG(mode):
+        raise BackupError("%s must be a regular file: %s" % (description, path))
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Discovery of the durable databases
 # --------------------------------------------------------------------------- #
+def _tenant_stores(cfg: Config) -> List[Tuple[str, Path]]:
+    """The two per-tenant database directories, by manifest label prefix.
+
+    ``tenants`` holds the snapshots served to a connected tenant; the collector
+    writes each connection's own database into ``worker_tenants``. Both are
+    keyed by user id, so the *same* basename legitimately exists in both.
+    """
+    return [
+        ("tenants", Path(cfg.tenants_dir)),
+        ("worker_tenants", Path(cfg.worker_tenants_dir)),
+    ]
+
+
 def _canonical_targets(cfg: Config) -> Dict[str, Path]:
-    """Map each backup member basename to the live path it restores to.
+    """Map each top-level backup member label to the live path it restores to.
 
     Restore never trusts a path recorded inside a manifest: it looks the member
-    up in this map (derived only from the current config), so a tampered
-    manifest can never redirect ``os.replace`` outside the data directory.
+    up here or in :func:`_tenant_stores` (both derived only from the current
+    config), so a tampered manifest can never redirect ``os.replace`` outside
+    the data directory.
     """
     targets: Dict[str, Path] = {
         cfg.db_path.name: cfg.db_path,
@@ -76,29 +129,74 @@ def _canonical_targets(cfg: Config) -> Dict[str, Path]:
     return targets
 
 
-def _durable_databases(cfg: Config) -> List[Tuple[str, Path]]:
-    """Return ``(basename, path)`` for every durable database that exists now.
+def _member_stem(label: str) -> str:
+    """Flat, collision-free file stem for a member label inside a generation."""
+    return label.replace("/", "__")
 
-    The three top-level stores plus every ``*.db`` file directly inside the
-    tenants directory. Basenames are unique across these sources by
-    construction; a duplicate is skipped rather than silently overwritten.
+
+def _is_tenant_db_name(name: str) -> bool:
+    """True for a plain ``*.db`` basename — never a path or a traversal step."""
+    return (
+        bool(name)
+        and name.endswith(".db")
+        and name == os.path.basename(name)
+        and "\\" not in name
+        and name not in (".", "..")
+    )
+
+
+def _restore_target(cfg: Config, label: str) -> Path:
+    """Resolve a manifest label to the live path it may be restored to.
+
+    A top-level label resolves through the canonical map and a
+    ``<store>/<basename>`` label through that store's configured directory. A
+    bare unknown label keeps generations written before the stores were
+    labelled restorable (they only ever held ``tenants`` members). Anything
+    else — an unknown store, a nested path, a traversal step — fails closed.
+    """
+    targets = _canonical_targets(cfg)
+    if label in targets:
+        return targets[label]
+    store, separator, name = label.partition("/")
+    if not separator:
+        store, name = "tenants", label
+    directory = dict(_tenant_stores(cfg)).get(store)
+    if directory is None or not _is_tenant_db_name(name):
+        raise BackupError(
+            "member %s has no known restore target in this config" % label
+        )
+    return directory / name
+
+
+def _durable_databases(cfg: Config) -> List[Tuple[str, Path]]:
+    """Return ``(label, path)`` for every durable database that exists now.
+
+    The three top-level stores plus every ``*.db`` file directly inside each
+    tenant store. Tenant labels carry their store prefix because one user id
+    yields the same basename in both stores — an unprefixed label would drop
+    one of the two databases from the generation.
     """
     seen: Dict[str, Path] = {}
-    candidates: List[Path] = [
-        cfg.db_path,
-        cfg.security_db_path,
-        cfg.worker_store_path,
+    candidates: List[Tuple[str, Path]] = [
+        (path.name, path)
+        for path in (cfg.db_path, cfg.security_db_path, cfg.worker_store_path)
     ]
-    if cfg.tenants_dir.is_dir():
-        candidates.extend(sorted(cfg.tenants_dir.glob("*.db")))
-    for path in candidates:
-        if not path.is_file() or path.is_symlink():
+    for store, directory in _tenant_stores(cfg):
+        _assert_no_symlink_components(directory, "%s tenant store" % store)
+        if os.path.lexists(str(directory)) and not directory.is_dir():
+            raise BackupError("tenant store must be a directory: %s" % directory)
+        if directory.is_dir():
+            candidates.extend(
+                (store + "/" + path.name, path)
+                for path in sorted(directory.glob("*.db"))
+            )
+    for label, path in candidates:
+        if not _lstat_regular_or_missing(path, "backup source"):
             continue
-        name = path.name
-        if name in seen:
-            logger.warning("skipping duplicate backup member name: %s", name)
+        if label in seen:
+            logger.warning("skipping duplicate backup member name: %s", label)
             continue
-        seen[name] = path
+        seen[label] = path
     return list(seen.items())
 
 
@@ -200,7 +298,7 @@ def create_backup(cfg: Config, *, now_iso: Optional[str] = None) -> Path:
         members = []
         for name, path in databases:
             gz_bytes = create_compressed_snapshot(path)
-            member_file = staging / (name + ".gz")
+            member_file = staging / (_member_stem(name) + ".gz")
             member_file.write_bytes(gz_bytes)
             try:
                 os.chmod(member_file, 0o600)
@@ -209,7 +307,7 @@ def create_backup(cfg: Config, *, now_iso: Optional[str] = None) -> Path:
             # Decompress into a scratch file and prove it restores cleanly
             # *before* the generation is published — a backup that fails its
             # own integrity check is worse than none.
-            scratch = staging / (name + ".check")
+            scratch = staging / (_member_stem(name) + ".check")
             _decompress_member(member_file, scratch)
             try:
                 schema_version = _verify_db_file(
@@ -312,49 +410,184 @@ def resolve_backup(cfg: Config, ref: str) -> Path:
     return candidate
 
 
+def _validated_manifest_members(cfg: Config, generation: Path, manifest: dict):
+    """Validate all manifest paths before any archive member is read."""
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("members"), list):
+        raise BackupError("manifest members must be a list")
+    members = manifest["members"]
+    if not members:
+        raise BackupError("backup manifest has no members")
+    seen_labels = set()
+    seen_files = set()
+    validated = []
+    for member in members:
+        if not isinstance(member, dict):
+            raise BackupError("manifest member must be an object")
+        label = member.get("label")
+        member_file = member.get("file")
+        if not isinstance(label, str) or not label:
+            raise BackupError("manifest member has an invalid label")
+        if not isinstance(member_file, str) or not member_file:
+            raise BackupError("manifest member %s has an invalid file" % label)
+        target = _restore_target(cfg, label)
+        expected_file = _member_stem(label) + ".gz"
+        if (
+            member_file != os.path.basename(member_file)
+            or "\\" in member_file
+            or member_file in (".", "..")
+            or member_file != expected_file
+        ):
+            raise BackupError(
+                "member %s must use archive file %s" % (label, expected_file)
+            )
+        if label in seen_labels:
+            raise BackupError("duplicate manifest member label: %s" % label)
+        if member_file in seen_files:
+            raise BackupError("duplicate manifest member file: %s" % member_file)
+        seen_labels.add(label)
+        seen_files.add(member_file)
+        source = generation / member_file
+        try:
+            mode = os.lstat(str(source)).st_mode
+        except OSError as exc:
+            raise BackupError("cannot inspect member file %s: %s" % (member_file, exc))
+        if not stat.S_ISREG(mode):
+            raise BackupError(
+                "member file must be a direct regular non-symlink child: %s"
+                % member_file
+            )
+        validated.append((member, label, source, target))
+    return validated
+
+
 def verify_backup(cfg: Config, ref: str) -> dict:
     """Decompress every member of a generation and re-check it end to end."""
     generation = resolve_backup(cfg, ref)
     manifest = load_manifest(generation)
+    members = _validated_manifest_members(cfg, generation, manifest)
     checked = []
     with tempfile.TemporaryDirectory(prefix=".aistat-verify-") as tmp:
         tmp_dir = Path(tmp)
-        for member in manifest.get("members", []):
-            gz_path = generation / member["file"]
-            if not gz_path.is_file():
-                raise BackupError("missing member file: %s" % member["file"])
-            scratch = tmp_dir / member["label"]
+        for member, label, gz_path, _target in members:
+            scratch = tmp_dir / _member_stem(label)
             _decompress_member(gz_path, scratch)
             digest = hashlib.sha256(scratch.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
                 raise BackupError(
                     "checksum mismatch for %s in %s"
-                    % (member["label"], generation.name)
+                    % (label, generation.name)
                 )
-            _verify_db_file(scratch, is_main=(member["label"] == MAIN_DB_NAME))
-            checked.append(member["label"])
+            _verify_db_file(scratch, is_main=(label == MAIN_DB_NAME))
+            checked.append(label)
     return {"name": generation.name, "verified_members": checked}
 
 
 # --------------------------------------------------------------------------- #
 # restore
 # --------------------------------------------------------------------------- #
+def _restore_state_paths(target: Path) -> List[Path]:
+    return [
+        target,
+        target.with_name(target.name + ".pre-restore"),
+    ] + [Path(str(target) + suffix) for suffix in _SIDECAR_SUFFIXES]
+
+
+def _validate_restore_target(target: Path) -> None:
+    """Reject every target hazard before the first live path is changed."""
+    for path in _restore_state_paths(target):
+        _lstat_regular_or_missing(path, "restore path")
+
+
+def _missing_directories(parent: Path) -> List[Path]:
+    missing = []
+    current = parent
+    while not os.path.lexists(str(current)):
+        missing.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    return missing
+
+
+def _snapshot_restore_state(planned, snapshot_dir: Path):
+    """Copy the exact pre-command file state before commit begins."""
+    state = []
+    missing_dirs = set()
+    for index, (_label, _scratch, target) in enumerate(planned):
+        missing_dirs.update(_missing_directories(target.parent))
+        for path_index, path in enumerate(_restore_state_paths(target)):
+            snapshot = None
+            if os.path.lexists(str(path)):
+                snapshot = snapshot_dir / ("%d-%d" % (index, path_index))
+                shutil.copy2(str(path), str(snapshot))
+            state.append((path, snapshot))
+    return state, missing_dirs
+
+
+def _same_file_state(path: Path, snapshot: Path) -> bool:
+    try:
+        current_stat = path.stat()
+        snapshot_stat = snapshot.stat()
+    except OSError:
+        return False
+    if (
+        stat.S_IMODE(current_stat.st_mode) != stat.S_IMODE(snapshot_stat.st_mode)
+        or current_stat.st_size != snapshot_stat.st_size
+        or current_stat.st_mtime_ns != snapshot_stat.st_mtime_ns
+    ):
+        return False
+    with path.open("rb") as current, snapshot.open("rb") as saved:
+        while True:
+            current_chunk = current.read(1024 * 1024)
+            if current_chunk != saved.read(1024 * 1024):
+                return False
+            if not current_chunk:
+                return True
+
+
+def _rollback_restore(state, missing_dirs) -> None:
+    errors = []
+    for path, snapshot in reversed(state):
+        try:
+            if snapshot is None:
+                if os.path.lexists(str(path)):
+                    _unlink_quiet(path)
+            elif not _same_file_state(path, snapshot):
+                shutil.copy2(str(snapshot), str(path))
+                fsync_file(path)
+                _fsync_dir(path.parent)
+        except OSError as exc:
+            errors.append("%s: %s" % (path, exc))
+    for directory in sorted(
+        missing_dirs, key=lambda path: len(path.parts), reverse=True
+    ):
+        try:
+            directory.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append("%s: %s" % (directory, exc))
+    if errors:
+        raise BackupError("restore rollback failed: %s" % "; ".join(errors))
+
+
 def _atomic_install(scratch: Path, target: Path) -> None:
     """Swap ``scratch`` over ``target`` after copying the old file aside.
 
-    Everything before ``os.replace`` may raise and leaves the live file intact;
-    everything after it is best-effort. A caught error therefore always means
-    the live database was not touched.
+    The caller snapshots all targets and rolls the whole plan back if this
+    synchronous install raises.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_symlink():
-        raise BackupError("restore target must not be a symlink: %s" % target)
+    _validate_restore_target(target)
+    if not target.parent.is_dir():
+        # A restore onto a fresh machine recreates a missing store directory
+        # (e.g. data/worker_tenants) owner-only, like the runtime itself does.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target.parent, 0o700)
+        except OSError:
+            pass
     previous = target.with_name(target.name + ".pre-restore")
-    if previous.is_symlink():
-        raise BackupError("pre-restore backup must not be a symlink: %s" % previous)
     if target.exists():
-        import shutil
-
         shutil.copy2(str(target), str(previous))
         try:
             os.chmod(previous, 0o600)
@@ -380,33 +613,32 @@ def restore_backup(
 
     Every member is decompressed, integrity-checked and checksum-matched before
     anything live is touched; the replaced file is preserved as ``.pre-restore``.
-    ``only`` limits the restore to a single member basename.
+    Synchronous commit failures roll every member back to its pre-command state.
+    ``only`` limits the restore to a single member label.
     """
     generation = resolve_backup(cfg, ref)
     manifest = load_manifest(generation)
-    targets = _canonical_targets(cfg)
-    planned = []
-    restored = []
+    members = _validated_manifest_members(cfg, generation, manifest)
+    selected = [entry for entry in members if not only or entry[1] == only]
+    if only and not selected:
+        raise BackupError("member not found in backup: %s" % only)
+
+    targets = set()
+    for _member, label, _source, target in selected:
+        target_key = os.path.abspath(str(target))
+        if target_key in targets:
+            raise BackupError("multiple manifest members restore to %s" % target)
+        targets.add(target_key)
+        _validate_restore_target(target)
+    _assert_no_symlink_components(cfg.db_path.parent, "restore scratch directory")
+
     with tempfile.TemporaryDirectory(
         prefix=".aistat-restore-", dir=str(cfg.db_path.parent)
     ) as tmp:
         tmp_dir = Path(tmp)
-        for member in manifest.get("members", []):
-            label = member["label"]
-            if only and label != only:
-                continue
-            target = targets.get(label)
-            if target is None and cfg.tenants_dir.is_dir():
-                # A tenant member restores back into the tenants directory only.
-                target = cfg.tenants_dir / label
-            if target is None:
-                raise BackupError(
-                    "member %s has no known restore target in this config" % label
-                )
-            gz_path = generation / member["file"]
-            if not gz_path.is_file():
-                raise BackupError("missing member file: %s" % member["file"])
-            scratch = tmp_dir / label
+        planned = []
+        for member, label, gz_path, target in selected:
+            scratch = tmp_dir / _member_stem(label)
             _decompress_member(gz_path, scratch)
             digest = hashlib.sha256(scratch.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
@@ -414,8 +646,6 @@ def restore_backup(
             _verify_db_file(scratch, is_main=(label == MAIN_DB_NAME))
             planned.append((label, scratch, target))
 
-        if only and not planned:
-            raise BackupError("member not found in backup: %s" % only)
         if dry_run:
             return {
                 "name": generation.name,
@@ -424,9 +654,23 @@ def restore_backup(
                     {"label": lbl, "target": str(tgt)} for lbl, _s, tgt in planned
                 ],
             }
-        for label, scratch, target in planned:
-            _atomic_install(scratch, target)
-            restored.append({"label": label, "target": str(target)})
+        state, missing_dirs = _snapshot_restore_state(planned, tmp_dir)
+        try:
+            for _label, scratch, target in planned:
+                _atomic_install(scratch, target)
+        except BaseException as exc:
+            try:
+                _rollback_restore(state, missing_dirs)
+            except BackupError as rollback_exc:
+                raise BackupError(
+                    "restore failed (%s) and compensation failed (%s)"
+                    % (exc, rollback_exc)
+                ) from exc
+            raise
+        restored = [
+            {"label": label, "target": str(target)}
+            for label, _scratch, target in planned
+        ]
     logger.info("restored %d member(s) from %s", len(restored), generation.name)
     return {"name": generation.name, "restored": restored}
 
@@ -440,16 +684,12 @@ def self_test(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
     data. Returns ``{"ok": bool, ...}``; raises :class:`BackupError` on failure."""
     generation = create_backup(cfg, now_iso=now_iso)
     manifest = load_manifest(generation)
-    members = manifest.get("members", [])
-    if not members:
-        raise BackupError("fresh backup has no members to test")
+    members = _validated_manifest_members(cfg, generation, manifest)
     results = []
     with tempfile.TemporaryDirectory(prefix=".aistat-selftest-") as tmp:
         tmp_dir = Path(tmp)
-        for member in members:
-            label = member["label"]
-            gz_path = generation / member["file"]
-            restored = tmp_dir / label
+        for member, label, gz_path, _target in members:
+            restored = tmp_dir / _member_stem(label)
             _decompress_member(gz_path, restored)
             digest = hashlib.sha256(restored.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
@@ -539,7 +779,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_verify.add_argument("ref", nargs="?", default="latest")
     p_restore = sub.add_parser("restore", help="restore a generation into data/")
     p_restore.add_argument("ref", nargs="?", default="latest")
-    p_restore.add_argument("--only", help="restore a single member basename")
+    p_restore.add_argument(
+        "--only", help="restore a single member label (e.g. worker_tenants/7.db)"
+    )
     p_restore.add_argument(
         "--dry-run", action="store_true", help="show what would be restored"
     )
