@@ -59,10 +59,28 @@ def upsert_projects(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
 
 def upsert_issues(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
                   synced_at: Optional[str] = None) -> int:
-    """Upsert issues while preserving the details_synced_* bookkeeping."""
+    """Upsert issues while preserving the details_synced_* bookkeeping.
+
+    Also records issue_status_events (FAN-3306): the first observation of an
+    issue is written with initial=1 (a collection baseline, not a real
+    transition), and every subsequently observed status change with initial=0.
+    Re-upserting an unchanged status writes nothing, so repeated cycles stay
+    idempotent.
+    """
     synced_at = synced_at or utcnow_iso()
     count = 0
     for row in rows:
+        status = row.get("status")
+        if status:
+            existing = conn.execute(
+                "SELECT status FROM issues WHERE id = ?", (row["id"],)
+            ).fetchone()
+            if existing is None or existing["status"] != status:
+                conn.execute(
+                    "INSERT OR IGNORE INTO issue_status_events "
+                    "(issue_id, status, observed_at, initial) VALUES (?, ?, ?, ?)",
+                    (row["id"], status, synced_at, 1 if existing is None else 0),
+                )
         _upsert(conn, "issues", ["id"], row, synced_at)
         count += 1
     return count
@@ -145,6 +163,122 @@ def mark_issue_details_synced(conn: sqlite3.Connection, issue_id: str,
         "UPDATE issues SET details_synced_at = ?, details_synced_for = ? WHERE id = ?",
         (synced_at or utcnow_iso(), detail_key, issue_id),
     )
+
+
+def parse_dispatch_profile(description: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse the machine-readable dispatch profile an agent description carries.
+
+    Delivery agents in this workspace describe themselves as
+    ``dispatch_profile=...; role=implementation; native_lane=dev_high;
+    borrow_lanes=dev_medium,dev_low; ...``. Returns {"role", "native_lane",
+    "lanes"} (lanes = native + borrow set) for an eligible delivery agent
+    (role implementation/qa/devops with a native lane), else None — RETIRED
+    and non-delivery agents carry no dispatch_profile and are not part of the
+    fleet.
+    """
+    if not description or "dispatch_profile=" not in description:
+        return None
+    fields = {}
+    for part in description.split(";"):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            fields[key.strip()] = value.strip()
+    role = fields.get("role")
+    native_lane = fields.get("native_lane")
+    if role not in ("implementation", "qa", "devops") or not native_lane:
+        return None
+    lanes = {native_lane}
+    for lane in (fields.get("borrow_lanes") or "").split(","):
+        lane = lane.strip()
+        if lane and lane != "none":
+            lanes.add(lane)
+    return {"role": role, "native_lane": native_lane, "lanes": lanes}
+
+
+# Non-terminal run statuses: an agent with such a run is busy right now.
+ACTIVE_RUN_STATUSES = ("pending", "dispatched", "running")
+
+# Issue statuses under which a dispatch_ready card is still waiting for an
+# executor (mirrors the dispatcher's queue: once dispatched it is in_progress).
+READY_CARD_STATUSES = ("todo", "backlog")
+
+
+def record_fleet_snapshot(conn: sqlite3.Connection, at: Optional[str] = None,
+                          paused: bool = False) -> Dict[str, int]:
+    """Record one durable fleet capacity snapshot (FAN-3306).
+
+    Resolved entirely from freshly synced local tables (agents, runs, issues)
+    — the caller is responsible for only invoking this when those inputs
+    synced successfully this cycle, so a degraded cycle never fabricates
+    capacity state. An idle agent is *starved* when no dispatch_ready card in
+    a lane it serves (native + borrow) exists; ready cards without a
+    dispatch_lane are counted but match no agent.
+    """
+    at = at or utcnow_iso()
+    busy_ids = {
+        row["agent_id"] for row in conn.execute(
+            "SELECT DISTINCT agent_id FROM runs WHERE status IN (?, ?, ?) "
+            "AND agent_id IS NOT NULL", ACTIVE_RUN_STATUSES,
+        )
+    }
+    ready_by_lane: Dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT COALESCE(dispatch_lane, 'unknown') AS lane, COUNT(*) AS n "
+        "FROM issues WHERE dispatch_ready = 1 AND is_jira = 0 "
+        "AND status IN (?, ?) GROUP BY lane", READY_CARD_STATUSES,
+    ):
+        ready_by_lane[row["lane"]] = row["n"]
+
+    lane_rollup: Dict[str, Dict[str, int]] = {}
+
+    def lane_bucket(lane: str) -> Dict[str, int]:
+        if lane not in lane_rollup:
+            lane_rollup[lane] = {
+                "eligible": 0, "idle": 0, "starved_idle": 0, "ready_cards": 0,
+            }
+        return lane_rollup[lane]
+
+    eligible = idle = starved = 0
+    for row in conn.execute(
+        "SELECT id, description FROM agents WHERE archived_at IS NULL"
+    ):
+        profile = parse_dispatch_profile(row["description"])
+        if profile is None:
+            continue
+        eligible += 1
+        bucket = lane_bucket(profile["native_lane"])
+        bucket["eligible"] += 1
+        if row["id"] in busy_ids:
+            continue
+        idle += 1
+        bucket["idle"] += 1
+        if not any(ready_by_lane.get(lane) for lane in profile["lanes"]):
+            starved += 1
+            bucket["starved_idle"] += 1
+
+    ready_total = sum(ready_by_lane.values())
+    for lane, n in ready_by_lane.items():
+        lane_bucket(lane)["ready_cards"] = n
+
+    conn.execute(
+        "INSERT OR REPLACE INTO fleet_snapshots "
+        "(at, eligible, idle, starved_idle, ready_cards, paused) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (at, eligible, idle, starved, ready_total, 1 if paused else 0),
+    )
+    conn.execute("DELETE FROM fleet_snapshot_lanes WHERE at = ?", (at,))
+    for lane, bucket in lane_rollup.items():
+        conn.execute(
+            "INSERT INTO fleet_snapshot_lanes "
+            "(at, lane, eligible, idle, starved_idle, ready_cards) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (at, lane, bucket["eligible"], bucket["idle"],
+             bucket["starved_idle"], bucket["ready_cards"]),
+        )
+    return {
+        "eligible": eligible, "idle": idle, "starved_idle": starved,
+        "ready_cards": ready_total,
+    }
 
 
 def record_beat(conn: sqlite3.Connection, phase: str,

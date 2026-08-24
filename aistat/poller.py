@@ -339,18 +339,32 @@ class Poller:
         self.conn.commit()
 
         # -- slow phase: issues, runs, detail backfill ----------------------
+        issues_ok = bool(projects)
         for project in projects or []:
             pid = project["id"]
-            self._source(result, f"issues:{pid}",
-                         functools.partial(self.sync_project_issues, pid))
+            ok, _ = self._source(result, f"issues:{pid}",
+                                 functools.partial(self.sync_project_issues, pid))
+            issues_ok = issues_ok and ok
 
         # agent_tasks before issue_details: fresh runs can mark issues stale
         # (and only issue_details is elastic, so it alone absorbs a deadline
         # overrun — no other source can be starved by a large backlog).
+        tasks_ok = True
         for agent in agents or []:
             aid = agent["id"]
-            self._source(result, f"agent_tasks:{aid}",
-                         functools.partial(self.sync_agent_tasks, aid))
+            ok, _ = self._source(result, f"agent_tasks:{aid}",
+                                 functools.partial(self.sync_agent_tasks, aid))
+            tasks_ok = tasks_ok and ok
+
+        # Durable fleet capacity snapshot (FAN-3306) — only when every input it
+        # is resolved from (agents, issues, runs) synced cleanly this cycle;
+        # a degraded cycle leaves a truthful coverage gap instead of a
+        # fabricated capacity state.
+        if agents and issues_ok and tasks_ok:
+            self._source(result, "flow_snapshot",
+                         functools.partial(store.record_fleet_snapshot, self.conn))
+        else:
+            logger.info("flow snapshot skipped: capacity inputs incomplete")
 
         self.sync_issue_details(result, budget=detail_budget, deadline=deadline)
 

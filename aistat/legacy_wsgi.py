@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from . import (
     __version__,
     aggregates,
+    flow_metrics,
     global_stats,
     handoff,
     oauth,
@@ -1952,6 +1953,19 @@ def _api(environ, start_response, path):
             data = aggregates.efficiency_breakdown(conn, filters=filters)
         elif path == "/api/efficiency-breakdown":
             data = aggregates.efficiency_chart_breakdown(conn, filters=filters)
+        elif path == "/api/flow":
+            try:
+                days = flow_metrics.validate_days(_first(query, "days", "30"))
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity",
+                    {"detail": str(exc)},
+                )
+            data = flow_metrics.flow(
+                conn, days=days,
+                project_ids=query.get("project") or [],
+                lanes=query.get("lane") or [],
+            )
         elif path in ("/api/health", "/health"):
             data = _health(conn)
         elif path == "/api/sync":

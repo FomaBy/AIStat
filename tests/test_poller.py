@@ -235,6 +235,34 @@ def test_failed_source_recorded_without_breaking_cycle(conn):
     assert table_counts(conn)["daily_usage"] > 0
 
 
+def test_flow_snapshot_recorded_on_clean_cycle_and_stamped_per_cycle(conn):
+    """FAN-3306: a healthy cycle writes one fleet snapshot; repeated cycles
+    append rows (time series), and initial issue observations produce
+    initial=1 status events, not fake transitions."""
+    poller = Poller(Config(), conn, runner=make_runner())
+    poller.run_cycle()
+    assert conn.execute("SELECT COUNT(*) FROM fleet_snapshots").fetchone()[0] == 1
+    ok = conn.execute(
+        "SELECT ok FROM sync_state WHERE source = 'flow_snapshot'"
+    ).fetchone()
+    assert ok is not None and ok[0] == 1
+    events = conn.execute(
+        "SELECT COUNT(*), SUM(initial) FROM issue_status_events"
+    ).fetchone()
+    assert events[0] == 3 and events[1] == 3  # every first observation is a baseline
+
+
+def test_flow_snapshot_skipped_when_capacity_inputs_degraded(conn):
+    """FAN-3306: a cycle with failed agents/issues/tasks sources must leave a
+    truthful coverage gap instead of fabricating a capacity snapshot."""
+    for prefix in ("agent list", "issue list", "agent tasks"):
+        Poller(Config(), conn,
+               runner=make_runner(fail_sources=(prefix,))).run_cycle()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM fleet_snapshots"
+        ).fetchone()[0] == 0, prefix
+
+
 def test_detail_sync_failure_leaves_issue_pending(conn):
     runner = make_runner(fail_sources=("issue usage",))
     poller = Poller(Config(), conn, runner=runner)
