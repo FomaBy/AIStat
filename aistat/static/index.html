@@ -259,6 +259,43 @@
       </div>
       <p class="note">Задачи без story points исключены из метрики (не считаются как 0). Показаны топ-15 по расходу на 1 SP с учётом фильтра проекта.</p>
     </section>
+
+    <section id="flow-panel" class="panel panel-wide" hidden>
+      <h2 data-i18n="flowMetrics">Метрики потока конвейера</h2>
+      <div class="chart-controls">
+        <label for="flow-days"><span data-i18n="flowWindow">Окно</span>
+          <select id="flow-days">
+            <option value="7">7 дней</option>
+            <option value="30" selected>30 дней</option>
+            <option value="90">90 дней</option>
+          </select>
+        </label>
+        <label for="flow-lane"><span data-i18n="flowLane">Лейн</span>
+          <select id="flow-lane">
+            <option value="">Все лейны</option>
+          </select>
+        </label>
+      </div>
+      <section class="cards flow-cards">
+        <div class="card"><div class="card-label" data-i18n="flowCycleMedian">Цикл: медиана</div><div class="card-value" id="card-flow-cycle">—</div><div class="card-sub" id="card-flow-cycle-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowCycleP90">Цикл: p90</div><div class="card-value" id="card-flow-p90">—</div><div class="card-sub" id="card-flow-p90-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowRework">Доля доработок</div><div class="card-value" id="card-flow-rework">—</div><div class="card-sub" id="card-flow-rework-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowIdle">Простой флота</div><div class="card-value" id="card-flow-idle">—</div><div class="card-sub" id="card-flow-idle-sub"></div></div>
+      </section>
+      <div class="table-wrap">
+        <table id="table-flow-groups" aria-label="Время цикла по проектам и лейнам">
+          <thead><tr>
+            <th data-i18n="project">Проект</th><th data-i18n="flowLane">Лейн</th>
+            <th class="num" data-i18n="flowMeasuredCount">Измерено задач</th>
+            <th class="num" data-i18n="flowMedian">Медиана</th>
+            <th class="num">p90</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="flow-coverage" class="note"></p>
+      <p class="note" data-i18n="flowNote">Метрики считаются только по наблюдаемым событиям: переходы статусов и снимки флота записываются с момента включения сбора, старая история честно показывается как непокрытая, без приближений. Простой флота — по всему воркспейсу; фильтр проектов на него не влияет.</p>
+    </section>
   </main>
 
   <footer class="footer">

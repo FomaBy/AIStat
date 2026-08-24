@@ -2200,3 +2200,22 @@ def test_concurrent_same_tenant_ingests_are_serialized(public_app, tmp_path):
     assert login(client).status_code == 303
     summary = client.get("/api/summary", base_url="https://localhost").get_json()
     assert summary["total_tokens"] == 6_700_000
+
+
+def test_flow_endpoint_requires_session_and_validates_days(public_app):
+    """FAN-3306: /api/flow is session-guarded, serves the flow payload and
+    rejects non-contract windows with 422."""
+    app, _ = public_app
+    client = app.test_client()
+    assert client.get(
+        "/api/flow", base_url="https://localhost"
+    ).status_code == 401
+    assert login(client).status_code == 303
+    response = client.get("/api/flow?days=90", base_url="https://localhost")
+    assert response.status_code == 200
+    out = response.get_json()
+    assert out["days"] == 90
+    assert set(out) >= {"cycle_time", "rework", "idle", "coverage"}
+    assert client.get(
+        "/api/flow?days=1", base_url="https://localhost"
+    ).status_code == 422

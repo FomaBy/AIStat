@@ -76,6 +76,9 @@ body {
 }
 .dashboard-content { min-width: 0; }
 .dashboard-content > .cards { padding-left: 0; padding-right: 0; }
+/* Flow-metrics tiles live inside a panel: cards on the panel background. */
+.flow-cards { padding: 12px 0; }
+.flow-cards .card { border: 1px solid var(--line); box-shadow: none; }
 .dashboard-content > .grid { padding-left: 0; padding-right: 0; }
 .dashboard-content > .footer { padding: 4px 0 0; }
 .filters {
