@@ -24,8 +24,9 @@ Deterministic edge behavior (also documented in docs/flow-metrics.md):
   never a PASSED. Candidates whose verdict carries no ``qa_verdict_at`` cannot
   be placed in a window and are reported as ``unwindowed``.
 - Idle fleet: consecutive snapshot pairs closer than ``SNAPSHOT_GAP_SECONDS``
-  form observed intervals; wider pairs are coverage gaps. Paused intervals are
-  excluded from both numerator and denominator. The interval counts as idle
+  form observed intervals; wider pairs are coverage gaps. Paused or
+  pause-unavailable intervals are excluded from both numerator and denominator.
+  The interval counts as idle
   when at least one eligible delivery agent was idle with no lane-compatible
   ``dispatch_ready`` card (``starved_idle > 0``). Agents are workspace-scoped,
   so a project filter does not narrow this metric (``workspace_wide: true``).
@@ -308,30 +309,32 @@ def _idle(conn: sqlite3.Connection, win_from: datetime, now: datetime,
         params.extend([fetch_from, now_s])
         rows = conn.execute(
             """
-            SELECT l.at AS at, SUM(l.starved_idle) AS starved, s.paused AS paused
+            SELECT l.at AS at, SUM(l.starved_idle) AS starved, s.paused AS paused,
+                   s.pause_observed AS pause_observed
             FROM fleet_snapshot_lanes l
             JOIN fleet_snapshots s ON s.at = l.at
             WHERE l.lane IN ({lanes}) AND l.at >= ? AND l.at <= ?
-            GROUP BY l.at, s.paused
+            GROUP BY l.at, s.paused, s.pause_observed
             ORDER BY l.at
             """.format(lanes=", ".join(["?"] * len(lanes))),
             params,
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT at, starved_idle AS starved, paused FROM fleet_snapshots "
+            "SELECT at, starved_idle AS starved, paused, pause_observed "
+            "FROM fleet_snapshots "
             "WHERE at >= ? AND at <= ? ORDER BY at",
             (fetch_from, now_s),
         ).fetchall()
 
-    idle_seconds = covered = paused_seconds = gap_seconds = 0.0
-    previous = None  # type: Optional[Tuple[datetime, int, int]]
+    idle_seconds = covered = paused_seconds = unavailable_pause_seconds = gap_seconds = 0.0
+    previous = None  # type: Optional[Tuple[datetime, int, int, int]]
     for row in rows:
         at = _parse_ts(row["at"])
         if at is None:
             continue
         if previous is not None:
-            prev_at, prev_starved, prev_paused = previous
+            prev_at, prev_starved, prev_paused, prev_pause_observed = previous
             span = (at - prev_at).total_seconds()
             # clip the interval to the requested window
             left = max(prev_at, win_from)
@@ -340,13 +343,16 @@ def _idle(conn: sqlite3.Connection, win_from: datetime, now: datetime,
             if span > SNAPSHOT_GAP_SECONDS:
                 gap_seconds += overlap
             elif overlap > 0:
-                if prev_paused:
+                if not prev_pause_observed:
+                    unavailable_pause_seconds += overlap
+                elif prev_paused:
                     paused_seconds += overlap
                 else:
                     covered += overlap
                     if prev_starved > 0:
                         idle_seconds += overlap
-        previous = (at, row["starved"] or 0, row["paused"] or 0)
+        previous = (at, row["starved"] or 0, row["paused"] or 0,
+                    row["pause_observed"] or 0)
 
     window_seconds = (now - win_from).total_seconds()
     return {
@@ -354,6 +360,7 @@ def _idle(conn: sqlite3.Connection, win_from: datetime, now: datetime,
         "idle_seconds": round(idle_seconds),
         "covered_seconds": round(covered),
         "paused_seconds": round(paused_seconds),
+        "unavailable_pause_seconds": round(unavailable_pause_seconds),
         "gap_seconds": round(gap_seconds),
         "coverage_pct": (
             round(100.0 * covered / window_seconds, 1)
@@ -429,7 +436,8 @@ def flow(conn: sqlite3.Connection, days: int = 30,
         idle = _idle(conn, win_from, now, lanes, bool(project_ids))
     else:
         idle = {"share": None, "idle_seconds": 0, "covered_seconds": 0,
-                "paused_seconds": 0, "gap_seconds": 0, "coverage_pct": 0.0,
+                "paused_seconds": 0, "unavailable_pause_seconds": 0,
+                "gap_seconds": 0, "coverage_pct": 0.0,
                 "snapshots": 0, "workspace_wide": True,
                 "project_filter_ignored": bool(project_ids)}
 
