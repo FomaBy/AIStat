@@ -15,18 +15,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
-# only the current schema may be admitted for serving: an older upload (e.g. a
-# valid v4 snapshot) or an unknown future version must be rejected before it
-# can reach aggregate SQL. Snapshot admission, owner migration admission and
-# both WSGI serving surfaces all consult this single definition via
-# :func:`schema_admission_error` so the surfaces cannot drift. The public host
-# never mutates authenticated snapshot bytes; a v4 database becomes servable
-# only by running :func:`init_db` on the writable source and re-publishing.
-MIN_SERVABLE_SCHEMA_VERSION = SCHEMA_VERSION
+# uploads older than v5 (e.g. a valid v4 snapshot) or unknown future versions
+# must be rejected before they can reach aggregate SQL. Schema v6 (FAN-3306)
+# only *adds* flow-metrics tables and issue columns, so a v5 snapshot stays
+# fully servable: every pre-existing aggregate works unchanged and the flow
+# endpoint truthfully reports "no data" instead of failing. Snapshot
+# admission, owner migration admission and both WSGI serving surfaces all
+# consult this single definition via :func:`schema_admission_error` so the
+# surfaces cannot drift. The public host never mutates authenticated snapshot
+# bytes; an inadmissible database becomes servable only by running
+# :func:`init_db` on the writable source and re-publishing.
+MIN_SERVABLE_SCHEMA_VERSION = 5
 REQUIRED_SERVABLE_COLUMNS = {"runs": ("model",)}
 
 # Multica's run payload does not carry a model snapshot.  The one documented
@@ -97,6 +100,18 @@ CREATE TABLE IF NOT EXISTS issues (
     -- jira_key keeps the original Jira key (e.g. SCRUM-1078) for reference.
     is_jira            INTEGER NOT NULL DEFAULT 0,
     jira_key           TEXT,
+    -- Flow-metrics fields (FAN-3306), sourced from Multica issue metadata at
+    -- ingest. dispatch_lane/dispatch_ready describe routing; the qa_* fields
+    -- mirror the durable QA verdict a QA card carries once review finished
+    -- (qa_candidate is the immutable candidate SHA or artifact revision the
+    -- verdict applies to, qa_for_issue_id links back to the implementation
+    -- issue). All are NULL/0 for issues that never carried the metadata.
+    dispatch_lane      TEXT,
+    dispatch_ready     INTEGER NOT NULL DEFAULT 0,
+    qa_verdict         TEXT,
+    qa_verdict_at      TEXT,
+    qa_candidate       TEXT,
+    qa_for_issue_id    TEXT,
     created_at         TEXT,
     updated_at         TEXT,
     synced_at          TEXT NOT NULL,
@@ -206,6 +221,52 @@ CREATE TABLE IF NOT EXISTS poll_cycles (
     notes           TEXT
 );
 
+-- Observed issue status transitions (FAN-3306). One row per (issue, status,
+-- observation time), written by store.upsert_issues when a freshly synced
+-- status differs from the stored one. `initial` marks the first observation
+-- of an issue (a collection baseline, not a real transition): cycle-time
+-- aggregation only trusts an initial in_progress row when the issue was
+-- created after collection began, so pre-existing history is reported as
+-- uncovered instead of being backdated to the first sync.
+CREATE TABLE IF NOT EXISTS issue_status_events (
+    issue_id     TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,
+    initial      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (issue_id, status, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_status_events_status
+    ON issue_status_events(status, observed_at);
+
+-- Durable fleet capacity snapshots (FAN-3306), one row per successful poll
+-- cycle. `starved_idle` counts eligible delivery agents that were idle while
+-- no lane-compatible dispatch_ready card existed — the idle-fleet condition,
+-- resolved at snapshot time from live agents/runs/issues. `paused` records a
+-- manual workspace pause when one is observable (none is today; the column
+-- keeps historical rows honest if a pause signal appears later). The old
+-- ``done -> next in_progress`` approximation is deliberately not derivable
+-- from this table: intervals without snapshots stay uncovered.
+CREATE TABLE IF NOT EXISTS fleet_snapshots (
+    at            TEXT PRIMARY KEY,
+    eligible      INTEGER NOT NULL,
+    idle          INTEGER NOT NULL,
+    starved_idle  INTEGER NOT NULL,
+    ready_cards   INTEGER NOT NULL,
+    paused        INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-lane breakdown of each fleet snapshot (agents attributed to their
+-- native lane; ready_cards counted by the card's dispatch_lane).
+CREATE TABLE IF NOT EXISTS fleet_snapshot_lanes (
+    at            TEXT NOT NULL,
+    lane          TEXT NOT NULL,
+    eligible      INTEGER NOT NULL,
+    idle          INTEGER NOT NULL,
+    starved_idle  INTEGER NOT NULL,
+    ready_cards   INTEGER NOT NULL,
+    PRIMARY KEY (at, lane)
+);
+
 -- Official per-1M-token rates, loaded from pricing.json (+ optional override).
 -- Rates are NULL for an unpriced model; source_url/captured_at record where
 -- and when each rate was taken from the vendor's official pricing page.
@@ -239,6 +300,12 @@ _ADDED_COLUMNS = {
     "issues": [
         ("is_jira", "INTEGER NOT NULL DEFAULT 0"),
         ("jira_key", "TEXT"),
+        ("dispatch_lane", "TEXT"),
+        ("dispatch_ready", "INTEGER NOT NULL DEFAULT 0"),
+        ("qa_verdict", "TEXT"),
+        ("qa_verdict_at", "TEXT"),
+        ("qa_candidate", "TEXT"),
+        ("qa_for_issue_id", "TEXT"),
     ],
     "runs": [
         ("model", "TEXT"),
@@ -317,8 +384,8 @@ def schema_admission_error(conn: sqlite3.Connection):
     """
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version < MIN_SERVABLE_SCHEMA_VERSION or version > SCHEMA_VERSION:
-        return "unsupported schema version {}; server requires {}".format(
-            version, SCHEMA_VERSION
+        return "unsupported schema version {}; server requires {}-{}".format(
+            version, MIN_SERVABLE_SCHEMA_VERSION, SCHEMA_VERSION
         )
     for table in sorted(REQUIRED_SERVABLE_COLUMNS):
         existing = {

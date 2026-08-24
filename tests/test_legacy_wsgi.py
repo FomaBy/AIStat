@@ -203,6 +203,7 @@ def test_source_parses_as_python_36():
         "aistat/aggregates.py",
         "aistat/db.py",
         "aistat/endpoints.py",
+        "aistat/flow_metrics.py",
         "aistat/global_stats.py",
         "aistat/handoff.py",
         "aistat/legacy_wsgi.py",
@@ -2288,3 +2289,17 @@ def test_legacy_rejects_symlink_target_without_touching_state(
     assert os.path.islink(target)
     assert _legacy_watermark(legacy, uid) == old_wm
     assert _legacy_journal_count(legacy) == 0
+
+
+def test_flow_endpoint_served_on_legacy_contour(legacy):
+    """FAN-3306: the dependency-free cPanel contour serves /api/flow with the
+    same payload contract and 422 validation."""
+    cookie = login(legacy)
+    status, _, body = request(legacy.application, "/api/flow", cookie=cookie)
+    assert status == "200 OK"
+    out = json.loads(body)
+    assert out["days"] == 30
+    assert set(out) >= {"cycle_time", "rework", "idle", "coverage"}
+    status, _, _ = request(
+        legacy.application, "/api/flow?days=45", cookie=cookie)
+    assert status == "422 Unprocessable Entity"

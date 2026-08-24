@@ -33,7 +33,7 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from . import __version__, aggregates, handoff, oauth
+from . import __version__, aggregates, flow_metrics, handoff, oauth
 from .config import Config
 from .db import connect_readonly, init_db, schema_admission_error
 from .health import snapshot
@@ -698,6 +698,24 @@ def create_app(config: Optional[Config] = None) -> Flask:
         conn = data_connection()
         try:
             return jsonify(aggregates.efficiency_chart_breakdown(conn, filters=filters))
+        finally:
+            conn.close()
+
+    @app.get("/api/flow")
+    def api_flow():
+        try:
+            days = flow_metrics.validate_days(request.args.get("days", "30"))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(
+                flow_metrics.flow(
+                    conn, days=days,
+                    project_ids=request.args.getlist("project"),
+                    lanes=request.args.getlist("lane"),
+                )
+            )
         finally:
             conn.close()
 

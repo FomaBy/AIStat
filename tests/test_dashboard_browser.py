@@ -1382,3 +1382,28 @@ def test_clear_button_returns_to_canonical_dashboard(dashboard):
     # The default 30-day window sees the whole fixture again.
     cdp.wait_for('document.getElementById("card-tokens").textContent'
                  '.includes("млн")')
+
+
+def test_flow_metrics_panel_renders_truthful_empty_state(dashboard):
+    """FAN-3306: the flow panel renders from live /api/flow data; with no
+    collected flow history every metric is an explicit dash (never 0) and the
+    coverage line states that transitions/snapshots are not observed yet."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('!document.getElementById("flow-panel").hidden')
+    for card in ("card-flow-cycle", "card-flow-p90", "card-flow-rework",
+                 "card-flow-idle"):
+        assert cdp.eval(
+            f'document.getElementById("{card}").textContent') == "—", card
+    coverage = cdp.eval(
+        'document.getElementById("flow-coverage").textContent')
+    assert coverage  # the sparse-history state is spelled out, not blank
+    lanes = cdp.eval(
+        '[...document.getElementById("flow-lane").options]'
+        '.map((o) => o.value)')
+    assert lanes == [""]  # only "all lanes" until a lane is observed
+    windows = cdp.eval(
+        '[...document.getElementById("flow-days").options]'
+        '.map((o) => o.value)')
+    assert windows == ["7", "30", "90"]

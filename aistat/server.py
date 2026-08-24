@@ -9,6 +9,7 @@ Endpoints:
     GET /api/efficiency  — per-issue tokens/SP, worst first (?project&limit)
     GET /api/model-efficiency — per-model token/cost/weighted efficiency (?project)
     GET /api/efficiency-breakdown — token/SP cuts by agent, model and time
+    GET /api/flow        — flow metrics: cycle time, rework, idle fleet (?days&project&lane)
     GET /api/health      — health snapshot (alias of /health)
     GET /api/events      — SSE: `update` after every poller data batch
                            (live phase or full cycle), `cycle` on full cycles
@@ -32,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, aggregates
+from . import __version__, aggregates, flow_metrics
 from .config import Config
 from .db import connect, init_db
 from .health import snapshot
@@ -261,6 +262,25 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        finally:
+            conn.close()
+
+    @app.get("/api/flow")
+    def api_flow(
+        days: str = Query("30"),
+        project: Optional[List[str]] = Query(None),
+        lane: Optional[List[str]] = Query(None),
+    ):
+        try:
+            window = flow_metrics.validate_days(days)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        conn = db()
+        try:
+            return flow_metrics.flow(
+                conn, days=window,
+                project_ids=project or [], lanes=lane or [],
+            )
         finally:
             conn.close()
 
