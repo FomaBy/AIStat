@@ -16,6 +16,7 @@ and completion transactions live in the bound
 ## Load context on demand
 
 - Usage and efficiency semantics: `docs/metrics-efficiency.md`
+- Flow metrics (cycle time, rework, idle fleet): `docs/flow-metrics.md`
 - Per-user collection and privacy boundaries: `docs/per-user-collection.md`
 - Runtime lifecycle and supervision: `docs/runtime-supervisor.md`
 - Operator recovery: `docs/operations-runbook.md`

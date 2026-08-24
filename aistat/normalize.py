@@ -108,6 +108,38 @@ def is_jira_issue(obj: Dict[str, Any]) -> bool:
     return str(metadata.get("historical_import", "")).strip().lower() == "true"
 
 
+def _is_true(value: Any) -> bool:
+    """Metadata booleans arrive as JSON true or as the string "true"."""
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def _meta_str(metadata: Dict[str, Any], *keys: str) -> Optional[str]:
+    """First non-empty string value among `keys` in issue metadata."""
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def extract_qa_verdict(metadata: Dict[str, Any]) -> Optional[str]:
+    """Terminal QA verdict recorded on a QA card, normalized to upper case.
+
+    Only the three documented terminal verdicts are accepted; anything else
+    (typos, in-flight markers) is treated as "no verdict" rather than being
+    guessed into a category.
+    """
+    verdict = _meta_str(metadata, "qa_verdict")
+    if verdict is None:
+        return None
+    verdict = verdict.upper()
+    if verdict in ("PASSED", "FAILED", "INCONCLUSIVE"):
+        return verdict
+    return None
+
+
 def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
     metadata = obj.get("metadata") or {}
     return {
@@ -126,6 +158,23 @@ def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
         "estimation_model": metadata.get("estimation_model"),
         "is_jira": 1 if is_jira_issue(obj) else 0,
         "jira_key": extract_jira_key(obj),
+        # Flow-metrics fields (FAN-3306). qa_candidate prefers the exact
+        # commit SHA and falls back to the artifact-revision string used by
+        # non-repository QA; qa_for_issue_id takes the first metadata key the
+        # pipeline has historically used to link a QA card to its
+        # implementation issue.
+        "dispatch_lane": _meta_str(metadata, "dispatch_lane"),
+        "dispatch_ready": 1 if _is_true(metadata.get("dispatch_ready")) else 0,
+        "qa_verdict": extract_qa_verdict(metadata),
+        "qa_verdict_at": _meta_str(metadata, "qa_verdict_at"),
+        "qa_candidate": _meta_str(
+            metadata, "qa_candidate_sha", "candidate_sha",
+            "qa_candidate_artifact_revisions",
+        ),
+        "qa_for_issue_id": _meta_str(
+            metadata, "qa_for_issue_id", "implementation_issue_id",
+            "source_issue_id",
+        ),
         "created_at": obj.get("created_at"),
         "updated_at": _require(obj, "updated_at", "issue"),
     }

@@ -149,6 +149,18 @@ class Poller:
         store.upsert_projects(self.conn, rows)
         return rows
 
+    def sync_workspace_pause(self) -> Optional[bool]:
+        """Read Multica's authoritative manual-pause observation, if exposed.
+
+        ``workspace get`` is the only workspace-scoped source.  Older/current
+        servers may not expose ``settings.manual_pause``; that is an unknown
+        observation, never evidence that the workspace is resumed.
+        """
+        workspace = self.runner(["workspace", "get"])
+        settings = workspace.get("settings") if isinstance(workspace, dict) else None
+        value = settings.get("manual_pause") if isinstance(settings, dict) else None
+        return value if isinstance(value, bool) else None
+
     def known_runtime_ids(self) -> List[str]:
         """Runtime ids already stored locally.
 
@@ -339,18 +351,35 @@ class Poller:
         self.conn.commit()
 
         # -- slow phase: issues, runs, detail backfill ----------------------
+        issues_ok = bool(projects)
         for project in projects or []:
             pid = project["id"]
-            self._source(result, f"issues:{pid}",
-                         functools.partial(self.sync_project_issues, pid))
+            ok, _ = self._source(result, f"issues:{pid}",
+                                 functools.partial(self.sync_project_issues, pid))
+            issues_ok = issues_ok and ok
 
         # agent_tasks before issue_details: fresh runs can mark issues stale
         # (and only issue_details is elastic, so it alone absorbs a deadline
         # overrun — no other source can be starved by a large backlog).
+        tasks_ok = True
         for agent in agents or []:
             aid = agent["id"]
-            self._source(result, f"agent_tasks:{aid}",
-                         functools.partial(self.sync_agent_tasks, aid))
+            ok, _ = self._source(result, f"agent_tasks:{aid}",
+                                 functools.partial(self.sync_agent_tasks, aid))
+            tasks_ok = tasks_ok and ok
+
+        # Durable fleet capacity snapshot (FAN-3306) — only when every input it
+        # is resolved from (agents, issues, runs) synced cleanly this cycle;
+        # a degraded cycle leaves a truthful coverage gap instead of a
+        # fabricated capacity state.
+        if agents and issues_ok and tasks_ok:
+            _, paused = self._source(result, "workspace_pause",
+                                     self.sync_workspace_pause)
+            self._source(result, "flow_snapshot",
+                         functools.partial(store.record_fleet_snapshot, self.conn,
+                                           paused=paused))
+        else:
+            logger.info("flow snapshot skipped: capacity inputs incomplete")
 
         self.sync_issue_details(result, budget=detail_budget, deadline=deadline)
 

@@ -140,6 +140,9 @@ const state = {
   chartCatalog: null,
   chartDimension: "time",
   chartMeasure: "total_tokens",
+  flowDays: "30",
+  flowLane: "",
+  metaProjects: [],
   lastDate: null, // max date present in daily_usage (from /api/meta)
   charts: {},
   csrf: null,
@@ -726,6 +729,16 @@ function query(params) {
   return s ? "?" + s : "";
 }
 
+// The flow endpoint takes rolling UTC windows (7/30/90 days), not from/to:
+// only the global project filter and the panel's own controls apply.
+function flowQuery() {
+  const q = new URLSearchParams();
+  q.set("days", state.flowDays);
+  for (const project of state.projects) q.append("project", project);
+  if (state.flowLane) q.append("lane", state.flowLane);
+  return "?" + q.toString();
+}
+
 function chartPair(dimension, measure) {
   return state.chartCatalog && state.chartCatalog.compatibility[dimension]
     && state.chartCatalog.compatibility[dimension][measure];
@@ -1173,6 +1186,92 @@ function renderBreakdownTable(id, rows) {
   }
 }
 
+function fmtShare(value) {
+  return value == null ? "—" : (100 * value).toFixed(1) + "%";
+}
+
+function renderFlow(data) {
+  const panel = $("flow-panel");
+  if (!data) {
+    // The endpoint is absent on this host (older deployment) — hide the panel.
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const cycle = data.cycle_time;
+  const rework = data.rework;
+  const idle = data.idle;
+
+  $("card-flow-cycle").textContent = fmtDuration(cycle.median_seconds);
+  $("card-flow-cycle-sub").textContent = t("flowMeasuredSub", {
+    measured: cycle.measured, done: cycle.done_total,
+  });
+  $("card-flow-p90").textContent = fmtDuration(cycle.p90_seconds);
+  $("card-flow-p90-sub").textContent = t("flowP90Sub", {
+    censored: cycle.open_censored,
+  });
+  $("card-flow-rework").textContent = fmtShare(rework.rate);
+  $("card-flow-rework-sub").textContent = t("flowReworkSub", {
+    reworked: rework.reworked, candidates: rework.candidates,
+  });
+  $("card-flow-idle").textContent = fmtShare(idle.share);
+  $("card-flow-idle-sub").textContent = t("flowIdleSub", {
+    pct: idle.coverage_pct,
+  });
+
+  // Lane selector: observed lanes, preserving the current choice.
+  const laneSelect = $("flow-lane");
+  const lanes = data.lanes || [];
+  while (laneSelect.options.length) laneSelect.remove(0);
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = t("allLanes");
+  all.selected = !state.flowLane;
+  laneSelect.appendChild(all);
+  const options = lanes.includes(state.flowLane) || !state.flowLane
+    ? lanes : lanes.concat([state.flowLane]);
+  for (const lane of options) {
+    const option = document.createElement("option");
+    option.value = lane;
+    option.textContent = lane;
+    option.selected = lane === state.flowLane;
+    laneSelect.appendChild(option);
+  }
+
+  const titles = new Map(state.metaProjects.map((p) => [p.id, p.title]));
+  const tbody = $("table-flow-groups").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const group of cycle.groups) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(titles.get(group.project_id) || group.project_id || t("unknown"))}</td>
+      <td>${esc(group.lane)}</td>
+      <td class="num">${group.count}</td>
+      <td class="num">${fmtDuration(group.median_seconds)}</td>
+      <td class="num">${fmtDuration(group.p90_seconds)}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!cycle.groups.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="5" class="note">${t("noData")}</td>`;
+    tbody.appendChild(tr);
+  }
+
+  const coverage = [];
+  coverage.push(data.coverage.events_start
+    ? t("flowCoverageEvents", { start: data.coverage.events_start })
+    : t("flowCoverageNoEvents"));
+  coverage.push(data.coverage.snapshots_start
+    ? t("flowCoverageSnapshots", { start: data.coverage.snapshots_start })
+    : t("flowCoverageNoSnapshots"));
+  coverage.push(t("flowCoverageDetail", {
+    noStart: cycle.excluded_no_start,
+    cancelled: cycle.cancelled,
+    unwindowed: rework.unwindowed,
+  }));
+  $("flow-coverage").textContent = coverage.join(" · ");
+}
+
 function renderEfficiencyBreakdown(data) {
   const agents = (data && data.agents) || [];
   const models = (data && data.models) || [];
@@ -1274,7 +1373,7 @@ async function refreshAll() {
   const chart = fetchJSON("/api/chart" + query({
     dimension: state.chartDimension, measure: state.chartMeasure,
   })).catch(() => null);
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels, flowData] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
@@ -1285,6 +1384,7 @@ async function refreshAll() {
     fetchJSON("/api/health"),
     chart,
     fetchJSON("/api/global-model-efficiency").catch(() => null),
+    fetchJSON("/api/flow" + flowQuery()).catch(() => null),
   ]);
   // The ≈-note legends the token-attribution markers. Drive it from the real
   // API flags, not merely from the presence of a filter: a unique-agent
@@ -1308,6 +1408,7 @@ async function refreshAll() {
   renderEfficiency(efficiency.issues);
   renderModelEfficiency(modelEfficiency);
   renderGlobalModelEfficiency(globalModels);
+  renderFlow(flowData);
   renderEfficiencyBreakdown(efficiencyBreakdown);
   if (chartData) renderConfigurableChart(chartData);
   else renderConfigurableChartError();
@@ -1435,6 +1536,7 @@ async function refreshMeta() {
   registerEntityColors("agent", meta.agents.map((agent) => agent.id));
   registerEntityColors("model", meta.models);
   state.lastDate = meta.date_span.last;
+  state.metaProjects = meta.projects;
   populateMultiSelect("filter-project", meta.projects, (p) => p.id, (p) => p.title, state.projects);
   populateMultiSelect("filter-agent", meta.agents, (a) => a.id, (a) => a.name, state.agents);
   populateMultiSelect("filter-model", meta.models, (m) => m, (m) => m, state.models);
@@ -1668,6 +1770,14 @@ async function boot() {
     if (!chartSupported(state.chartDimension, e.target.value)) return;
     state.chartMeasure = e.target.value;
     syncFiltersToUrl();
+    refreshAll().catch(console.error);
+  });
+  $("flow-days").addEventListener("change", (e) => {
+    state.flowDays = e.target.value;
+    refreshAll().catch(console.error);
+  });
+  $("flow-lane").addEventListener("change", (e) => {
+    state.flowLane = e.target.value;
     refreshAll().catch(console.error);
   });
   $("filter-reset").addEventListener("click", resetFilters);
