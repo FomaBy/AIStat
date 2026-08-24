@@ -15,13 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
 # uploads older than v5 (e.g. a valid v4 snapshot) or unknown future versions
-# must be rejected before they can reach aggregate SQL. Schema v6 (FAN-3306)
-# only *adds* flow-metrics tables and issue columns, so a v5 snapshot stays
+# must be rejected before they can reach aggregate SQL. Schemas v6 (FAN-3306)
+# and v7 (FAN-3349) only add flow-metrics data, so a v5 snapshot stays
 # fully servable: every pre-existing aggregate works unchanged and the flow
 # endpoint truthfully reports "no data" instead of failing. Snapshot
 # admission, owner migration admission and both WSGI serving surfaces all
@@ -252,7 +252,10 @@ CREATE TABLE IF NOT EXISTS fleet_snapshots (
     idle          INTEGER NOT NULL,
     starved_idle  INTEGER NOT NULL,
     ready_cards   INTEGER NOT NULL,
-    paused        INTEGER NOT NULL DEFAULT 0
+    paused        INTEGER NOT NULL DEFAULT 0,
+    -- Whether `paused` came from the authoritative workspace observation.
+    -- A missing observation is not evidence of an active workspace.
+    pause_observed INTEGER NOT NULL DEFAULT 0
 );
 
 -- Per-lane breakdown of each fleet snapshot (agents attributed to their
@@ -309,6 +312,9 @@ _ADDED_COLUMNS = {
     ],
     "runs": [
         ("model", "TEXT"),
+    ],
+    "fleet_snapshots": [
+        ("pause_observed", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 

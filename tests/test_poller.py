@@ -1,7 +1,10 @@
 """Poller cycle against a stubbed CLI runner: idempotency and error handling."""
 
+from datetime import datetime
+
 from aistat.cli import CliError
 from aistat.config import Config
+from aistat import flow_metrics, store
 from aistat.poller import CycleResult, Poller
 from conftest import load_fixture
 
@@ -34,6 +37,8 @@ def make_runner(fail_sources=()):
             return load_fixture("agent_tasks.json")
         if args[:2] == ["project", "list"]:
             return load_fixture("project_list.json")
+        if args[:2] == ["workspace", "get"]:
+            return {"settings": {}}
         if args[:2] == ["issue", "list"]:
             page = load_fixture("issue_list_page.json")
             page["has_more"] = False  # single page per project in tests
@@ -88,6 +93,19 @@ def test_poller_runner_binds_durable_cli_env(monkeypatch):
     poller = Poller(Config(multica_token="mat_durable"), conn=None)
     poller.runner(["runtime", "list"])
     assert seen["env"]["MULTICA_TOKEN"] == "mat_durable"
+
+
+def test_workspace_pause_observation_keeps_unknown_distinct_from_resumed(conn):
+    def poll(value):
+        return Poller(
+            Config(), conn,
+            runner=lambda args: {"settings": value},
+        ).sync_workspace_pause()
+
+    assert poll({"manual_pause": True}) is True
+    assert poll({"manual_pause": False}) is False
+    assert poll({}) is None
+    assert poll({"manual_pause": "false"}) is None
 
 
 def test_runtime_list_failure_still_polls_known_runtime_usage(conn):
@@ -250,6 +268,48 @@ def test_flow_snapshot_recorded_on_clean_cycle_and_stamped_per_cycle(conn):
         "SELECT COUNT(*), SUM(initial) FROM issue_status_events"
     ).fetchone()
     assert events[0] == 3 and events[1] == 3  # every first observation is a baseline
+
+
+def test_poller_records_pause_observations_and_excludes_unknown_intervals(
+        conn, monkeypatch):
+    """Changing the workspace pause signal must change metric coverage."""
+    states = iter([True, False, None, None])
+    times = iter([
+        "2026-08-24T11:56:00Z", "2026-08-24T11:57:00Z",
+        "2026-08-24T11:58:00Z", "2026-08-24T11:59:00Z",
+    ])
+    base = make_runner()
+
+    def runner(args):
+        if args[:2] == ["workspace", "get"]:
+            state = next(states)
+            return {"settings": (
+                {} if state is None else {"manual_pause": state}
+            )}
+        return base(args)
+
+    real_record = store.record_fleet_snapshot
+
+    def record_at_next_minute(db, **kwargs):
+        return real_record(db, at=next(times), **kwargs)
+
+    monkeypatch.setattr(store, "record_fleet_snapshot", record_at_next_minute)
+    poller = Poller(Config(), conn, runner=runner)
+    for _ in range(4):
+        poller.run_cycle()
+
+    observations = conn.execute(
+        "SELECT paused, pause_observed FROM fleet_snapshots ORDER BY at"
+    ).fetchall()
+    assert [tuple(row) for row in observations] == [
+        (1, 1), (0, 1), (0, 0), (0, 0),
+    ]
+    idle = flow_metrics.flow(
+        conn, days=7, now=datetime(2026, 8, 24, 12, 0, 0),
+    )["idle"]
+    assert idle["paused_seconds"] == 60
+    assert idle["covered_seconds"] == 60
+    assert idle["unavailable_pause_seconds"] == 60
 
 
 def test_flow_snapshot_skipped_when_capacity_inputs_degraded(conn):

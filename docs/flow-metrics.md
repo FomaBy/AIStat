@@ -80,10 +80,14 @@ agent was idle while no lane-compatible `dispatch_ready` card existed
   earlier snapshot's state; wider gaps are coverage gaps (excluded from both
   numerator and denominator, reported as `gap_seconds` and via
   `coverage_pct`).
-- Paused intervals are excluded from both numerator and denominator
-  (`paused_seconds`). No workspace pause signal is observable today, so
-  collected snapshots record `paused=0`; the column and the exclusion logic
-  exist so a future pause signal keeps history honest.
+- The authoritative source is Multica `workspace get`, field
+  `settings.manual_pause`, captured beside the fleet snapshot. `true` excludes
+  the interval as paused and `false` includes it. If that field is absent,
+  malformed, or its read fails, the snapshot records an unavailable observation
+  rather than silently treating it as `false`; its interval is excluded and
+  reported as `unavailable_pause_seconds`. Existing snapshots from before this
+  observation was added are also unavailable, so history is never relabelled as
+  active without evidence.
 - Agents are workspace-scoped: the project filter does not narrow this metric
   (`workspace_wide` / `project_filter_ignored` flags in the payload). The lane
   filter aggregates the per-lane snapshot rows (agents attributed to their

@@ -204,7 +204,7 @@ READY_CARD_STATUSES = ("todo", "backlog")
 
 
 def record_fleet_snapshot(conn: sqlite3.Connection, at: Optional[str] = None,
-                          paused: bool = False) -> Dict[str, int]:
+                          paused: Optional[bool] = None) -> Dict[str, int]:
     """Record one durable fleet capacity snapshot (FAN-3306).
 
     Resolved entirely from freshly synced local tables (agents, runs, issues)
@@ -262,9 +262,10 @@ def record_fleet_snapshot(conn: sqlite3.Connection, at: Optional[str] = None,
 
     conn.execute(
         "INSERT OR REPLACE INTO fleet_snapshots "
-        "(at, eligible, idle, starved_idle, ready_cards, paused) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (at, eligible, idle, starved, ready_total, 1 if paused else 0),
+        "(at, eligible, idle, starved_idle, ready_cards, paused, "
+        "pause_observed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (at, eligible, idle, starved, ready_total, 1 if paused else 0,
+         1 if paused is not None else 0),
     )
     conn.execute("DELETE FROM fleet_snapshot_lanes WHERE at = ?", (at,))
     for lane, bucket in lane_rollup.items():

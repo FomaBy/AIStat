@@ -3,8 +3,8 @@
 Covers the metric contracts end to end on hand-checkable fixtures: exact
 median/nearest-rank p90, candidate de-duplication, FAILED/INCONCLUSIVE rework,
 lane compatibility of capacity snapshots, pause exclusion, sparse/absent
-coverage, the idempotent v5 -> v6 migration and legacy v5 startup, and the
-100k-event aggregation performance bound (AC6).
+coverage, idempotent migrations and legacy v5 startup, and the 100k-event
+aggregation performance bound (AC6).
 """
 
 import time
@@ -59,13 +59,13 @@ def add_lifecycle(conn, issue_id, started_at, done_at, **issue_kwargs):
         add_event(conn, issue_id, "done", done_at)
 
 
-def add_snapshot(conn, at, starved=0, paused=0, idle=0, eligible=1,
-                 ready=0, lane="dev_high"):
+def add_snapshot(conn, at, starved=0, paused=0, pause_observed=1, idle=0,
+                 eligible=1, ready=0, lane="dev_high"):
     conn.execute(
         "INSERT OR REPLACE INTO fleet_snapshots "
-        "(at, eligible, idle, starved_idle, ready_cards, paused) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (at, eligible, idle, starved, ready, paused),
+        "(at, eligible, idle, starved_idle, ready_cards, paused, "
+        "pause_observed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (at, eligible, idle, starved, ready, paused, pause_observed),
     )
     conn.execute(
         "INSERT OR REPLACE INTO fleet_snapshot_lanes "
@@ -396,7 +396,7 @@ def test_legacy_v5_database_serves_with_flow_reported_unsupported(tmp_path):
     conn.close()
 
 
-def test_migration_v5_to_v6_is_idempotent_and_preserves_data(tmp_path):
+def test_migration_v5_to_v7_is_idempotent_and_preserves_data(tmp_path):
     """init_db upgrades a populated v5 database in place; a second run is a
     no-op, and rolling user_version back to 5 stays servable (rollback path:
     the additive tables are ignored by pre-v6 code)."""
@@ -428,6 +428,17 @@ def test_migration_v5_to_v6_is_idempotent_and_preserves_data(tmp_path):
     assert kept["status"] == "done"
     columns = {r[1] for r in conn.execute("PRAGMA table_info(issues)")}
     assert {"dispatch_lane", "qa_verdict", "qa_candidate"} <= columns
+
+    # A v6 database already has fleet rows, but cannot claim that its old
+    # paused=0 values were observed resumes. The additive v7 marker defaults
+    # to unavailable and survives a second initialization.
+    conn.execute("ALTER TABLE fleet_snapshots DROP COLUMN pause_observed")
+    conn.execute("PRAGMA user_version = 6")
+    init_db(conn)
+    snapshot_columns = {
+        r[1] for r in conn.execute("PRAGMA table_info(fleet_snapshots)")
+    }
+    assert "pause_observed" in snapshot_columns
 
     init_db(conn)  # idempotent second run
     assert schema_admission_error(conn) is None

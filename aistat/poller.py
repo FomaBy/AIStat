@@ -149,6 +149,18 @@ class Poller:
         store.upsert_projects(self.conn, rows)
         return rows
 
+    def sync_workspace_pause(self) -> Optional[bool]:
+        """Read Multica's authoritative manual-pause observation, if exposed.
+
+        ``workspace get`` is the only workspace-scoped source.  Older/current
+        servers may not expose ``settings.manual_pause``; that is an unknown
+        observation, never evidence that the workspace is resumed.
+        """
+        workspace = self.runner(["workspace", "get"])
+        settings = workspace.get("settings") if isinstance(workspace, dict) else None
+        value = settings.get("manual_pause") if isinstance(settings, dict) else None
+        return value if isinstance(value, bool) else None
+
     def known_runtime_ids(self) -> List[str]:
         """Runtime ids already stored locally.
 
@@ -361,8 +373,11 @@ class Poller:
         # a degraded cycle leaves a truthful coverage gap instead of a
         # fabricated capacity state.
         if agents and issues_ok and tasks_ok:
+            _, paused = self._source(result, "workspace_pause",
+                                     self.sync_workspace_pause)
             self._source(result, "flow_snapshot",
-                         functools.partial(store.record_fleet_snapshot, self.conn))
+                         functools.partial(store.record_fleet_snapshot, self.conn,
+                                           paused=paused))
         else:
             logger.info("flow snapshot skipped: capacity inputs incomplete")
 
