@@ -110,7 +110,8 @@ def _disable_transient_rendering(cdp):
           animation: none !important;
           transition: none !important;
           caret-color: transparent !important;
-        }`;
+        }
+        :root { color-scheme: light !important; }`;
         document.head.appendChild(style);
       }
       document.querySelectorAll(

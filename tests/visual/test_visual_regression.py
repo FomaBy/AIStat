@@ -63,6 +63,7 @@ def test_transient_rendering_is_disabled_only_in_test_page():
     assert "animation: none !important" in cdp.expressions[0]
     assert "transition: none !important" in cdp.expressions[0]
     assert "caret-color: transparent !important" in cdp.expressions[0]
+    assert "color-scheme: light !important" in cdp.expressions[0]
     assert "outline: none" not in cdp.expressions[0]
 
 
