@@ -36,7 +36,6 @@ import functools
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import normalize, pricing, store
@@ -78,16 +77,28 @@ DETAIL_STALE_WHERE = (
 )
 
 
-@dataclass
 class CycleResult:
-    started_at: str = ""
-    finished_at: str = ""
-    sources_ok: int = 0
-    sources_failed: int = 0
-    errors: List[str] = field(default_factory=list)
-    detail_synced: int = 0
-    detail_failed: int = 0
-    detail_deferred: int = 0  # pending issues pushed past the tick deadline
+    """Mutable cycle counters kept explicit for Python 3.6 compatibility."""
+
+    def __init__(
+        self,
+        started_at: str = "",
+        finished_at: str = "",
+        sources_ok: int = 0,
+        sources_failed: int = 0,
+        errors: Optional[List[str]] = None,
+        detail_synced: int = 0,
+        detail_failed: int = 0,
+        detail_deferred: int = 0,
+    ) -> None:
+        self.started_at = started_at
+        self.finished_at = finished_at
+        self.sources_ok = sources_ok
+        self.sources_failed = sources_failed
+        self.errors = list(errors) if errors is not None else []
+        self.detail_synced = detail_synced
+        self.detail_failed = detail_failed
+        self.detail_deferred = detail_deferred  # pending issues past tick deadline
 
     @property
     def ok(self) -> bool:
@@ -97,10 +108,13 @@ class CycleResult:
 class Poller:
     def __init__(self, config: Config, conn: sqlite3.Connection,
                  runner: Optional[Runner] = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 now: Callable[[], str] = utcnow_iso):
         self.config = config
         self.conn = conn
         self.clock = clock  # injectable for deadline tests
+        self.now = now
+        self._fixed_now = now is not utcnow_iso
         self.runner: Runner = runner or functools.partial(
             run_cli, binary=config.cli_bin, timeout=config.cli_timeout_seconds,
             env=config.poller_cli_env(),
@@ -118,13 +132,13 @@ class Poller:
         except Exception:
             logger.error("source %s failed", str(name).split(":", 1)[0])
             store.record_source_attempt(
-                self.conn, name, ok=False, error=POLL_SOURCE_FAILURE
+                self.conn, name, ok=False, error=POLL_SOURCE_FAILURE, at=self.now()
             )
             self.conn.commit()
             result.sources_failed += 1
             result.errors.append(POLL_SOURCE_FAILURE)
             return False, None
-        store.record_source_attempt(self.conn, name, ok=True)
+        store.record_source_attempt(self.conn, name, ok=True, at=self.now())
         self.conn.commit()
         result.sources_ok += 1
         return True, value
@@ -134,19 +148,19 @@ class Poller:
     def sync_runtimes(self) -> List[Dict[str, Any]]:
         data = self.runner(["runtime", "list"])
         rows = [normalize.normalize_runtime(item) for item in data]
-        store.upsert_runtimes(self.conn, rows)
+        store.upsert_runtimes(self.conn, rows, synced_at=self.now())
         return rows
 
     def sync_agents(self) -> List[Dict[str, Any]]:
         data = self.runner(["agent", "list"])
         rows = [normalize.normalize_agent(item) for item in data]
-        store.upsert_agents(self.conn, rows)
+        store.upsert_agents(self.conn, rows, synced_at=self.now())
         return rows
 
     def sync_projects(self) -> List[Dict[str, Any]]:
         data = self.runner(["project", "list"])
         rows = [normalize.normalize_project(item) for item in data]
-        store.upsert_projects(self.conn, rows)
+        store.upsert_projects(self.conn, rows, synced_at=self.now())
         return rows
 
     def sync_workspace_pause(self) -> Optional[bool]:
@@ -181,12 +195,14 @@ class Poller:
             ["runtime", "usage", runtime_id, "--days", str(self.config.usage_days)]
         )
         rows = [normalize.normalize_daily_usage(item) for item in data]
-        return store.upsert_daily_usage(self.conn, rows)
+        return store.upsert_daily_usage(self.conn, rows, synced_at=self.now())
 
     def sync_runtime_activity(self, runtime_id: str) -> int:
         data = self.runner(["runtime", "activity", runtime_id])
         rows = normalize.normalize_activity(runtime_id, data)
-        return store.replace_runtime_activity(self.conn, runtime_id, rows)
+        return store.replace_runtime_activity(
+            self.conn, runtime_id, rows, synced_at=self.now()
+        )
 
     def sync_project_issues(self, project_id: str) -> int:
         """Paginate through all issues of a project and upsert them."""
@@ -200,7 +216,7 @@ class Poller:
             )
             issues = data.get("issues") or []
             rows = [normalize.normalize_issue(item) for item in issues]
-            total += store.upsert_issues(self.conn, rows)
+            total += store.upsert_issues(self.conn, rows, synced_at=self.now())
             if not data.get("has_more") or not issues:
                 break
             offset += limit
@@ -253,12 +269,16 @@ class Poller:
                 usage = self.runner(["issue", "usage", issue_id])
                 runs = self.runner(["issue", "runs", issue_id])
                 store.upsert_issue_usage(
-                    self.conn, normalize.normalize_issue_usage(issue_id, usage)
+                    self.conn, normalize.normalize_issue_usage(issue_id, usage),
+                    synced_at=self.now(),
                 )
                 store.upsert_runs(
-                    self.conn, [normalize.normalize_run(item) for item in runs]
+                    self.conn, [normalize.normalize_run(item) for item in runs],
+                    synced_at=self.now(),
                 )
-                store.mark_issue_details_synced(self.conn, issue_id, detail_key)
+                store.mark_issue_details_synced(
+                    self.conn, issue_id, detail_key, synced_at=self.now()
+                )
                 self.conn.commit()
                 result.detail_synced += 1
             except (KeyboardInterrupt, SystemExit):
@@ -270,19 +290,22 @@ class Poller:
 
         if errors:
             store.record_source_attempt(
-                self.conn, "issue_details", ok=False, error=ISSUE_DETAILS_FAILURE
+                self.conn, "issue_details", ok=False,
+                error=ISSUE_DETAILS_FAILURE, at=self.now()
             )
             result.sources_failed += 1
             result.errors.append(ISSUE_DETAILS_FAILURE)
         else:
-            store.record_source_attempt(self.conn, "issue_details", ok=True)
+            store.record_source_attempt(
+                self.conn, "issue_details", ok=True, at=self.now()
+            )
             result.sources_ok += 1
         self.conn.commit()
 
     def sync_agent_tasks(self, agent_id: str) -> int:
         data = self.runner(["agent", "tasks", agent_id])
         rows = [normalize.normalize_run(item) for item in data]
-        return store.upsert_runs(self.conn, rows)
+        return store.upsert_runs(self.conn, rows, synced_at=self.now())
 
     def sync_pricing(self, result: CycleResult) -> None:
         """Load pricing.json, mirror it into the DB and (re)compute daily costs.
@@ -296,9 +319,10 @@ class Poller:
             rates = pricing.load_pricing(
                 self.config.pricing_path, self.config.pricing_overrides_path
             )
-            pricing.upsert_model_pricing(self.conn, rates)
+            pricing.upsert_model_pricing(self.conn, rates, loaded_at=self.now())
             pricing.recompute_daily_costs(
-                self.conn, rates, self.config.credits_per_usd
+                self.conn, rates, self.config.credits_per_usd,
+                computed_at=self.now(),
             )
             unpriced = pricing.unpriced_models_in_usage(self.conn, rates)
             self.conn.commit()
@@ -307,13 +331,16 @@ class Poller:
         except Exception:
             logger.error("source pricing failed")
             store.record_source_attempt(
-                self.conn, "pricing", ok=False, error=PRICING_FAILURE
+                self.conn, "pricing", ok=False, error=PRICING_FAILURE,
+                at=self.now(),
             )
             self.conn.commit()
             result.sources_failed += 1
             result.errors.append(PRICING_FAILURE)
             return
-        store.record_source_attempt(self.conn, "pricing", ok=True)
+        store.record_source_attempt(
+            self.conn, "pricing", ok=True, at=self.now()
+        )
         self.conn.commit()
         result.sources_ok += 1
         if unpriced:
@@ -323,7 +350,7 @@ class Poller:
 
     def run_cycle(self, detail_budget: Optional[int] = None,
                   deadline: Optional[float] = None) -> CycleResult:
-        result = CycleResult(started_at=utcnow_iso())
+        result = CycleResult(started_at=self.now())
 
         # -- live phase: dimensions, daily usage, activity, pricing ---------
         _, runtimes = self._source(result, "runtimes", self.sync_runtimes)
@@ -347,7 +374,7 @@ class Poller:
         self.sync_pricing(result)
 
         # Live data is committed — wake SSE clients before the slow phase.
-        store.record_beat(self.conn, "live")
+        store.record_beat(self.conn, "live", at=self.now())
         self.conn.commit()
 
         # -- slow phase: issues, runs, detail backfill ----------------------
@@ -375,15 +402,18 @@ class Poller:
         if agents and issues_ok and tasks_ok:
             _, paused = self._source(result, "workspace_pause",
                                      self.sync_workspace_pause)
+            snapshot_kwargs = {"paused": paused}
+            if self._fixed_now:
+                snapshot_kwargs["at"] = self.now()
             self._source(result, "flow_snapshot",
                          functools.partial(store.record_fleet_snapshot, self.conn,
-                                           paused=paused))
+                                           **snapshot_kwargs))
         else:
             logger.info("flow snapshot skipped: capacity inputs incomplete")
 
         self.sync_issue_details(result, budget=detail_budget, deadline=deadline)
 
-        result.finished_at = utcnow_iso()
+        result.finished_at = self.now()
         self.conn.execute(
             """
             INSERT INTO poll_cycles (started_at, finished_at, sources_ok, sources_failed, notes)
@@ -397,7 +427,7 @@ class Poller:
                 "; ".join(result.errors)[:2000] if result.errors else None,
             ),
         )
-        store.record_beat(self.conn, "cycle")
+        store.record_beat(self.conn, "cycle", at=self.now())
         self.conn.commit()
         logger.info(
             "cycle done: %d ok, %d failed, details %d synced / %d failed / %d deferred",

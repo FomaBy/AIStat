@@ -31,7 +31,6 @@ Opus 4.8 = GPT-5.6 Terra) per owner directive FAN-1427.
 
 import json
 import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -44,7 +43,6 @@ class PricingError(ValueError):
     """pricing.json (or an override) did not match the expected contract."""
 
 
-@dataclass
 class CreditRate:
     """Per-1M-token credit rates for one model (OpenAI Codex rate card unit).
 
@@ -52,39 +50,63 @@ class CreditRate:
     not part of the credit rate card.
     """
 
-    input: float
-    cache_read: float
-    output: float
-    source: Optional[str] = None
-    captured_at: Optional[str] = None
-    notes: Optional[str] = None
+    def __init__(
+        self,
+        input: float,
+        cache_read: float,
+        output: float,
+        source: Optional[str] = None,
+        captured_at: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        self.input = input
+        self.cache_read = cache_read
+        self.output = output
+        self.source = source
+        self.captured_at = captured_at
+        self.notes = notes
 
 
-@dataclass
 class Rate:
     """Per-1M-token rates for one model, with provenance."""
 
-    model: str
-    input: float = 0.0
-    output: float = 0.0
-    cache_read: float = 0.0
-    cache_write: float = 0.0
-    cache_write_1h: Optional[float] = None
-    currency: str = "USD"
-    vendor: Optional[str] = None
-    source_url: Optional[str] = None
-    captured_at: Optional[str] = None
-    notes: Optional[str] = None
-    unpriced: bool = False
-    credits: Optional[CreditRate] = None
+    def __init__(
+        self,
+        model: str,
+        input: float = 0.0,
+        output: float = 0.0,
+        cache_read: float = 0.0,
+        cache_write: float = 0.0,
+        cache_write_1h: Optional[float] = None,
+        currency: str = "USD",
+        vendor: Optional[str] = None,
+        source_url: Optional[str] = None,
+        captured_at: Optional[str] = None,
+        notes: Optional[str] = None,
+        unpriced: bool = False,
+        credits: Optional[CreditRate] = None,
+    ) -> None:
+        self.model = model
+        self.input = input
+        self.output = output
+        self.cache_read = cache_read
+        self.cache_write = cache_write
+        self.cache_write_1h = cache_write_1h
+        self.currency = currency
+        self.vendor = vendor
+        self.source_url = source_url
+        self.captured_at = captured_at
+        self.notes = notes
+        self.unpriced = unpriced
+        self.credits = credits
 
 
-@dataclass
 class CostResult:
     """Cost of a usage row. ``usd`` is None for an unpriced model."""
 
-    usd: Optional[float]
-    priced: bool
+    def __init__(self, usd: Optional[float], priced: bool) -> None:
+        self.usd = usd
+        self.priced = priced
 
 
 _RATE_FIELDS = ("input", "output", "cache_read", "cache_write")

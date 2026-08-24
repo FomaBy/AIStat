@@ -122,6 +122,54 @@ python -m aistat.backup restore latest --only aistat.db --yes  # одну баз
 выводится только из текущей конфигурации, поэтому подделанный manifest не может
 читать archive member или записать live DB через внешний путь.
 
+## Детерминированное восстановление из Multica на изолированной копии
+
+`python -m aistat.rebuild` готовит доказуемую копию данных для независимой
+проверки. Он не использует существующую AIStat DB, snapshot, publisher или
+deploy: `capture` только читает ответы авторизованного CLI Multica, а `rebuild`
+и `verify` работают исключительно с сохранёнными файлами. Все созданные файлы
+owner-only; не переносите этот каталог на публичный хост и не добавляйте его в
+Git.
+
+Перед началом зафиксируйте точную интегрированную базу и создайте новый
+изолированный каталог (например, через `mktemp -d`). Команды ниже не меняют
+`origin/dev`, production, `data/`, `.previous` или любые release refs:
+
+```
+recovery_root="$(mktemp -d)"
+base_sha="$(git rev-parse origin/dev)"
+base_tree="$(git rev-parse "$base_sha^{tree}")"
+captured_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+python -m aistat.rebuild capture "$recovery_root/input" \
+  --base-sha "$base_sha" --base-ref origin/dev --base-tree "$base_tree" \
+  --captured-at "$captured_at"
+python -m aistat.rebuild rebuild "$recovery_root/input" "$recovery_root/output-a"
+python -m aistat.rebuild rebuild "$recovery_root/input" "$recovery_root/output-b"
+python -m aistat.rebuild verify "$recovery_root/input" "$recovery_root/output-a"
+python -m aistat.rebuild verify "$recovery_root/input" "$recovery_root/output-b"
+python -m aistat.rebuild self-test "$recovery_root/input" "$recovery_root/self-test"
+```
+
+`capture` pins every command and JSON response, full currently available
+365-day usage window, exact base/ref/tree, capture time, issue-page limit,
+credits-per-dollar setting and pricing-table hashes (including an optional
+override) in `input-manifest.json`. It fails rather than publishing a partial
+capture. The two output manifests must be byte-identical and report SHA-256 of
+the standalone SQLite copy, ordered per-runtime/model/day counter hash, range,
+totals, watermark, schema and table counts. A changed response, an unknown
+file, duplicate row, negative/decreased counter, unused response or output
+diff is a failure — never edit a manifest to bypass it.
+
+`self-test` runs backup/restore validation and a staged same-filesystem atomic
+swap followed by rollback **only** beneath its new `self-test` directory. It
+proves that the initial target bytes return after rollback. There is deliberately
+no production cutover command here: after independent exact-SHA QA, any live
+operation requires a separately authorized production card and its own backup,
+approval and rollback plan. Preserve `input/`, both `output-*` directories and
+the `self-test` evidence unchanged for that QA; do not delete or overwrite them
+while a verdict is pending.
+
 ## Безопасная диагностика HTTP 409 freshness
 
 Если подписанная отправка snapshot получила `HTTP 409`, сначала сохраните обе
