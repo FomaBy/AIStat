@@ -225,6 +225,101 @@ def test_dashboard_plist_runs_serve_and_never_the_checkout_run_sh(tmp_path):
     assert "AISTAT_CLI_BIN" not in result.stdout
 
 
+FAKE_PLUTIL = """#!/usr/bin/env bash
+printf 'plutil-lint %s\\n' "$*" >>"$AISTAT_TEST_PLUTIL_LOG"
+exit "${AISTAT_TEST_PLUTIL_EXIT:-0}"
+"""
+
+VALID_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.aistat.local.dev</string>
+</dict>
+</plist>
+"""
+
+
+NO_PLUTIL_TOOLS = ["bash", "python3", "dirname", "id", "mkdir", "cat", "rm"]
+
+
+def _minimal_path(tmp_path):
+    """A PATH deliberately missing `plutil`, so the portable fallback runs
+    regardless of whether the host actually has plutil (e.g. macOS)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in NO_PLUTIL_TOOLS:
+        found = shutil.which(tool)
+        if found:
+            (bin_dir / tool).symlink_to(found)
+    return str(bin_dir)
+
+
+def _run_validate_plist(tmp_path, plist_content, *, path, **env_overrides):
+    plist = tmp_path / "candidate.plist"
+    plist.write_text(plist_content, encoding="utf-8")
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; validate_plist "$2"', "test-local-deploy", str(SCRIPT), str(plist)],
+        env=dict(os.environ, HOME=str(tmp_path), PATH=path, **env_overrides),
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_validate_plist_uses_native_plutil_when_available(tmp_path):
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    plutil = shim_dir / "plutil"
+    plutil.write_text(FAKE_PLUTIL, encoding="utf-8")
+    plutil.chmod(0o755)
+    plutil_log = tmp_path / "plutil.log"
+
+    result = _run_validate_plist(
+        tmp_path,
+        VALID_PLIST,
+        path=f"{shim_dir}{os.pathsep}{_minimal_path(tmp_path)}{os.pathsep}{os.environ['PATH']}",
+        AISTAT_TEST_PLUTIL_LOG=str(plutil_log),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert plutil_log.exists()
+
+
+def test_validate_plist_dies_when_native_plutil_rejects_it(tmp_path):
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    plutil = shim_dir / "plutil"
+    plutil.write_text(FAKE_PLUTIL, encoding="utf-8")
+    plutil.chmod(0o755)
+    plutil_log = tmp_path / "plutil.log"
+
+    result = _run_validate_plist(
+        tmp_path,
+        VALID_PLIST,
+        path=f"{shim_dir}{os.pathsep}{_minimal_path(tmp_path)}{os.pathsep}{os.environ['PATH']}",
+        AISTAT_TEST_PLUTIL_LOG=str(plutil_log),
+        AISTAT_TEST_PLUTIL_EXIT="1",
+    )
+
+    assert result.returncode != 0
+    assert "generated plist invalid" in result.stderr
+    assert plutil_log.exists()
+
+
+def test_validate_plist_portable_fallback_accepts_well_formed_plist(tmp_path):
+    result = _run_validate_plist(tmp_path, VALID_PLIST, path=_minimal_path(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_validate_plist_portable_fallback_rejects_malformed_plist(tmp_path):
+    result = _run_validate_plist(tmp_path, "<plist><dict>not closed", path=_minimal_path(tmp_path))
+
+    assert result.returncode != 0
+    assert "generated plist invalid" in result.stderr
+
+
 LEGACY_RUN_SH = """#!/usr/bin/env bash
 # The pre-cutover run.sh every deployment on an older branch still carries.
 "$(dirname "$0")/.venv/bin/python" -m aistat.poller &

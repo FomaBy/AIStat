@@ -140,6 +140,16 @@ cmd_serve() {
   exec "$dir/.venv/bin/uvicorn" aistat.server:app --host 127.0.0.1 --port "$port"
 }
 
+validate_plist() {
+  local plist="$1"
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$plist" >/dev/null || die "generated plist invalid: $plist"
+  else
+    python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$plist" \
+      >/dev/null 2>&1 || die "generated plist invalid: $plist"
+  fi
+}
+
 write_server_plist() {
   local branch="$1" dir port label plist
   branch_guard "$branch"
@@ -176,7 +186,7 @@ write_server_plist() {
 </dict>
 </plist>
 PLIST
-  plutil -lint "$plist" >/dev/null || die "generated plist invalid: $plist"
+  validate_plist "$plist"
 }
 
 write_updater_plist() {
@@ -211,7 +221,7 @@ write_updater_plist() {
 </dict>
 </plist>
 PLIST
-  plutil -lint "$plist" >/dev/null || die "generated plist invalid: $plist"
+  validate_plist "$plist"
 }
 
 cmd_install() {
