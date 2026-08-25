@@ -29,6 +29,7 @@ _EXPECTED_CHROME_VERSION = os.environ.get(
     "AISTAT_CHROME_VERSION", "151.0.7922.170")
 _VIEWPORT = {"width": 1440, "height": 1000, "deviceScaleFactor": 1,
              "mobile": False}
+_PAINT_BUDGET_SECONDS = 15
 _DASHBOARD_READY_JS = '''(() => {
   const card = document.getElementById("card-tokens");
   const live = document.getElementById("live-label");
@@ -157,40 +158,72 @@ def _set_viewport(cdp):
     cdp.call("Emulation.setDeviceMetricsOverride", _VIEWPORT)
 
 
-def _capture_png(cdp):
-    return base64.b64decode(cdp.call("Page.captureScreenshot")["data"])
+def _eval_before(cdp, expression, deadline):
+    result = cdp.call("Runtime.evaluate", {
+        "expression": expression, "returnByValue": True,
+        "awaitPromise": True}, deadline=deadline)
+    if "exceptionDetails" in result:
+        raise RuntimeError(result["exceptionDetails"].get(
+            "text", "JS exception") + ": " + str(result["exceptionDetails"]))
+    return result["result"].get("value")
 
 
 def _wait_for_stable_screenshot(cdp):
-    """Observe a bounded capture window, then require its final three frames
-    to be byte-identical.
+    """Capture only after the restored panel paint is observed by Chromium."""
+    deadline = time.monotonic() + _PAINT_BUDGET_SECONDS
+    layers = []
+    original_read = cdp._read_message
 
-    Native form controls (e.g. the ``<select>`` filters) are painted by
-    Blink's own control-part rasterizer, which is not driven by the
-    ``requestAnimationFrame`` cadence the ``_LAYOUT_STABLE_JS`` settle already
-    waits on. Its first raster on a fresh renderer process can land a frame
-    late relative to ``captureScreenshot``, so a single stray frame could
-    slip past a three-frame match before a later compositor update. Sampling
-    the complete fixed window prevents an early match from ending observation;
-    only the final three exact-RGBA frames prove the captured state settled.
-    """
-    _capture_png(cdp)
-    cdp.eval("new Promise(resolve => setTimeout(resolve, 500))")
-    previous_pixels = None
-    consecutive = 0
-    actual = None
-    for _ in range(12):
-        actual = _capture_png(cdp)
-        _, _, pixels = _decode_png(actual)
-        pixels = bytes(pixels)
-        consecutive = consecutive + 1 if pixels == previous_pixels else 1
-        previous_pixels = pixels
-        cdp.eval(
-            "new Promise(resolve => requestAnimationFrame(() => "
-            "requestAnimationFrame(resolve)))")
-    if consecutive >= 3:
-        return actual
-    raise AssertionError("screenshot did not stabilize after 12 frames")
+    def record_layer_events(read_deadline):
+        message = original_read(read_deadline)
+        if message.get("method") == "LayerTree.layerTreeDidChange":
+            layers.extend(message.get("params", {}).get("layers", ()))
+        return message
+
+    def paint_counts():
+        return {layer["layerId"]: layer.get("paintCount", 0)
+                for layer in layers if layer.get("drawsContent")}
+
+    cdp._read_message = record_layer_events
+    try:
+        cdp.call("LayerTree.enable", deadline=deadline)
+        _eval_before(cdp, '''new Promise(resolve => {
+          const targets = [...document.querySelectorAll(".panel")];
+          if (!targets.length) targets.push(document.body);
+          window.__aistatVisualPaintOwners = targets.map(
+            element => [element, element.style.willChange]);
+          targets.forEach(element => element.style.willChange = "transform");
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })''', deadline)
+        before = paint_counts()
+        while not before:
+            _eval_before(cdp, "new Promise(requestAnimationFrame)", deadline)
+            before = paint_counts()
+
+        layers.clear()
+        _eval_before(cdp, '''new Promise(resolve => {
+          (window.__aistatVisualPaintOwners || []).forEach(([element, value]) => {
+            if (value) element.style.willChange = value;
+            else element.style.removeProperty("will-change");
+          });
+          delete window.__aistatVisualPaintOwners;
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })''', deadline)
+        while not any(
+                layer.get("layerId") in before and
+                layer.get("paintCount", 0) > before[layer["layerId"]]
+                for layer in layers):
+            _eval_before(cdp, "new Promise(requestAnimationFrame)", deadline)
+
+        result = cdp.call("Page.captureScreenshot", deadline=deadline)
+        cdp.call("LayerTree.disable", deadline=deadline)
+        return base64.b64decode(result["data"])
+    except TimeoutError as exc:
+        raise AssertionError(
+            "screenshot paint completion was not observed within %s seconds" %
+            _PAINT_BUDGET_SECONDS) from exc
+    finally:
+        cdp._read_message = original_read
 
 
 def _capture(cdp, name):
@@ -262,7 +295,8 @@ def visual_browser():
             target=public_server.serve_forever, daemon=True)
         public_thread.start()
 
-        session.cdp = launch_chrome(CHROME)
+        session.cdp = launch_chrome(
+            CHROME, extra_args=("--run-all-compositor-stages-before-draw",))
         _assert_browser_version(session.cdp, _EXPECTED_CHROME_VERSION)
         yield (session.cdp, f"http://127.0.0.1:{dashboard_port}",
                f"http://127.0.0.1:{public_port}")

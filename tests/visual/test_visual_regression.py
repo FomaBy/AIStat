@@ -40,16 +40,48 @@ class FakeCdp:
         return True
 
 
-class FakeScreenshotCdp(FakeCdp):
-    def __init__(self, frames):
+class FakeCausalPaintCdp(FakeCdp):
+    def __init__(self, early, settled, *, completes=True):
         super().__init__("Chrome/151.0.7922.170")
-        self.frames = iter(frames)
+        self.early = early
+        self.settled = settled
+        self.completes = completes
+        self.paint_completed = False
         self.captures = 0
+        self.deadlines = []
+        self._events = []
 
-    def call(self, method, params=None, session=False):
+    def _read_message(self, deadline):
+        return self._events.pop(0)
+
+    def call(self, method, params=None, session=False, deadline=None):
+        self.deadlines.append(deadline)
+        if method in ("LayerTree.enable", "LayerTree.disable"):
+            return {}
+        if method == "Runtime.evaluate":
+            expression = params["expression"]
+            self.expressions.append(expression)
+            if "willChange =" in expression and "removeProperty" not in expression:
+                paint_count = 1
+            elif "removeProperty" in expression:
+                paint_count = 2 if self.completes else 1
+                self.paint_completed = self.completes
+            else:
+                raise TimeoutError("paint completion signal did not arrive")
+            self._events.append({
+                "method": "LayerTree.layerTreeDidChange",
+                "params": {"layers": [{
+                    "layerId": "document",
+                    "drawsContent": True,
+                    "paintCount": paint_count,
+                }]},
+            })
+            self._read_message(deadline)
+            return {"result": {"value": True}}
         if method == "Page.captureScreenshot":
             self.captures += 1
-            return {"data": base64.b64encode(next(self.frames)).decode("ascii")}
+            frame = self.settled if self.paint_completed else self.early
+            return {"data": base64.b64encode(frame).decode("ascii")}
         return super().call(method, params, session)
 
 
@@ -91,12 +123,24 @@ def test_css_probe_is_a_test_only_one_pixel_shift():
     assert "!important" in cdp.expressions[0]
 
 
-def test_screenshot_stability_observes_a_late_changed_frame():
-    warmup = _png(1, [bytes((1, 1, 1, 255))])
+def test_screenshot_stability_waits_for_causal_repaint_after_equal_early_frames():
     early = _png(1, [bytes((2, 2, 2, 255))])
     settled = _png(1, [bytes((3, 3, 3, 255))])
-    cdp = FakeScreenshotCdp([warmup, early, early, early] + [settled] * 9)
+    cdp = FakeCausalPaintCdp(early, settled)
 
     assert _wait_for_stable_screenshot(cdp) == settled
-    assert cdp.captures == 13
-    assert "setTimeout(resolve, 500)" in cdp.expressions[0]
+    assert cdp.captures == 1
+    assert cdp.paint_completed
+    assert all(deadline is not None for deadline in cdp.deadlines)
+    assert not any("setTimeout" in expression for expression in cdp.expressions)
+
+
+def test_screenshot_stability_fails_closed_without_causal_repaint():
+    early = _png(1, [bytes((2, 2, 2, 255))])
+    settled = _png(1, [bytes((3, 3, 3, 255))])
+    cdp = FakeCausalPaintCdp(early, settled, completes=False)
+
+    with pytest.raises(AssertionError, match="paint completion"):
+        _wait_for_stable_screenshot(cdp)
+
+    assert cdp.captures == 0
