@@ -9,18 +9,24 @@
    `passenger_wsgi.py`) намеренно остаётся синтаксически совместимым со
    старыми интерпретаторами — это свойство кода, а не заявление о
    поддерживаемом runtime.
-2. **Явный proxy trust.** Новый параметр `AISTAT_PROXY_TRUST_HOPS`
-   (default `0`). При `0` приложение не доверяет ни одному прокси: любые
-   `X-Forwarded-*` заголовки игнорируются (ProxyFix не подключается). За
-   ровно N терминирующими прокси оператор ставит `AISTAT_PROXY_TRUST_HOPS=N`
-   — тогда Werkzeug `ProxyFix` берёт ровно N крайних правых значений из
-   каждого forwarded-заголовка, а всё, что клиент дописал слева,
-   отбрасывается. Негативные тесты: `tests/test_proxy_trust.py`.
+2. **Явный proxy trust.** Параметр `AISTAT_PROXY_TRUST_HOPS` (default `0`)
+   одинаково действует в Flask и в stdlib-only контуре, который запускают
+   `passenger_wsgi.py` и `aistat.cgi`. При `0` приложение не доверяет ни
+   одному прокси: любые `X-Forwarded-*` заголовки игнорируются. За ровно N
+   терминирующими прокси оператор ставит `AISTAT_PROXY_TRUST_HOPS=N`:
+   Werkzeug `ProxyFix`, а legacy-контур для `X-Forwarded-Proto`, берут ровно
+   N-е значение справа. Всё, что клиент дописал слева, отбрасывается; если
+   значений меньше N, заголовок не доверяется. Негативные и позитивные
+   проверки: `tests/test_proxy_trust.py`, `tests/test_legacy_wsgi.py` и
+   `tests/test_cpanel_package.py`.
 3. **Security CI** (`.github/workflows/security.yml`): pip-audit (SCA),
    CodeQL + bandit (static analysis), CycloneDX SBOM, полный
    full-history secret-scan gitleaks с опубликованием только
-   санитизированного отчёта. Артефакты версионированы по commit SHA и
-   падают в required workflow при подтверждённой finding.
+   санитизированного отчёта. `scripts/test_gitleaks_history.sh` в
+   изолированной Git-истории проверяет чистую историю, документированный
+   `.env.example` и current/deleted synthetic findings без вывода их значений.
+   На PR scan checkout и артефакт привязаны к source SHA кандидата; на push —
+   к `github.sha`. Job падает при подтверждённой finding.
 4. **Required browser lane** (`Tests / browser`): pinned Chrome
    131.0.6778.85 + `AISTAT_REQUIRE_BROWSER=1`; отсутствие/неработоспособность
    браузера — FAIL, а не skip (`tests/test_dashboard_browser.py`,
@@ -34,11 +40,12 @@
    - выбрать в cPanel Python App интерпретатор 3.11/3.12 (или оставить
      текущий — контур остаётся importable, но это больше не
      поддерживаемая конфигурация);
-   - добавить в `aistat-private/aistat.env` строку
+   - добавить в Passenger Environment Variables (или в
+     `aistat-private/aistat.env` для CGI) строку
      `AISTAT_PROXY_TRUST_HOPS=1` (ровно один терминирующий прокси
-     LiteSpeed/Passenger впереди приложения). **Без этой строки и за
-     прокси, редирект/HTTPS-редиректы будут видеть HTTP и внутренний
-     адрес** — это видимое поведение, проверяемое `curl -I https://aistat.app/`.
+     LiteSpeed/Passenger впереди приложения). Это одинаково относится к
+     Passenger и CGI: без этой строки они не используют forwarded headers, а
+     цепочка короче одного доверенного hop также не считается HTTPS.
 3. Migration на host: `python3 -m aistat.migrate` без изменений
    (schema/данные не меняются этой картой).
 
@@ -61,4 +68,5 @@
   throttle-ключ) и позитивные (hops=1 доверяет крайнему правому значению)
   проверки.
 - Security artifacts: `pip-audit-<sha>`, `bandit-<sha>`, `sbom-cyclonedx-<sha>`,
-  `gitleaks-redacted-<sha>` на каждом запуске.
+  `gitleaks-redacted-<sha>` на каждом запуске; `<sha>` для PR — source SHA
+  кандидата, для push — `github.sha`.

@@ -152,16 +152,20 @@ python3 -m aistat.migrate
 ### Proxy trust (FAN-3458)
 
 Если впереди приложения стоит ровно один терминирующий прокси
-(LiteSpeed/Passenger terminating TLS), добавьте в `aistat.env`:
+(LiteSpeed/Passenger terminating TLS), добавьте в Passenger Environment
+Variables или в `aistat.env` для CGI:
 
 ```bash
 AISTAT_PROXY_TRUST_HOPS=1
 ```
 
-По умолчанию (`0`) приложение не доверяет ни одному прокси и игнорирует все
-`X-Forwarded-*` заголовки — подделанный заголовок не может пройти host-gate,
-удовлетворить force-HTTPS или выбрать адрес для login-throttling. Ставьте
-ровно то число прокси, что реально стоит впереди приложения: см.
+Эта настройка читается одним `aistat.legacy_wsgi` и поэтому одинаково
+работает для Passenger и CGI. По умолчанию (`0`) приложение не доверяет ни
+одному прокси и игнорирует все `X-Forwarded-*` заголовки — подделанный
+заголовок не может удовлетворить force-HTTPS или включить HSTS на plain HTTP.
+При `N > 0` для `X-Forwarded-Proto` доверяется только N-е значение справа;
+клиентский префикс слева и цепочка короче N игнорируются. Ставьте ровно то
+число прокси, что реально стоит впереди приложения: см.
 `docs/runtime-python-security-ci.md`.
 
 Команда использует только standard library, повторный запуск безопасен. Она:

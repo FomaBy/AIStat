@@ -38,12 +38,19 @@ SESSION_SECRET = "legacy-session-" + "s" * 48
 INGEST_SECRET = "legacy-ingest-" + "i" * 48
 
 
-def configure_legacy_env(tmp_path, monkeypatch, allowed_emails="allowed@example.com"):
+def configure_legacy_env(
+    tmp_path,
+    monkeypatch,
+    allowed_emails="allowed@example.com",
+    force_https=False,
+    proxy_trust_hops=0,
+):
     monkeypatch.setenv("AISTAT_DB_PATH", str(tmp_path / "public.db"))
     monkeypatch.setenv("AISTAT_SECURITY_DB_PATH", str(tmp_path / "security.db"))
     monkeypatch.setenv("AISTAT_TENANTS_DIR", str(tmp_path / "tenants"))
     monkeypatch.setenv("AISTAT_ALLOWED_HOSTS", "localhost,aistat.app")
-    monkeypatch.setenv("AISTAT_FORCE_HTTPS", "0")
+    monkeypatch.setenv("AISTAT_FORCE_HTTPS", "1" if force_https else "0")
+    monkeypatch.setenv("AISTAT_PROXY_TRUST_HOPS", str(proxy_trust_hops))
     monkeypatch.setenv("AISTAT_SESSION_COOKIE_SECURE", "1")
     monkeypatch.setenv("AISTAT_ADMIN_USERNAME", "sergey")
     monkeypatch.setenv(
@@ -111,7 +118,7 @@ def legacy_open(tmp_path, monkeypatch):
     return _boot_legacy(tmp_path)
 
 
-def request(app, path, method="GET", body=b"", headers=None, cookie=None):
+def request(app, path, method="GET", body=b"", headers=None, cookie=None, secure=True):
     query = ""
     if "?" in path:
         path, query = path.split("?", 1)
@@ -123,8 +130,8 @@ def request(app, path, method="GET", body=b"", headers=None, cookie=None):
             "PATH_INFO": path,
             "QUERY_STRING": query,
             "HTTP_HOST": "localhost",
-            "HTTPS": "on",
-            "wsgi.url_scheme": "https",
+            "HTTPS": "on" if secure else "",
+            "wsgi.url_scheme": "https" if secure else "http",
             "REMOTE_ADDR": "127.0.0.1",
             "wsgi.input": io.BytesIO(body),
             "CONTENT_LENGTH": str(len(body)),
@@ -216,6 +223,77 @@ def test_source_parses_as_python_36():
     ):
         source = open(path, encoding="utf-8").read()
         ast.parse(source, filename=path, feature_version=(3, 6))
+
+
+def _legacy_proxy_app(tmp_path, monkeypatch, hops):
+    configure_legacy_env(
+        tmp_path,
+        monkeypatch,
+        force_https=True,
+        proxy_trust_hops=hops,
+    )
+    return _boot_legacy(tmp_path)
+
+
+def test_legacy_untrusted_forwarded_proto_cannot_bypass_https_or_enable_hsts(
+    tmp_path, monkeypatch
+):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=0)
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "https"},
+        secure=False,
+    )
+    assert status == "308 Permanent Redirect"
+    assert header_values(headers, "Strict-Transport-Security") == []
+
+
+def test_legacy_proxy_hop_1_uses_the_rightmost_forwarded_proto(
+    tmp_path, monkeypatch
+):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=1)
+    status, _, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "https, http"},
+        secure=False,
+    )
+    assert status == "308 Permanent Redirect"
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "http, https"},
+        secure=False,
+    )
+    assert status == "200 OK"
+    assert header_values(headers, "Strict-Transport-Security")
+
+
+def test_legacy_proxy_hop_2_uses_the_second_value_from_the_right(
+    tmp_path, monkeypatch
+):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=2)
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "http, https, http"},
+        secure=False,
+    )
+    assert status == "200 OK"
+    assert header_values(headers, "Strict-Transport-Security")
+
+
+def test_legacy_proxy_ignores_an_insufficient_forwarded_chain(tmp_path, monkeypatch):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=2)
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "https"},
+        secure=False,
+    )
+    assert status == "308 Permanent Redirect"
+    assert header_values(headers, "Strict-Transport-Security") == []
 
 
 def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):

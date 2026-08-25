@@ -94,6 +94,11 @@ ALLOWED_HOSTS = {
 }
 FORCE_HTTPS = _env_bool("AISTAT_FORCE_HTTPS", False)
 COOKIE_SECURE = _env_bool("AISTAT_SESSION_COOKIE_SECURE", FORCE_HTTPS)
+# Match the Flask ProxyFix contour: 0 trusts no client-supplied forwarded
+# value; N trusts only the N-th value from the right (the proxy-appended end).
+PROXY_TRUST_HOPS = max(
+    0, int(os.environ.get("AISTAT_PROXY_TRUST_HOPS", "0") or "0")
+)
 ADMIN_USERNAME = os.environ.get("AISTAT_ADMIN_USERNAME", "admin")
 ADMIN_EMAIL = os.environ.get("AISTAT_ADMIN_EMAIL") or None
 PASSWORD_HASH = os.environ.get("AISTAT_PASSWORD_HASH", "")
@@ -946,7 +951,18 @@ def _json_response(environ, start_response, status, data, headers=None):
 
 
 def _is_secure(environ):
-    forwarded = environ.get("HTTP_X_FORWARDED_PROTO", "").split(",", 1)[0].strip()
+    forwarded = []
+    if PROXY_TRUST_HOPS:
+        forwarded = [
+            value.strip().lower()
+            for value in environ.get("HTTP_X_FORWARDED_PROTO", "").split(",")
+            if value.strip()
+        ]
+    forwarded = (
+        forwarded[-PROXY_TRUST_HOPS]
+        if PROXY_TRUST_HOPS and len(forwarded) >= PROXY_TRUST_HOPS
+        else ""
+    )
     return (
         forwarded == "https"
         or environ.get("HTTPS", "").lower() in ("on", "1", "true")
