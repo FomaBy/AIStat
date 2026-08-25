@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import math
 import os
 import socket
 import tempfile
@@ -18,7 +19,7 @@ from aistat.config import Config
 from aistat.db import connect, init_db
 from conftest import seed_aggregate_fixture
 from cdp_harness import BOOTED_JS, CHROME, DashboardSession, launch_chrome
-from visual_regression import _decode_png, assert_png_matches
+from visual_regression import _decode_png, _encode_png, assert_png_matches
 
 
 pytestmark = pytest.mark.skipif(
@@ -29,7 +30,89 @@ _EXPECTED_CHROME_VERSION = os.environ.get(
     "AISTAT_CHROME_VERSION", "151.0.7922.170")
 _VIEWPORT = {"width": 1440, "height": 1000, "deviceScaleFactor": 1,
              "mobile": False}
+_CAPTURE_CLIP = {"x": 0, "y": 0, "width": 1440, "height": 1000,
+                 "scale": 1}
 _PAINT_BUDGET_SECONDS = 15
+_NATIVE_SELECT_IDS = ("filter-project", "filter-agent", "filter-model")
+_NATIVE_SELECTS = {
+    "metrics": [
+        {"id": "filter-project", "matches": 1, "id_matches": 1,
+         "rect": [45, 107.234375, 291, 172.234375], "value": "",
+         "multiple": True, "disabled": False, "hidden": False,
+         "display": "block", "visibility": "visible",
+         "options": [["", "All projects", True, False],
+                     ["P1", "Alpha", False, False],
+                     ["P2", "Beta", False, False]]},
+        {"id": "filter-agent", "matches": 1, "id_matches": 1,
+         "rect": [45, 207.078125, 291, 289.078125], "value": "",
+         "multiple": True, "disabled": False, "hidden": False,
+         "display": "block", "visibility": "visible",
+         "options": [["", "All agents", True, False],
+                     ["A2", "Dev Shared", False, False],
+                     ["A3", "QA Shared", False, False],
+                     ["A1", "Solo Claude", False, False]]},
+        {"id": "filter-model", "matches": 1, "id_matches": 1,
+         "rect": [45, 323.921875, 291, 405.921875], "value": "",
+         "multiple": True, "disabled": False, "hidden": False,
+         "display": "block", "visibility": "visible",
+         "options": [["", "All models", True, False],
+                     ["m-claude", "m-claude", False, False],
+                     ["m-mystery", "m-mystery", False, False],
+                     ["m-shared", "m-shared", False, False]]},
+    ],
+    "i18n-switch": [
+        {"id": "filter-project", "matches": 1, "id_matches": 1,
+         "rect": [45, 107.234375, 291, 172.234375], "value": "P1",
+         "multiple": True, "disabled": False, "hidden": False,
+         "display": "block", "visibility": "visible",
+         "options": [["", "Все проекты", False, False],
+                     ["P1", "Alpha", True, False],
+                     ["P2", "Beta", False, False]]},
+        {"id": "filter-agent", "matches": 1, "id_matches": 1,
+         "rect": [45, 207.078125, 291, 289.078125], "value": "",
+         "multiple": True, "disabled": False, "hidden": False,
+         "display": "block", "visibility": "visible",
+         "options": [["", "Все агенты", True, False],
+                     ["A2", "Dev Shared", False, False],
+                     ["A3", "QA Shared", False, False],
+                     ["A1", "Solo Claude", False, False]]},
+        {"id": "filter-model", "matches": 1, "id_matches": 1,
+         "rect": [45, 323.921875, 291, 405.921875], "value": "",
+         "multiple": True, "disabled": False, "hidden": False,
+         "display": "block", "visibility": "visible",
+         "options": [["", "Все модели", True, False],
+                     ["m-claude", "m-claude", False, False],
+                     ["m-mystery", "m-mystery", False, False],
+                     ["m-shared", "m-shared", False, False]]},
+    ],
+}
+_NATIVE_SELECT_EXCLUDED_PIXELS = 54412
+_NATIVE_SELECT_JS = '''(() => {
+  const ids = ["filter-project", "filter-agent", "filter-model"];
+  const controls = ids.map(id => {
+    const matches = [...document.querySelectorAll(`select[multiple][id="${id}"]`)];
+    const select = matches[0];
+    const idMatches = document.querySelectorAll(`[id="${id}"]`).length;
+    if (!select) return {id, matches: matches.length, id_matches: idMatches};
+    const rect = select.getBoundingClientRect();
+    const style = getComputedStyle(select);
+    return {
+      id, matches: matches.length, id_matches: idMatches,
+      rect: [rect.left, rect.top, rect.right, rect.bottom],
+      value: select.value, multiple: select.multiple,
+      disabled: select.disabled, hidden: select.hidden,
+      display: style.display, visibility: style.visibility,
+      options: [...select.options].map(option => [
+        option.value, option.text, option.selected, option.disabled
+      ]),
+    };
+  });
+  return {
+    controls,
+    multiple_ids: [...document.querySelectorAll("select[multiple]")]
+      .map(select => select.id),
+  };
+})()'''
 _DASHBOARD_READY_JS = '''(() => {
   const card = document.getElementById("card-tokens");
   const live = document.getElementById("live-label");
@@ -154,8 +237,132 @@ def _apply_css_shift_probe(cdp):
     })()''')
 
 
-def _set_viewport(cdp):
-    cdp.call("Emulation.setDeviceMetricsOverride", _VIEWPORT)
+def _set_viewport(cdp, scrollbar_width=0):
+    viewport = dict(_VIEWPORT)
+    viewport["width"] += scrollbar_width
+    cdp.call("Emulation.setDeviceMetricsOverride", viewport)
+
+
+def _capture_geometry(cdp):
+    return cdp.eval('''(() => {
+      const root = document.documentElement;
+      const body = document.body;
+      return {
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        clientWidth: root.clientWidth,
+        clientHeight: root.clientHeight,
+        rootScrollWidth: root.scrollWidth,
+        bodyScrollWidth: body.scrollWidth,
+        scrollbarWidth: window.innerWidth - root.clientWidth,
+      };
+    })()''')
+
+
+def _assert_capture_geometry(geometry, scrollbar_width):
+    expected = {
+        "viewportWidth": _VIEWPORT["width"] + scrollbar_width,
+        "viewportHeight": _VIEWPORT["height"],
+        "clientWidth": _VIEWPORT["width"],
+        "clientHeight": _VIEWPORT["height"],
+        "scrollbarWidth": scrollbar_width,
+    }
+    if any(geometry.get(key) != value for key, value in expected.items()):
+        raise AssertionError("capture surface geometry is inconsistent: %s" %
+                             geometry)
+    if (geometry.get("rootScrollWidth", 0) > _VIEWPORT["width"] or
+            geometry.get("bodyScrollWidth", 0) > _VIEWPORT["width"]):
+        raise AssertionError("capture surface geometry has horizontal overflow: %s" %
+                             geometry)
+
+
+def _normalize_capture_surface(cdp, ready_js):
+    scrollbar_width = _capture_geometry(cdp).get("scrollbarWidth")
+    if scrollbar_width not in (0, 15):
+        raise AssertionError("unsupported capture scrollbar width: %s" %
+                             scrollbar_width)
+    _set_viewport(cdp, scrollbar_width)
+    _settle(cdp, ready_js)
+    geometry = _capture_geometry(cdp)
+    _assert_capture_geometry(geometry, scrollbar_width)
+    return geometry
+
+
+def _native_control_masks(controls):
+    masks = []
+    for control in controls:
+        left, top, right, bottom = control["rect"]
+        # Keep the one-CSS-pixel product-owned border and layout outside the
+        # native-control interior; pixel bounds are right/bottom exclusive.
+        mask = (math.ceil(left + 0.5), math.ceil(top + 0.5),
+                math.floor(right - 0.5), math.floor(bottom - 0.5))
+        if (mask[0] < 0 or mask[1] < 0 or mask[2] > _VIEWPORT["width"] or
+                mask[3] > _VIEWPORT["height"] or
+                mask[0] >= mask[2] or mask[1] >= mask[3]):
+            raise AssertionError("native control interior is invalid: %s" %
+                                 control)
+        masks.append(mask)
+    for index, mask in enumerate(masks):
+        for other in masks[index + 1:]:
+            if (mask[0] < other[2] and other[0] < mask[2] and
+                    mask[1] < other[3] and other[1] < mask[3]):
+                raise AssertionError("native control interiors overlap")
+    return masks
+
+
+def _native_control_contract(cdp, name):
+    snapshot = cdp.eval(_NATIVE_SELECT_JS)
+    controls = snapshot.get("controls") if isinstance(snapshot, dict) else None
+    expected = _NATIVE_SELECTS[name]
+    if (snapshot.get("multiple_ids") != list(_NATIVE_SELECT_IDS) or
+            controls != expected):
+        raise AssertionError("native control contract mismatch: %s" % snapshot)
+    masks = _native_control_masks(controls)
+    excluded_pixels = sum((right - left) * (bottom - top)
+                          for left, top, right, bottom in masks)
+    if excluded_pixels != _NATIVE_SELECT_EXCLUDED_PIXELS:
+        raise AssertionError("native control excluded-pixel count: %s" %
+                             excluded_pixels)
+    semantic = [{key: control[key] for key in (
+        "id", "value", "multiple", "disabled", "hidden", "display",
+        "visibility", "options")} for control in controls]
+    return {
+        "masks": masks,
+        "excluded_pixels": excluded_pixels,
+        "semantic_digest": hashlib.sha256(json.dumps(
+            semantic, ensure_ascii=False, separators=(",", ":"),
+            sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def _assert_native_control_pixels_match(actual, baseline, masks, diff_path):
+    actual_image = _decode_png(actual)
+    baseline_image = _decode_png(baseline)
+    if actual_image[:2] != baseline_image[:2]:
+        assert_png_matches(actual, baseline, diff_path)
+
+    width, height, actual_pixels = actual_image
+    _, _, baseline_pixels = baseline_image
+    excluded = bytearray(width * height)
+    for left, top, right, bottom in masks:
+        for y in range(top, bottom):
+            excluded[y * width + left:y * width + right] = b"\1" * (right - left)
+
+    changed = [index for index in range(width * height)
+               if not excluded[index] and actual_pixels[index * 4:index * 4 + 4]
+               != baseline_pixels[index * 4:index * 4 + 4]]
+    if not changed:
+        return 0
+
+    diff = bytearray(b"\xff\xff\xff\xff" * (width * height))
+    for index in changed:
+        diff[index * 4:index * 4 + 4] = b"\xff\x00\x00\xff"
+    diff_path = Path(diff_path)
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_bytes(_encode_png(width, height, diff))
+    raise AssertionError(
+        "%d changed non-native pixel%s; diff artifact: %s" %
+        (len(changed), "" if len(changed) == 1 else "s", diff_path))
 
 
 def _eval_before(cdp, expression, deadline):
@@ -215,7 +422,9 @@ def _wait_for_stable_screenshot(cdp):
                 for layer in layers):
             _eval_before(cdp, "new Promise(requestAnimationFrame)", deadline)
 
-        result = cdp.call("Page.captureScreenshot", deadline=deadline)
+        result = cdp.call("Page.captureScreenshot", {
+            "clip": _CAPTURE_CLIP, "captureBeyondViewport": False},
+            deadline=deadline)
         cdp.call("LayerTree.disable", deadline=deadline)
         return base64.b64decode(result["data"])
     except TimeoutError as exc:
@@ -226,11 +435,16 @@ def _wait_for_stable_screenshot(cdp):
         cdp._read_message = original_read
 
 
-def _capture(cdp, name):
+def _capture(cdp, name, geometry=None):
     if (name == "metrics" and
             os.environ.get("AISTAT_VISUAL_CSS_PROBE") == "1"):
         _apply_css_shift_probe(cdp)
+    native_controls = (_native_control_contract(cdp, name)
+                       if name in _NATIVE_SELECTS else None)
     actual = _wait_for_stable_screenshot(cdp)
+    if geometry is not None:
+        print("%s visual-geometry=%s" %
+              (name, json.dumps(geometry, sort_keys=True)))
     if os.environ.get("AISTAT_VISUAL_HASHES") == "1":
         _, _, pixels = _decode_png(actual)
         print("%s visual-sha256=%s" %
@@ -245,8 +459,19 @@ def _capture(cdp, name):
             "missing visual baseline %s; set AISTAT_UPDATE_VISUAL_BASELINES=1 "
             "after reviewing the rendered state" % baseline)
     diff_dir = Path(os.environ.get("AISTAT_VISUAL_DIFF_DIR", tempfile.gettempdir()))
-    assert_png_matches(actual, baseline.read_bytes(),
-                       diff_dir / (name + ".diff.png"))
+    if native_controls is None:
+        assert_png_matches(actual, baseline.read_bytes(),
+                           diff_dir / (name + ".diff.png"))
+        return
+    changed = _assert_native_control_pixels_match(
+        actual, baseline.read_bytes(), native_controls["masks"],
+        diff_dir / (name + ".diff.png"))
+    print("%s visual-native-controls=%s" % (name, json.dumps({
+        "rectangles": native_controls["masks"],
+        "excluded_pixels": native_controls["excluded_pixels"],
+        "semantic_digest": native_controls["semantic_digest"],
+        "non_native_changed_pixels": changed,
+    }, sort_keys=True)))
 
 
 @pytest.fixture(scope="module")
@@ -313,7 +538,8 @@ def test_metrics_page_matches_visual_baseline(visual_browser):
     cdp.open_page(dashboard_base + "/", preload_script=_locale_preload("en-US"))
     _set_viewport(cdp)
     _settle(cdp, _DASHBOARD_READY_JS)
-    _capture(cdp, "metrics")
+    _capture(cdp, "metrics", _normalize_capture_surface(
+        cdp, _DASHBOARD_READY_JS))
 
 
 def test_login_page_matches_visual_baseline(visual_browser):
@@ -321,7 +547,7 @@ def test_login_page_matches_visual_baseline(visual_browser):
     cdp.open_page(public_base + "/login", preload_script=_locale_preload("en-US"))
     _set_viewport(cdp)
     _settle(cdp, _LOGIN_READY_JS)
-    _capture(cdp, "login")
+    _capture(cdp, "login", _normalize_capture_surface(cdp, _LOGIN_READY_JS))
 
 
 def test_i18n_switch_matches_visual_baseline(visual_browser):
@@ -332,4 +558,5 @@ def test_i18n_switch_matches_visual_baseline(visual_browser):
     _settle(cdp, _DASHBOARD_READY_JS)
     cdp.eval('document.getElementById("locale-switcher").click()')
     _settle(cdp, _DASHBOARD_RU_READY_JS)
-    _capture(cdp, "i18n-switch")
+    _capture(cdp, "i18n-switch", _normalize_capture_surface(
+        cdp, _DASHBOARD_RU_READY_JS))
