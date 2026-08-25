@@ -162,19 +162,34 @@ def _capture_png(cdp):
 
 
 def _wait_for_stable_screenshot(cdp):
+    """Discard one warm-up capture, then require three consecutive identical
+    ``Page.captureScreenshot`` frames (not just two).
+
+    Native form controls (e.g. the ``<select>`` filters) are painted by
+    Blink's own control-part rasterizer, which is not driven by the
+    ``requestAnimationFrame`` cadence the ``_LAYOUT_STABLE_JS`` settle already
+    waits on. Its first raster on a fresh renderer process can land a frame
+    late relative to ``captureScreenshot``, so a single stray frame could
+    slip past a two-frame match by (old-frame, new-settled, new-settled). A
+    discarded warm-up plus a three-in-a-row requirement forces that first
+    raster to happen and resettle before any frame counts toward stability.
+    """
+    _capture_png(cdp)
     previous_pixels = None
+    consecutive = 0
     actual = None
-    for _ in range(10):
+    for _ in range(12):
         actual = _capture_png(cdp)
         _, _, pixels = _decode_png(actual)
         pixels = bytes(pixels)
-        if pixels == previous_pixels:
+        consecutive = consecutive + 1 if pixels == previous_pixels else 1
+        if consecutive >= 3:
             return actual
         previous_pixels = pixels
         cdp.eval(
             "new Promise(resolve => requestAnimationFrame(() => "
             "requestAnimationFrame(resolve)))")
-    raise AssertionError("screenshot did not stabilize after 10 frames")
+    raise AssertionError("screenshot did not stabilize after 12 frames")
 
 
 def _capture(cdp, name):
