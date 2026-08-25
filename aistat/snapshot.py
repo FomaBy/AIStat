@@ -38,7 +38,7 @@ class SnapshotError(ValueError):
 
 # A frozen, keyword-constructed value object. Uses ``typing.NamedTuple`` rather
 # than ``@dataclass(frozen=True)`` so this module — part of the ``aistat.backup``
-# import chain — stays importable on the production host's Python 3.6.8, which
+# import chain — stays importable on legacy stdlib-only shared-host interpreters, which
 # has no ``dataclasses`` module (FAN-1435).
 class SnapshotInfo(NamedTuple):
     sha256: str
@@ -87,7 +87,7 @@ def _cleanup_snapshot_temp_files(temp_path: Path) -> None:
     """Remove a temporary SQLite file and every sidecar it may have created."""
     for suffix in ("",) + _SQLITE_SIDECAR_SUFFIXES:
         # ``Path.unlink(missing_ok=True)`` is Python 3.8+; the production host
-        # runs 3.6.8, so swallow the missing-file case explicitly instead.
+        # is a legacy interpreter, so swallow the missing-file case explicitly instead.
         try:
             Path(str(temp_path) + suffix).unlink()
         except FileNotFoundError:
@@ -106,7 +106,7 @@ def _path_has_open_owner(path: Path) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             # ``text=`` is the Python 3.7+ spelling; ``universal_newlines`` is the
-            # identical, 3.6-compatible option (the host runs 3.6.8).
+            # identical, legacy-compatible option.
             universal_newlines=True,
             check=False,
             timeout=2,
@@ -147,7 +147,7 @@ def cleanup_orphan_snapshot_sidecars(parent: Path) -> int:
 
 
 # ``sqlite3.Connection.backup()`` — SQLite's online backup API — exists only on
-# Python 3.7+. The production host runs 3.6.8, so a lock-guarded file copy stands
+# Python 3.7+; older interpreters lack it, so a lock-guarded file copy stands
 # in there (FAN-1435). Detected once at import; the owner-publisher on Python
 # 3.9+ keeps using the backup API unchanged.
 _HAS_SQLITE_BACKUP = hasattr(sqlite3.Connection, "backup")
@@ -169,7 +169,7 @@ def _snapshot_with_backup_api(db_path: Path, temp_path: Path) -> None:
 
 
 def _snapshot_with_file_copy(db_path: Path, temp_path: Path) -> None:
-    """Coherent copy for Python 3.6, which lacks ``Connection.backup()``.
+    """Coherent copy for interpreters that lack ``Connection.backup()``.
 
     Holds a write lock (``BEGIN IMMEDIATE``) on the source so no concurrent
     writer or checkpoint can move it while the main database and any ``-wal``
@@ -208,7 +208,7 @@ def create_compressed_snapshot(db_path: Path) -> bytes:
     """Copy a possibly WAL-backed database coherently, gzip-compressed.
 
     Uses SQLite's online backup API on Python 3.7+; on the production host's
-    Python 3.6.8 (no ``Connection.backup()``) it falls back to a lock-guarded
+    a legacy interpreter (no ``Connection.backup()``) it falls back to a lock-guarded
     file copy (FAN-1435). Both paths yield a self-contained, integrity-checkable
     rollback-journal database.
     """
@@ -319,7 +319,7 @@ def daily_usage_max_date(path: Path):
     Read-only and deliberately defensive: a missing file, a missing or empty
     ``daily_usage`` table, or any read error all yield ``None`` so a caller
     reads that as "this database carries no usage data". Standard-library only
-    and Python 3.6 compatible so the Flask app and the legacy cPanel WSGI entry
+    and dependency-free so the Flask app and the legacy cPanel WSGI entry
     point share one identical check (the ingest freshness guard below).
     """
     path = Path(path)

@@ -2,6 +2,6 @@ fastapi>=0.110,<1
 uvicorn>=0.29,<1
 Werkzeug>=3.1.3,<4
 # Trusted local worker only (encrypted token store); never ships to cPanel —
-# requirements-cpanel.txt stays dependency-free. <45 keeps wheels for the
-# system Python 3.9 used by run.sh.
+# requirements-cpanel.txt stays dependency-free. The <45 cap keeps prebuilt
+# wheels available for the interpreters run.sh may pick up.
 cryptography>=42,<45

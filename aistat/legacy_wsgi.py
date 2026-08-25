@@ -2,7 +2,7 @@
 
 Namecheap's generic Passenger application currently runs ``/usr/bin/python3``
 with a package index capped at Flask 2.0.3. This entry point deliberately uses
-only the Python 3.6 standard library, while preserving the security contract of
+only the Python standard library, while preserving the security contract of
 the modern Flask WSGI app:
 
 * opaque HttpOnly/Secure/SameSite sessions resolved server-side;
@@ -689,7 +689,7 @@ class _LegacyOAuthStore(object):
 
     Mirrors ``aistat.security.SecurityStore``'s account methods with the same
     SQL and one-time semantics, kept inline so ``legacy_wsgi`` stays free of the
-    ``dataclasses``-based config import and remains Python 3.6-clean.
+    ``dataclasses``-based config import and stays clean on legacy interpreters.
     """
 
     def put_oauth_state(
@@ -828,7 +828,7 @@ class _LegacyOAuthStore(object):
         """Subject-first resolution + atomic first registration.
 
         Mirrors ``SecurityStore.register_or_link_identity`` byte-for-byte in
-        behaviour so the Python 3.6 cPanel contour registers, links and gates
+        behaviour so the stdlib-only cPanel contour registers, links and gates
         identically. Returns ``{"user_id", "outcome"}`` with ``outcome`` in
         ``existing`` / ``linked_owner`` / ``created`` / ``denied``; a denied new
         subject writes nothing and yields ``user_id`` ``None``.

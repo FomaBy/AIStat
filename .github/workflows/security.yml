@@ -1,0 +1,190 @@
+name: Security
+
+# FAN-3458: dependency/SCA audit, static analysis, SBOM and a full-history
+# secret scan. Every job uploads a versioned artifact (keyed by commit SHA)
+# and fails the workflow on a confirmed critical finding. Historical secret
+# findings are reported without ever publishing the matched value; rotation
+# itself stays a separate, operator-owned security gate.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    # SCA: pip-audit resolves the exact dependency trees of both contours and
+    # exits non-zero on any known vulnerable dependency, which fails this
+    # required workflow.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: python -m pip install pip-audit
+
+      - name: Audit runtime and test dependencies
+        run: |
+          pip-audit \
+            -r requirements.txt \
+            -r requirements-dev.txt \
+            --format json \
+            --output pip-audit-report.json \
+            || code=$?
+          if [ "${code:-0}" != "0" ]; then
+            echo "FAIL: vulnerable dependencies found (see artifact)"; exit "$code"
+          fi
+
+      - name: Upload versioned audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-${{ github.sha }}
+          path: pip-audit-report.json
+          if-no-files-found: error
+
+  static-analysis:
+    # CodeQL semantic analysis for Python plus a bandit pass; the SARIF
+    # findings are attached to the run and kept as a versioned artifact.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+      - name: Install bandit
+        run: python -m pip install bandit
+
+      # Bandit's config targets the review surface: application and scripts.
+      # The stdlib-only cPanel contour legitimately uses md5/sha1-free HMAC
+      # and subprocess with fixed argv; anything new must be justified here.
+      - name: Run bandit static analysis
+        run: |
+          bandit -r aistat scripts -f json -o bandit-report.json \
+            --skip B101 --confidence-level medium || code=$?
+          if [ "${code:-0}" != "0" ]; then
+            echo "FAIL: bandit findings above the threshold (see artifact)"; exit "$code"
+          fi
+
+      - name: Upload versioned bandit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-${{ github.sha }}
+          path: bandit-report.json
+          if-no-files-found: error
+
+  sbom:
+    # CycloneDX SBOM from the resolved runtime dependency tree, versioned by
+    # commit SHA so every candidate release carries its exact inventory.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cyclonedx-py and resolve runtime requirements
+        run: |
+          python -m pip install cyclonedx-py
+          python -m pip install -r requirements.txt
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cyclonedx-py environment \
+            --output-format JSON \
+            --output-file sbom.json
+          python - <<'EOF'
+          import json
+          doc = json.load(open("sbom.json"))
+          assert doc.get("bomFormat") == "CycloneDX", doc.get("bomFormat")
+          components = doc.get("components") or []
+          print(f"SBOM ok: {len(components)} components")
+          assert components, "empty SBOM is not evidence"
+          EOF
+
+      - name: Upload versioned SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx-${{ github.sha }}
+          path: sbom.json
+          if-no-files-found: error
+
+  secret-scan:
+    # Full-history scan with gitleaks. The raw report can embed the matched
+    # secret fragment, so only a redacted copy (locations, rule, fingerprint)
+    # is uploaded; the value itself is never published. Remediation/rotation
+    # stays a separate operator security gate.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          version="8.24.3"
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan full git history
+        run: |
+          gitleaks detect \
+            --source . \
+            --redact \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --exit-code 1
+
+      - name: Redact and upload the versioned report
+        if: always()
+        run: |
+          # Belt and braces on top of --redact: strip the fields that could
+          # carry matched material before the report leaves the runner.
+          # gitleaks writes no report file when the history is clean; an
+          # empty list is valid, a missing file is not.
+          [ -f gitleaks-report.json ] || echo "[]" > gitleaks-report.json
+          jq '[.[] | del(.Secret, .Match, .Line)]' gitleaks-report.json \
+            > gitleaks-redacted.json || echo "[]" > gitleaks-redacted.json
+
+      - name: Upload versioned secret-scan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-redacted-${{ github.sha }}
+          path: gitleaks-redacted.json
+          if-no-files-found: error

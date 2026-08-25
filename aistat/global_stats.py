@@ -29,7 +29,7 @@ deletes the rows in the same security.db transaction
 tenant's rows were derived from, so a crash between snapshot install and
 aggregation self-heals on the next worker start (:func:`sync_tenants`).
 
-This module is intentionally Python 3.6-compatible: the legacy cPanel WSGI
+This module is dependency-free and legacy-interpreter compatible: the cPanel WSGI
 entry point imports it on the shared host.
 """
 

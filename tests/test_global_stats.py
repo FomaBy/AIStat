@@ -327,8 +327,9 @@ def test_stored_columns_carry_no_identity_or_timing_data(stats_conn, tmp_path):
 
 
 def test_module_parses_as_python_36():
-    """The legacy cPanel contour imports this module on Python 3.6.8, so the
-    suppression change must not introduce newer syntax (FAN-2397)."""
+    """The stdlib-only cPanel contour imports this module on legacy
+    interpreters, so the suppression change must not introduce newer
+    syntax (FAN-2397)."""
     source = open("aistat/global_stats.py", encoding="utf-8").read()
     ast.parse(source, filename="aistat/global_stats.py",
               feature_version=(3, 6))

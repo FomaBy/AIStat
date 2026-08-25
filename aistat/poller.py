@@ -78,7 +78,7 @@ DETAIL_STALE_WHERE = (
 
 
 class CycleResult:
-    """Mutable cycle counters kept explicit for Python 3.6 compatibility."""
+    """Mutable cycle counters kept explicit (no dataclasses on legacy interpreters)."""
 
     def __init__(
         self,
