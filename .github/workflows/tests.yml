@@ -56,7 +56,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AISTAT_REQUIRE_BROWSER: "1"
-      AISTAT_CHROME: /opt/chrome/chrome
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -74,10 +73,14 @@ jobs:
       # visual/browser suites on the new version. A channel name is NOT a pin;
       # only an exact version is.
       - name: Install pinned Chrome 131.0.6778.85
+        id: setup_chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: 131.0.6778.85
           install-dependencies: true
+
+      - name: Point the harness at the pinned binary
+        run: echo "AISTAT_CHROME=${{ steps.setup_chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
 
       - name: Verify the pinned browser binary is usable (fail, never skip)
         run: |
