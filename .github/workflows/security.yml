@@ -16,6 +16,18 @@ permissions:
   contents: read
 
 jobs:
+  artifact-sha-contract:
+    # FAN-3513: static self-test proving every security artifact name below
+    # is keyed by the exact PR head SHA (pull_request) or github.sha (push),
+    # never the PR merge SHA. Fails closed on a mismatched or missing binding.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify artifact SHA binding contract
+        run: bash scripts/test_security_artifact_sha.sh
+
   dependency-audit:
     # SCA: pip-audit resolves the exact dependency trees of both contours and
     # exits non-zero on any known vulnerable dependency, which fails this
@@ -49,7 +61,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pip-audit-${{ github.sha }}
+          name: pip-audit-${{ github.event.pull_request.head.sha || github.sha }}
           path: pip-audit-report.json
           if-no-files-found: error
 
@@ -102,7 +114,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bandit-${{ github.sha }}
+          name: bandit-${{ github.event.pull_request.head.sha || github.sha }}
           path: bandit-report.json
           if-no-files-found: error
 
@@ -141,7 +153,7 @@ jobs:
       - name: Upload versioned SBOM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-cyclonedx-${{ github.sha }}
+          name: sbom-cyclonedx-${{ github.event.pull_request.head.sha || github.sha }}
           path: sbom.json
           if-no-files-found: error
 

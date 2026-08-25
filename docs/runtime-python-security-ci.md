@@ -25,8 +25,14 @@
    санитизированного отчёта. `scripts/test_gitleaks_history.sh` в
    изолированной Git-истории проверяет чистую историю, документированный
    `.env.example` и current/deleted synthetic findings без вывода их значений.
-   На PR scan checkout и артефакт привязаны к source SHA кандидата; на push —
-   к `github.sha`. Job падает при подтверждённой finding.
+   Все четыре артефакта (`pip-audit`, `bandit`, `sbom-cyclonedx`,
+   `gitleaks-redacted`) привязаны к одному и тому же выражению —
+   `${{ github.event.pull_request.head.sha || github.sha }}` — так что на PR
+   имя несёт source head SHA кандидата, а не merge SHA; на push — `github.sha`.
+   `artifact-sha-contract` job и `scripts/test_security_artifact_sha.sh`
+   статически проверяют это выражение на каждом запуске и падают, если
+   привязка к SHA отсутствует или расходится. Job падает при подтверждённой
+   finding.
 4. **Required browser lane** (`Tests / browser`): pinned Chrome
    131.0.6778.85 + `AISTAT_REQUIRE_BROWSER=1`; отсутствие/неработоспособность
    браузера — FAIL, а не skip (`tests/test_dashboard_browser.py`,
