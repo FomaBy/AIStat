@@ -121,6 +121,8 @@ class Config:
         worker_collect_interval_seconds=_UNSET,
         backup_dir=_UNSET,
         backup_retention=_UNSET,
+        offsite_backup_dir=_UNSET,
+        offsite_retention=_UNSET,
     ):
         # Path to the SQLite database file.
         self.db_path = (
@@ -435,6 +437,23 @@ class Config:
             max(1, _env_int("AISTAT_BACKUP_RETENTION", 14))
             if backup_retention is _UNSET
             else backup_retention
+        )
+        # Independent off-site copy of each local backup generation (FAN-3462).
+        # Must point outside the local backup tree — a mounted external volume,
+        # a free-tier rclone/SSHFS mount, or another machine's disk. Bundles are
+        # encrypted (AES-256-CBC + PBKDF2) before they are written here; the key
+        # lives only in AISTAT_BACKUP_ENCRYPTION_KEY and is never stored on Config
+        # so it cannot leak through logs or repr.
+        self.offsite_backup_dir = (
+            _env_path("AISTAT_OFFSITE_BACKUP_DIR", PROJECT_ROOT / "data" / "backups-offsite")
+            if offsite_backup_dir is _UNSET
+            else offsite_backup_dir
+        )
+        # How many encrypted off-site bundles to keep (oldest pruned first).
+        self.offsite_retention = (
+            max(1, _env_int("AISTAT_OFFSITE_RETENTION", 7))
+            if offsite_retention is _UNSET
+            else offsite_retention
         )
 
     def poller_cli_env(self) -> Optional[Dict[str, str]]:

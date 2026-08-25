@@ -11,6 +11,8 @@
 | Операция | Команда | Периодичность | Владелец |
 |---|---|---|---|
 | Резервная копия данных | `python -m aistat.backup create` | ежедневно | Сергей Фомин |
+| Off-site копия (зашифрованная) | `python -m aistat.backup_offsite push` | ежедневно, после `create` | Сергей Фомин |
+| Изолированный restore drill | `python -m aistat.backup_offsite drill` | еженедельно + перед каждым релизом | Сергей Фомин |
 | Тест восстановления | `python -m aistat.backup self-test` | еженедельно + перед каждым релизом | Сергей Фомин |
 | Проверка логов/артефактов на секреты | `scripts/scan_secrets.sh` | после каждого деплоя | Сергей Фомин |
 | Очистка orphan-сайдкаров snapshot | `python -m aistat.backup clean --apply` | по мере необходимости | Сергей Фомин |
@@ -45,8 +47,10 @@
 не попадает в репозиторий или в cPanel-пакет. Права — owner-only (`0700`/`0600`).
 
 Пути и ретенция переопределяются переменными окружения `AISTAT_BACKUP_DIR`,
-`AISTAT_BACKUP_RETENTION`, `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH`,
-`AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`.
+`AISTAT_BACKUP_RETENTION`, `AISTAT_OFFSITE_BACKUP_DIR`,
+`AISTAT_OFFSITE_RETENTION`, `AISTAT_BACKUP_ENCRYPTION_KEY`, `AISTAT_DB_PATH`,
+`AISTAT_SECURITY_DB_PATH`, `AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`,
+`AISTAT_WORKER_TENANTS_DIR`.
 
 ### Расписание
 
@@ -68,7 +72,79 @@ cPanel (Cron Jobs, ежедневно; без SSH — одноразовый з�
 
 ```
 15 3 * * * cd $HOME/aistat && python -m aistat.backup create >> $HOME/aistat/data/backup.log 2>&1
+30 3 * * * cd $HOME/aistat && python -m aistat.backup_offsite push >> $HOME/aistat/data/offsite-backup.log 2>&1
 ```
+
+## RPO / RTO / retention / владелец
+
+| Параметр | Значение | Чем измеряется/гарантируется |
+|---|---|---|
+| RPO (локальная копия) | ≤ 24 ч | ежедневный `aistat.backup create` (launchd/cron) |
+| RPO (off-site копия) | ≤ 24 ч | ежедневный `aistat.backup_offsite push` после `create` |
+| RTO | цель ≤ 4 ч | измеряется каждым `drill` (`measured_rto_seconds` в `drill-report.json`) |
+| Retention локально | 14 поколений | `AISTAT_BACKUP_RETENTION`, prune при каждом `create` |
+| Retention off-site | 7 бандлов | `AISTAT_OFFSITE_RETENTION`, prune при каждом `push` |
+| Шифрование off-site | AES-256-CBC + PBKDF2 | системный `openssl`, ключ только в `AISTAT_BACKUP_ENCRYPTION_KEY` |
+| Владелец | Сергей Фомин | таблица выше |
+| Escalation | провал `create`/`push`/`drill` → событие в `alerts.jsonl` (dedupe-ready) → владелец разбирает в течение 24 ч; два подряд неудачных ежедневных push или любой неудачный drill → эскалация в Multica-тикет ops-очереди | `alerts.jsonl` в off-site каталоге |
+
+## Off-site копия (FAN-3462)
+
+Локальные поколения живут на том же носителе, что и production-базы, поэтому
+`aistat.backup_offsite push` публикует новейшее поколение как **один
+зашифрованный бандл** `<generation>.tar.gz.enc` в независимый каталог
+`AISTAT_OFFSITE_BACKUP_DIR` (по умолчанию `data/backups-offsite/`, обязательно
+вне `data/backups/` — вложенность проверяется и отклоняется).
+
+Бандл — это tar.gz поколения, зашифрованный системным `openssl`
+(AES-256-CBC, PBKDF2). Ключ передаётся openssl через `-pass env:` из
+`AISTAT_BACKUP_ENCRYPTION_KEY`: он не попадает в argv, логи, манифесты или
+отчёты и никогда не хранится в `Config`. Рядом лежит `<generation>.json` с
+sha256 шифротекста и внутреннего tar — по ним `verify`/`drill` детектируют
+повреждение и неверный ключ.
+
+Публикация идёт через staging-файл `.incoming-*` и атомарный `rename`, поэтому
+провал или retry **никогда не повреждает предыдущий успешный бандл**; повторный
+`push` того же поколения — идемпотентный no-op. Любой провал (нет ключа, нет
+локального поколения, ошибка записи) дописывает событие в `alerts.jsonl` с
+стабильным `dedupe_key` — потребитель алертов может сворачивать retry.
+
+Независимость носителя: путь должен быть вне локального backup-дерева;
+признак `same_device_as_local` в метаданных показывает, физически ли это тот
+же диск. **Целевая конфигурация — другой носитель**: смонтированный внешний
+диск, бесплатный rclone/SSHFS-маунт или диск другой машины. Используйте только
+бесплатные ресурсы; если доступен лишь платный target — остановите шаг и
+вынесите решение в отдельную карту (финансовые действия вне этой операции).
+
+Команды:
+
+```
+export AISTAT_BACKUP_ENCRYPTION_KEY='<секрет из менеджера секретов>'
+python -m aistat.backup_offsite push          # опубликовать новейшее поколение
+python -m aistat.backup_offsite list          # бандлы + метаданные
+python -m aistat.backup_offsite verify latest # расшифровать и перепроверить sha256
+python -m aistat.backup_offsite drill latest  # изолированный restore drill
+```
+
+### Изолированный restore drill
+
+`drill` восстанавливает бандл **полностью в scratch-пространстве**: расшифровка,
+проверка sha256 каждого члена по манифесту, `PRAGMA integrity_check`,
+сравнение счётчиков строк и критические запросы (наличие и наполненность
+таблицы `issues` в `aistat.db`). Живые данные не читаются-не пишутся. Отчёт с
+поэтапными таймингами и измеренным RTO сохраняется как `drill-report.json`
+в off-site каталоге; превышение RTO-цели 4 ч — warning в отчёте, любой провал
+проверок — FAIL, событие в `alerts.jsonl` и ненулевой код выхода.
+
+### Ротация логов
+
+`python -m aistat.backup_offsite rotate-log <path>` (или `rotate_backup_logs`)
+ротирует операционные логи (`data/backup.log`, `data/offsite-backup.log`) по
+лимиту размера (по умолчанию 5 MB) или возраста (по умолчанию 30 дней), хранит
+`<keep>` (по умолчанию 5) предыдущих файлов. Ротация касается только
+перечисленных логов: манифесты поколений, `alerts.jsonl` и `drill-report.json`
+— audit evidence и никогда не удаляются ротацией.
+
 
 ## Восстановление и тест восстановления
 
