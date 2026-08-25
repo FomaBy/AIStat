@@ -56,6 +56,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AISTAT_REQUIRE_BROWSER: "1"
+      # Chrome-for-Testing aborts (rc=-6) inside its namespace sandbox on the
+      # shared runner; the harness appends these flags to its fixed argv.
+      AISTAT_CHROME_EXTRA_ARGS: "--no-sandbox --disable-dev-shm-usage"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

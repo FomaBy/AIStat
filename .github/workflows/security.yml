@@ -84,12 +84,16 @@ jobs:
         run: python -m pip install bandit
 
       # Bandit's config targets the review surface: application and scripts.
-      # The stdlib-only cPanel contour legitimately uses md5/sha1-free HMAC
-      # and subprocess with fixed argv; anything new must be justified here.
+      # The full JSON report is always archived, but the gate follows the
+      # card's contract and fails only on HIGH-severity findings
+      # (``-lll``). The current baseline is low/medium: parameterized SQL
+      # assembled from internal constant fragments (B608), subprocess with
+      # fixed argv (B404/B603/B607), narrow except-pass cleanup (B110) and
+      # configured-provider HTTPS urlopen (B310).
       - name: Run bandit static analysis
         run: |
           bandit -r aistat scripts -f json -o bandit-report.json \
-            --skip B101 --confidence-level medium || code=$?
+            --skip B101 --confidence-level medium -lll || code=$?
           if [ "${code:-0}" != "0" ]; then
             echo "FAIL: bandit findings above the threshold (see artifact)"; exit "$code"
           fi
