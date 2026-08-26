@@ -1334,6 +1334,14 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     needs_run_filter, selection = _run_filter_selection(conn, filters)
     rates = _pricing_rates(conn)
     stats = {} if needs_run_filter else _issue_model_stats(conn)
+    accepted = {
+        row["implementation_issue_id"]: row["accepted_story_points"]
+        for row in conn.execute(
+            "SELECT implementation_issue_id, accepted_story_points "
+            "FROM qa_lineage_events WHERE accepted_candidate IS NOT NULL "
+            "AND accepted_story_points > 0"
+        )
+    }
 
     where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
              "AND i.story_points > 0")
@@ -1360,6 +1368,8 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     cost_issues = 0
     weighted_num = 0.0   # Σ cost_i / hours_i over fully priced issues
     weighted_den = 0.0   # Σ sp_i over those same issues
+    accepted_cost = 0.0
+    accepted_sp = 0.0
     models: Dict[str, Dict[str, Any]] = {}
 
     def bucket(model: str) -> Dict[str, Any]:
@@ -1440,6 +1450,12 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         if issue_priced and issue_hours > 0 and sp > 0:
             weighted_num += issue_cost / issue_hours
             weighted_den += sp
+        # A quality-adjusted denominator comes only from terminal QA
+        # acceptance.  The numerator stays the whole implementation cost,
+        # including failed attempts and rework represented by its runs.
+        if issue_priced and row["id"] in accepted:
+            accepted_cost += issue_cost
+            accepted_sp += accepted[row["id"]] * factor
 
     model_rows = []
     for model, b in models.items():
@@ -1483,6 +1499,10 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         "cost_per_sp": (cost_usd / cost_sp) if cost_sp > 0 else None,
         "weighted_efficiency": (
             weighted_num / weighted_den if weighted_den > 0 else None
+        ),
+        "accepted_story_points": accepted_sp,
+        "quality_adjusted_cost_per_sp": (
+            accepted_cost / accepted_sp if accepted_sp > 0 else None
         ),
         "models": model_rows,
     }
@@ -1633,6 +1653,8 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "weighted_efficiency": eff["weighted_efficiency"],
         "efficiency_cost_usd": eff["cost_usd"],
         "efficiency_cost_sp": eff["cost_story_points"],
+        "accepted_story_points": eff["accepted_story_points"],
+        "quality_adjusted_cost_per_sp": eff["quality_adjusted_cost_per_sp"],
         "efficiency_hours": eff["active_hours"],
         "efficiency_has_unpriced": eff["has_unpriced"],
         "agent_count": len(work_seconds),

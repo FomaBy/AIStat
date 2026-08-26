@@ -284,6 +284,26 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         finally:
             conn.close()
 
+    @app.get("/api/billing-reconciliation")
+    def api_billing_reconciliation():
+        """Sanitized billing totals; provider exports stay outside AIStat."""
+        conn = db()
+        try:
+            rows = conn.execute(
+                "SELECT provider, period, calculated_usd, actual_usd, "
+                "variance_ratio, over_threshold, diagnostic_emitted_at "
+                "FROM billing_reconciliation ORDER BY period DESC, provider"
+            ).fetchall()
+            return {"rows": [{
+                "provider": row["provider"], "period": row["period"],
+                "calculated_usd": row["calculated_usd"], "actual_usd": row["actual_usd"],
+                "variance_ratio": row["variance_ratio"],
+                "over_threshold": bool(row["over_threshold"]),
+                "diagnostic_emitted": row["diagnostic_emitted_at"] is not None,
+            } for row in rows]}
+        finally:
+            conn.close()
+
     def health_payload():
         conn = db()
         try:

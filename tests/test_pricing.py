@@ -362,6 +362,61 @@ def test_recompute_current_luna_cost_is_idempotent(conn):
     assert first["cost_priced"] == 1
 
 
+def test_effective_rate_keeps_prior_usage_on_its_historical_price(conn, tmp_path):
+    """A later catalog revision must not reprice a closed usage day."""
+    catalog = tmp_path / "dated-pricing.json"
+    catalog.write_text(json.dumps({"models": {"vendor/m": [
+        {"effective_from": "2026-01-01", "input": 1, "output": 1,
+         "cache_read": 1, "cache_write": 1, "source_url": "https://vendor/pricing"},
+        {"effective_from": "2026-02-01", "input": 2, "output": 2,
+         "cache_read": 2, "cache_write": 2, "source_url": "https://vendor/pricing"},
+    ]}}), encoding="utf-8")
+    _insert_usage(conn, "rt", "vendor/m", "2026-01-31", 1_000_000, 0, 0, 0)
+    _insert_usage(conn, "rt", "vendor/m", "2026-02-01", 1_000_000, 0, 0, 0)
+
+    rates = pricing.load_pricing(catalog)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0)
+    first = conn.execute(
+        "SELECT date, cost_usd, rate_effective_from FROM daily_usage ORDER BY date"
+    ).fetchall()
+    assert [(r["date"], r["cost_usd"], r["rate_effective_from"]) for r in first] == [
+        ("2026-01-31", 1.0, "2026-01-01"),
+        ("2026-02-01", 2.0, "2026-02-01"),
+    ]
+
+    # Publishing a new future rate preserves the stored historical result.
+    catalog.write_text(json.dumps({"models": {"vendor/m": [
+        {"effective_from": "2026-01-01", "input": 99, "output": 99,
+         "cache_read": 99, "cache_write": 99, "source_url": "https://vendor/pricing"},
+        {"effective_from": "2026-02-01", "input": 2, "output": 2,
+         "cache_read": 2, "cache_write": 2, "source_url": "https://vendor/pricing"},
+    ]}}), encoding="utf-8")
+    pricing.recompute_daily_costs(conn, pricing.load_pricing(catalog), credits_per_usd=1.0)
+    assert [r["cost_usd"] for r in conn.execute(
+        "SELECT cost_usd FROM daily_usage ORDER BY date"
+    )] == [1.0, 2.0]
+
+
+def test_reconciliation_deduplicates_sanitized_variance_diagnostic(conn):
+    """The same high variance alerts once and stores no invoice payload."""
+    first = pricing.reconcile_billing_actual(
+        conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
+        threshold=0.05,
+    )
+    assert first == {"provider": "anthropic", "period": "2026-02",
+                     "variance_ratio": 0.1, "over_threshold": True,
+                     "diagnostic_emitted": True}
+    assert pricing.reconcile_billing_actual(
+        conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
+        threshold=0.05,
+    )["diagnostic_emitted"] is False
+    stored = conn.execute("SELECT * FROM billing_reconciliation").fetchone()
+    assert set(stored.keys()) == {"provider", "period", "calculated_usd",
+                                  "actual_usd", "variance_ratio", "over_threshold",
+                                  "diagnostic_emitted_at"}
+
+
 def test_upsert_model_pricing_idempotent(conn):
     rates = pricing.load_pricing(PRICING_JSON)
     pricing.upsert_model_pricing(conn, rates)

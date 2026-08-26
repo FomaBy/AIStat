@@ -24,6 +24,19 @@ def test_weights_fall_back_to_counts_then_equal():
     assert ag._weights(["a", "b"], {}, {}) == {"a": 0.5, "b": 0.5}
 
 
+def test_quality_adjusted_cost_uses_accepted_sp_and_all_attempt_cost(agg_conn):
+    """A terminal acceptance supplies the denominator; the issue cost is whole."""
+    agg_conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    out = ag.efficiency_breakdown(agg_conn)
+    assert out["accepted_story_points"] == 3.0
+    # I1's input/output are split equally: $0.0005 + $0.002 = $0.0025.
+    assert out["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+
+
 # -- daily series ----------------------------------------------------------------
 
 

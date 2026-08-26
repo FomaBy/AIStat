@@ -147,6 +147,33 @@ def test_summary_endpoint(api):
     assert filtered["total_tokens"] == 3_400_000
 
 
+def test_summary_exposes_accepted_sp_quality_cost(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    conn.commit()
+    data = client.get("/api/summary").json()
+    assert data["accepted_story_points"] == 3.0
+    assert data["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+
+
+def test_billing_reconciliation_api_exposes_sanitized_totals_only(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO billing_reconciliation VALUES "
+        "('anthropic', '2026-02', 90, 100, 0.1, 1, '2026-02-28T00:00:00Z')"
+    )
+    conn.commit()
+    assert client.get("/api/billing-reconciliation").json() == {"rows": [{
+        "provider": "anthropic", "period": "2026-02", "calculated_usd": 90.0,
+        "actual_usd": 100.0, "variance_ratio": 0.1, "over_threshold": True,
+        "diagnostic_emitted": True,
+    }]}
+
+
 def test_hour_and_dimension_filters_are_validated_and_applied(api):
     client, _ = api
     params = [

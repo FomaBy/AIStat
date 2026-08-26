@@ -1368,6 +1368,8 @@ function renderSummary(s) {
   const effStar = s.efficiency_has_unpriced ? " *" : "";
   $("card-cost-eff").textContent =
     s.cost_per_sp == null ? "—" : "≈ " + fmtUSDFine(s.cost_per_sp) + effStar;
+  $("card-quality-cost").textContent =
+    s.quality_adjusted_cost_per_sp == null ? "—" : "≈ " + fmtUSDFine(s.quality_adjusted_cost_per_sp) + effStar;
   $("card-weighted-eff").textContent =
     s.weighted_efficiency == null ? "—" : "≈ " + fmtUSDFine(s.weighted_efficiency) + effStar;
   // Agent participation and total agent-time — any eligible run over the
