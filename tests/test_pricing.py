@@ -1,6 +1,7 @@
 """Tests for the pricing / cost / credits module (stage 2)."""
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -500,6 +501,30 @@ def test_reconcile_billing_actual_stores_provenance(conn):
         "WHERE provider = 'anthropic' AND period = '2026-02'"
     ).fetchone()
     assert tuple(stored) == ("USD", 7, "2026-02-15T00:00:00Z")
+
+
+def test_billing_snapshot_degrades_without_optional_usage_columns():
+    usage = sqlite3.connect(":memory:")
+    usage.row_factory = sqlite3.Row
+    usage.execute("CREATE TABLE daily_usage (date TEXT)")
+    durable = sqlite3.connect(":memory:")
+    durable.row_factory = sqlite3.Row
+    durable.execute(
+        "CREATE TABLE billing_reconciliation ("
+        "user_id INTEGER, provider TEXT, period TEXT, calculated_usd REAL, "
+        "actual_usd REAL, variance_ratio REAL, over_threshold INTEGER, "
+        "diagnostic_emitted_at TEXT, currency TEXT, submitted_by INTEGER, "
+        "submitted_at TEXT)"
+    )
+    try:
+        assert pricing.billing_reconciliation_snapshot(
+            usage, durable_conn=durable, user_id=1
+        ) == {
+            "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}
+        }
+    finally:
+        usage.close()
+        durable.close()
 
 
 def test_replaying_dated_catalog_is_idempotent(conn, tmp_path):

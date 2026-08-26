@@ -180,6 +180,23 @@ def test_billing_reconciliation_api_exposes_sanitized_totals_only(api):
     assert data["coverage"] == {"periods_submitted": 1, "periods_total": 0}
 
 
+def test_billing_reconciliation_api_degrades_old_table_shape(api):
+    client, conn = api
+    conn.execute("DROP TABLE billing_reconciliation")
+    conn.execute(
+        "CREATE TABLE billing_reconciliation ("
+        "provider TEXT, period TEXT, calculated_usd REAL, actual_usd REAL, "
+        "variance_ratio REAL, over_threshold INTEGER, "
+        "diagnostic_emitted_at TEXT)"
+    )
+    conn.commit()
+    response = client.get("/api/billing-reconciliation")
+    assert response.status_code == 200
+    assert response.json() == {
+        "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}
+    }
+
+
 def test_pricing_api_exposes_rate_provenance_and_coverage(api):
     client, conn = api
     conn.execute(

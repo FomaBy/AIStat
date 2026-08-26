@@ -732,9 +732,19 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.get("/api/billing-reconciliation")
     def api_billing_reconciliation():
-        conn = data_connection()
+        user_id = current_user_id()
+        if user_id is None:
+            return jsonify({"detail": "authentication required"}), 401
         try:
-            return jsonify(pricing.billing_reconciliation_snapshot(conn))
+            conn = data_connection()
+        except SchemaUpgradeRequired:
+            # Reconciliation rows live in security.db, so an old tenant
+            # snapshot can still be read with degraded usage coverage.
+            conn = empty_data_connection()
+        try:
+            return jsonify(
+                security_store.billing_reconciliation_snapshot(user_id, conn)
+            )
         finally:
             conn.close()
 
@@ -760,6 +770,10 @@ def create_app(config: Optional[Config] = None) -> Flask:
             actual_usd = float(amount)
         except (TypeError, ValueError):
             return jsonify({"detail": "amount must be a number"}), 422
+        try:
+            pricing.validate_billing_reconciliation(provider, period, currency)
+        except pricing.PricingError as exc:
+            return jsonify({"detail": str(exc)}), 422
         path = config.tenant_db_path(user_id)
         if not path.is_file():
             return jsonify({"detail": "no usage snapshot ingested yet"}), 503
@@ -782,17 +796,23 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 calculated_usd = pricing.calculated_cost_for_period(
                     conn, provider, period
                 )
-                result = pricing.reconcile_billing_actual(
-                    conn, provider, period, calculated_usd, actual_usd,
-                    currency=currency, submitted_by=user_id,
-                )
             except pricing.PricingError as exc:
                 conn.rollback()
                 return jsonify({"detail": str(exc)}), 422
-            else:
-                conn.commit()
+            except sqlite3.OperationalError:
+                conn.rollback()
+                return jsonify({"detail": "database schema upgrade required"}), 503
             finally:
                 conn.close()
+            try:
+                result = security_store.record_billing_reconciliation(
+                    user_id, provider, period, calculated_usd, actual_usd,
+                    currency=currency,
+                )
+            except pricing.PricingError as exc:
+                return jsonify({"detail": str(exc)}), 422
+            except sqlite3.OperationalError:
+                return jsonify({"detail": "billing storage unavailable"}), 503
         return jsonify(result)
 
     def health_payload():

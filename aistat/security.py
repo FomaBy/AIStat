@@ -318,6 +318,20 @@ class SecurityStore:
                     last_snapshot_at       INTEGER,
                     last_snapshot_sha256   TEXT
                 );
+                CREATE TABLE IF NOT EXISTS billing_reconciliation (
+                    user_id               INTEGER NOT NULL,
+                    provider              TEXT NOT NULL,
+                    period                TEXT NOT NULL,
+                    calculated_usd        REAL NOT NULL,
+                    actual_usd             REAL NOT NULL,
+                    variance_ratio        REAL NOT NULL,
+                    over_threshold         INTEGER NOT NULL,
+                    diagnostic_emitted_at TEXT,
+                    currency               TEXT NOT NULL DEFAULT 'USD',
+                    submitted_by           INTEGER,
+                    submitted_at           TEXT,
+                    PRIMARY KEY (user_id, provider, period)
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     sid_hash    TEXT PRIMARY KEY,
                     user_id     INTEGER NOT NULL,
@@ -663,6 +677,54 @@ class SecurityStore:
         finally:
             conn.close()
 
+    def record_billing_reconciliation(
+        self,
+        user_id: int,
+        provider: str,
+        period: str,
+        calculated_usd: float,
+        actual_usd: float,
+        currency: str = "USD",
+    ) -> dict:
+        """Store one sanitized owner aggregate outside replaceable snapshots."""
+        from . import pricing
+
+        user_id = canonical_tenant_id(user_id)
+        conn = self._connect()
+        try:
+            result = pricing.reconcile_billing_actual(
+                conn,
+                provider,
+                period,
+                calculated_usd,
+                actual_usd,
+                currency=currency,
+                submitted_by=user_id,
+                user_id=user_id,
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def billing_reconciliation_snapshot(
+        self, user_id: int, usage_conn: sqlite3.Connection
+    ) -> dict:
+        """Read one tenant's durable aggregates and current usage coverage."""
+        from . import pricing
+
+        user_id = canonical_tenant_id(user_id)
+        conn = self._connect()
+        try:
+            return pricing.billing_reconciliation_snapshot(
+                usage_conn, durable_conn=conn, user_id=user_id
+            )
+        finally:
+            conn.close()
+
     def ingest_timestamp_is_fresh(
         self, user_id: int, timestamp: int
     ) -> bool:
@@ -802,8 +864,9 @@ class SecurityStore:
         ``BEGIN IMMEDIATE`` transaction on security.db (opened with
         ``secure_delete = ON`` so any lingering token bytes are zeroed rather
         than left in free pages) this removes the user's account row, external
-        identities, live sessions, per-tenant registry row, connection
-        submission throttle and any snapshot install journal, and drives an
+        identities, live sessions, per-tenant registry row, billing
+        reconciliation aggregates, connection submission throttle and any
+        snapshot install journal, and drives an
         outstanding "connect your Multica" connection through the existing
         two-party revocation so the trusted worker deletes its own encrypted
         credential copy.
@@ -876,6 +939,10 @@ class SecurityStore:
             )
             conn.execute(
                 "DELETE FROM snapshot_install_journal WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM billing_reconciliation WHERE user_id = ?",
                 (user_id,),
             )
             conn.execute("DELETE FROM tenants WHERE user_id = ?", (user_id,))
