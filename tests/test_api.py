@@ -147,6 +147,67 @@ def test_summary_endpoint(api):
     assert filtered["total_tokens"] == 3_400_000
 
 
+def test_summary_exposes_accepted_sp_quality_cost(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    conn.commit()
+    data = client.get("/api/summary").json()
+    assert data["accepted_story_points"] == 3.0
+    assert data["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+
+
+def test_billing_reconciliation_api_exposes_sanitized_totals_only(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO billing_reconciliation VALUES "
+        "('anthropic', '2026-02', 90, 100, 0.1, 1, '2026-02-28T00:00:00Z')"
+    )
+    conn.commit()
+    assert client.get("/api/billing-reconciliation").json() == {"rows": [{
+        "provider": "anthropic", "period": "2026-02", "calculated_usd": 90.0,
+        "actual_usd": 100.0, "variance_ratio": 0.1, "over_threshold": True,
+        "diagnostic_emitted": True,
+    }]}
+
+
+def test_pricing_api_exposes_rate_provenance_and_coverage(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, source_url, loaded_at) "
+        "VALUES ('m', '2026-01-01', 1, 2, .1, 1.25, 0, 'https://vendor/pricing', 'now')"
+    )
+    conn.commit()
+    data = client.get("/api/pricing").json()
+    assert data["rates"][0]["source_url"] == "https://vendor/pricing"
+    assert data["rates"][0]["effective_from"] == "2026-01-01"
+    assert data["coverage"] == {"rows": 4, "priced_rows": 3, "unpriced_rows": 1}
+
+
+@pytest.mark.parametrize("schema_version", [5, 6, 7, 8])
+def test_legacy_snapshot_without_new_cost_tables_keeps_api_neutral(api, schema_version):
+    """v5-v8 snapshots predate these optional v9 tables but remain servable."""
+    client, conn = api
+    conn.executescript("""
+    DROP TABLE qa_lineage_events;
+    DROP TABLE model_price_history;
+    DROP TABLE billing_reconciliation;
+    """)
+    conn.execute("PRAGMA user_version = {}".format(schema_version))
+    conn.commit()
+
+    summary = client.get("/api/summary")
+    assert summary.status_code == 200
+    assert summary.json()["accepted_story_points"] == 0.0
+    assert summary.json()["quality_adjusted_cost_per_sp"] is None
+    assert client.get("/api/pricing").json()["rates"] == []
+    assert client.get("/api/billing-reconciliation").json() == {"rows": []}
+
+
 def test_hour_and_dimension_filters_are_validated_and_applied(api):
     client, _ = api
     params = [

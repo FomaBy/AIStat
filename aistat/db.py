@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
@@ -23,7 +23,9 @@ SCHEMA_VERSION = 8
 # must be rejected before they can reach aggregate SQL. Schemas v6 (FAN-3306),
 # v7 (FAN-3349), and v8 (FAN-3454) only add flow-metrics data, so a v5 snapshot stays
 # fully servable: every pre-existing aggregate works unchanged and the flow
-# endpoint truthfully reports "no data" instead of failing. Snapshot
+# endpoint truthfully reports "no data" instead of failing. Schema v9 adds
+# optional pricing and QA-provenance tables, which use the same neutral
+# fallbacks for older admitted snapshots. Snapshot
 # admission, owner migration admission and both WSGI serving surfaces all
 # consult this single definition via :func:`schema_admission_error` so the
 # surfaces cannot drift. The public host never mutates authenticated snapshot
@@ -155,6 +157,7 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     cost_credits        REAL,
     cost_priced         INTEGER NOT NULL DEFAULT 0,
     cost_computed_at    TEXT,
+    rate_effective_from TEXT,
     PRIMARY KEY (runtime_id, model, date)
 );
 
@@ -344,6 +347,41 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     notes                TEXT,
     loaded_at            TEXT NOT NULL
 );
+
+-- Append-only price revisions.  The first observed rate for a model/date is
+-- retained so a later catalog publication cannot rewrite closed history.
+CREATE TABLE IF NOT EXISTS model_price_history (
+    model                TEXT NOT NULL,
+    effective_from       TEXT NOT NULL,
+    vendor               TEXT,
+    currency             TEXT,
+    input_rate           REAL,
+    output_rate          REAL,
+    cache_read_rate      REAL,
+    cache_write_rate     REAL,
+    cache_write_1h_rate  REAL,
+    credit_input_rate    REAL,
+    credit_cache_read_rate REAL,
+    credit_output_rate   REAL,
+    unpriced             INTEGER NOT NULL DEFAULT 0,
+    source_url           TEXT,
+    captured_at          TEXT,
+    loaded_at            TEXT NOT NULL,
+    PRIMARY KEY (model, effective_from)
+);
+
+-- Sanitized billing reconciliation totals only: no provider export or invoice
+-- payload is stored in the application database.
+CREATE TABLE IF NOT EXISTS billing_reconciliation (
+    provider               TEXT NOT NULL,
+    period                 TEXT NOT NULL,
+    calculated_usd         REAL NOT NULL,
+    actual_usd             REAL NOT NULL,
+    variance_ratio         REAL NOT NULL,
+    over_threshold         INTEGER NOT NULL,
+    diagnostic_emitted_at  TEXT,
+    PRIMARY KEY (provider, period)
+);
 """
 
 # Columns added to pre-existing tables after their first release. init_db adds
@@ -355,6 +393,13 @@ _ADDED_COLUMNS = {
         ("cost_credits", "REAL"),
         ("cost_priced", "INTEGER NOT NULL DEFAULT 0"),
         ("cost_computed_at", "TEXT"),
+        ("rate_effective_from", "TEXT"),
+    ],
+    "model_price_history": [
+        ("cache_write_1h_rate", "REAL"),
+        ("credit_input_rate", "REAL"),
+        ("credit_cache_read_rate", "REAL"),
+        ("credit_output_rate", "REAL"),
     ],
     "issues": [
         ("is_jira", "INTEGER NOT NULL DEFAULT 0"),
