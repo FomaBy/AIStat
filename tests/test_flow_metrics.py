@@ -448,6 +448,39 @@ def test_migration_v5_to_v7_is_idempotent_and_preserves_data(tmp_path):
     conn.close()
 
 
+def test_v7_to_v8_migration_keeps_raw_runs_and_marks_legacy_unknown(tmp_path):
+    path = tmp_path / "v7.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.execute(
+        "INSERT INTO runs (id, issue_id, status, synced_at) VALUES (?, ?, ?, ?)",
+        ("legacy-run", "legacy-issue", "completed", "2026-08-20T00:00:00Z"),
+    )
+    conn.commit()
+    before = [tuple(row) for row in conn.execute("SELECT * FROM runs")]
+    conn.execute("PRAGMA user_version = 7")
+    conn.commit()
+
+    init_db(conn)
+
+    assert SCHEMA_VERSION == 8
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert [tuple(row) for row in conn.execute("SELECT * FROM runs")] == before
+    attribution = conn.execute(
+        "SELECT run_id, provenance_state, model_revision, prompt_revision "
+        "FROM run_attribution_events"
+    ).fetchall()
+    assert [tuple(row) for row in attribution] == [
+        ("legacy-run", "legacy_unknown", None, None),
+    ]
+
+    init_db(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM run_attribution_events"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
 # -- performance (AC6) --------------------------------------------------------
 
 

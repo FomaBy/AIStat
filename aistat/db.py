@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
@@ -112,6 +112,16 @@ CREATE TABLE IF NOT EXISTS issues (
     qa_verdict_at      TEXT,
     qa_candidate       TEXT,
     qa_for_issue_id    TEXT,
+    -- Versioned control-plane provenance. These values arrive from issue
+    -- metadata and are copied into a first-seen run attribution event; they
+    -- never repair or relabel older raw runs.
+    attribution_schema_version INTEGER,
+    model_revision     TEXT,
+    runtime_revision   TEXT,
+    prompt_revision    TEXT,
+    skills_revision    TEXT,
+    harness_revision   TEXT,
+    governance_bundle_revision TEXT,
     created_at         TEXT,
     updated_at         TEXT,
     synced_at          TEXT NOT NULL,
@@ -270,6 +280,52 @@ CREATE TABLE IF NOT EXISTS fleet_snapshot_lanes (
     PRIMARY KEY (at, lane)
 );
 
+-- Immutable provenance captured when a run is first observed. Existing runs
+-- are backfilled only as legacy_unknown so the original run rows remain raw.
+CREATE TABLE IF NOT EXISTS run_attribution_events (
+    run_id                       TEXT PRIMARY KEY,
+    issue_id                     TEXT,
+    attribution_schema_version   INTEGER,
+    provenance_state             TEXT NOT NULL,
+    model_revision               TEXT,
+    runtime_revision             TEXT,
+    prompt_revision              TEXT,
+    skills_revision              TEXT,
+    harness_revision             TEXT,
+    governance_bundle_revision  TEXT,
+    observed_at                  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_attribution_issue
+    ON run_attribution_events(issue_id);
+
+-- A readiness baseline is explicitly marked initial when v8 first sees a
+-- card that was already ready. Only later observed transitions measure PM
+-- preparation and current waiting time.
+CREATE TABLE IF NOT EXISTS issue_readiness_events (
+    issue_id     TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,
+    initial      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (issue_id, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_readiness_events_observed
+    ON issue_readiness_events(observed_at);
+
+-- One immutable terminal QA observation per QA issue. A row first seen after
+-- collection but already terminal is marked initial by the collector.
+CREATE TABLE IF NOT EXISTS qa_lineage_events (
+    qa_issue_id            TEXT PRIMARY KEY,
+    implementation_issue_id TEXT NOT NULL,
+    candidate              TEXT NOT NULL,
+    verdict                TEXT NOT NULL,
+    verdict_at             TEXT,
+    observed_at            TEXT NOT NULL,
+    initial                INTEGER NOT NULL DEFAULT 0,
+    accepted_candidate     TEXT,
+    accepted_story_points  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_qa_lineage_impl
+    ON qa_lineage_events(implementation_issue_id);
+
 -- Official per-1M-token rates, loaded from pricing.json (+ optional override).
 -- Rates are NULL for an unpriced model; source_url/captured_at record where
 -- and when each rate was taken from the vendor's official pricing page.
@@ -309,6 +365,13 @@ _ADDED_COLUMNS = {
         ("qa_verdict_at", "TEXT"),
         ("qa_candidate", "TEXT"),
         ("qa_for_issue_id", "TEXT"),
+        ("attribution_schema_version", "INTEGER"),
+        ("model_revision", "TEXT"),
+        ("runtime_revision", "TEXT"),
+        ("prompt_revision", "TEXT"),
+        ("skills_revision", "TEXT"),
+        ("harness_revision", "TEXT"),
+        ("governance_bundle_revision", "TEXT"),
     ],
     "runs": [
         ("model", "TEXT"),
@@ -380,6 +443,26 @@ def _backfill_run_models(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_legacy_attribution(conn: sqlite3.Connection) -> None:
+    """Mark pre-v8 raw rows unknown without altering their source columns."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO run_attribution_events
+            (run_id, issue_id, provenance_state, observed_at)
+        SELECT id, issue_id, 'legacy_unknown', ? FROM runs
+        """,
+        (utcnow_iso(),),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO issue_readiness_events
+            (issue_id, observed_at, initial)
+        SELECT id, ?, 1 FROM issues WHERE dispatch_ready = 1
+        """,
+        (utcnow_iso(),),
+    )
+
+
 def schema_admission_error(conn: sqlite3.Connection):
     """Why ``conn``'s database may not be served, or ``None`` when it may.
 
@@ -435,5 +518,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _add_missing_columns(conn)
     _backfill_run_models(conn)
+    _backfill_legacy_attribution(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

@@ -124,6 +124,14 @@ def _meta_str(metadata: Dict[str, Any], *keys: str) -> Optional[str]:
     return None
 
 
+def _meta_positive_int(metadata: Dict[str, Any], key: str) -> Optional[int]:
+    """A numeric metadata version, without coercing strings or booleans."""
+    value = metadata.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
 def extract_qa_verdict(metadata: Dict[str, Any]) -> Optional[str]:
     """Terminal QA verdict recorded on a QA card, normalized to upper case.
 
@@ -175,6 +183,19 @@ def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
             metadata, "qa_for_issue_id", "implementation_issue_id",
             "source_issue_id",
         ),
+        "attribution_schema_version": _meta_positive_int(
+            metadata, "attribution_schema_version"
+        ),
+        "model_revision": _meta_str(metadata, "model_revision"),
+        "runtime_revision": _meta_str(metadata, "runtime_revision"),
+        "prompt_revision": _meta_str(metadata, "prompt_revision"),
+        "skills_revision": _meta_str(
+            metadata, "skills_revision", "skill_revision"
+        ),
+        "harness_revision": _meta_str(metadata, "harness_revision"),
+        "governance_bundle_revision": _meta_str(
+            metadata, "governance_bundle_revision"
+        ),
         "created_at": obj.get("created_at"),
         "updated_at": _require(obj, "updated_at", "issue"),
     }
@@ -216,6 +237,13 @@ def normalize_run(obj: Dict[str, Any]) -> Dict[str, Any]:
         # Present on some future/extended payloads.  Standard Multica run
         # responses currently omit it; store.upsert_runs snapshots then.
         "model": obj.get("model"),
+        "model_revision": obj.get("model_revision"),
+        "runtime_revision": obj.get("runtime_revision"),
+        "prompt_revision": obj.get("prompt_revision"),
+        "skills_revision": obj.get("skills_revision"),
+        "harness_revision": obj.get("harness_revision"),
+        "governance_bundle_revision": obj.get("governance_bundle_revision"),
+        "attribution_schema_version": obj.get("attribution_schema_version"),
         "kind": obj.get("kind"),
         "status": obj.get("status"),
         "attempt": obj.get("attempt"),
