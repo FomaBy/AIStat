@@ -6,6 +6,7 @@ import os
 import stat
 import tarfile
 import io
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -253,7 +254,7 @@ def test_verify_cleans_all_scratch_on_unexpected_extraction_error(
         raise RuntimeError("injected extraction failure")
 
     monkeypatch.setattr(tarfile.TarFile, "extract", extract_then_fail)
-    with pytest.raises(RuntimeError, match="injected extraction failure"):
+    with pytest.raises(OffsiteError, match="off-site bundle extraction failed"):
         verify_offsite(cfg, "latest")
 
     assert not list(cfg.offsite_backup_dir.glob(".extract-*"))
@@ -270,7 +271,7 @@ def test_verify_cleans_all_scratch_when_member_validation_fails(
         raise OffsiteError("injected validation failure")
 
     monkeypatch.setattr(offsite, "_check_generation", fail_validation)
-    with pytest.raises(OffsiteError, match="injected validation failure"):
+    with pytest.raises(OffsiteError, match="off-site verification failed"):
         verify_offsite(cfg, "latest")
 
     assert not list(cfg.offsite_backup_dir.glob(".extract-*"))
@@ -354,3 +355,73 @@ def _alerts(cfg):
     if not path.is_file():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def _assert_sentinel_absent(cfg, sentinel, captured=""):
+    assert sentinel not in captured
+    for path in cfg.offsite_backup_dir.rglob("*"):
+        if path.is_file():
+            assert sentinel not in path.read_bytes().decode("utf-8", "replace")
+
+
+def test_openssl_failure_does_not_echo_secret_in_exception_or_streams(
+    key, monkeypatch, capsys
+):
+    sentinel = "offsite-encryption-sentinel-9f3c"
+
+    def fail_run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=("openssl failure: " + sentinel).encode(),
+        )
+
+    monkeypatch.setattr(offsite.subprocess, "run", fail_run)
+    with pytest.raises(OffsiteError) as exc:
+        _encrypt(sentinel, b"payload")
+
+    captured = capsys.readouterr()
+    assert sentinel not in str(exc.value)
+    assert sentinel not in captured.out + captured.err
+
+
+def test_alert_reason_is_redacted_before_persistence(cfg):
+    sentinel = "offsite-alert-sentinel-2a71"
+
+    event = record_alert(cfg, "test", "test:sentinel", sentinel)
+
+    assert event["reason"] != sentinel
+    _assert_sentinel_absent(cfg, sentinel)
+
+
+def test_metadata_write_failure_does_not_echo_secret_anywhere(
+    cfg, key, monkeypatch, capsys, caplog
+):
+    sentinel = "offsite-metadata-sentinel-6d20"
+    backup.create_backup(cfg)
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError(sentinel)
+
+    monkeypatch.setattr(offsite.os, "replace", fail_replace)
+    with pytest.raises(OffsiteError) as exc:
+        push_offsite(cfg)
+
+    captured = capsys.readouterr()
+    assert sentinel not in str(exc.value)
+    _assert_sentinel_absent(cfg, sentinel, captured.out + captured.err + caplog.text)
+
+
+def test_drill_decryption_failure_does_not_echo_secret_in_report_alert_or_cli(
+    cfg, pushed, monkeypatch, capsys, caplog
+):
+    sentinel = "offsite-decrypt-sentinel-4b8e"
+    monkeypatch.setattr(offsite, "_decrypt", lambda *_args: (_ for _ in ()).throw(
+        OffsiteError(sentinel)
+    ))
+    monkeypatch.setattr(offsite, "Config", lambda: cfg)
+
+    assert offsite.main(["drill"]) == 1
+
+    captured = capsys.readouterr()
+    _assert_sentinel_absent(cfg, sentinel, captured.out + captured.err + caplog.text)
