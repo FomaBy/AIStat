@@ -606,6 +606,11 @@ def test_v7_to_v8_migration_keeps_raw_runs_and_marks_legacy_unknown(tmp_path):
         "INSERT INTO runs (id, issue_id, status, synced_at) VALUES (?, ?, ?, ?)",
         ("legacy-run", "legacy-issue", "completed", "2026-08-20T00:00:00Z"),
     )
+    conn.execute(
+        "INSERT INTO issues (id, status, dispatch_ready, synced_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("legacy-ready", "todo", 1, "2026-08-20T00:00:00Z"),
+    )
     conn.commit()
     before = [tuple(row) for row in conn.execute("SELECT * FROM runs")]
     conn.execute("PRAGMA user_version = 7")
@@ -623,10 +628,21 @@ def test_v7_to_v8_migration_keeps_raw_runs_and_marks_legacy_unknown(tmp_path):
     assert [tuple(row) for row in attribution] == [
         ("legacy-run", "legacy_unknown", None, None),
     ]
+    readiness = conn.execute(
+        "SELECT issue_id, initial FROM issue_readiness_events"
+    ).fetchall()
+    assert [tuple(row) for row in readiness] == [("legacy-ready", 1)]
 
+    conn.execute(
+        "UPDATE issue_readiness_events SET observed_at = '2026-08-20T00:00:00Z'"
+    )
+    conn.commit()
     init_db(conn)
     assert conn.execute(
         "SELECT COUNT(*) FROM run_attribution_events"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM issue_readiness_events"
     ).fetchone()[0] == 1
     conn.close()
 

@@ -663,7 +663,8 @@ def test_dashboard_flow_panel_static_contract():
     for control in ("flow-days", "flow-lane"):
         assert f'id="{control}"' in index_html
     for card in ("card-flow-cycle", "card-flow-p90", "card-flow-rework",
-                 "card-flow-idle"):
+                 "card-flow-idle", "card-flow-ready", "card-flow-pm-p95",
+                 "card-flow-waiting", "card-flow-first-pass"):
         assert f'id="{card}"' in index_html
     assert 'id="table-flow-groups"' in index_html
     assert 'id="flow-coverage"' in index_html
@@ -673,9 +674,11 @@ def test_dashboard_flow_panel_static_contract():
     assert "|| 0" not in render
     assert 't("noData")' in render
     assert "flowCoverageNoEvents" in render  # absent history is spelled out
+    assert "flowFirstPassSub" in render
     share = _js_function(app_js, "fmtShare")
     assert "—" in share  # null share/rate renders as a dash, not 0%
 
     i18n_js = (static / "i18n.js").read_text(encoding="utf-8")
-    for key in ("flowMetrics", "flowLane", "allLanes", "flowCoverageDetail"):
+    for key in ("flowMetrics", "flowLane", "allLanes", "flowCoverageDetail",
+                "flowFirstPassSub", "flowReady", "flowPmP95", "flowWaiting"):
         assert key + ":" in i18n_js

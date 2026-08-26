@@ -20,8 +20,8 @@ SCHEMA_VERSION = 8
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
 # uploads older than v5 (e.g. a valid v4 snapshot) or unknown future versions
-# must be rejected before they can reach aggregate SQL. Schemas v6 (FAN-3306)
-# and v7 (FAN-3349) only add flow-metrics data, so a v5 snapshot stays
+# must be rejected before they can reach aggregate SQL. Schemas v6 (FAN-3306),
+# v7 (FAN-3349), and v8 (FAN-3454) only add flow-metrics data, so a v5 snapshot stays
 # fully servable: every pre-existing aggregate works unchanged and the flow
 # endpoint truthfully reports "no data" instead of failing. Snapshot
 # admission, owner migration admission and both WSGI serving surfaces all
@@ -457,7 +457,11 @@ def _backfill_legacy_attribution(conn: sqlite3.Connection) -> None:
         """
         INSERT OR IGNORE INTO issue_readiness_events
             (issue_id, observed_at, initial)
-        SELECT id, ?, 1 FROM issues WHERE dispatch_ready = 1
+        SELECT i.id, ?, 1 FROM issues i
+        WHERE i.dispatch_ready = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM issue_readiness_events e WHERE e.issue_id = i.id
+          )
         """,
         (utcnow_iso(),),
     )
