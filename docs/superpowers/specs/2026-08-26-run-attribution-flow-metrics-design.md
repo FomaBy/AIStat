@@ -21,7 +21,7 @@ dashboard.
 
 ## Data model
 
-Schema v8 adds two append-only tables.
+Schema v8 adds three append-only tables.
 
 `run_attribution_events` has one row per newly observed run id. It records the
 attribution schema version, provenance state, model/runtime/prompt/skills/
@@ -30,12 +30,19 @@ collector reads the revision fields from the run payload first and then from
 the matching normalized issue metadata. It never fills a missing revision from
 the current agent or runtime catalogue.
 
+`issue_readiness_events` records each observed false→true
+`dispatch_ready` transition. It also records one `initial=1` baseline for a
+card that was already ready when v8 collection began. Initial baselines are
+explicitly legacy/unknown and are excluded from elapsed-time metrics; a later
+observed transition creates a trusted event.
+
 `qa_lineage_events` has one row per QA issue after a terminal, well-formed
 verdict is observed. It records the implementation issue, immutable candidate,
 verdict, reported verdict time, observation time, and for `PASSED` the accepted
 candidate and the implementation story points observed at that time. The
-primary key makes repeat polls idempotent. A malformed or incomplete QA record
-does not generate an event.
+primary key makes repeat polls idempotent. An existing terminal QA row first
+seen during v8 migration is marked `initial=1` and excluded from period metrics;
+a malformed or incomplete QA record does not generate an event.
 
 The normalized issue row carries the attribution metadata needed by the store:
 `attribution_schema_version`, `model_revision`, `runtime_revision`,
@@ -48,12 +55,18 @@ incomplete new attribution.
 
 ## Collection and lineage
 
+At migration, one `legacy_unknown` attribution event is created for every
+already-stored raw run, with no invented revision values. This backfill is
+`INSERT OR IGNORE`, so it is repeatable and never changes a raw row. Existing
+ready cards receive an `initial=1` readiness baseline for the same reason.
+
 `store.upsert_runs` inserts a first-seen run attribution alongside the existing
 run upsert. Its value is frozen by `INSERT OR IGNORE`; later catalog changes or
 metadata refreshes cannot rewrite it. `store.upsert_issues` inserts a QA
-lineage event when its terminal QA metadata is complete. For an acceptance, it
-looks up the implementation issue's current story points in the same
-transaction and snapshots the value into the event.
+lineage event when its terminal QA metadata is complete and records a rising
+readiness transition. For an acceptance, it looks up the implementation issue's
+current story points in the same transaction and snapshots the value into the
+event.
 
 Because both tables are observed-event logs, attempts are the number of
 distinct `run_attribution_events` for an implementation issue, rework is the
