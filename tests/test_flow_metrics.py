@@ -27,17 +27,18 @@ def ts(**delta):
 
 
 def add_issue(conn, issue_id, status="todo", project_id="p1", lane="dev_high",
-              created_at=None, is_jira=0, dispatch_ready=0, **qa):
+              created_at=None, is_jira=0, dispatch_ready=0, story_points=None,
+              **qa):
     conn.execute(
         """
         INSERT OR REPLACE INTO issues
             (id, status, project_id, dispatch_lane, dispatch_ready, is_jira,
-             created_at, qa_verdict, qa_verdict_at, qa_candidate,
+             story_points, created_at, qa_verdict, qa_verdict_at, qa_candidate,
              qa_for_issue_id, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (issue_id, status, project_id, lane, dispatch_ready, is_jira,
-         created_at or ts(days=80), qa.get("qa_verdict"),
+         story_points, created_at or ts(days=80), qa.get("qa_verdict"),
          qa.get("qa_verdict_at"), qa.get("qa_candidate"),
          qa.get("qa_for_issue_id"), ts()),
     )
@@ -48,6 +49,29 @@ def add_event(conn, issue_id, status, observed_at, initial=0):
         "INSERT INTO issue_status_events (issue_id, status, observed_at, initial) "
         "VALUES (?, ?, ?, ?)",
         (issue_id, status, observed_at, initial),
+    )
+
+
+def add_ready_event(conn, issue_id, observed_at, initial=0):
+    conn.execute(
+        "INSERT INTO issue_readiness_events (issue_id, observed_at, initial) "
+        "VALUES (?, ?, ?)", (issue_id, observed_at, initial),
+    )
+
+
+def add_lineage_event(conn, qa_issue_id, implementation_issue_id, candidate,
+                      verdict, verdict_at, accepted_story_points=None,
+                      initial=0):
+    conn.execute(
+        """
+        INSERT INTO qa_lineage_events
+            (qa_issue_id, implementation_issue_id, candidate, verdict, verdict_at,
+             observed_at, initial, accepted_candidate, accepted_story_points)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (qa_issue_id, implementation_issue_id, candidate, verdict, verdict_at,
+         verdict_at or ts(), initial,
+         candidate if verdict == "PASSED" else None, accepted_story_points),
     )
 
 
@@ -93,6 +117,132 @@ def test_upsert_records_initial_and_transition_events_idempotently(conn):
         ("todo", "2026-08-01T00:00:00Z", 1),
         ("in_progress", "2026-08-01T00:02:00Z", 0),
     ]
+
+
+def test_run_attribution_is_frozen_and_incomplete_values_are_unknown(conn):
+    observed_at = ts(days=2)
+    complete = {
+        "id": "impl", "status": "todo", "story_points": 5,
+        "attribution_schema_version": 1,
+        "model_revision": "model@v1", "runtime_revision": "runtime@v1",
+        "prompt_revision": "prompt@v1", "skills_revision": "skills@v1",
+        "harness_revision": "harness@v1",
+        "governance_bundle_revision": "bundle@v1",
+    }
+    store.upsert_issues(conn, [complete], synced_at=observed_at)
+    store.upsert_runs(conn, [{"id": "run-1", "issue_id": "impl"}],
+                      synced_at=observed_at)
+    complete["prompt_revision"] = "prompt@v2"
+    store.upsert_issues(conn, [complete], synced_at=ts(days=1))
+    store.upsert_runs(conn, [{"id": "run-1", "issue_id": "impl"}],
+                      synced_at=ts(days=1))
+
+    incomplete = {"id": "incomplete", "status": "todo"}
+    store.upsert_issues(conn, [incomplete], synced_at=observed_at)
+    store.upsert_runs(conn, [{"id": "run-2", "issue_id": "incomplete"}],
+                      synced_at=observed_at)
+
+    rows = conn.execute(
+        "SELECT run_id, prompt_revision, provenance_state "
+        "FROM run_attribution_events ORDER BY run_id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("run-1", "prompt@v1", "observed"),
+        ("run-2", None, "unknown"),
+    ]
+
+
+def test_terminal_qa_lineage_snapshots_acceptance_once(conn):
+    store.upsert_issues(conn, [{"id": "impl", "status": "in_review",
+                                "story_points": 5}], synced_at=ts(days=2))
+    verdict = {
+        "id": "qa", "status": "done", "qa_for_issue_id": "impl",
+        "qa_candidate": "sha-a", "qa_verdict": "PASSED",
+        "qa_verdict_at": ts(days=1),
+    }
+    store.upsert_issues(conn, [verdict], synced_at=ts(days=1))
+    verdict["qa_candidate"] = "sha-b"
+    store.upsert_issues(conn, [verdict], synced_at=ts())
+
+    saved = conn.execute(
+        "SELECT candidate, verdict, accepted_candidate, accepted_story_points "
+        "FROM qa_lineage_events"
+    ).fetchone()
+    assert tuple(saved) == ("sha-a", "PASSED", "sha-a", 5.0)
+
+
+def test_ready_transition_is_append_only_and_not_an_initial_baseline(conn):
+    row = {"id": "i1", "status": "todo", "dispatch_ready": 0}
+    store.upsert_issues(conn, [row], synced_at=ts(days=2))
+    row["dispatch_ready"] = 1
+    store.upsert_issues(conn, [row], synced_at=ts(days=1))
+    store.upsert_issues(conn, [row], synced_at=ts())
+
+    rows = conn.execute(
+        "SELECT observed_at, initial FROM issue_readiness_events"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(ts(days=1), 0)]
+
+
+def test_frontier_reports_ready_pm_p95_and_waiting_age(conn):
+    for hours in range(1, 21):
+        issue_id = "ready-{}".format(hours)
+        add_issue(conn, issue_id, status="todo", dispatch_ready=1,
+                  story_points=1, created_at=ts(days=1, hours=hours))
+        add_ready_event(conn, issue_id, ts(days=1))
+    conn.commit()
+
+    frontier = flow_metrics.flow(conn, days=7, now=NOW)["frontier"]
+
+    assert frontier == {
+        "ready": 20,
+        "ready_story_points": 20.0,
+        "pm_p95_seconds": 19 * 3600.0,
+        "pm_measured": 20,
+        "waiting_median_seconds": 86400.0,
+        "waiting_p95_seconds": 86400.0,
+        "waiting": 20,
+    }
+
+
+def test_lineage_metrics_use_immutable_events_and_explicit_denominators(conn):
+    add_issue(conn, "impl-a", story_points=5)
+    add_issue(conn, "impl-b", story_points=3)
+    add_issue(conn, "impl-c")
+    add_lineage_event(conn, "qa-a", "impl-a", "sha-a", "PASSED", ts(days=2),
+                      accepted_story_points=5)
+    add_lineage_event(conn, "qa-b1", "impl-b", "sha-b", "FAILED", ts(days=4))
+    add_lineage_event(conn, "qa-b2", "impl-b", "sha-c", "PASSED", ts(days=1),
+                      accepted_story_points=3)
+    add_lineage_event(conn, "qa-c", "impl-c", "sha-d", "INCONCLUSIVE", None)
+    conn.executemany(
+        """
+        INSERT INTO run_attribution_events
+            (run_id, issue_id, provenance_state, observed_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            ("run-a", "impl-a", "observed", ts(days=2)),
+            ("run-b", "impl-b", "unknown", ts(days=1)),
+            ("run-legacy", "impl-c", "legacy_unknown", ts(days=1)),
+        ],
+    )
+    conn.commit()
+
+    lineage = flow_metrics.flow(conn, days=7, now=NOW)["lineage"]
+
+    assert lineage == {
+        "attempts": 2,
+        "rework": 1,
+        "accepted_candidates": 2,
+        "accepted_story_points": 8.0,
+        "first_pass_rate": 0.5,
+        "first_passed": 1,
+        "first_pass_denominator": 2,
+        "unwindowed": 1,
+        "unknown": 1,
+        "legacy_unknown": 1,
+    }
 
 
 # -- cycle time ---------------------------------------------------------------
@@ -445,6 +595,55 @@ def test_migration_v5_to_v7_is_idempotent_and_preserves_data(tmp_path):
 
     conn.execute("PRAGMA user_version = 5")  # rollback evidence
     assert schema_admission_error(conn) is None
+    conn.close()
+
+
+def test_v7_to_v8_migration_keeps_raw_runs_and_marks_legacy_unknown(tmp_path):
+    path = tmp_path / "v7.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.execute(
+        "INSERT INTO runs (id, issue_id, status, synced_at) VALUES (?, ?, ?, ?)",
+        ("legacy-run", "legacy-issue", "completed", "2026-08-20T00:00:00Z"),
+    )
+    conn.execute(
+        "INSERT INTO issues (id, status, dispatch_ready, synced_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("legacy-ready", "todo", 1, "2026-08-20T00:00:00Z"),
+    )
+    conn.commit()
+    before = [tuple(row) for row in conn.execute("SELECT * FROM runs")]
+    conn.execute("PRAGMA user_version = 7")
+    conn.commit()
+
+    init_db(conn)
+
+    assert SCHEMA_VERSION == 8
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert [tuple(row) for row in conn.execute("SELECT * FROM runs")] == before
+    attribution = conn.execute(
+        "SELECT run_id, provenance_state, model_revision, prompt_revision "
+        "FROM run_attribution_events"
+    ).fetchall()
+    assert [tuple(row) for row in attribution] == [
+        ("legacy-run", "legacy_unknown", None, None),
+    ]
+    readiness = conn.execute(
+        "SELECT issue_id, initial FROM issue_readiness_events"
+    ).fetchall()
+    assert [tuple(row) for row in readiness] == [("legacy-ready", 1)]
+
+    conn.execute(
+        "UPDATE issue_readiness_events SET observed_at = '2026-08-20T00:00:00Z'"
+    )
+    conn.commit()
+    init_db(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM run_attribution_events"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM issue_readiness_events"
+    ).fetchone()[0] == 1
     conn.close()
 
 

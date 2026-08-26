@@ -1201,6 +1201,8 @@ function renderFlow(data) {
   const cycle = data.cycle_time;
   const rework = data.rework;
   const idle = data.idle;
+  const frontier = data.frontier || {};
+  const lineage = data.lineage || {};
 
   $("card-flow-cycle").textContent = fmtDuration(cycle.median_seconds);
   $("card-flow-cycle-sub").textContent = t("flowMeasuredSub", {
@@ -1217,6 +1219,24 @@ function renderFlow(data) {
   $("card-flow-idle").textContent = fmtShare(idle.share);
   $("card-flow-idle-sub").textContent = t("flowIdleSub", {
     pct: idle.coverage_pct,
+  });
+  $("card-flow-ready").textContent = fmtNum(frontier.ready);
+  $("card-flow-ready-sub").textContent = t("flowReadySub", {
+    ready: frontier.ready == null ? 0 : frontier.ready,
+    points: fmtNum(frontier.ready_story_points),
+  });
+  $("card-flow-pm-p95").textContent = fmtDuration(frontier.pm_p95_seconds);
+  $("card-flow-pm-p95-sub").textContent = t("flowPmP95Sub", {
+    measured: frontier.pm_measured == null ? 0 : frontier.pm_measured,
+  });
+  $("card-flow-waiting").textContent = fmtDuration(frontier.waiting_median_seconds);
+  $("card-flow-waiting-sub").textContent = t("flowWaitingSub", {
+    waiting: frontier.waiting == null ? 0 : frontier.waiting,
+  });
+  $("card-flow-first-pass").textContent = fmtShare(lineage.first_pass_rate);
+  $("card-flow-first-pass-sub").textContent = t("flowFirstPassSub", {
+    passed: lineage.first_passed == null ? 0 : lineage.first_passed,
+    denominator: lineage.first_pass_denominator == null ? 0 : lineage.first_pass_denominator,
   });
 
   // Lane selector: observed lanes, preserving the current choice.
@@ -1268,6 +1288,10 @@ function renderFlow(data) {
     noStart: cycle.excluded_no_start,
     cancelled: cycle.cancelled,
     unwindowed: rework.unwindowed,
+  }));
+  coverage.push(t("flowAttributionCoverage", {
+    unknown: lineage.unknown == null ? 0 : lineage.unknown,
+    legacy: lineage.legacy_unknown == null ? 0 : lineage.legacy_unknown,
   }));
   $("flow-coverage").textContent = coverage.join(" · ");
 }

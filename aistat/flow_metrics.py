@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 WINDOW_DAYS = (7, 30, 90)
 REWORK_VERDICTS = ("FAILED", "INCONCLUSIVE")
+READY_CARD_STATUSES = ("todo", "backlog")
 UNKNOWN_LANE = "unknown"
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -94,6 +95,15 @@ def _p90_nearest_rank(values: List[float]) -> Optional[float]:
     if n == 0:
         return None
     rank = -(-9 * n // 10)  # ceil(0.9 * n) without float error
+    return values[rank - 1]
+
+
+def _p95_nearest_rank(values: List[float]) -> Optional[float]:
+    """Nearest-rank 95th percentile over a sorted list (1-indexed ceil)."""
+    n = len(values)
+    if n == 0:
+        return None
+    rank = -(-95 * n // 100)
     return values[rank - 1]
 
 
@@ -297,6 +307,196 @@ def _rework(conn: sqlite3.Connection, win_from: datetime, now: datetime,
     }
 
 
+# -- observed readiness and run lineage --------------------------------------
+
+
+def _frontier(conn: sqlite3.Connection, win_from: datetime, now: datetime,
+              project_ids: Sequence[str], lanes: Sequence[str]) -> Dict[str, Any]:
+    params = []  # type: List[Any]
+    filter_sql = _in_clause("i.project_id", project_ids, params)
+    filter_sql += _in_clause(
+        "COALESCE(i.dispatch_lane, '{}')".format(UNKNOWN_LANE), lanes, params)
+    ready_rows = conn.execute(
+        """
+        SELECT i.id, i.story_points
+        FROM issues i
+        WHERE i.is_jira = 0 AND i.dispatch_ready = 1
+          AND i.status IN (?, ?){filters}
+        """.format(filters=filter_sql),
+        list(READY_CARD_STATUSES) + params,
+    ).fetchall()
+
+    pm_params = []  # type: List[Any]
+    pm_filters = _in_clause("i.project_id", project_ids, pm_params)
+    pm_filters += _in_clause(
+        "COALESCE(i.dispatch_lane, '{}')".format(UNKNOWN_LANE), lanes,
+        pm_params)
+    readiness_rows = conn.execute(
+        """
+        SELECT e.issue_id, MIN(e.observed_at) AS ready_at, i.created_at
+        FROM issue_readiness_events e
+        JOIN issues i ON i.id = e.issue_id
+        WHERE e.initial = 0 AND i.is_jira = 0{filters}
+        GROUP BY e.issue_id, i.created_at
+        """.format(filters=pm_filters),
+        pm_params,
+    ).fetchall()
+    pm_values = []  # type: List[float]
+    for row in readiness_rows:
+        ready_at = _parse_ts(row["ready_at"])
+        created_at = _parse_ts(row["created_at"])
+        if (ready_at is None or created_at is None or ready_at < created_at or
+                not (win_from <= ready_at <= now)):
+            continue
+        pm_values.append((ready_at - created_at).total_seconds())
+    pm_values.sort()
+
+    waiting_params = []  # type: List[Any]
+    waiting_filters = _in_clause("i.project_id", project_ids, waiting_params)
+    waiting_filters += _in_clause(
+        "COALESCE(i.dispatch_lane, '{}')".format(UNKNOWN_LANE), lanes,
+        waiting_params)
+    waiting_rows = conn.execute(
+        """
+        SELECT e.ready_at
+        FROM (
+            SELECT issue_id, MAX(observed_at) AS ready_at
+            FROM issue_readiness_events WHERE initial = 0 GROUP BY issue_id
+        ) e
+        JOIN issues i ON i.id = e.issue_id
+        WHERE i.is_jira = 0 AND i.dispatch_ready = 1
+          AND i.status IN (?, ?){filters}
+        """.format(filters=waiting_filters),
+        list(READY_CARD_STATUSES) + waiting_params,
+    ).fetchall()
+    waiting_values = []  # type: List[float]
+    for row in waiting_rows:
+        ready_at = _parse_ts(row["ready_at"])
+        if ready_at is not None and ready_at <= now:
+            waiting_values.append((now - ready_at).total_seconds())
+    waiting_values.sort()
+
+    return {
+        "ready": len(ready_rows),
+        "ready_story_points": sum(
+            float(row["story_points"]) for row in ready_rows
+            if row["story_points"] is not None
+        ),
+        "pm_p95_seconds": _p95_nearest_rank(pm_values),
+        "pm_measured": len(pm_values),
+        "waiting_median_seconds": _median(waiting_values),
+        "waiting_p95_seconds": _p95_nearest_rank(waiting_values),
+        "waiting": len(waiting_values),
+    }
+
+
+def _lineage(conn: sqlite3.Connection, win_from: datetime, now: datetime,
+             project_ids: Sequence[str], lanes: Sequence[str]) -> Dict[str, Any]:
+    empty = {
+        "attempts": 0, "rework": 0, "accepted_candidates": 0,
+        "accepted_story_points": 0.0, "first_pass_rate": None,
+        "first_passed": 0, "first_pass_denominator": 0,
+        "unwindowed": 0, "unknown": 0, "legacy_unknown": 0,
+    }
+    params = [_fmt_ts(win_from), _fmt_ts(now)]  # type: List[Any]
+    filter_sql = _in_clause("i.project_id", project_ids, params)
+    filter_sql += _in_clause(
+        "COALESCE(i.dispatch_lane, '{}')".format(UNKNOWN_LANE), lanes, params)
+    run_rows = conn.execute(
+        """
+        SELECT a.provenance_state
+        FROM run_attribution_events a
+        JOIN issues i ON i.id = a.issue_id
+        WHERE i.is_jira = 0 AND a.observed_at >= ? AND a.observed_at <= ?{filters}
+        """.format(filters=filter_sql),
+        params,
+    ).fetchall()
+    for row in run_rows:
+        state = row["provenance_state"]
+        if state == "legacy_unknown":
+            empty["legacy_unknown"] += 1
+        else:
+            empty["attempts"] += 1
+            if state != "observed":
+                empty["unknown"] += 1
+
+    lineage_params = []  # type: List[Any]
+    lineage_filters = _in_clause("i.project_id", project_ids, lineage_params)
+    lineage_filters += _in_clause(
+        "COALESCE(i.dispatch_lane, '{}')".format(UNKNOWN_LANE), lanes,
+        lineage_params)
+    lineage_rows = conn.execute(
+        """
+        SELECT q.qa_issue_id, q.implementation_issue_id, q.candidate, q.verdict,
+               q.verdict_at, q.accepted_candidate, q.accepted_story_points
+        FROM qa_lineage_events q
+        JOIN issues i ON i.id = q.implementation_issue_id
+        WHERE q.initial = 0 AND i.is_jira = 0{filters}
+        """.format(filters=lineage_filters),
+        lineage_params,
+    ).fetchall()
+    candidates = {}  # type: Dict[Tuple[str, str], Dict[str, Any]]
+    implementations = {}  # type: Dict[str, List[Dict[str, Any]]]
+    for row in lineage_rows:
+        event = {
+            "qa_issue_id": row["qa_issue_id"], "verdict": row["verdict"],
+            "at": _parse_ts(row["verdict_at"]),
+            "accepted_candidate": row["accepted_candidate"],
+            "accepted_story_points": row["accepted_story_points"],
+        }
+        implementations.setdefault(row["implementation_issue_id"], []).append(event)
+        key = (row["implementation_issue_id"], row["candidate"])
+        candidate = candidates.setdefault(
+            key, {"passed": False, "reworked": False, "at": None,
+                  "unwindowed": False, "accepted_story_points": None})
+        if event["verdict"] == "PASSED":
+            candidate["passed"] = True
+            if event["accepted_story_points"] is not None:
+                candidate["accepted_story_points"] = event["accepted_story_points"]
+        elif event["verdict"] in REWORK_VERDICTS:
+            candidate["reworked"] = True
+        if event["at"] is None:
+            candidate["unwindowed"] = True
+        elif candidate["at"] is None or event["at"] < candidate["at"]:
+            candidate["at"] = event["at"]
+
+    unwindowed_implementations = set()
+    for implementation_issue_id, events in implementations.items():
+        if any(event["at"] is None for event in events):
+            unwindowed_implementations.add(implementation_issue_id)
+            continue
+        first = min(events, key=lambda event: (event["at"], event["qa_issue_id"]))
+        if win_from <= first["at"] <= now:
+            empty["first_pass_denominator"] += 1
+            if first["verdict"] == "PASSED":
+                empty["first_passed"] += 1
+
+    unwindowed_candidates = set()
+    for key, candidate in candidates.items():
+        if candidate["unwindowed"] or candidate["at"] is None:
+            unwindowed_candidates.add(key[0])
+            continue
+        if not (win_from <= candidate["at"] <= now):
+            continue
+        if candidate["reworked"] and not candidate["passed"]:
+            empty["rework"] += 1
+        if candidate["passed"]:
+            empty["accepted_candidates"] += 1
+            if candidate["accepted_story_points"] is not None:
+                empty["accepted_story_points"] += float(
+                    candidate["accepted_story_points"]
+                )
+
+    empty["unwindowed"] = len(
+        unwindowed_implementations | unwindowed_candidates
+    )
+    denominator = empty["first_pass_denominator"]
+    empty["first_pass_rate"] = (
+        empty["first_passed"] / denominator if denominator else None
+    )
+    return empty
+
+
 # -- idle-fleet share ---------------------------------------------------------
 
 
@@ -398,6 +598,11 @@ def flow(conn: sqlite3.Connection, days: int = 30,
         ("qa_verdict", "qa_verdict_at", "qa_candidate", "qa_for_issue_id"))
     has_snapshots = (_table_exists(conn, "fleet_snapshots")
                      and _table_exists(conn, "fleet_snapshot_lanes"))
+    has_frontier = (_table_exists(conn, "issue_readiness_events")
+                    and _has_columns(conn, "issues", ("dispatch_lane",
+                                                        "dispatch_ready")))
+    has_lineage = (_table_exists(conn, "run_attribution_events")
+                   and _table_exists(conn, "qa_lineage_events"))
 
     events_start = None
     if has_events:
@@ -440,12 +645,31 @@ def flow(conn: sqlite3.Connection, days: int = 30,
                 "gap_seconds": 0, "coverage_pct": 0.0,
                 "snapshots": 0, "workspace_wide": True,
                 "project_filter_ignored": bool(project_ids)}
+    if has_frontier:
+        frontier = _frontier(conn, win_from, now, project_ids, lanes)
+    else:
+        frontier = {
+            "ready": 0, "ready_story_points": 0.0,
+            "pm_p95_seconds": None, "pm_measured": 0,
+            "waiting_median_seconds": None, "waiting_p95_seconds": None,
+            "waiting": 0,
+        }
+    if has_lineage:
+        lineage = _lineage(conn, win_from, now, project_ids, lanes)
+    else:
+        lineage = {
+            "attempts": 0, "rework": 0, "accepted_candidates": 0,
+            "accepted_story_points": 0.0, "first_pass_rate": None,
+            "first_passed": 0, "first_pass_denominator": 0,
+            "unwindowed": 0, "unknown": 0, "legacy_unknown": 0,
+        }
 
     return {
         "days": days,
         "now": _fmt_ts(now),
         "window_from": _fmt_ts(win_from),
         "schema_supported": has_events or has_qa or has_snapshots,
+        "attribution_schema_supported": has_frontier and has_lineage,
         "coverage": {
             "events_start": events_start,
             "snapshots_start": snapshots_start,
@@ -454,4 +678,6 @@ def flow(conn: sqlite3.Connection, days: int = 30,
         "cycle_time": cycle,
         "rework": rework,
         "idle": idle,
+        "frontier": frontier,
+        "lineage": lineage,
     }

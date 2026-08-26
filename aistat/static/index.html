@@ -281,6 +281,10 @@
         <div class="card"><div class="card-label" data-i18n="flowCycleP90">Цикл: p90</div><div class="card-value" id="card-flow-p90">—</div><div class="card-sub" id="card-flow-p90-sub"></div></div>
         <div class="card"><div class="card-label" data-i18n="flowRework">Доля доработок</div><div class="card-value" id="card-flow-rework">—</div><div class="card-sub" id="card-flow-rework-sub"></div></div>
         <div class="card"><div class="card-label" data-i18n="flowIdle">Простой флота</div><div class="card-value" id="card-flow-idle">—</div><div class="card-sub" id="card-flow-idle-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowReady">Готовый фронтир</div><div class="card-value" id="card-flow-ready">—</div><div class="card-sub" id="card-flow-ready-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowPmP95">PM: p95 до готовности</div><div class="card-value" id="card-flow-pm-p95">—</div><div class="card-sub" id="card-flow-pm-p95-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowWaiting">Возраст ожидания: медиана</div><div class="card-value" id="card-flow-waiting">—</div><div class="card-sub" id="card-flow-waiting-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowFirstPass">QA с первой попытки</div><div class="card-value" id="card-flow-first-pass">—</div><div class="card-sub" id="card-flow-first-pass-sub"></div></div>
       </section>
       <div class="table-wrap">
         <table id="table-flow-groups" aria-label="Время цикла по проектам и лейнам">
@@ -294,7 +298,7 @@
         </table>
       </div>
       <p id="flow-coverage" class="note"></p>
-      <p class="note" data-i18n="flowNote">Метрики считаются только по наблюдаемым событиям: переходы статусов и снимки флота записываются с момента включения сбора, старая история честно показывается как непокрытая, без приближений. Простой флота — по всему воркспейсу; фильтр проектов на него не влияет.</p>
+      <p class="note" data-i18n="flowNote">Метрики считаются только по наблюдаемым событиям. До включения provenance старые запуски остаются неизвестными, без догадок. Простой флота — по всему воркспейсу; фильтр проектов на него не влияет.</p>
     </section>
   </main>
 
