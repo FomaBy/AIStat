@@ -377,8 +377,6 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
             "generation": generation.name,
             "enc_path": str(enc_path),
             "pushed_at": now,
-            "member_count": len(list(generation.glob("*.gz"))),
-            "has_main_database": (generation / "aistat.db.gz").is_file(),
             "same_device_as_local": _same_device(target, Path(cfg.backup_dir)),
         }
         meta_staging = target / (_INCOMING_PREFIX + meta_path.name)
@@ -463,14 +461,9 @@ def _check_generation(generation: Path) -> bool:
     return has_main_database
 
 
-def _verified_member_summary(meta: dict, has_main_database: bool) -> List[str]:
+def _verified_member_summary(has_main_database: bool) -> List[str]:
     """Return a report-safe summary without exposing archive-derived labels."""
-    count = meta.get("member_count")
-    if not isinstance(count, int) or count < 0:
-        count = 1 if has_main_database else 0
-    summary = ["aistat.db"] if has_main_database else []
-    summary.extend("backup member" for _ in range(max(0, count - len(summary))))
-    return summary
+    return ["aistat.db"] if has_main_database else []
 
 
 def _cleanup_scratch(scratch_dir: Path) -> None:
@@ -488,9 +481,9 @@ def verify_offsite(cfg: Config, ref: str = "latest") -> dict:
     finally:
         _cleanup_scratch(bundle["scratch_dir"])
     return {
-        "bundle": str(enc_path),
-        "generation": bundle["meta"].get("generation"),
-        "verified_members": _verified_member_summary(bundle["meta"], has_main_database),
+        "bundle": "off-site bundle",
+        "generation": "redacted",
+        "verified_members": _verified_member_summary(has_main_database),
     }
 
 
@@ -540,17 +533,15 @@ def restore_drill_offsite(cfg: Config, ref: str = "latest") -> dict:
     report = {
         "tool": "aistat.backup_offsite.drill",
         "executed_at": utcnow_iso(),
-        "bundle": str(enc_path),
-        "generation": bundle["meta"].get("generation") if bundle else None,
+        "bundle": "off-site bundle",
+        "generation": "redacted",
         "ok": ok,
         "failure": failure,
         "steps_seconds": steps,
         "measured_rto_seconds": elapsed,
         "rto_target_seconds": RTO_TARGET_SECONDS,
         "within_rto_target": elapsed <= RTO_TARGET_SECONDS,
-        "verified_members": _verified_member_summary(
-            bundle["meta"] if bundle else {}, has_main_database
-        ),
+        "verified_members": _verified_member_summary(has_main_database),
     }
     try:
         target = _resolve_target_dir(cfg)
@@ -654,7 +645,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         if args.command == "push":
-            print(json.dumps(push_offsite(cfg), indent=2))
+            result = push_offsite(cfg)
+            if result.get("pushed"):
+                output = {"pushed": True}
+            else:
+                output = {"pushed": False, "reason": "already-published"}
+            print(json.dumps(output, indent=2))
             return 0
         if args.command == "list":
             for entry in _list_bundles(cfg):
@@ -669,7 +665,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             return 0
         if args.command == "verify":
-            print(json.dumps(verify_offsite(cfg, args.ref), indent=2))
+            result = verify_offsite(cfg, args.ref)
+            output = {
+                "bundle": "off-site bundle",
+                "generation": "redacted",
+                "verified_members": ["aistat.db"] if result["verified_members"] else [],
+            }
+            print(json.dumps(output, indent=2))
             return 0
         if args.command == "drill":
             report = restore_drill_offsite(cfg, args.ref)
