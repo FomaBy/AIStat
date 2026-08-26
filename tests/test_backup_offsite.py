@@ -1,14 +1,17 @@
 """Encrypted off-site backup copies and the isolated restore drill (FAN-3462)."""
 
 import json
+import hashlib
 import os
 import stat
 import tarfile
 import io
+from pathlib import Path
 
 import pytest
 
 from aistat import backup
+from aistat import backup_offsite as offsite
 from aistat.backup_offsite import (
     KEY_ENV,
     ALERTS_NAME,
@@ -67,6 +70,37 @@ def pushed(cfg, key):
 
 def _bundle_file(cfg):
     return next(p for p in cfg.offsite_backup_dir.iterdir() if p.name.endswith(".enc"))
+
+
+def _replace_bundle_tar(cfg, key, tar_bytes):
+    enc = _bundle_file(cfg)
+    meta_path = enc.with_name(enc.name[: -len(".tar.gz.enc")] + ".json")
+    meta = json.loads(meta_path.read_text())
+    blob = _encrypt(key, tar_bytes)
+    enc.write_bytes(blob)
+    meta["enc_sha256"] = hashlib.sha256(blob).hexdigest()
+    meta["tar_sha256"] = hashlib.sha256(tar_bytes).hexdigest()
+    meta_path.write_text(json.dumps(meta))
+
+
+def _tar_file(tar, name, payload):
+    info = tarfile.TarInfo(name)
+    info.mode = 0o600
+    info.size = len(payload)
+    tar.addfile(info, io.BytesIO(payload))
+
+
+def _captured_temp_dirs(monkeypatch):
+    created = []
+    real_mkdtemp = offsite.tempfile.mkdtemp
+
+    def capture(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(offsite.tempfile, "mkdtemp", capture)
+    return created
 
 
 # --------------------------------------------------------------------------- #
@@ -167,9 +201,11 @@ def test_push_rejects_target_inside_backup_tree(cfg, key):
 # --------------------------------------------------------------------------- #
 # verify / drill
 # --------------------------------------------------------------------------- #
-def test_verify_offsite_end_to_end(cfg, pushed):
+def test_verify_offsite_end_to_end(cfg, pushed, monkeypatch):
+    created = _captured_temp_dirs(monkeypatch)
     report = verify_offsite(cfg, "latest")
     assert "aistat.db" in report["verified_members"]
+    assert created and all(not path.exists() for path in created)
 
 
 def test_verify_detects_corrupt_bundle(cfg, pushed):
@@ -180,6 +216,66 @@ def test_verify_detects_corrupt_bundle(cfg, pushed):
     with pytest.raises(OffsiteError) as exc:
         verify_offsite(cfg, "latest")
     assert "checksum mismatch" in str(exc.value)
+
+
+def test_verify_rejects_unsafe_member_and_cleans_all_scratch(cfg, pushed, key, monkeypatch):
+    created = _captured_temp_dirs(monkeypatch)
+    generation = "aistat-2026-08-26T00-00-00Z"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        _tar_file(tar, generation + "/manifest.json", b"{}")
+        _tar_file(tar, "../escaped.txt", b"plaintext")
+    _replace_bundle_tar(cfg, key, buf.getvalue())
+
+    with pytest.raises(OffsiteError, match="unsafe path"):
+        verify_offsite(cfg, "latest")
+
+    assert not list(cfg.offsite_backup_dir.glob(".extract-*"))
+    assert not list(cfg.offsite_backup_dir.glob("**/manifest.json"))
+    assert not (cfg.offsite_backup_dir.parent / "escaped.txt").exists()
+    assert created and all(not path.exists() for path in created)
+
+
+def test_verify_cleans_all_scratch_on_unexpected_extraction_error(
+    cfg, pushed, key, monkeypatch
+):
+    created = _captured_temp_dirs(monkeypatch)
+    generation = "aistat-2026-08-26T00-00-00Z"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        _tar_file(tar, generation + "/manifest.json", b"{}")
+    _replace_bundle_tar(cfg, key, buf.getvalue())
+
+    original_extract = tarfile.TarFile.extract
+
+    def extract_then_fail(tar, member, *args, **kwargs):
+        original_extract(tar, member, *args, **kwargs)
+        raise RuntimeError("injected extraction failure")
+
+    monkeypatch.setattr(tarfile.TarFile, "extract", extract_then_fail)
+    with pytest.raises(RuntimeError, match="injected extraction failure"):
+        verify_offsite(cfg, "latest")
+
+    assert not list(cfg.offsite_backup_dir.glob(".extract-*"))
+    assert not list(cfg.offsite_backup_dir.glob("**/manifest.json"))
+    assert created and all(not path.exists() for path in created)
+
+
+def test_verify_cleans_all_scratch_when_member_validation_fails(
+    cfg, pushed, monkeypatch
+):
+    created = _captured_temp_dirs(monkeypatch)
+
+    def fail_validation(_generation):
+        raise OffsiteError("injected validation failure")
+
+    monkeypatch.setattr(offsite, "_check_generation", fail_validation)
+    with pytest.raises(OffsiteError, match="injected validation failure"):
+        verify_offsite(cfg, "latest")
+
+    assert not list(cfg.offsite_backup_dir.glob(".extract-*"))
+    assert not list(cfg.offsite_backup_dir.glob("**/manifest.json"))
+    assert created and all(not path.exists() for path in created)
 
 
 def test_restore_drill_passes_and_never_touches_live_data(cfg, pushed):

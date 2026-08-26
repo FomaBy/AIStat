@@ -265,31 +265,33 @@ def _read_bundle(cfg: Config, enc_path: Path) -> dict:
     blob = enc_path.read_bytes()
     if hashlib.sha256(blob).hexdigest() != meta.get("enc_sha256"):
         raise OffsiteError("off-site bundle checksum mismatch: %s" % enc_path.name)
-    tar_bytes = _decrypt(key, blob)
-    if hashlib.sha256(tar_bytes).hexdigest() != meta.get("tar_sha256"):
-        raise OffsiteError(
-            "decrypted bundle checksum mismatch: %s (wrong key or corrupt copy)"
-            % enc_path.name
-        )
-    extract_dir = enc_path.parent / (
-        ".extract-" + enc_path.name[: -len(BUNDLE_SUFFIX)]
-    )
-    if extract_dir.exists():
-        shutil.rmtree(str(extract_dir), ignore_errors=True)
-    extract_dir.mkdir(parents=True)
-    # Safe extraction: only regular files/dirs below extract_dir.
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        for member in tar.getmembers():
-            dest = (extract_dir / member.name).resolve()
-            if extract_dir.resolve() not in dest.parents and dest != extract_dir.resolve():
-                raise OffsiteError(
-                    "bundle %s contains an unsafe path: %s" % (enc_path.name, member.name)
-                )
-            tar.extract(member, str(extract_dir))
-    generation = extract_dir / str(meta.get("generation", ""))
-    if not (generation / "manifest.json").is_file():
-        raise OffsiteError("bundle %s has no backup generation inside" % enc_path.name)
-    return {"meta": meta, "generation": generation, "extract_dir": extract_dir}
+    scratch_dir = Path(tempfile.mkdtemp(prefix=".aistat-offsite-"))
+    try:
+        tar_bytes = _decrypt(key, blob)
+        if hashlib.sha256(tar_bytes).hexdigest() != meta.get("tar_sha256"):
+            raise OffsiteError(
+                "decrypted bundle checksum mismatch: %s (wrong key or corrupt copy)"
+                % enc_path.name
+            )
+        extract_dir = scratch_dir / "extract"
+        extract_dir.mkdir()
+        # Safe extraction: only regular files/dirs below extract_dir.
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                dest = (extract_dir / member.name).resolve()
+                if extract_dir.resolve() not in dest.parents and dest != extract_dir.resolve():
+                    raise OffsiteError(
+                        "bundle %s contains an unsafe path: %s"
+                        % (enc_path.name, member.name)
+                    )
+                tar.extract(member, str(extract_dir))
+        generation = extract_dir / str(meta.get("generation", ""))
+        if not (generation / "manifest.json").is_file():
+            raise OffsiteError("bundle %s has no backup generation inside" % enc_path.name)
+        return {"meta": meta, "generation": generation, "scratch_dir": scratch_dir}
+    except BaseException:
+        _cleanup_scratch(scratch_dir)
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -437,8 +439,8 @@ def _check_generation(generation: Path) -> List[dict]:
     return checked
 
 
-def _cleanup_extract(extract_dir: Path) -> None:
-    shutil.rmtree(str(extract_dir), ignore_errors=True)
+def _cleanup_scratch(scratch_dir: Path) -> None:
+    shutil.rmtree(str(scratch_dir), ignore_errors=True)
 
 
 def verify_offsite(cfg: Config, ref: str = "latest") -> dict:
@@ -448,7 +450,7 @@ def verify_offsite(cfg: Config, ref: str = "latest") -> dict:
     try:
         checked = _check_generation(bundle["generation"])
     finally:
-        _cleanup_extract(bundle["extract_dir"])
+        _cleanup_scratch(bundle["scratch_dir"])
     return {
         "bundle": str(enc_path),
         "generation": bundle["meta"].get("generation"),
@@ -500,7 +502,7 @@ def restore_drill_offsite(cfg: Config, ref: str = "latest") -> dict:
         record_alert(cfg, "offsite_drill_failed", "drill:%s" % enc_path.name, failure)
     finally:
         if bundle is not None:
-            _cleanup_extract(bundle["extract_dir"])
+            _cleanup_scratch(bundle["scratch_dir"])
 
     elapsed = round(time.monotonic() - started, 3)
     report = {
