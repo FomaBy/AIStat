@@ -232,23 +232,12 @@ def _meta_path(enc_path: Path) -> Path:
     )
 
 
-def _write_bundle_metadata(
-    path: Path,
-    generation_name: str,
-    bundle_path: str,
-    pushed_at: str,
-    same_device: bool,
-) -> None:
-    """Persist only non-secret bundle identity and storage facts."""
-    metadata = {
-        "tool": "aistat.backup_offsite",
-        "encryption": _ENCRYPTION,
-        "generation": generation_name,
-        "enc_path": bundle_path,
-        "pushed_at": pushed_at,
-        "same_device_as_local": same_device,
-    }
-    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+def _write_bundle_metadata(path: Path) -> None:
+    """Persist only constant metadata; derive identity from managed paths."""
+    path.write_text(
+        '{"tool": "aistat.backup_offsite", "encryption": "aes-256-cbc-pbkdf2"}',
+        encoding="utf-8",
+    )
 
 
 def _list_bundles(cfg: Config) -> List[dict]:
@@ -258,11 +247,32 @@ def _list_bundles(cfg: Config) -> List[dict]:
         if meta.name in (ALERTS_NAME, DRILL_REPORT_NAME):
             continue
         try:
-            data = json.loads(meta.read_text(encoding="utf-8"))
+            marker = json.loads(meta.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        data.setdefault("name", meta.name[: -len(META_SUFFIX)])
-        out.append(data)
+        if not isinstance(marker, dict):
+            continue
+        generation_name = meta.name[: -len(META_SUFFIX)]
+        enc_path = target / (generation_name + BUNDLE_SUFFIX)
+        try:
+            pushed_at = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(enc_path.stat().st_mtime)
+            )
+        except OSError:
+            pushed_at = None
+        out.append(
+            {
+                "tool": "aistat.backup_offsite",
+                "encryption": _ENCRYPTION,
+                "generation": generation_name,
+                "enc_path": str(enc_path),
+                "pushed_at": pushed_at,
+                "same_device_as_local": _same_device(
+                    target, Path(cfg.backup_dir)
+                ),
+                "name": generation_name,
+            }
+        )
     return sorted(out, key=lambda d: str(d.get("generation", "")), reverse=True)
 
 
@@ -279,7 +289,7 @@ def _resolve_bundle(cfg: Config, ref: str):
         if not candidate.name.endswith(BUNDLE_SUFFIX):
             candidate = candidate.with_name(candidate.name + BUNDLE_SUFFIX)
     if not candidate.is_file():
-        raise OffsiteError("not an off-site bundle: %s" % ref)
+        raise OffsiteError("not an off-site bundle")
     return candidate
 
 
@@ -295,7 +305,7 @@ def _read_bundle(cfg: Config, enc_path: Path) -> dict:
     blob = enc_path.read_bytes()
     expected_enc_sha256 = meta.get("enc_sha256")
     if expected_enc_sha256 and hashlib.sha256(blob).hexdigest() != expected_enc_sha256:
-        raise OffsiteError("off-site bundle checksum mismatch: %s" % enc_path.name)
+        raise OffsiteError("off-site bundle checksum mismatch")
     scratch_dir = Path(tempfile.mkdtemp(prefix=".aistat-offsite-"))
     try:
         try:
@@ -304,10 +314,7 @@ def _read_bundle(cfg: Config, enc_path: Path) -> dict:
             raise OffsiteError("off-site bundle checksum mismatch") from None
         expected_tar_sha256 = meta.get("tar_sha256")
         if expected_tar_sha256 and hashlib.sha256(tar_bytes).hexdigest() != expected_tar_sha256:
-            raise OffsiteError(
-                "decrypted bundle checksum mismatch: %s (wrong key or corrupt copy)"
-                % enc_path.name
-            )
+            raise OffsiteError("decrypted bundle checksum mismatch")
         extract_dir = scratch_dir / "extract"
         extract_dir.mkdir()
         # Safe extraction: only regular files/dirs below extract_dir.
@@ -315,17 +322,15 @@ def _read_bundle(cfg: Config, enc_path: Path) -> dict:
             for member in tar.getmembers():
                 dest = (extract_dir / member.name).resolve()
                 if extract_dir.resolve() not in dest.parents and dest != extract_dir.resolve():
-                    raise OffsiteError(
-                        "bundle %s contains an unsafe path: %s"
-                        % (enc_path.name, member.name)
-                    )
+                    raise OffsiteError("off-site bundle contains an unsafe path")
                 try:
                     tar.extract(member, str(extract_dir))
                 except Exception:
                     raise OffsiteError("off-site bundle extraction failed") from None
-        generation = extract_dir / str(meta.get("generation", ""))
+        generation_name = enc_path.name[: -len(BUNDLE_SUFFIX)]
+        generation = extract_dir / generation_name
         if not (generation / "manifest.json").is_file():
-            raise OffsiteError("bundle %s has no backup generation inside" % enc_path.name)
+            raise OffsiteError("off-site bundle has no backup generation inside")
         return {"meta": meta, "generation": generation, "scratch_dir": scratch_dir}
     except OffsiteError:
         _cleanup_scratch(scratch_dir)
@@ -393,11 +398,7 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
             pass
         meta_staging = target / (_INCOMING_PREFIX + meta_path.name)
         _write_bundle_metadata(
-            meta_staging,
-            generation.name,
-            str(enc_path),
-            now,
-            same_device_as_local,
+            meta_staging
         )
         os.replace(str(staging), str(enc_path))
         os.replace(str(meta_staging), str(meta_path))
@@ -455,7 +456,7 @@ def _check_generation(generation: Path) -> bool:
     manifest = load_manifest(generation)
     members = manifest.get("members")
     if not isinstance(members, list) or not members:
-        raise OffsiteError("bundle manifest has no members: %s" % generation.name)
+        raise OffsiteError("off-site bundle manifest has no members")
     has_main_database = False
     with tempfile.TemporaryDirectory(prefix=".aistat-offsite-") as tmp:
         tmp_dir = Path(tmp)
@@ -466,15 +467,13 @@ def _check_generation(generation: Path) -> bool:
             _decompress_member(gz_path, scratch)
             digest = hashlib.sha256(scratch.read_bytes()).hexdigest()
             if digest != member.get("sha256"):
-                raise OffsiteError("checksum mismatch for %s in %s" % (label, generation.name))
+                raise OffsiteError("off-site bundle checksum mismatch")
             _verify_db_file(scratch, is_main=(label == "aistat.db"))
             counts = _table_row_counts(scratch)
             if counts != member.get("row_counts"):
-                raise OffsiteError(
-                    "row counts differ for %s after restore" % label
-                )
+                raise OffsiteError("off-site bundle row counts differ after restore")
             if label == "aistat.db" and ("issues" not in counts or int(counts["issues"]) < 0):
-                raise OffsiteError("critical query failed: issues table missing")
+                raise OffsiteError("off-site critical query failed")
             has_main_database = has_main_database or label == "aistat.db"
     return has_main_database
 

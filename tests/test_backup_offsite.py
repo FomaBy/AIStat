@@ -139,7 +139,7 @@ def test_push_creates_encrypted_independent_bundle(cfg, pushed):
         enc.with_name(enc.name[: -len(".tar.gz.enc")] + ".json").read_text()
     )
     assert meta["encryption"] == "aes-256-cbc-pbkdf2"
-    assert meta["generation"].startswith("aistat-")
+    assert set(meta) == {"tool", "encryption"}
     assert KEY_ENV not in json.dumps(meta)
     # Owner-only permissions on the bundle.
     assert stat.S_IMODE(enc.stat().st_mode) & 0o077 == 0
