@@ -1,0 +1,723 @@
+"""Independent, encrypted off-site copy of AIStat backups (FAN-3462).
+
+``aistat.backup`` (FAN-1185) keeps integrity-checked generations on the same
+machine as the live databases. This module adds the missing half of the
+recovery story:
+
+* ``push``       — bundle the newest local generation, encrypt it with a key
+                   that lives only in the environment, and atomically publish
+                   it to a target directory that must be outside the local
+                   backup tree (a mounted external volume, an rclone/SSHFS
+                   mount of a free tier, or another machine's disk — anything
+                   reachable as a path, at no cost);
+* ``list``       — enumerate the off-site bundles with their metadata;
+* ``verify``     — decrypt a bundle and re-check every member checksum;
+* ``drill``      — an *isolated* restore drill: decrypt, extract, checksum,
+                   integrity-check and run the critical queries against the
+                   restored copies only. Live data is never touched, and the
+                   measured wall time is the RTO evidence;
+* ``rotate-log`` — size/age-capped rotation for operational logs that must
+                   never grow unbounded yet never delete audit evidence
+                   (manifests, drill reports and alert events are not logs).
+
+Everything is standard-library plus the system ``openssl`` binary, so a cPanel
+cron one-shot can run it directly. The encryption key is read from
+``AISTAT_BACKUP_ENCRYPTION_KEY`` at call time and handed to openssl via
+``-pass env:`` — it never appears in argv, logs, manifests or reports.
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import logging
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+from typing import List, Optional
+
+from .backup import (
+    BackupError,
+    _decompress_member,
+    _table_row_counts,
+    _verify_db_file,
+    load_manifest,
+    resolve_backup,
+)
+from .config import Config
+from .db import utcnow_iso
+
+logger = logging.getLogger("aistat.backup_offsite")
+
+KEY_ENV = "AISTAT_BACKUP_ENCRYPTION_KEY"
+BUNDLE_SUFFIX = ".tar.gz.enc"
+META_SUFFIX = ".json"
+ALERTS_NAME = "alerts.jsonl"
+DRILL_REPORT_NAME = "drill-report.json"
+_INCOMING_PREFIX = ".incoming-"
+_ENCRYPTION = "aes-256-cbc-pbkdf2"
+_REDACTED_REASON = "failure details redacted"
+# Matches the documented recovery objective; the drill only *measures* against
+# it, a slower drill is a warning in the report, not a failure.
+RTO_TARGET_SECONDS = 4 * 3600
+
+
+class OffsiteError(Exception):
+    """An off-site copy could not be pushed, verified or drilled."""
+
+
+def _assert_no_symlink_components(path, description: str) -> None:
+    """Reject parent traversal and symlinks anywhere in a managed path."""
+    raw = Path(path)
+    if ".." in raw.parts:
+        raise OffsiteError("%s contains a parent traversal: %s" % (description, path))
+    absolute = Path(os.path.abspath(str(raw)))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(str(current)).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OffsiteError(
+                "cannot inspect %s %s: %s" % (description, path, exc)
+            )
+        if stat.S_ISLNK(mode):
+            raise OffsiteError(
+                "%s must not contain a symlink: %s" % (description, current)
+            )
+
+
+# --------------------------------------------------------------------------- #
+# target independence
+# --------------------------------------------------------------------------- #
+def _resolve_target_dir(cfg: Config) -> Path:
+    """Validate the off-site target and return it, creating it if needed.
+
+    The target must be outside the local backup tree (and the local backup tree
+    must not be inside it) so an accident on one directory can never take both
+    copies. Whether it sits on a different *physical* device is reported by
+    ``push`` as ``same_device`` — the runbook tells the operator to mount a
+    genuinely independent volume there.
+    """
+    target = Path(cfg.offsite_backup_dir)
+    backup_dir = Path(cfg.backup_dir)
+    _assert_no_symlink_components(target, "off-site backup target")
+    try:
+        target_resolved = target.resolve()
+        backup_resolved = backup_dir.resolve()
+    except OSError:
+        raise OffsiteError("cannot resolve off-site target") from None
+    if (
+        target_resolved == backup_resolved
+        or target_resolved in backup_resolved.parents
+        or backup_resolved in target_resolved.parents
+    ):
+        raise OffsiteError(
+            "off-site target %s must be outside the local backup tree %s"
+            % (target, backup_dir)
+        )
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _same_device(a: Path, b: Path) -> bool:
+    try:
+        return os.stat(str(a)).st_dev == os.stat(str(b)).st_dev
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# encryption
+# --------------------------------------------------------------------------- #
+def _require_key() -> str:
+    key = os.environ.get(KEY_ENV, "")
+    if not key:
+        raise OffsiteError(
+            "%s is not set; refusing to write an unencrypted off-site copy" % KEY_ENV
+        )
+    return key
+
+
+def _run_openssl(args: List[str], key: str, data: bytes) -> bytes:
+    """Run ``openssl enc`` with the key passed via the environment only."""
+    env = dict(os.environ)
+    env[KEY_ENV] = key
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/openssl" if os.path.exists("/usr/bin/openssl") else "openssl"]
+            + args
+            + ["-pass", "env:%s" % KEY_ENV],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+    except OSError:
+        raise OffsiteError("cannot run openssl") from None
+    if proc.returncode != 0:
+        raise OffsiteError("openssl operation failed") from None
+    return proc.stdout
+
+
+def _encrypt(key: str, plain: bytes) -> bytes:
+    return _run_openssl(["enc", "-aes-256-cbc", "-salt", "-pbkdf2"], key, plain)
+
+
+def _decrypt(key: str, blob: bytes) -> bytes:
+    return _run_openssl(["enc", "-d", "-aes-256-cbc", "-pbkdf2"], key, blob)
+
+
+# --------------------------------------------------------------------------- #
+# alerts (dedupe-ready; never pruned by log rotation)
+# --------------------------------------------------------------------------- #
+def record_alert(
+    cfg: Config, kind: str, dedupe_key: str, reason: str, *, now_iso: Optional[str] = None
+) -> dict:
+    """Append one alert event to the off-site target's ``alerts.jsonl``.
+
+    The ``dedupe_key`` is normalized to a stable failure class, so an alert
+    consumer can collapse retries without receiving archive-derived data.
+    ``reason`` remains in the API for compatibility but is never persisted
+    because it may contain exception text. Never raises: alerting must not mask
+    the original backup error.
+    """
+    if kind == "offsite_push_failed" and dedupe_key == "push:no-local-generation":
+        stored_kind = kind
+        stored_dedupe_key = "push:no-local-generation"
+    elif kind == "offsite_push_failed":
+        stored_kind = kind
+        stored_dedupe_key = "push:failed"
+    elif kind == "offsite_drill_failed":
+        stored_kind = kind
+        stored_dedupe_key = "drill:failed"
+    else:
+        stored_kind = "offsite_failure"
+        stored_dedupe_key = "offsite:failure"
+    event = {
+        "timestamp": now_iso or utcnow_iso(),
+        "kind": stored_kind,
+        "dedupe_key": stored_dedupe_key,
+        "reason": _REDACTED_REASON,
+    }
+    try:
+        target = _resolve_target_dir(cfg)
+        with (target / ALERTS_NAME).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except (OffsiteError, BackupError, OSError):
+        logger.error("could not record off-site alert event")
+    return event
+
+
+# --------------------------------------------------------------------------- #
+# bundle helpers
+# --------------------------------------------------------------------------- #
+def _bundle_paths(target: Path, generation: Path):
+    stem = generation.name
+    return target / (stem + BUNDLE_SUFFIX), target / (stem + META_SUFFIX)
+
+
+def _meta_path(enc_path: Path) -> Path:
+    """``<generation>.tar.gz.enc`` -> ``<generation>.json`` sidecar."""
+    return enc_path.with_name(
+        enc_path.name[: -len(BUNDLE_SUFFIX)] + META_SUFFIX
+    )
+
+
+def _write_bundle_metadata(path: Path) -> None:
+    """Persist only constant metadata; derive identity from managed paths."""
+    path.write_text(
+        '{"tool": "aistat.backup_offsite", "encryption": "aes-256-cbc-pbkdf2"}',
+        encoding="utf-8",
+    )
+
+
+def _list_bundles(cfg: Config) -> List[dict]:
+    target = _resolve_target_dir(cfg)
+    out = []
+    for meta in sorted(target.glob("*" + META_SUFFIX)):
+        if meta.name in (ALERTS_NAME, DRILL_REPORT_NAME):
+            continue
+        try:
+            marker = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(marker, dict):
+            continue
+        generation_name = meta.name[: -len(META_SUFFIX)]
+        enc_path = target / (generation_name + BUNDLE_SUFFIX)
+        try:
+            pushed_at = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(enc_path.stat().st_mtime)
+            )
+        except OSError:
+            pushed_at = None
+        out.append(
+            {
+                "tool": "aistat.backup_offsite",
+                "encryption": _ENCRYPTION,
+                "generation": generation_name,
+                "enc_path": str(enc_path),
+                "pushed_at": pushed_at,
+                "same_device_as_local": _same_device(
+                    target, Path(cfg.backup_dir)
+                ),
+                "name": generation_name,
+            }
+        )
+    return sorted(out, key=lambda d: str(d.get("generation", "")), reverse=True)
+
+
+def _resolve_bundle(cfg: Config, ref: str):
+    """Resolve ``latest``, a generation name or an explicit ``.enc`` path."""
+    if ref == "latest":
+        bundles = _list_bundles(cfg)
+        if not bundles:
+            raise OffsiteError("no off-site bundles found")
+        return Path(bundles[0]["enc_path"])
+    candidate = Path(ref)
+    if not candidate.is_absolute():
+        candidate = Path(cfg.offsite_backup_dir) / ref
+        if not candidate.name.endswith(BUNDLE_SUFFIX):
+            candidate = candidate.with_name(candidate.name + BUNDLE_SUFFIX)
+    if not candidate.is_file():
+        raise OffsiteError("not an off-site bundle")
+    return candidate
+
+
+def _read_bundle(cfg: Config, enc_path: Path) -> dict:
+    """Decrypt a bundle, verify available checksums and return its extracted
+    generation directory inside a caller-managed temp directory."""
+    key = _require_key()
+    meta_path = _meta_path(enc_path)
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise OffsiteError("cannot read bundle metadata") from None
+    blob = enc_path.read_bytes()
+    expected_enc_sha256 = meta.get("enc_sha256")
+    if expected_enc_sha256 and hashlib.sha256(blob).hexdigest() != expected_enc_sha256:
+        raise OffsiteError("off-site bundle checksum mismatch")
+    scratch_dir = Path(tempfile.mkdtemp(prefix=".aistat-offsite-"))
+    try:
+        try:
+            tar_bytes = _decrypt(key, blob)
+        except Exception:
+            raise OffsiteError("off-site bundle checksum mismatch") from None
+        expected_tar_sha256 = meta.get("tar_sha256")
+        if expected_tar_sha256 and hashlib.sha256(tar_bytes).hexdigest() != expected_tar_sha256:
+            raise OffsiteError("decrypted bundle checksum mismatch")
+        extract_dir = scratch_dir / "extract"
+        extract_dir.mkdir()
+        # Safe extraction: only regular files/dirs below extract_dir.
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                dest = (extract_dir / member.name).resolve()
+                if extract_dir.resolve() not in dest.parents and dest != extract_dir.resolve():
+                    raise OffsiteError("off-site bundle contains an unsafe path")
+                try:
+                    tar.extract(member, str(extract_dir))
+                except Exception:
+                    raise OffsiteError("off-site bundle extraction failed") from None
+        generation_name = enc_path.name[: -len(BUNDLE_SUFFIX)]
+        generation = extract_dir / generation_name
+        if not (generation / "manifest.json").is_file():
+            raise OffsiteError("off-site bundle has no backup generation inside")
+        return {"meta": meta, "generation": generation, "scratch_dir": scratch_dir}
+    except OffsiteError:
+        _cleanup_scratch(scratch_dir)
+        raise
+    except Exception:
+        _cleanup_scratch(scratch_dir)
+        raise OffsiteError("off-site bundle extraction failed") from None
+    except BaseException:
+        _cleanup_scratch(scratch_dir)
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# push
+# --------------------------------------------------------------------------- #
+def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
+    """Publish the newest local backup generation as an encrypted off-site bundle.
+
+    The bundle is staged under ``.incoming-`` and atomically renamed, so a
+    failure or retry never damages the previous good bundle. Any failure
+    records a dedupe-ready alert event and re-raises.
+    """
+    target = _resolve_target_dir(cfg)
+    now = now_iso or utcnow_iso()
+    try:
+        generation = resolve_backup(cfg, "latest")
+    except BackupError:
+        record_alert(
+            cfg,
+            "offsite_push_failed",
+            "push:no-local-generation",
+            "local generation unavailable",
+            now_iso=now,
+        )
+        raise OffsiteError("no local backup generation") from None
+
+    def _fail(dedupe_key: str) -> OffsiteError:
+        record_alert(cfg, "offsite_push_failed", dedupe_key, "push failed", now_iso=now)
+        return OffsiteError("off-site push failed")
+
+    enc_path, meta_path = _bundle_paths(target, generation)
+    if enc_path.exists():
+        # Already published; idempotent no-op keeps retries safe.
+        return {"pushed": False, "reason": "already-published", "bundle": str(enc_path)}
+
+    key = _require_key()
+    try:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(str(generation), arcname=generation.name)
+        blob = _encrypt(key, buf.getvalue())
+    except Exception:
+        raise _fail("push:%s" % generation.name) from None
+
+    staging = target / (
+        _INCOMING_PREFIX + generation.name + BUNDLE_SUFFIX
+    )
+    same_device_as_local = _same_device(target, Path(cfg.backup_dir))
+    try:
+        _assert_no_symlink_components(staging, "off-site staging file")
+        staging.write_bytes(blob)
+        try:
+            os.chmod(str(staging), 0o600)
+        except OSError:
+            pass
+        meta_staging = target / (_INCOMING_PREFIX + meta_path.name)
+        _write_bundle_metadata(
+            meta_staging
+        )
+        os.replace(str(staging), str(enc_path))
+        os.replace(str(meta_staging), str(meta_path))
+    except (OffsiteError, BackupError, OSError):
+        for leftover in (staging, target / (_INCOMING_PREFIX + meta_path.name)):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        raise _fail("push:%s" % generation.name) from None
+
+    removed = _prune_offsite(cfg)
+    logger.info("pushed off-site bundle")
+    return {
+        "pushed": True,
+        "bundle": str(enc_path),
+        "generation": generation.name,
+        "same_device_as_local": same_device_as_local,
+        "pruned": removed or 0,
+    }
+
+
+def _prune_offsite(cfg: Config) -> Optional[int]:
+    """Keep only the newest ``cfg.offsite_retention`` bundles. Never touches
+    alerts, drill reports or anything that is not a bundle+metadata pair."""
+    target = Path(cfg.offsite_backup_dir)
+    bundles = _list_bundles(cfg)
+    excess = bundles[cfg.offsite_retention :]
+    removed = 0
+    for meta in excess:
+        enc_path = Path(meta.get("enc_path", ""))
+        if enc_path.is_file():
+            try:
+                enc_path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        meta_path = target / (meta["name"] + META_SUFFIX)
+        try:
+            meta_path.unlink()
+        except OSError:
+            pass
+    return removed
+
+
+# --------------------------------------------------------------------------- #
+# verify / isolated restore drill
+# --------------------------------------------------------------------------- #
+def _check_generation(generation: Path) -> bool:
+    """Validate every member and return whether the main database was checked.
+
+    Row counts and database bytes stay inside the validation boundary.
+    Raises :class:`OffsiteError` on the first fault.
+    """
+    manifest = load_manifest(generation)
+    members = manifest.get("members")
+    if not isinstance(members, list) or not members:
+        raise OffsiteError("off-site bundle manifest has no members")
+    has_main_database = False
+    with tempfile.TemporaryDirectory(prefix=".aistat-offsite-") as tmp:
+        tmp_dir = Path(tmp)
+        for member in members:
+            label = member.get("label")
+            gz_path = generation / (str(label).replace("/", "__") + ".gz")
+            scratch = tmp_dir / str(label).replace("/", "__")
+            _decompress_member(gz_path, scratch)
+            digest = hashlib.sha256(scratch.read_bytes()).hexdigest()
+            if digest != member.get("sha256"):
+                raise OffsiteError("off-site bundle checksum mismatch")
+            _verify_db_file(scratch, is_main=(label == "aistat.db"))
+            counts = _table_row_counts(scratch)
+            if counts != member.get("row_counts"):
+                raise OffsiteError("off-site bundle row counts differ after restore")
+            if label == "aistat.db" and ("issues" not in counts or int(counts["issues"]) < 0):
+                raise OffsiteError("off-site critical query failed")
+            has_main_database = has_main_database or label == "aistat.db"
+    return has_main_database
+
+
+def _verified_member_summary(has_main_database: bool) -> List[str]:
+    """Return a report-safe summary without exposing archive-derived labels."""
+    return ["aistat.db"] if has_main_database else []
+
+
+def _cleanup_scratch(scratch_dir: Path) -> None:
+    shutil.rmtree(str(scratch_dir), ignore_errors=True)
+
+
+def verify_offsite(cfg: Config, ref: str = "latest") -> dict:
+    """Decrypt and fully re-check one off-site bundle."""
+    enc_path = _resolve_bundle(cfg, ref)
+    bundle = _read_bundle(cfg, enc_path)
+    try:
+        has_main_database = _check_generation(bundle["generation"])
+    except Exception:
+        raise OffsiteError("off-site verification failed") from None
+    finally:
+        _cleanup_scratch(bundle["scratch_dir"])
+    return {
+        "bundle": "off-site bundle",
+        "generation": "redacted",
+        "verified_members": _verified_member_summary(has_main_database),
+    }
+
+
+def restore_drill_offsite(cfg: Config, ref: str = "latest") -> dict:
+    """Isolated restore drill: decrypt → extract → checksum → integrity →
+    critical queries, entirely in scratch space. Live data is never touched.
+
+    Returns a report with per-step timings (the measured RTO evidence) and
+    writes it next to the bundles as ``drill-report.json``.
+    """
+    started = time.monotonic()
+    enc_path = _resolve_bundle(cfg, ref)
+    steps = {}
+
+    def _step(name):
+        class _Timer(object):
+            def __enter__(self):
+                self.t0 = time.monotonic()
+                return self
+
+            def __exit__(self, *exc):
+                steps[name] = round(time.monotonic() - self.t0, 3)
+
+        return _Timer()
+
+    ok = False
+    failure = None
+    has_main_database = False
+    bundle = None
+    try:
+        with _step("decrypt_extract"):
+            bundle = _read_bundle(cfg, enc_path)
+        with _step("verify_members"):
+            has_main_database = _check_generation(bundle["generation"])
+        with _step("critical_queries"):
+            if not has_main_database:
+                raise OffsiteError("bundle has no aistat.db member")
+        ok = True
+    except Exception:
+        failure = "restore drill failed"
+        record_alert(cfg, "offsite_drill_failed", "drill:%s" % enc_path.name, failure)
+    finally:
+        if bundle is not None:
+            _cleanup_scratch(bundle["scratch_dir"])
+
+    elapsed = round(time.monotonic() - started, 3)
+    report = {
+        "tool": "aistat.backup_offsite.drill",
+        "executed_at": utcnow_iso(),
+        "bundle": "off-site bundle",
+        "generation": "redacted",
+        "ok": ok,
+        "failure": failure,
+        "steps_seconds": steps,
+        "measured_rto_seconds": elapsed,
+        "rto_target_seconds": RTO_TARGET_SECONDS,
+        "within_rto_target": elapsed <= RTO_TARGET_SECONDS,
+        "verified_members": _verified_member_summary(has_main_database),
+    }
+    try:
+        target = _resolve_target_dir(cfg)
+        report_path = target / DRILL_REPORT_NAME
+        report_tmp = target / (_INCOMING_PREFIX + DRILL_REPORT_NAME)
+        report_tmp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        os.replace(str(report_tmp), str(report_path))
+    except (OffsiteError, BackupError, OSError):
+        logger.error("could not persist drill report")
+    if not ok:
+        raise OffsiteError(failure or "restore drill failed") from None
+    logger.info("restore drill completed")
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# log rotation
+# --------------------------------------------------------------------------- #
+def rotate_log(
+    path: Path, *, max_bytes: int, keep: int, max_age_days: float = 0.0
+) -> dict:
+    """Rotate ``path`` when it exceeds ``max_bytes`` or ``max_age_days``.
+
+    ``path`` becomes ``path.1``, previous shifts up, the oldest beyond ``keep``
+    is deleted. Only the numbered sidecars of this one log are ever touched —
+    manifests, alert events and drill reports are not logs and survive every
+    rotation.
+    """
+    path = Path(path)
+    try:
+        st = os.stat(str(path))
+    except OSError:
+        return {"rotated": False, "reason": "missing"}
+    too_big = st.st_size > max_bytes
+    too_old = max_age_days > 0 and (time.time() - st.st_mtime) > max_age_days * 86400
+    if not (too_big or too_old):
+        return {"rotated": False}
+    try:
+        oldest = path.with_name("%s.%d" % (path.name, max(1, keep)))
+        oldest.unlink()
+    except OSError:
+        pass
+    for index in range(max(1, keep) - 1, 0, -1):
+        src = path.with_name("%s.%d" % (path.name, index))
+        if src.exists():
+            os.replace(str(src), str(path.with_name("%s.%d" % (path.name, index + 1))))
+    os.replace(str(path), str(path.with_name(path.name + ".1")))
+    return {"rotated": True, "reason": "size" if too_big else "age"}
+
+
+def rotate_backup_logs(
+    cfg: Config, *, max_bytes: int = 5 * 1024 * 1024, keep: int = 5, max_age_days: float = 30.0
+) -> List[dict]:
+    """Rotate the operational backup logs. Never touches audit evidence."""
+    logs = [Path(cfg.db_path.parent) / "backup.log"]
+    offsite_log = Path(cfg.offsite_backup_dir) / "offsite-backup.log"
+    if _list_safe(offsite_log):
+        logs.append(offsite_log)
+    return [rotate_log(p, max_bytes=max_bytes, keep=keep, max_age_days=max_age_days) for p in logs]
+
+
+def _list_safe(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m aistat.backup_offsite",
+        description="Encrypted off-site copies and isolated restore drills.",
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("push", help="publish the newest local generation off-site")
+    sub.add_parser("list", help="list off-site bundles")
+    p_verify = sub.add_parser("verify", help="decrypt and re-check a bundle")
+    p_verify.add_argument("ref", nargs="?", default="latest")
+    p_drill = sub.add_parser(
+        "drill", help="isolated restore drill with checksums and critical queries"
+    )
+    p_drill.add_argument("ref", nargs="?", default="latest")
+    p_rotate = sub.add_parser("rotate-log", help="rotate an operational log file")
+    p_rotate.add_argument("path")
+    p_rotate.add_argument("--max-bytes", type=int, default=5 * 1024 * 1024)
+    p_rotate.add_argument("--keep", type=int, default=5)
+    p_rotate.add_argument("--max-age-days", type=float, default=30.0)
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_usage(sys.stderr)
+        print("error: a command is required", file=sys.stderr)
+        return 2
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    cfg = Config()
+
+    try:
+        if args.command == "push":
+            result = push_offsite(cfg)
+            if result.get("pushed"):
+                output = {"pushed": True}
+            else:
+                output = {"pushed": False, "reason": "already-published"}
+            print(json.dumps(output, indent=2))
+            return 0
+        if args.command == "list":
+            for entry in _list_bundles(cfg):
+                print(
+                    "%s  pushed=%s  enc_sha256=%s  same_device=%s"
+                    % (
+                        entry.get("generation"),
+                        entry.get("pushed_at"),
+                        entry.get("enc_sha256"),
+                        entry.get("same_device_as_local"),
+                    )
+                )
+            return 0
+        if args.command == "verify":
+            result = verify_offsite(cfg, args.ref)
+            output = {
+                "bundle": "off-site bundle",
+                "generation": "redacted",
+                "verified_members": ["aistat.db"] if result["verified_members"] else [],
+            }
+            print(json.dumps(output, indent=2))
+            return 0
+        if args.command == "drill":
+            report = restore_drill_offsite(cfg, args.ref)
+            print(
+                "PASS drill %s rto=%.1fs members=%s"
+                % (
+                    report["generation"],
+                    report["measured_rto_seconds"],
+                    ", ".join(report["verified_members"]),
+                )
+            )
+            return 0
+        if args.command == "rotate-log":
+            print(
+                json.dumps(
+                    rotate_log(
+                        Path(args.path),
+                        max_bytes=args.max_bytes,
+                        keep=args.keep,
+                        max_age_days=args.max_age_days,
+                    )
+                )
+            )
+            return 0
+    except OffsiteError:
+        print("error: off-site backup operation failed", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
