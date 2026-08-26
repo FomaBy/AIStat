@@ -232,6 +232,25 @@ def _meta_path(enc_path: Path) -> Path:
     )
 
 
+def _write_bundle_metadata(
+    path: Path,
+    generation_name: str,
+    bundle_path: str,
+    pushed_at: str,
+    same_device: bool,
+) -> None:
+    """Persist only non-secret bundle identity and storage facts."""
+    metadata = {
+        "tool": "aistat.backup_offsite",
+        "encryption": _ENCRYPTION,
+        "generation": generation_name,
+        "enc_path": bundle_path,
+        "pushed_at": pushed_at,
+        "same_device_as_local": same_device,
+    }
+    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
 def _list_bundles(cfg: Config) -> List[dict]:
     target = _resolve_target_dir(cfg)
     out = []
@@ -364,6 +383,7 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
     staging = target / (
         _INCOMING_PREFIX + generation.name + BUNDLE_SUFFIX
     )
+    same_device_as_local = _same_device(target, Path(cfg.backup_dir))
     try:
         _assert_no_symlink_components(staging, "off-site staging file")
         staging.write_bytes(blob)
@@ -371,16 +391,14 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
             os.chmod(str(staging), 0o600)
         except OSError:
             pass
-        meta = {
-            "tool": "aistat.backup_offsite",
-            "encryption": _ENCRYPTION,
-            "generation": generation.name,
-            "enc_path": str(enc_path),
-            "pushed_at": now,
-            "same_device_as_local": _same_device(target, Path(cfg.backup_dir)),
-        }
         meta_staging = target / (_INCOMING_PREFIX + meta_path.name)
-        meta_staging.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        _write_bundle_metadata(
+            meta_staging,
+            generation.name,
+            str(enc_path),
+            now,
+            same_device_as_local,
+        )
         os.replace(str(staging), str(enc_path))
         os.replace(str(meta_staging), str(meta_path))
     except (OffsiteError, BackupError, OSError):
@@ -397,7 +415,7 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
         "pushed": True,
         "bundle": str(enc_path),
         "generation": generation.name,
-        "same_device_as_local": meta["same_device_as_local"],
+        "same_device_as_local": same_device_as_local,
         "pruned": removed or 0,
     }
 
