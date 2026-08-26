@@ -289,6 +289,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         """Sanitized billing totals; provider exports stay outside AIStat."""
         conn = db()
         try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'billing_reconciliation'"
+            ).fetchone() is None:
+                return {"rows": []}
             rows = conn.execute(
                 "SELECT provider, period, calculated_usd, actual_usd, "
                 "variance_ratio, over_threshold, diagnostic_emitted_at "
@@ -309,6 +313,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         """Published price revisions and priced/unpriced daily coverage."""
         conn = db()
         try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_price_history'"
+            ).fetchone() is None:
+                return {"rates": [], "coverage": {"rows": 0, "priced_rows": 0, "unpriced_rows": 0}}
             rates = [dict(row) for row in conn.execute(
                 "SELECT model, effective_from, vendor, currency, input_rate, "
                 "output_rate, cache_read_rate, cache_write_rate, unpriced, "

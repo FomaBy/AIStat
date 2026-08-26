@@ -21,6 +21,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-07-15",
+      "effective_from": "2026-07-15",
       "notes": "Claude Opus 4.8. 5m cache write = 1.25x input; 1h = 2x; cache read (hit) = 0.1x input.",
       "credits": {
         "input": 50,
@@ -41,6 +42,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-07-15",
+      "effective_from": "2026-07-15",
       "notes": "Claude Opus 5. Uses the same 5m/1h cache and cache-read rates as Claude Opus 4.8 by owner directive FAN-1715; the model ID remains distinct.",
       "credits": {
         "input": 50,
@@ -61,6 +63,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-07-15",
+      "effective_from": "2026-07-15",
       "notes": "Claude Fable 5 (Anthropic's most capable widely released model). 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input.",
       "credits": {
         "input": 125,
@@ -81,6 +84,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-08-05",
+      "effective_from": "2026-08-05",
       "notes": "Claude Sonnet 5 at introductory pricing, in effect through 2026-08-31. Standard pricing (input 3.0, output 15.0, cache_read 0.30, cache_write 3.75, cache_write_1h 6.0) takes effect 2026-09-01 — update this entry then; recompute reprices all history at the flat current rate. 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input. No credits block: no owner directive maps Sonnet to a Codex credit tier."
     },
     "claude-sonnet-4-6": {
@@ -93,6 +97,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-08-05",
+      "effective_from": "2026-08-05",
       "notes": "Claude Sonnet 4.6. 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input."
     },
     "claude-sonnet-4-5-20250929": {
@@ -105,6 +110,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-08-05",
+      "effective_from": "2026-08-05",
       "notes": "Claude Sonnet 4.5 (API ID claude-sonnet-4-5-20250929). 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input."
     },
     "claude-sonnet-4-20250514": {
@@ -117,6 +123,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-08-05",
+      "effective_from": "2026-08-05",
       "notes": "Claude Sonnet 4 (API ID claude-sonnet-4-20250514; retired except on Amazon Bedrock and Google Cloud). 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input."
     },
     "claude-haiku-4-5-20251001": {
@@ -129,6 +136,7 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-07-15",
+      "effective_from": "2026-07-15",
       "notes": "Claude Haiku 4.5 (API ID claude-haiku-4-5-20251001). 5m cache write = 1.25x input; 1h = 2x; cache read = 0.1x input."
     },
     "gpt-5.6-sol": {
@@ -140,6 +148,7 @@
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "captured_at": "2026-07-30",
+      "effective_from": "2026-07-30",
       "notes": "GPT-5.6 Sol Standard / short-context API rates. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator.",
       "credits": {
         "input": 125,
@@ -159,6 +168,7 @@
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "captured_at": "2026-07-30",
+      "effective_from": "2026-07-30",
       "notes": "GPT-5.6 Terra Standard / short-context API rates. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator.",
       "credits": {
         "input": 50,
@@ -178,6 +188,7 @@
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "captured_at": "2026-07-30",
+      "effective_from": "2026-07-30",
       "notes": "GPT-5.6 Luna Standard / short-context API rates. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator.",
       "credits": {
         "input": 5,

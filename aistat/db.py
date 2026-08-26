@@ -23,7 +23,9 @@ SCHEMA_VERSION = 9
 # must be rejected before they can reach aggregate SQL. Schemas v6 (FAN-3306),
 # v7 (FAN-3349), and v8 (FAN-3454) only add flow-metrics data, so a v5 snapshot stays
 # fully servable: every pre-existing aggregate works unchanged and the flow
-# endpoint truthfully reports "no data" instead of failing. Snapshot
+# endpoint truthfully reports "no data" instead of failing. Schema v9 adds
+# optional pricing and QA-provenance tables, which use the same neutral
+# fallbacks for older admitted snapshots. Snapshot
 # admission, owner migration admission and both WSGI serving surfaces all
 # consult this single definition via :func:`schema_admission_error` so the
 # surfaces cannot drift. The public host never mutates authenticated snapshot
@@ -357,6 +359,10 @@ CREATE TABLE IF NOT EXISTS model_price_history (
     output_rate          REAL,
     cache_read_rate      REAL,
     cache_write_rate     REAL,
+    cache_write_1h_rate  REAL,
+    credit_input_rate    REAL,
+    credit_cache_read_rate REAL,
+    credit_output_rate   REAL,
     unpriced             INTEGER NOT NULL DEFAULT 0,
     source_url           TEXT,
     captured_at          TEXT,
@@ -388,6 +394,12 @@ _ADDED_COLUMNS = {
         ("cost_priced", "INTEGER NOT NULL DEFAULT 0"),
         ("cost_computed_at", "TEXT"),
         ("rate_effective_from", "TEXT"),
+    ],
+    "model_price_history": [
+        ("cache_write_1h_rate", "REAL"),
+        ("credit_input_rate", "REAL"),
+        ("credit_cache_read_rate", "REAL"),
+        ("credit_output_rate", "REAL"),
     ],
     "issues": [
         ("is_jira", "INTEGER NOT NULL DEFAULT 0"),

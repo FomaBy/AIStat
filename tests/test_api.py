@@ -188,6 +188,26 @@ def test_pricing_api_exposes_rate_provenance_and_coverage(api):
     assert data["coverage"] == {"rows": 4, "priced_rows": 3, "unpriced_rows": 1}
 
 
+@pytest.mark.parametrize("schema_version", [5, 6, 7, 8])
+def test_legacy_snapshot_without_new_cost_tables_keeps_api_neutral(api, schema_version):
+    """v5-v8 snapshots predate these optional v9 tables but remain servable."""
+    client, conn = api
+    conn.executescript("""
+    DROP TABLE qa_lineage_events;
+    DROP TABLE model_price_history;
+    DROP TABLE billing_reconciliation;
+    """)
+    conn.execute("PRAGMA user_version = {}".format(schema_version))
+    conn.commit()
+
+    summary = client.get("/api/summary")
+    assert summary.status_code == 200
+    assert summary.json()["accepted_story_points"] == 0.0
+    assert summary.json()["quality_adjusted_cost_per_sp"] is None
+    assert client.get("/api/pricing").json()["rates"] == []
+    assert client.get("/api/billing-reconciliation").json() == {"rows": []}
+
+
 def test_hour_and_dimension_filters_are_validated_and_applied(api):
     client, _ = api
     params = [

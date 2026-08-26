@@ -371,7 +371,7 @@ def _run_filter_selection(conn: sqlite3.Connection,
         # model-less agent — so the unknown part stays unpriced instead of
         # being renormalized onto the known models (FAN-1247).
         model = models.setdefault(issue_id, {}).setdefault(
-            row["model"], {"dur": 0.0, "n": 0}
+            row["model"], {"dur": 0.0, "n": 0, "rate_at": row["started_at"]}
         )
         model["dur"] += overlap / (HOURS_PER_DAY * 3600.0)
         model["n"] += 1
@@ -836,6 +836,27 @@ def _pricing_rates(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _pricing_rate_at(conn: sqlite3.Connection, rates: Dict[str, Dict[str, Any]],
+                     model: str, event_at: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Rate published for a run's UTC day, with current pricing as fallback."""
+    if event_at and _has_table(conn, "model_price_history"):
+        row = conn.execute(
+            "SELECT input_rate, output_rate, cache_read_rate, cache_write_rate, unpriced "
+            "FROM model_price_history WHERE model = ? AND effective_from <= ? "
+            "ORDER BY effective_from DESC LIMIT 1",
+            (model, event_at[:10]),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+    return rates.get(model)
+
+
 def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Per issue: ``{model: {'dur': run-duration-in-days, 'n': run-count}}``.
 
@@ -848,14 +869,15 @@ def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str
         """
         SELECT r.issue_id, COALESCE(r.model, a.model) AS model,
                COUNT(*) AS n,
-               SUM(MAX(COALESCE(julianday(r.completed_at) - julianday(r.started_at), 0), 0)) AS dur
+               SUM(MAX(COALESCE(julianday(r.completed_at) - julianday(r.started_at), 0), 0)) AS dur,
+               MIN(COALESCE(r.started_at, r.dispatched_at, r.created_at)) AS rate_at
         FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
         GROUP BY r.issue_id, COALESCE(r.model, a.model)
         """
     )
     for row in rows:
         stats.setdefault(row["issue_id"], {})[row["model"]] = {
-            "dur": row["dur"] or 0.0, "n": row["n"],
+            "dur": row["dur"] or 0.0, "n": row["n"], "rate_at": row["rate_at"],
         }
     return stats
 
@@ -1341,7 +1363,7 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             "FROM qa_lineage_events WHERE accepted_candidate IS NOT NULL "
             "AND accepted_story_points > 0"
         )
-    }
+    } if _has_table(conn, "qa_lineage_events") else {}
 
     where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
              "AND i.story_points > 0")
@@ -1421,7 +1443,7 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             b["story_points"] += sp * weight
             model_hours = issue_models[model]["dur"] * HOURS_PER_DAY
             b["active_hours"] += model_hours
-            rate = rates.get(model)
+            rate = _pricing_rate_at(conn, rates, model, issue_models[model].get("rate_at"))
             if rate is None or rate["unpriced"]:
                 # Unknown cost: surface the tokens, never price them as $0, and
                 # keep this share's SP out of the cost denominator (QA FAN-1188).

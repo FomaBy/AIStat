@@ -351,15 +351,21 @@ def upsert_model_pricing(conn: sqlite3.Connection, pricing: Dict[str, Rate],
                 """
                 INSERT OR IGNORE INTO model_price_history (
                     model, effective_from, vendor, currency, input_rate,
-                    output_rate, cache_read_rate, cache_write_rate, unpriced,
+                    output_rate, cache_read_rate, cache_write_rate,
+                    cache_write_1h_rate, credit_input_rate,
+                    credit_cache_read_rate, credit_output_rate, unpriced,
                     source_url, captured_at, loaded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (rate.model, rate.effective_from, rate.vendor, rate.currency,
                  None if rate.unpriced else rate.input,
                  None if rate.unpriced else rate.output,
                  None if rate.unpriced else rate.cache_read,
                  None if rate.unpriced else rate.cache_write,
+                 rate.cache_write_1h,
+                 rate.credits.input if rate.credits else None,
+                 rate.credits.cache_read if rate.credits else None,
+                 rate.credits.output if rate.credits else None,
                  1 if rate.unpriced else 0, rate.source_url, rate.captured_at,
                  loaded_at),
             )
@@ -375,11 +381,19 @@ def _historical_rate(conn: sqlite3.Connection, pricing: Dict[str, Rate],
         (model, usage_date),
     ).fetchone()
     if row is None:
-        return effective_rate(pricing, model, usage_date)
+        # A catalog's first confirmed historical revision cannot make earlier
+        # already-priced usage silently become unpriced. Until a matching
+        # revision exists, retain the catalog's compatibility rate.
+        return effective_rate(pricing, model, usage_date) or pricing.get(model)
+    credits = None
+    if row["credit_input_rate"] is not None:
+        credits = CreditRate(row["credit_input_rate"], row["credit_cache_read_rate"],
+                             row["credit_output_rate"])
     return Rate(model=model, input=row["input_rate"] or 0.0,
                 output=row["output_rate"] or 0.0,
                 cache_read=row["cache_read_rate"] or 0.0,
                 cache_write=row["cache_write_rate"] or 0.0,
+                cache_write_1h=row["cache_write_1h_rate"], credits=credits,
                 unpriced=bool(row["unpriced"]), vendor=row["vendor"],
                 currency=row["currency"] or "USD", source_url=row["source_url"],
                 captured_at=row["captured_at"], effective_from=row["effective_from"])

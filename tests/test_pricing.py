@@ -186,6 +186,11 @@ def test_repo_gpt_5_6_standard_rates_and_credits_are_current():
         assert rate.captured_at == rate.credits.captured_at == "2026-07-30"
 
 
+def test_repo_pricing_has_an_effective_date_for_each_confirmed_rate():
+    rates = pricing.load_pricing(PRICING_JSON)
+    assert all(rate.effective_from for rate in rates.values())
+
+
 def test_repo_sonnet_rates_match_official_table():
     # FAN-2161: Sonnet rows from the official Anthropic pricing table.
     # Sonnet 5 carries introductory pricing through 2026-08-31 ($3/$15 after);
@@ -396,6 +401,26 @@ def test_effective_rate_keeps_prior_usage_on_its_historical_price(conn, tmp_path
     assert [r["cost_usd"] for r in conn.execute(
         "SELECT cost_usd FROM daily_usage ORDER BY date"
     )] == [1.0, 2.0]
+
+
+def test_historical_rate_preserves_credit_card_and_cache_write_1h(conn, tmp_path):
+    catalog = tmp_path / "dated-credits.json"
+    catalog.write_text(json.dumps({"models": {"vendor/m": [{
+        "effective_from": "2026-01-01", "input": 1, "output": 1,
+        "cache_read": 1, "cache_write": 1, "cache_write_1h": 2,
+        "credits": {"input": 1, "cache_read": 2, "output": 4},
+    }]}}), encoding="utf-8")
+    _insert_usage(conn, "rt", "vendor/m", "2026-01-01", 1_000_000, 1_000_000, 0, 0)
+    rates = pricing.load_pricing(catalog)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=2.0)
+
+    stored = conn.execute(
+        "SELECT cache_write_1h_rate, credit_input_rate, credit_cache_read_rate, "
+        "credit_output_rate FROM model_price_history"
+    ).fetchone()
+    assert tuple(stored) == (2.0, 1.0, 2.0, 4.0)
+    assert conn.execute("SELECT cost_credits FROM daily_usage").fetchone()[0] == 5.0
 
 
 def test_reconciliation_deduplicates_sanitized_variance_diagnostic(conn):

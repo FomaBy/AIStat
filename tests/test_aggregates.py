@@ -906,6 +906,24 @@ def test_efficiency_breakdown_tokens_cost_weighted(agg_conn):
     assert eff["cost_issues"] == 1
 
 
+def test_efficiency_uses_rate_effective_when_the_run_started(agg_conn):
+    """A later catalog price cannot reprice the January issue metrics."""
+    agg_conn.executemany(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, loaded_at) "
+        "VALUES (?, '2026-01-01', ?, ?, 0, 0, 0, 'now')",
+        [("m-claude", 1.0, 0.0), ("m-shared", 1.0, 1.0)],
+    )
+    agg_conn.execute("UPDATE model_pricing SET input_rate = 30.8, output_rate = 30.8")
+    agg_conn.commit()
+
+    out = ag.efficiency_breakdown(agg_conn)
+    # Half of I1's 1,000 input + 500 output tokens belongs to each January run.
+    assert out["cost_usd"] == pytest.approx(0.00125)
+    assert out["cost_per_sp"] == pytest.approx(0.00025)
+    assert out["weighted_efficiency"] == pytest.approx(0.000125)
+
+
 def test_efficiency_breakdown_per_model_cheapest_first(agg_conn):
     models = ag.efficiency_breakdown(agg_conn)["models"]
     assert [m["model"] for m in models] == ["m-claude", "m-shared"]  # cheaper first
