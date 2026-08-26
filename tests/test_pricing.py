@@ -417,6 +417,18 @@ def test_reconciliation_deduplicates_sanitized_variance_diagnostic(conn):
                                   "diagnostic_emitted_at"}
 
 
+def test_replaying_dated_catalog_is_idempotent(conn, tmp_path):
+    catalog = tmp_path / "dated.json"
+    catalog.write_text(json.dumps({"models": {"vendor/m": [
+        {"effective_from": "2026-01-01", "input": 1, "output": 1,
+         "cache_read": 1, "cache_write": 1},
+    ]}}), encoding="utf-8")
+    rates = pricing.load_pricing(catalog)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.upsert_model_pricing(conn, rates)
+    assert conn.execute("SELECT COUNT(*) FROM model_price_history").fetchone()[0] == 1
+
+
 def test_upsert_model_pricing_idempotent(conn):
     rates = pricing.load_pricing(PRICING_JSON)
     pricing.upsert_model_pricing(conn, rates)
