@@ -528,7 +528,8 @@ def visual_browser():
         public_thread.start()
 
         session.cdp = launch_chrome(
-            CHROME, extra_args=("--run-all-compositor-stages-before-draw",))
+            CHROME, extra_args=("--run-all-compositor-stages-before-draw",
+                                "--lang=en-GB"))
         _assert_browser_version(session.cdp, _EXPECTED_CHROME_VERSION)
         yield (session.cdp, f"http://127.0.0.1:{dashboard_port}",
                f"http://127.0.0.1:{public_port}")

@@ -27,7 +27,8 @@ The fixture calls `Browser.getVersion` and fails with `Chrome version mismatch`
 if the launched binary does not report the pinned build.
 The harness also fixes the browser timezone to `Europe/Warsaw`, matching the
 committed baseline timezone so UTC sync timestamps render deterministically on
-all runners.
+all runners, and starts Chrome with `en-GB` so native date-input placeholders
+render consistently as well.
 
 Local runs use the same expected version. Set `AISTAT_CHROME` to the absolute
 Chrome/Chromium path when automatic discovery does not find it. To test a
