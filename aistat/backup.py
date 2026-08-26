@@ -753,7 +753,7 @@ def _unlink_quiet(path: Path) -> None:
     """Delete ``path`` if it exists, ignoring a missing file.
 
     ``Path.unlink(missing_ok=True)`` is Python 3.8+; the production host runs
-    Python 3.6.8, so the missing-file case is swallowed explicitly instead.
+    legacy interpreters, so the missing-file case is swallowed explicitly instead.
     """
     try:
         path.unlink()
@@ -770,7 +770,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Backup, verify and restore AIStat's SQLite data.",
     )
     # ``add_subparsers(required=...)`` is Python 3.7+; the production host runs
-    # 3.6.8, so leave the subparsers optional here and enforce a command after
+    # older interpreters, so leave the subparsers optional here and enforce a command after
     # parsing (below) instead.
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("create", help="create one integrity-checked backup generation")

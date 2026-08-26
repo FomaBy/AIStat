@@ -1,4 +1,5 @@
-"""The isolated recovery CLI must run on the production Python 3.6.8 host."""
+"""The isolated recovery CLI must stay importable on legacy stdlib-only
+host interpreters (the contour is deliberately kept 3.6-clean)."""
 
 import ast
 import json

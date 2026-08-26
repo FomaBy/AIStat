@@ -8,10 +8,13 @@ task-owned HOME/TMPDIR/profile isolation and the ``--use-mock-keychain``
 clean-HOME fix (FAN-1346) live in ``cdp_harness``; the pure protocol/deadline/
 cleanup tests that need no browser live in ``test_cdp_protocol``. The suite
 skips cleanly on machines without a Chrome/Chromium binary; everything else in
-the test run stays unaffected.
+the test run stays unaffected. In a certifying run
+(``AISTAT_REQUIRE_BROWSER=1``) a missing Chrome is a hard failure instead of
+a skip, so a required lane can never pass without driving a real browser.
 """
 
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -30,7 +33,23 @@ from conftest import seed_aggregate_fixture
 from cdp_harness import (
     BOOTED_JS, CHROME, DashboardSession, NO_CHROME_REASON, launch_chrome)
 
-pytestmark = pytest.mark.skipif(CHROME is None, reason=NO_CHROME_REASON)
+_REQUIRE_BROWSER = os.environ.get("AISTAT_REQUIRE_BROWSER", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def _require_real_chrome():
+    """Skip without Chrome — unless the run is certifying, then fail hard."""
+    if CHROME is not None:
+        return
+    if _REQUIRE_BROWSER:
+        pytest.fail(
+            NO_CHROME_REASON
+            + " — the real-browser dashboard regression was NOT executed; a "
+            "certifying run (AISTAT_REQUIRE_BROWSER=1) requires a real Chrome "
+            "so an all-skipped suite is never mistaken for green."
+        )
+    pytest.skip(NO_CHROME_REASON)
 
 
 def _free_port():
@@ -43,6 +62,7 @@ def _free_port():
 
 @pytest.fixture(scope="module")
 def dashboard():
+    _require_real_chrome()
     """The dashboard on a real HTTP port over a seeded database, plus one
     headless Chrome the tests navigate page-by-page. Every resource is owned by
     a :class:`DashboardSession` so teardown stays failure-safe and idempotent."""
@@ -89,6 +109,7 @@ def dashboard():
 
 @pytest.fixture
 def public_page():
+    _require_real_chrome()
     """The public Flask login page on a real HTTP port and headless Chrome."""
     with tempfile.TemporaryDirectory(prefix="aistat-public-browser-") as path:
         root = Path(path)

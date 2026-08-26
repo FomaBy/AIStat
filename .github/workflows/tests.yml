@@ -11,15 +11,21 @@ permissions:
 
 jobs:
   pytest:
+    # Supported runtimes (FAN-3458): the full suite must pass on every entry
+    # of this matrix. Python 3.6.8 is no longer a target production runtime.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.9
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
@@ -41,3 +47,51 @@ jobs:
 
       - name: Run full pytest suite
         run: python -m pytest tests/ -q
+
+  # Required browser lane (FAN-3458): a pinned Chrome drives the real-browser
+  # regression matrix. AISTAT_REQUIRE_BROWSER=1 turns a missing/unusable
+  # browser binary into a hard failure, so this lane can never go green by
+  # silently skipping the browser tests.
+  browser:
+    runs-on: ubuntu-latest
+    env:
+      AISTAT_REQUIRE_BROWSER: "1"
+      # Chrome-for-Testing aborts (rc=-6) inside its namespace sandbox on the
+      # shared runner; the harness appends these flags to its fixed argv.
+      AISTAT_CHROME_EXTRA_ARGS: "--no-sandbox --disable-dev-shm-usage"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # Pinned browser: bump deliberately, together with a green run of the
+      # visual/browser suites on the new version. A channel name is NOT a pin;
+      # only an exact version is.
+      - name: Install pinned Chrome 131.0.6778.85
+        id: setup_chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: 131.0.6778.85
+          install-dependencies: true
+
+      - name: Point the harness at the pinned binary
+        run: echo "AISTAT_CHROME=${{ steps.setup_chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+
+      - name: Verify the pinned browser binary is usable (fail, never skip)
+        run: |
+          "$AISTAT_CHROME" --version
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run real-browser regression suites
+        run: |
+          python -m pytest tests/test_dashboard_browser.py tests/test_auth_browser.py tests/test_cdp_protocol.py -q

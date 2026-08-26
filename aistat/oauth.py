@@ -3,13 +3,13 @@
 This module is the single, testable heart of the OAuth login flow. It is shared
 by both public entry points so they behave identically:
 
-* the dependency-free ``legacy_wsgi`` app (cPanel system Python 3.6, stdlib
+* the dependency-free ``legacy_wsgi`` app (stdlib-only contour; supported
   only, token exchange over ``urllib.request``);
 * the Flask ``wsgi`` app.
 
-Because ``legacy_wsgi`` targets Python 3.6 and must stay free of third-party
+Because ``legacy_wsgi`` must stay free of third-party
 imports, this module uses only the standard library and avoids constructs
-newer than 3.6 (no ``dataclasses``). A provider is pure configuration
+``dataclasses``). A provider is pure configuration
 (:class:`OAuthProvider`), so a new provider such as Yandex is added with data
 and env vars, not by changing this core.
 

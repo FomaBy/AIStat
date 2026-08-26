@@ -2,7 +2,7 @@
 
 Namecheap's generic Passenger application currently runs ``/usr/bin/python3``
 with a package index capped at Flask 2.0.3. This entry point deliberately uses
-only the Python 3.6 standard library, while preserving the security contract of
+only the Python standard library, while preserving the security contract of
 the modern Flask WSGI app:
 
 * opaque HttpOnly/Secure/SameSite sessions resolved server-side;
@@ -94,6 +94,11 @@ ALLOWED_HOSTS = {
 }
 FORCE_HTTPS = _env_bool("AISTAT_FORCE_HTTPS", False)
 COOKIE_SECURE = _env_bool("AISTAT_SESSION_COOKIE_SECURE", FORCE_HTTPS)
+# Match the Flask ProxyFix contour: 0 trusts no client-supplied forwarded
+# value; N trusts only the N-th value from the right (the proxy-appended end).
+PROXY_TRUST_HOPS = max(
+    0, int(os.environ.get("AISTAT_PROXY_TRUST_HOPS", "0") or "0")
+)
 ADMIN_USERNAME = os.environ.get("AISTAT_ADMIN_USERNAME", "admin")
 ADMIN_EMAIL = os.environ.get("AISTAT_ADMIN_EMAIL") or None
 PASSWORD_HASH = os.environ.get("AISTAT_PASSWORD_HASH", "")
@@ -689,7 +694,7 @@ class _LegacyOAuthStore(object):
 
     Mirrors ``aistat.security.SecurityStore``'s account methods with the same
     SQL and one-time semantics, kept inline so ``legacy_wsgi`` stays free of the
-    ``dataclasses``-based config import and remains Python 3.6-clean.
+    ``dataclasses``-based config import and stays clean on legacy interpreters.
     """
 
     def put_oauth_state(
@@ -828,7 +833,7 @@ class _LegacyOAuthStore(object):
         """Subject-first resolution + atomic first registration.
 
         Mirrors ``SecurityStore.register_or_link_identity`` byte-for-byte in
-        behaviour so the Python 3.6 cPanel contour registers, links and gates
+        behaviour so the stdlib-only cPanel contour registers, links and gates
         identically. Returns ``{"user_id", "outcome"}`` with ``outcome`` in
         ``existing`` / ``linked_owner`` / ``created`` / ``denied``; a denied new
         subject writes nothing and yields ``user_id`` ``None``.
@@ -946,7 +951,18 @@ def _json_response(environ, start_response, status, data, headers=None):
 
 
 def _is_secure(environ):
-    forwarded = environ.get("HTTP_X_FORWARDED_PROTO", "").split(",", 1)[0].strip()
+    forwarded = []
+    if PROXY_TRUST_HOPS:
+        forwarded = [
+            value.strip().lower()
+            for value in environ.get("HTTP_X_FORWARDED_PROTO", "").split(",")
+            if value.strip()
+        ]
+    forwarded = (
+        forwarded[-PROXY_TRUST_HOPS]
+        if PROXY_TRUST_HOPS and len(forwarded) >= PROXY_TRUST_HOPS
+        else ""
+    )
     return (
         forwarded == "https"
         or environ.get("HTTPS", "").lower() in ("on", "1", "true")

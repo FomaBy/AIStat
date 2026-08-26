@@ -87,9 +87,20 @@ def create_app(config: Optional[Config] = None) -> Flask:
         static_folder=None,
         template_folder=str(TEMPLATE_DIR),
     )
-    app.wsgi_app = ProxyFix(
-        app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1
-    )
+    # Explicit, configured proxy trust (FAN-3458): the default of 0 trusts no
+    # proxy, so spoofed ``X-Forwarded-*`` headers are ignored entirely. An
+    # operator behind exactly N terminating proxies sets
+    # ``AISTAT_PROXY_TRUST_HOPS=N`` and ProxyFix consumes only the N right-most
+    # forwarded values, discarding anything a direct client prepended.
+    if config.proxy_trust_hops > 0:
+        hops = config.proxy_trust_hops
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=hops,
+            x_proto=hops,
+            x_host=hops,
+            x_port=hops,
+        )
     # No Flask client-side session is used: the auth cookie is set and read
     # directly below, so the framework never serializes identity into a signed
     # cookie. ``MAX_CONTENT_LENGTH`` still bounds snapshot uploads.

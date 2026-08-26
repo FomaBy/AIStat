@@ -7,6 +7,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -126,6 +127,57 @@ def test_cpanel_package_excludes_local_fastapi_contour(tmp_path):
         assert forbidden not in requirements
     assert "legacy_wsgi" in (package / "passenger_wsgi.py").read_text("utf-8")
     assert "legacy_wsgi" in (package / "aistat.cgi").read_text("utf-8")
+
+
+def test_cpanel_passenger_package_uses_legacy_proxy_trust_boundary(tmp_path):
+    package, _repo, _sha, _tree = _build_package(tmp_path)
+    probe = """
+import json
+import passenger_wsgi
+
+captured = {}
+
+def start_response(status, headers):
+    captured["status"] = status
+    captured["headers"] = headers
+
+environ = {
+    "REQUEST_METHOD": "GET",
+    "PATH_INFO": "/healthz",
+    "QUERY_STRING": "",
+    "HTTP_HOST": "localhost",
+    "HTTPS": "",
+    "wsgi.url_scheme": "http",
+    "HTTP_X_FORWARDED_PROTO": "https",
+}
+b"".join(passenger_wsgi.application(environ, start_response))
+print(json.dumps({
+    "status": captured["status"],
+    "hsts": any(name == "Strict-Transport-Security" for name, _ in captured["headers"]),
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=package,
+        env=dict(
+            os.environ,
+            PYTHONPATH=str(package),
+            AISTAT_ALLOWED_HOSTS="localhost",
+            AISTAT_FORCE_HTTPS="1",
+            AISTAT_PROXY_TRUST_HOPS="0",
+            AISTAT_ADMIN_USERNAME="test-admin",
+            AISTAT_PASSWORD_HASH="placeholder",
+            AISTAT_SESSION_SECRET="s" * 48,
+            AISTAT_INGEST_SECRET="i" * 48,
+        ),
+    )
+    assert json.loads(result.stdout) == {
+        "hsts": False,
+        "status": "308 Permanent Redirect",
+    }
 
 
 def test_package_uses_only_exact_commit_and_rejects_wrong_tree(tmp_path):

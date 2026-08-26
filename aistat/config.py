@@ -67,10 +67,10 @@ class Config:
 
     Formerly a ``@dataclass``; rewritten as a plain class with an explicit
     ``__init__`` so the whole ``aistat.backup`` import chain stays importable on
-    the production host's Python 3.6.8, which ships no ``dataclasses`` module
-    (FAN-1435). Every field keeps its per-instance, environment-driven default
-    and its keyword-argument override, so ``Config()`` and ``Config(db_path=...)``
-    behave exactly as they did under the dataclass.
+    legacy stdlib-only shared-host interpreters that ship no ``dataclasses``
+    module (FAN-1435). Every field keeps its per-instance, environment-driven
+    default and its keyword-argument override, so ``Config()`` and
+    ``Config(db_path=...)`` behave exactly as they did under the dataclass.
     """
 
     def __init__(
@@ -97,6 +97,7 @@ class Config:
         security_db_path=_UNSET,
         tenants_dir=_UNSET,
         allowed_hosts=_UNSET,
+        proxy_trust_hops=_UNSET,
         oauth_providers=_UNSET,
         oauth_allowed_emails=_UNSET,
         force_https=_UNSET,
@@ -274,6 +275,19 @@ class Config:
             _env_bool("AISTAT_FORCE_HTTPS", False)
             if force_https is _UNSET
             else force_https
+        )
+        # Number of trusted reverse-proxy hops in front of the app (FAN-3458).
+        # 0 (default) trusts no proxy: every ``X-Forwarded-*`` header is client
+        # input and ignored, so a spoofed header can never forge the host,
+        # scheme or client address the request boundary and login throttling
+        # rely on. Set it to exactly the number of proxies that terminate TLS
+        # in front of the app (typically 1 on the shared host); Werkzeug's
+        # ``ProxyFix`` then consumes only that many values from the right end
+        # of each forwarded header, discarding anything a client prepended.
+        self.proxy_trust_hops = (
+            max(0, _env_int("AISTAT_PROXY_TRUST_HOPS", 0))
+            if proxy_trust_hops is _UNSET
+            else proxy_trust_hops
         )
         # The hosted app receives only signed SQLite snapshots. The Multica CLI
         # token remains on the trusted local machine.

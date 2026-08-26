@@ -284,8 +284,8 @@ class DeployHarness:
         )
         argv = [sys.executable]
         if sys.version_info >= (3, 8):
-            # The production host runs CPython 3.6.8, which has no pycache
-            # prefix and always writes bytecode next to the sources. Some 3.8+
+            # Legacy host interpreters (historically CPython 3.6.8) have no
+            # pycache prefix and always write bytecode next to the sources. Some 3.8+
             # builds (Apple's, for one) ship a non-empty default prefix, so
             # clear it to reproduce the host behaviour instead of the dev box's.
             argv.append("-X")

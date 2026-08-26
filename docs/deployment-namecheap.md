@@ -9,7 +9,8 @@
 - `aistat.cgi` → `aistat.legacy_wsgi` для Namecheap Shared Hosting с LiteSpeed,
   где системный WSGI launcher может отсутствовать.
 
-Оба входа используют один dependency-free Python 3.6+ WSGI-контур. CGI-вариант
+Оба входа используют один dependency-free WSGI-контур (только standard
+library; поддерживаемый и проверенный CI runtime — Python 3.11/3.12). CGI-вариант
 запускается отдельным процессом на запрос, что медленнее Passenger, но
 предсказуемо работает на shared-тарифе без установки старых web-зависимостей.
 
@@ -99,7 +100,7 @@ live-манифеста. Все обновления работающего са
 
 В `cPanel → Setup Python App`:
 
-- Python: системная Python 3.6 или новее;
+- Python: 3.11 или 3.12 (поддерживаемые runtime; 3.6.8 больше не является целевым production-интерпретатором);
 - Application root: `aistat_app`;
 - Application URL: домен `aistat.app`, путь `/`;
 - Startup file: `passenger_wsgi.py`;
@@ -148,7 +149,26 @@ set +a
 python3 -m aistat.migrate
 ```
 
-Команда совместима с Python 3.6, повторный запуск безопасен. Она:
+### Proxy trust (FAN-3458)
+
+Если впереди приложения стоит ровно один терминирующий прокси
+(LiteSpeed/Passenger terminating TLS), добавьте в Passenger Environment
+Variables или в `aistat.env` для CGI:
+
+```bash
+AISTAT_PROXY_TRUST_HOPS=1
+```
+
+Эта настройка читается одним `aistat.legacy_wsgi` и поэтому одинаково
+работает для Passenger и CGI. По умолчанию (`0`) приложение не доверяет ни
+одному прокси и игнорирует все `X-Forwarded-*` заголовки — подделанный
+заголовок не может удовлетворить force-HTTPS или включить HSTS на plain HTTP.
+При `N > 0` для `X-Forwarded-Proto` доверяется только N-е значение справа;
+клиентский префикс слева и цепочка короче N игнорируются. Ставьте ровно то
+число прокси, что реально стоит впереди приложения: см.
+`docs/runtime-python-security-ci.md`.
+
+Команда использует только standard library, повторный запуск безопасен. Она:
 
 - находит единственного `users.is_admin=1`, либо назначает пользователя с
   `AISTAT_ADMIN_EMAIL`, либо создаёт владельца из `AISTAT_ADMIN_USERNAME`;
@@ -483,8 +503,8 @@ rollback всегда оставляют валидную live-цель — пр
 ровно каталоги `__pycache__/` и файлы `*.pyc` внутри них, и больше ничего.
 
 Причина исключения: `aistat.cgi` работает как отдельный CGI-процесс на запрос
-под `#!/usr/bin/python3` (на хосте это CPython 3.6.8), поэтому интерпретатор
-пишет `__pycache__/*.cpython-36.pyc` рядом с исходниками — то есть через
+под `#!/usr/bin/python3`, поэтому интерпретатор
+пишет `__pycache__/*.cpython-XY.pyc` рядом с исходниками — то есть через
 live-symlink внутрь опубликованного release. Это нормальная работа, а не
 повреждение пакета.
 

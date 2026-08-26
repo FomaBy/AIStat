@@ -27,7 +27,7 @@
 | Сторона | Код | Роль |
 |---|---|---|
 | Публичный хост | `aistat/wsgi.py`, `aistat/legacy_wsgi.py` | приём токена, pull-канал worker'а |
-| Общая логика | `aistat/handoff.py` | подпись канала, валидация, state machine (Python 3.6, только stdlib — грузится в оба контура) |
+| Общая логика | `aistat/handoff.py` | подпись канала, валидация, state machine (только stdlib — грузится в оба контура) |
 | Worker (локальная машина) | `aistat/worker_sync.py`, `aistat/worker_store.py` | pull, шифрованное хранение, ack |
 
 Оба публичных контура (Flask и dependency-free legacy для cPanel) используют
