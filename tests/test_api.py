@@ -163,15 +163,21 @@ def test_summary_exposes_accepted_sp_quality_cost(api):
 def test_billing_reconciliation_api_exposes_sanitized_totals_only(api):
     client, conn = api
     conn.execute(
-        "INSERT INTO billing_reconciliation VALUES "
-        "('anthropic', '2026-02', 90, 100, 0.1, 1, '2026-02-28T00:00:00Z')"
+        "INSERT INTO billing_reconciliation (provider, period, calculated_usd, "
+        "actual_usd, variance_ratio, over_threshold, diagnostic_emitted_at, "
+        "currency, submitted_by, submitted_at) VALUES "
+        "('anthropic', '2026-02', 90, 100, 0.1, 1, '2026-02-28T00:00:00Z', "
+        "'USD', 1, '2026-02-28T00:00:00Z')"
     )
     conn.commit()
-    assert client.get("/api/billing-reconciliation").json() == {"rows": [{
+    data = client.get("/api/billing-reconciliation").json()
+    assert data["rows"] == [{
         "provider": "anthropic", "period": "2026-02", "calculated_usd": 90.0,
         "actual_usd": 100.0, "variance_ratio": 0.1, "over_threshold": True,
-        "diagnostic_emitted": True,
-    }]}
+        "diagnostic_emitted": True, "currency": "USD", "submitted_by": 1,
+        "submitted_at": "2026-02-28T00:00:00Z",
+    }]
+    assert data["coverage"] == {"periods_submitted": 1, "periods_total": 0}
 
 
 def test_pricing_api_exposes_rate_provenance_and_coverage(api):
@@ -205,7 +211,9 @@ def test_legacy_snapshot_without_new_cost_tables_keeps_api_neutral(api, schema_v
     assert summary.json()["accepted_story_points"] == 0.0
     assert summary.json()["quality_adjusted_cost_per_sp"] is None
     assert client.get("/api/pricing").json()["rates"] == []
-    assert client.get("/api/billing-reconciliation").json() == {"rows": []}
+    assert client.get("/api/billing-reconciliation").json() == {
+        "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0},
+    }
 
 
 def test_hour_and_dimension_filters_are_validated_and_applied(api):

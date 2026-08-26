@@ -448,18 +448,41 @@ def unpriced_models_in_usage(conn: sqlite3.Connection,
 
 _BILLING_PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _BILLING_PERIOD = re.compile(r"^\d{4}-\d{2}$")
+_BILLING_CURRENCY = "USD"
+
+
+def calculated_cost_for_period(conn: sqlite3.Connection, provider: str,
+                               period: str) -> float:
+    """Sum this provider's own recorded ``daily_usage`` cost for one month.
+
+    This is the system's own tally to reconcile against a submitted actual
+    total; it is never accepted from the caller.
+    """
+    if not _BILLING_PROVIDER.fullmatch(provider) or not _BILLING_PERIOD.fullmatch(period):
+        raise PricingError("provider and period must use canonical identifiers")
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM daily_usage "
+        "WHERE provider = ? AND substr(date, 1, 7) = ?",
+        (provider, period),
+    ).fetchone()
+    return float(row["total"])
 
 
 def reconcile_billing_actual(conn: sqlite3.Connection, provider: str, period: str,
                              calculated_usd: float, actual_usd: float,
-                             threshold: float = 0.05) -> Dict[str, Any]:
+                             threshold: float = 0.05, currency: str = "USD",
+                             submitted_by: Optional[int] = None,
+                             submitted_at: Optional[str] = None) -> Dict[str, Any]:
     """Store sanitized provider totals and emit one diagnostic per variance.
 
     Callers retain the export/invoice outside the repository; this table holds
-    only period totals required to explain a cost mismatch.
+    only period totals, currency and submission provenance required to
+    explain a cost mismatch.
     """
     if not _BILLING_PROVIDER.fullmatch(provider) or not _BILLING_PERIOD.fullmatch(period):
         raise PricingError("provider and period must use canonical identifiers")
+    if currency != _BILLING_CURRENCY:
+        raise PricingError("currency must be USD; no conversion is performed")
     values = (calculated_usd, actual_usd, threshold)
     if any(not isinstance(value, (int, float)) or not math.isfinite(value)
            for value in values) or calculated_usd < 0 or actual_usd < 0 or threshold < 0:
@@ -473,12 +496,14 @@ def reconcile_billing_actual(conn: sqlite3.Connection, provider: str, period: st
         "WHERE provider = ? AND period = ?", (provider, period)
     ).fetchone()
     emitted = bool(over and (previous is None or not previous["over_threshold"]))
+    submitted_at = submitted_at or utcnow_iso()
     conn.execute(
         """
         INSERT INTO billing_reconciliation (
             provider, period, calculated_usd, actual_usd, variance_ratio,
-            over_threshold, diagnostic_emitted_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            over_threshold, diagnostic_emitted_at, currency, submitted_by,
+            submitted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(provider, period) DO UPDATE SET
             calculated_usd = excluded.calculated_usd,
             actual_usd = excluded.actual_usd,
@@ -488,10 +513,49 @@ def reconcile_billing_actual(conn: sqlite3.Connection, provider: str, period: st
                 WHEN excluded.over_threshold = 1
                  AND billing_reconciliation.over_threshold = 0 THEN excluded.diagnostic_emitted_at
                 WHEN excluded.over_threshold = 0 THEN NULL
-                ELSE billing_reconciliation.diagnostic_emitted_at END
+                ELSE billing_reconciliation.diagnostic_emitted_at END,
+            currency = excluded.currency,
+            submitted_by = excluded.submitted_by,
+            submitted_at = excluded.submitted_at
         """,
         (provider, period, float(calculated_usd), float(actual_usd), variance,
-         1 if over else 0, utcnow_iso() if emitted else None),
+         1 if over else 0, utcnow_iso() if emitted else None, currency,
+         submitted_by, submitted_at),
     )
     return {"provider": provider, "period": period, "variance_ratio": variance,
-            "over_threshold": over, "diagnostic_emitted": emitted}
+            "over_threshold": over, "diagnostic_emitted": emitted,
+            "currency": currency, "submitted_by": submitted_by,
+            "submitted_at": submitted_at}
+
+
+def billing_reconciliation_snapshot(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Persisted reconciliation rows plus provider/period submission coverage.
+
+    Degrades to an empty snapshot on a legacy database that predates the
+    ``billing_reconciliation`` table, rather than raising.
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'billing_reconciliation'"
+    ).fetchone() is None:
+        return {"rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}}
+    rows = conn.execute(
+        "SELECT provider, period, calculated_usd, actual_usd, variance_ratio, "
+        "over_threshold, diagnostic_emitted_at, currency, submitted_by, "
+        "submitted_at FROM billing_reconciliation ORDER BY period DESC, provider"
+    ).fetchall()
+    periods_total = conn.execute(
+        "SELECT COUNT(DISTINCT provider || ':' || substr(date, 1, 7)) "
+        "FROM daily_usage WHERE provider IS NOT NULL AND cost_usd IS NOT NULL"
+    ).fetchone()[0]
+    return {"rows": [{
+        "provider": row["provider"], "period": row["period"],
+        "calculated_usd": row["calculated_usd"], "actual_usd": row["actual_usd"],
+        "variance_ratio": row["variance_ratio"],
+        "over_threshold": bool(row["over_threshold"]),
+        "diagnostic_emitted": row["diagnostic_emitted_at"] is not None,
+        "currency": row["currency"], "submitted_by": row["submitted_by"],
+        "submitted_at": row["submitted_at"],
+    } for row in rows], "coverage": {
+        "periods_submitted": len(rows), "periods_total": periods_total,
+    }}

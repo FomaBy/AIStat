@@ -429,9 +429,12 @@ def test_reconciliation_deduplicates_sanitized_variance_diagnostic(conn):
         conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
         threshold=0.05,
     )
+    assert first["submitted_by"] is None
+    del first["submitted_at"]
+    del first["submitted_by"]
     assert first == {"provider": "anthropic", "period": "2026-02",
                      "variance_ratio": 0.1, "over_threshold": True,
-                     "diagnostic_emitted": True}
+                     "diagnostic_emitted": True, "currency": "USD"}
     assert pricing.reconcile_billing_actual(
         conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
         threshold=0.05,
@@ -439,7 +442,64 @@ def test_reconciliation_deduplicates_sanitized_variance_diagnostic(conn):
     stored = conn.execute("SELECT * FROM billing_reconciliation").fetchone()
     assert set(stored.keys()) == {"provider", "period", "calculated_usd",
                                   "actual_usd", "variance_ratio", "over_threshold",
-                                  "diagnostic_emitted_at"}
+                                  "diagnostic_emitted_at", "currency",
+                                  "submitted_by", "submitted_at"}
+
+
+def test_calculated_cost_for_period_sums_provider_month(conn):
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt1", "claude-opus-4-8", "2026-02-14", "anthropic", utcnow_iso(), 40.0),
+    )
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt2", "claude-opus-4-8", "2026-02-20", "anthropic", utcnow_iso(), 50.0),
+    )
+    # Different month and different provider must not be counted.
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt3", "claude-opus-4-8", "2026-03-01", "anthropic", utcnow_iso(), 999.0),
+    )
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt4", "gpt-5.6", "2026-02-10", "openai", utcnow_iso(), 999.0),
+    )
+    assert pricing.calculated_cost_for_period(conn, "anthropic", "2026-02") == 90.0
+    assert pricing.calculated_cost_for_period(conn, "anthropic", "2026-04") == 0.0
+
+    with pytest.raises(pricing.PricingError):
+        pricing.calculated_cost_for_period(conn, "ANTHROPIC", "2026-02")
+
+
+def test_reconcile_billing_actual_rejects_non_usd_currency(conn):
+    with pytest.raises(pricing.PricingError):
+        pricing.reconcile_billing_actual(
+            conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
+            currency="EUR",
+        )
+
+
+def test_reconcile_billing_actual_stores_provenance(conn):
+    result = pricing.reconcile_billing_actual(
+        conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=95.0,
+        submitted_by=7, submitted_at="2026-02-15T00:00:00Z",
+    )
+    assert result["currency"] == "USD"
+    assert result["submitted_by"] == 7
+    assert result["submitted_at"] == "2026-02-15T00:00:00Z"
+    stored = conn.execute(
+        "SELECT currency, submitted_by, submitted_at FROM billing_reconciliation "
+        "WHERE provider = 'anthropic' AND period = '2026-02'"
+    ).fetchone()
+    assert tuple(stored) == ("USD", 7, "2026-02-15T00:00:00Z")
 
 
 def test_replaying_dated_catalog_is_idempotent(conn, tmp_path):

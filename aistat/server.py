@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, aggregates, flow_metrics
+from . import __version__, aggregates, flow_metrics, pricing
 from .config import Config
 from .db import connect, init_db
 from .health import snapshot
@@ -286,25 +286,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
     @app.get("/api/billing-reconciliation")
     def api_billing_reconciliation():
-        """Sanitized billing totals; provider exports stay outside AIStat."""
+        """Sanitized billing totals and coverage; provider exports stay outside AIStat."""
         conn = db()
         try:
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'billing_reconciliation'"
-            ).fetchone() is None:
-                return {"rows": []}
-            rows = conn.execute(
-                "SELECT provider, period, calculated_usd, actual_usd, "
-                "variance_ratio, over_threshold, diagnostic_emitted_at "
-                "FROM billing_reconciliation ORDER BY period DESC, provider"
-            ).fetchall()
-            return {"rows": [{
-                "provider": row["provider"], "period": row["period"],
-                "calculated_usd": row["calculated_usd"], "actual_usd": row["actual_usd"],
-                "variance_ratio": row["variance_ratio"],
-                "over_threshold": bool(row["over_threshold"]),
-                "diagnostic_emitted": row["diagnostic_emitted_at"] is not None,
-            } for row in rows]}
+            return pricing.billing_reconciliation_snapshot(conn)
         finally:
             conn.close()
 

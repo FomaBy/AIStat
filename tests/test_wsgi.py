@@ -2202,6 +2202,146 @@ def test_concurrent_same_tenant_ingests_are_serialized(public_app, tmp_path):
     assert summary["total_tokens"] == 6_700_000
 
 
+def _login_csrf(client):
+    assert login(client).status_code == 303
+    return client.get("/api/session", base_url="https://localhost").get_json()["csrf"]
+
+
+def _submit_billing(client, csrf, **fields):
+    return client.post(
+        "/api/billing-reconciliation",
+        data=fields,
+        headers={"X-CSRF-Token": csrf},
+        base_url="https://localhost",
+    )
+
+
+def test_billing_reconciliation_get_requires_session(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).status_code == 401
+    assert login(client).status_code == 303
+    data = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert data == {"rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}}
+
+
+def test_billing_reconciliation_intake_is_owner_only_and_authenticated(public_app):
+    app, config = public_app
+    client = app.test_client()
+
+    # No session at all.
+    assert client.post(
+        "/api/billing-reconciliation",
+        data={"provider": "anthropic", "period": "2026-02",
+              "currency": "USD", "amount": "100"},
+        base_url="https://localhost",
+    ).status_code == 401
+
+    store = SecurityStore(config.security_db_path)
+    guest_id = store.find_or_create_user_by_identity(
+        "google", "guest-subject", email="guest@example.com"
+    )
+    store.ensure_tenant(guest_id)
+    sid = store.create_session(guest_id, 3600)
+    guest_csrf = store.resolve_session(sid)["csrf"]
+    denied = app.test_client(use_cookies=False).post(
+        "/api/billing-reconciliation",
+        data={"provider": "anthropic", "period": "2026-02",
+              "currency": "USD", "amount": "100"},
+        headers={"X-CSRF-Token": guest_csrf, "Cookie": "aistat_session=" + sid},
+        base_url="https://localhost",
+    )
+    assert denied.status_code == 403
+
+
+def test_billing_reconciliation_intake_rejects_missing_or_bad_csrf(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert login(client).status_code == 303
+    response = client.post(
+        "/api/billing-reconciliation",
+        data={"provider": "anthropic", "period": "2026-02",
+              "currency": "USD", "amount": "100"},
+        headers={"X-CSRF-Token": "wrong"},
+        base_url="https://localhost",
+    )
+    assert response.status_code == 400
+
+
+def test_billing_reconciliation_intake_stores_sanitized_totals_and_is_idempotent(public_app):
+    app, config = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    conn = connect(config.tenant_db_path(config.publish_tenant_id))
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES ('rt', 'm', '2026-02-10', 'anthropic', "
+        "0, 0, 0, 0, '2026-02-10T00:00:00Z', 90.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    first = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert first.status_code == 200
+    body = first.get_json()
+    assert body["provider"] == "anthropic"
+    assert body["variance_ratio"] == pytest.approx(0.1)
+    assert body["over_threshold"] is True
+    assert body["diagnostic_emitted"] is True
+    assert body["currency"] == "USD"
+    assert "invoice" not in json.dumps(body)
+
+    replay = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert replay.status_code == 200
+    assert replay.get_json()["diagnostic_emitted"] is False
+
+    rows = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert rows["rows"] == [{
+        "provider": "anthropic", "period": "2026-02", "calculated_usd": 90.0,
+        "actual_usd": 100.0, "variance_ratio": pytest.approx(0.1),
+        "over_threshold": True, "diagnostic_emitted": True, "currency": "USD",
+        "submitted_by": config.publish_tenant_id,
+        "submitted_at": rows["rows"][0]["submitted_at"],
+    }]
+    assert rows["coverage"] == {"periods_submitted": 1, "periods_total": 1}
+
+
+def test_billing_reconciliation_intake_rejects_bad_provider_and_currency(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    bad_provider = _submit_billing(
+        client, csrf, provider="Not Canonical!", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert bad_provider.status_code == 422
+
+    bad_currency = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="EUR", amount="100",
+    )
+    assert bad_currency.status_code == 422
+
+    bad_amount = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="not-a-number",
+    )
+    assert bad_amount.status_code == 422
+
+
 def test_flow_endpoint_requires_session_and_validates_days(public_app):
     """FAN-3306: /api/flow is session-guarded, serves the flow payload and
     rejects non-contract windows with 422."""

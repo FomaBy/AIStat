@@ -33,7 +33,7 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from . import __version__, aggregates, flow_metrics, handoff, oauth
+from . import __version__, aggregates, flow_metrics, handoff, oauth, pricing
 from .config import Config
 from .db import connect_readonly, init_db, schema_admission_error
 from .health import snapshot
@@ -729,6 +729,71 @@ def create_app(config: Optional[Config] = None) -> Flask:
             )
         finally:
             conn.close()
+
+    @app.get("/api/billing-reconciliation")
+    def api_billing_reconciliation():
+        conn = data_connection()
+        try:
+            return jsonify(pricing.billing_reconciliation_snapshot(conn))
+        finally:
+            conn.close()
+
+    @app.post("/api/billing-reconciliation")
+    def api_billing_reconciliation_submit():
+        """Owner-only aggregate intake: period totals only, never invoices.
+
+        Accepts a provider's already-known period/currency/actual total,
+        recomputes this instance's own calculated total from stored usage and
+        stores the sanitized comparison — the provider export itself never
+        reaches AIStat.
+        """
+        user_id = current_user_id()
+        if user_id != owner_user_id:
+            return jsonify({"detail": "owner account required"}), 403
+        if not request_csrf_ok():
+            return jsonify({"detail": "invalid CSRF token"}), 400
+        provider = (request.form.get("provider") or "").strip()
+        period = (request.form.get("period") or "").strip()
+        currency = (request.form.get("currency") or "").strip()
+        amount = request.form.get("amount")
+        try:
+            actual_usd = float(amount)
+        except (TypeError, ValueError):
+            return jsonify({"detail": "amount must be a number"}), 422
+        path = config.tenant_db_path(user_id)
+        if not path.is_file():
+            return jsonify({"detail": "no usage snapshot ingested yet"}), 503
+        probe = connect_readonly(path)
+        try:
+            problem = schema_admission_error(probe)
+        finally:
+            probe.close()
+        if problem is not None:
+            return jsonify({"detail": "database schema upgrade required"}), 503
+        with ingest_lock():
+            # A plain connection, never the WAL-forcing ``db.connect()``: the
+            # hosted tenant file is distributed and served as a single
+            # checkpointed DELETE-journal file (snapshot.py, migrate.py), and
+            # flipping it to WAL here would strand a -wal/-shm pair that a
+            # later read-only ``mode=ro`` open cannot reopen.
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            try:
+                calculated_usd = pricing.calculated_cost_for_period(
+                    conn, provider, period
+                )
+                result = pricing.reconcile_billing_actual(
+                    conn, provider, period, calculated_usd, actual_usd,
+                    currency=currency, submitted_by=user_id,
+                )
+            except pricing.PricingError as exc:
+                conn.rollback()
+                return jsonify({"detail": str(exc)}), 422
+            else:
+                conn.commit()
+            finally:
+                conn.close()
+        return jsonify(result)
 
     def health_payload():
         conn = data_connection()
