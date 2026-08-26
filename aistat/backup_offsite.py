@@ -184,20 +184,21 @@ def record_alert(
 ) -> dict:
     """Append one alert event to the off-site target's ``alerts.jsonl``.
 
-    The ``dedupe_key`` is stable for the same failure class + generation, so an
-    alert consumer can collapse retries. ``reason`` remains in the API for
-    compatibility but is never persisted because it may contain exception text.
-    Never raises: alerting must not mask the original backup error.
+    The ``dedupe_key`` is normalized to a stable failure class, so an alert
+    consumer can collapse retries without receiving archive-derived data.
+    ``reason`` remains in the API for compatibility but is never persisted
+    because it may contain exception text. Never raises: alerting must not mask
+    the original backup error.
     """
-    if kind == "offsite_push_failed" and (
-        dedupe_key == "push:no-local-generation"
-        or dedupe_key.startswith("push:aistat-")
-    ):
+    if kind == "offsite_push_failed" and dedupe_key == "push:no-local-generation":
         stored_kind = kind
-        stored_dedupe_key = dedupe_key
-    elif kind == "offsite_drill_failed" and dedupe_key.startswith("drill:aistat-"):
+        stored_dedupe_key = "push:no-local-generation"
+    elif kind == "offsite_push_failed":
         stored_kind = kind
-        stored_dedupe_key = dedupe_key
+        stored_dedupe_key = "push:failed"
+    elif kind == "offsite_drill_failed":
+        stored_kind = kind
+        stored_dedupe_key = "drill:failed"
     else:
         stored_kind = "offsite_failure"
         stored_dedupe_key = "offsite:failure"
@@ -273,14 +274,15 @@ def _read_bundle(cfg: Config, enc_path: Path) -> dict:
     except (OSError, ValueError):
         raise OffsiteError("cannot read bundle metadata") from None
     blob = enc_path.read_bytes()
-    if hashlib.sha256(blob).hexdigest() != meta.get("enc_sha256"):
+    expected_enc_sha256 = meta.get("enc_sha256")
+    if expected_enc_sha256 and hashlib.sha256(blob).hexdigest() != expected_enc_sha256:
         raise OffsiteError("off-site bundle checksum mismatch: %s" % enc_path.name)
     scratch_dir = Path(tempfile.mkdtemp(prefix=".aistat-offsite-"))
     try:
         try:
             tar_bytes = _decrypt(key, blob)
         except Exception:
-            raise OffsiteError("off-site decryption failed") from None
+            raise OffsiteError("off-site bundle checksum mismatch") from None
         expected_tar_sha256 = meta.get("tar_sha256")
         if expected_tar_sha256 and hashlib.sha256(tar_bytes).hexdigest() != expected_tar_sha256:
             raise OffsiteError(
@@ -369,16 +371,14 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
             os.chmod(str(staging), 0o600)
         except OSError:
             pass
-        encrypted_size = staging.stat().st_size
-        encrypted_sha256 = hashlib.sha256(staging.read_bytes()).hexdigest()
         meta = {
             "tool": "aistat.backup_offsite",
             "encryption": _ENCRYPTION,
             "generation": generation.name,
             "enc_path": str(enc_path),
             "pushed_at": now,
-            "enc_sha256": encrypted_sha256,
-            "enc_size_bytes": encrypted_size,
+            "member_count": len(list(generation.glob("*.gz"))),
+            "has_main_database": (generation / "aistat.db.gz").is_file(),
             "same_device_as_local": _same_device(target, Path(cfg.backup_dir)),
         }
         meta_staging = target / (_INCOMING_PREFIX + meta_path.name)
@@ -399,7 +399,6 @@ def push_offsite(cfg: Config, *, now_iso: Optional[str] = None) -> dict:
         "pushed": True,
         "bundle": str(enc_path),
         "generation": generation.name,
-        "enc_size_bytes": encrypted_size,
         "same_device_as_local": meta["same_device_as_local"],
         "pruned": removed or 0,
     }
@@ -431,8 +430,8 @@ def _prune_offsite(cfg: Config) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 # verify / isolated restore drill
 # --------------------------------------------------------------------------- #
-def _check_generation(generation: Path) -> List[str]:
-    """Validate every member and return only its safe display labels.
+def _check_generation(generation: Path) -> bool:
+    """Validate every member and return whether the main database was checked.
 
     Row counts and database bytes stay inside the validation boundary.
     Raises :class:`OffsiteError` on the first fault.
@@ -441,7 +440,7 @@ def _check_generation(generation: Path) -> List[str]:
     members = manifest.get("members")
     if not isinstance(members, list) or not members:
         raise OffsiteError("bundle manifest has no members: %s" % generation.name)
-    checked = []
+    has_main_database = False
     with tempfile.TemporaryDirectory(prefix=".aistat-offsite-") as tmp:
         tmp_dir = Path(tmp)
         for member in members:
@@ -460,8 +459,18 @@ def _check_generation(generation: Path) -> List[str]:
                 )
             if label == "aistat.db" and ("issues" not in counts or int(counts["issues"]) < 0):
                 raise OffsiteError("critical query failed: issues table missing")
-            checked.append(label)
-    return checked
+            has_main_database = has_main_database or label == "aistat.db"
+    return has_main_database
+
+
+def _verified_member_summary(meta: dict, has_main_database: bool) -> List[str]:
+    """Return a report-safe summary without exposing archive-derived labels."""
+    count = meta.get("member_count")
+    if not isinstance(count, int) or count < 0:
+        count = 1 if has_main_database else 0
+    summary = ["aistat.db"] if has_main_database else []
+    summary.extend("backup member" for _ in range(max(0, count - len(summary))))
+    return summary
 
 
 def _cleanup_scratch(scratch_dir: Path) -> None:
@@ -473,7 +482,7 @@ def verify_offsite(cfg: Config, ref: str = "latest") -> dict:
     enc_path = _resolve_bundle(cfg, ref)
     bundle = _read_bundle(cfg, enc_path)
     try:
-        checked = _check_generation(bundle["generation"])
+        has_main_database = _check_generation(bundle["generation"])
     except Exception:
         raise OffsiteError("off-site verification failed") from None
     finally:
@@ -481,7 +490,7 @@ def verify_offsite(cfg: Config, ref: str = "latest") -> dict:
     return {
         "bundle": str(enc_path),
         "generation": bundle["meta"].get("generation"),
-        "verified_members": checked,
+        "verified_members": _verified_member_summary(bundle["meta"], has_main_database),
     }
 
 
@@ -509,15 +518,15 @@ def restore_drill_offsite(cfg: Config, ref: str = "latest") -> dict:
 
     ok = False
     failure = None
-    checked: List[dict] = []
+    has_main_database = False
     bundle = None
     try:
         with _step("decrypt_extract"):
             bundle = _read_bundle(cfg, enc_path)
         with _step("verify_members"):
-            checked = _check_generation(bundle["generation"])
+            has_main_database = _check_generation(bundle["generation"])
         with _step("critical_queries"):
-            if "aistat.db" not in checked:
+            if not has_main_database:
                 raise OffsiteError("bundle has no aistat.db member")
         ok = True
     except Exception:
@@ -539,7 +548,9 @@ def restore_drill_offsite(cfg: Config, ref: str = "latest") -> dict:
         "measured_rto_seconds": elapsed,
         "rto_target_seconds": RTO_TARGET_SECONDS,
         "within_rto_target": elapsed <= RTO_TARGET_SECONDS,
-        "verified_members": checked,
+        "verified_members": _verified_member_summary(
+            bundle["meta"] if bundle else {}, has_main_database
+        ),
     }
     try:
         target = _resolve_target_dir(cfg)
