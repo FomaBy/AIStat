@@ -1413,8 +1413,11 @@ def test_flow_metrics_panel_renders_truthful_empty_state(dashboard):
     cdp.open_page(base + "/")
     cdp.wait_for(BOOTED_JS)
     cdp.wait_for('!document.getElementById("flow-panel").hidden')
+    assert cdp.eval(
+        'document.getElementById("card-flow-ready").textContent') == "0"
     for card in ("card-flow-cycle", "card-flow-p90", "card-flow-rework",
-                 "card-flow-idle"):
+                 "card-flow-idle", "card-flow-pm-p95", "card-flow-waiting",
+                 "card-flow-first-pass"):
         assert cdp.eval(
             f'document.getElementById("{card}").textContent') == "—", card
     coverage = cdp.eval(

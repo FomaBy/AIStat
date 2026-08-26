@@ -6,6 +6,100 @@ from typing import Any, Dict, Iterable, List, Optional
 from .db import model_snapshot_for_run, utcnow_iso
 
 
+ATTRIBUTION_REVISIONS = (
+    "model_revision", "runtime_revision", "prompt_revision",
+    "skills_revision", "harness_revision", "governance_bundle_revision",
+)
+TERMINAL_QA_VERDICTS = ("PASSED", "FAILED", "INCONCLUSIVE")
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _revision(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _run_attribution(conn: sqlite3.Connection,
+                     row: Dict[str, Any]) -> Dict[str, Any]:
+    """First-observation provenance, never inferred from catalog state."""
+    issue = None
+    if row.get("issue_id"):
+        columns = ", ".join(("attribution_schema_version",) + ATTRIBUTION_REVISIONS)
+        issue = conn.execute(
+            "SELECT {} FROM issues WHERE id = ?".format(columns),
+            (row["issue_id"],),
+        ).fetchone()
+    version = _positive_int(row.get("attribution_schema_version"))
+    if version is None and issue is not None:
+        version = _positive_int(issue["attribution_schema_version"])
+    values = {}
+    for name in ATTRIBUTION_REVISIONS:
+        value = _revision(row.get(name))
+        if value is None and issue is not None:
+            value = _revision(issue[name])
+        values[name] = value
+    values["attribution_schema_version"] = version
+    values["provenance_state"] = (
+        "observed" if version is not None and all(values[name] for name in
+                                                  ATTRIBUTION_REVISIONS)
+        else "unknown"
+    )
+    return values
+
+
+def _insert_run_attribution(conn: sqlite3.Connection, row: Dict[str, Any],
+                            synced_at: str) -> None:
+    attribution = _run_attribution(conn, row)
+    columns = [
+        "run_id", "issue_id", "attribution_schema_version", "provenance_state",
+    ] + list(ATTRIBUTION_REVISIONS) + ["observed_at"]
+    conn.execute(
+        "INSERT OR IGNORE INTO run_attribution_events ({}) VALUES ({})".format(
+            ", ".join(columns), ", ".join(["?"] * len(columns))
+        ),
+        [row["id"], row.get("issue_id"), attribution["attribution_schema_version"],
+         attribution["provenance_state"]] +
+        [attribution[name] for name in ATTRIBUTION_REVISIONS] + [synced_at],
+    )
+
+
+def _insert_qa_lineage(conn: sqlite3.Connection, row: Dict[str, Any],
+                       existing: Optional[sqlite3.Row], synced_at: str) -> None:
+    verdict = row.get("qa_verdict")
+    candidate = _revision(row.get("qa_candidate"))
+    implementation_issue_id = _revision(row.get("qa_for_issue_id"))
+    if (verdict not in TERMINAL_QA_VERDICTS or candidate is None or
+            implementation_issue_id is None):
+        return
+    initial = 1 if existing is None or existing["qa_verdict"] else 0
+    accepted_candidate = candidate if verdict == "PASSED" else None
+    accepted_story_points = None
+    if accepted_candidate is not None:
+        implementation = conn.execute(
+            "SELECT story_points FROM issues WHERE id = ?",
+            (implementation_issue_id,),
+        ).fetchone()
+        if implementation is not None:
+            accepted_story_points = implementation["story_points"]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO qa_lineage_events
+            (qa_issue_id, implementation_issue_id, candidate, verdict, verdict_at,
+             observed_at, initial, accepted_candidate, accepted_story_points)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (row["id"], implementation_issue_id, candidate, verdict,
+         row.get("qa_verdict_at"), synced_at, initial, accepted_candidate,
+         accepted_story_points),
+    )
+
+
 def _upsert(
     conn: sqlite3.Connection,
     table: str,
@@ -70,18 +164,27 @@ def upsert_issues(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
     synced_at = synced_at or utcnow_iso()
     count = 0
     for row in rows:
+        existing = conn.execute(
+            "SELECT status, dispatch_ready, qa_verdict FROM issues WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
         status = row.get("status")
         if status:
-            existing = conn.execute(
-                "SELECT status FROM issues WHERE id = ?", (row["id"],)
-            ).fetchone()
             if existing is None or existing["status"] != status:
                 conn.execute(
                     "INSERT OR IGNORE INTO issue_status_events "
                     "(issue_id, status, observed_at, initial) VALUES (?, ?, ?, ?)",
                     (row["id"], status, synced_at, 1 if existing is None else 0),
                 )
+        if row.get("dispatch_ready") and (
+                existing is None or not existing["dispatch_ready"]):
+            conn.execute(
+                "INSERT OR IGNORE INTO issue_readiness_events "
+                "(issue_id, observed_at, initial) VALUES (?, ?, ?)",
+                (row["id"], synced_at, 1 if existing is None else 0),
+            )
         _upsert(conn, "issues", ["id"], row, synced_at)
+        _insert_qa_lineage(conn, row, existing, synced_at)
         count += 1
     return count
 
@@ -113,6 +216,8 @@ def upsert_runs(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
     count = 0
     for row in rows:
         row = dict(row)
+        for name in ("attribution_schema_version",) + ATTRIBUTION_REVISIONS:
+            row.setdefault(name, None)
         existing = conn.execute(
             "SELECT model FROM runs WHERE id = ?", (row["id"],)
         ).fetchone()
@@ -135,6 +240,9 @@ def upsert_runs(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
                 row.get("created_at"),
                 agent_model,
             )
+        _insert_run_attribution(conn, row, synced_at)
+        for name in ("attribution_schema_version",) + ATTRIBUTION_REVISIONS:
+            row.pop(name)
         _upsert(conn, "runs", ["id"], row, synced_at)
         count += 1
     return count

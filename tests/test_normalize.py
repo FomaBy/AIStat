@@ -196,3 +196,36 @@ def test_normalize_issue_flow_metadata_fields():
     assert odd["dispatch_ready"] == 1  # string "true" tolerated
     assert odd["qa_candidate"] == "rev@1"  # artifact fallback
     assert odd["qa_for_issue_id"] == "impl-2"
+
+
+def test_normalize_issue_keeps_versioned_attribution_revisions():
+    issue = {
+        "id": "i1",
+        "updated_at": "2026-08-26T00:00:00Z",
+        "metadata": {
+            "attribution_schema_version": 1,
+            "model_revision": "model@v1",
+            "runtime_revision": "runtime@v1",
+            "prompt_revision": "prompt@v1",
+            "skills_revision": "skills@v1",
+            "harness_revision": "harness@v1",
+            "governance_bundle_revision": "bundle@v1",
+        },
+    }
+
+    row = normalize.normalize_issue(issue)
+
+    assert row["attribution_schema_version"] == 1
+    assert row["model_revision"] == "model@v1"
+    assert row["runtime_revision"] == "runtime@v1"
+    assert row["prompt_revision"] == "prompt@v1"
+    assert row["skills_revision"] == "skills@v1"
+    assert row["harness_revision"] == "harness@v1"
+    assert row["governance_bundle_revision"] == "bundle@v1"
+
+    invalid = normalize.normalize_issue({
+        "id": "i2",
+        "updated_at": "2026-08-26T00:00:00Z",
+        "metadata": {"attribution_schema_version": "one"},
+    })
+    assert invalid["attribution_schema_version"] is None
