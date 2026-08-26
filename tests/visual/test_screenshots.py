@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 
 _BASELINES = Path(__file__).with_name("baselines")
 _EXPECTED_CHROME_VERSION = os.environ.get(
-    "AISTAT_CHROME_VERSION", "151.0.7922.170")
+    "AISTAT_CHROME_VERSION", "151.0.7922.138")
 _VIEWPORT = {"width": 1440, "height": 1000, "deviceScaleFactor": 1,
              "mobile": False}
 _CAPTURE_CLIP = {"x": 0, "y": 0, "width": 1440, "height": 1000,

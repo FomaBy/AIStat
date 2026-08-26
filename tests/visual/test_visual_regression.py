@@ -45,7 +45,7 @@ class FakeCdp:
 
 class FakeCausalPaintCdp(FakeCdp):
     def __init__(self, early, settled, *, completes=True):
-        super().__init__("Chrome/151.0.7922.170")
+        super().__init__("Chrome/151.0.7922.138")
         self.early = early
         self.settled = settled
         self.completes = completes
@@ -92,7 +92,7 @@ class FakeCausalPaintCdp(FakeCdp):
 
 class FakeCaptureSurfaceCdp(FakeCdp):
     def __init__(self, geometries):
-        super().__init__("Chrome/151.0.7922.170")
+        super().__init__("Chrome/151.0.7922.138")
         self.geometries = iter(geometries)
         self.metrics = []
 
@@ -114,7 +114,7 @@ class FakeCaptureSurfaceCdp(FakeCdp):
 
 class FakeNativeControlCdp(FakeCdp):
     def __init__(self, controls, multiple_ids=None):
-        super().__init__("Chrome/151.0.7922.170")
+        super().__init__("Chrome/151.0.7922.138")
         self.controls = controls
         self.multiple_ids = (multiple_ids if multiple_ids is not None else
                              [control["id"] for control in controls])
@@ -171,12 +171,12 @@ def test_png_mismatch_writes_a_readable_diff(tmp_path):
 
 
 def test_browser_version_mismatch_is_explicit():
-    with pytest.raises(RuntimeError, match=r"Chrome version mismatch.*151\.0\.7922\.170"):
-        _assert_browser_version(FakeCdp("Chrome/150.0.0.0"), "151.0.7922.170")
+    with pytest.raises(RuntimeError, match=r"Chrome version mismatch.*151\.0\.7922\.138"):
+        _assert_browser_version(FakeCdp("Chrome/150.0.0.0"), "151.0.7922.138")
 
 
 def test_transient_rendering_is_disabled_only_in_test_page():
-    cdp = FakeCdp("Chrome/151.0.7922.170")
+    cdp = FakeCdp("Chrome/151.0.7922.138")
 
     _disable_transient_rendering(cdp)
 
@@ -189,7 +189,7 @@ def test_transient_rendering_is_disabled_only_in_test_page():
 
 
 def test_css_probe_is_a_test_only_one_pixel_shift():
-    cdp = FakeCdp("Chrome/151.0.7922.170")
+    cdp = FakeCdp("Chrome/151.0.7922.138")
 
     _apply_css_shift_probe(cdp)
 

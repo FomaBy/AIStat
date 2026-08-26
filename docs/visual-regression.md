@@ -21,7 +21,7 @@ templates, CSS, screenshot tolerances, and masks are not changed.
 
 ### Browser pin
 
-CI uses Chrome for Testing `151.0.7922.170`, not a floating `stable` channel;
+CI uses Chrome for Testing `151.0.7922.138`, not a floating `stable` channel;
 the committed baselines are captured with that exact revision.
 The fixture calls `Browser.getVersion` and fails with `Chrome version mismatch`
 if the launched binary does not report the pinned build.
