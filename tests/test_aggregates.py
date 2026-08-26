@@ -665,6 +665,30 @@ def test_projects_overview_cost_estimate(agg_conn):
     assert projects["Beta"]["cost_unattributed_issues"] == 1
 
 
+def test_projects_overview_uses_rate_effective_when_the_run_started(agg_conn):
+    """FAN-3550 FAIL-1: publishing a later catalog rate must not reprice a
+    closed project's cost, the same invariant efficiency_breakdown already
+    holds (test_efficiency_uses_rate_effective_when_the_run_started)."""
+    before = {p["title"]: p for p in ag.projects_overview(agg_conn)}
+
+    agg_conn.executemany(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, loaded_at) "
+        "VALUES (?, '2026-01-01', ?, ?, ?, ?, 0, 'now')",
+        [("m-claude", 1.0, 0.0, 0.0, 0.0), ("m-shared", 2.0, 4.0, 0.2, 2.5)],
+    )
+    agg_conn.execute(
+        "UPDATE model_pricing SET input_rate = 30.8, output_rate = 30.8, "
+        "cache_read_rate = 30.8, cache_write_rate = 30.8"
+    )
+    agg_conn.commit()
+
+    after = {p["title"]: p for p in ag.projects_overview(agg_conn)}
+    assert after["Alpha"]["cost_usd"] == pytest.approx(before["Alpha"]["cost_usd"])
+    assert after["Alpha"]["cost_credits"] == pytest.approx(before["Alpha"]["cost_credits"])
+    assert after["Beta"]["cost_usd"] == pytest.approx(before["Beta"]["cost_usd"])
+
+
 def test_projects_overview_filtered_cost_uses_matching_run_models(agg_conn):
     """FAN-1251: a run filter must price project cost from the matching runs'
     models — the same run-overlap set that feeds tokens, SP and
@@ -702,6 +726,67 @@ def test_projects_overview_filtered_cost_uses_matching_run_models(agg_conn):
     row, f = alpha(agent_ids=["A1", "A2"])
     assert row["cost_usd"] == pytest.approx(0.0025)
     assert ag.efficiency_breakdown(agg_conn, filters=f)["cost_usd"] == pytest.approx(0.0025)
+
+
+def _seed_two_run_history_fixture(conn, run_order):
+    """One issue, one model, two dated runs — a January run priced at 1.0
+    and an August run priced at 30.8 after a later catalog rate is
+    published. ``run_order`` controls the physical insertion order of the
+    two run rows, which must never influence the priced rate."""
+    now = "2026-08-10T00:00:00Z"
+    conn.executescript(f"""
+    INSERT INTO runtimes (id, name, provider, status, synced_at) VALUES
+      ('R1', 'RT', 'claude', 'online', '{now}');
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A1', 'Solo', 'm1', 'R1', '{now}');
+    INSERT INTO projects (id, title, status, synced_at) VALUES
+      ('P1', 'Alpha', 'in_progress', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I1', 'T-1', 'two dated runs', 'done', 'P1', 5, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I1', 2, 1000000, 0, 0, 0, '{now}');
+    INSERT INTO model_pricing (model, input_rate, output_rate, cache_read_rate,
+                               cache_write_rate, unpriced, loaded_at) VALUES
+      ('m1', 30.8, 0.0, 0.0, 0.0, 0, '{now}');
+    INSERT INTO model_price_history (model, effective_from, input_rate,
+                                     output_rate, cache_read_rate,
+                                     cache_write_rate, unpriced, loaded_at) VALUES
+      ('m1', '2026-01-01', 1.0, 0.0, 0.0, 0.0, 0, '{now}'),
+      ('m1', '2026-08-01', 30.8, 0.0, 0.0, 0.0, 0, '{now}');
+    """)
+    runs = {
+        "jan": ("run-jan", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+        "aug": ("run-aug", "2026-08-10T10:00:00Z", "2026-08-10T11:00:00Z"),
+    }
+    for key in run_order:
+        run_id, started, completed = runs[key]
+        conn.execute(
+            "INSERT INTO runs (id, issue_id, agent_id, runtime_id, status, "
+            "started_at, completed_at, synced_at) VALUES "
+            "(?, 'I1', 'A1', 'R1', 'completed', ?, ?, ?)",
+            (run_id, started, completed, now),
+        )
+    conn.commit()
+
+
+@pytest.mark.parametrize("run_order", [("aug", "jan"), ("jan", "aug")])
+def test_run_filter_rate_at_is_earliest_run_regardless_of_row_order(conn, run_order):
+    """FAN-3550 FAIL-2: an agent filter selecting every one of an issue's runs
+    must price the same as the unfiltered view, and that price must not
+    depend on the physical insertion order of the run rows — both must use
+    the earliest dated run (January, rate 1.0), never the first row visited
+    by an unordered scan."""
+    _seed_two_run_history_fixture(conn, run_order)
+
+    unfiltered = ag.efficiency_breakdown(conn)
+    f = ag.make_filters(None, None, agent_ids=["A1"])
+    filtered = ag.efficiency_breakdown(conn, filters=f)
+
+    assert filtered["cost_usd"] == pytest.approx(1.0)
+    assert filtered["cost_usd"] == pytest.approx(unfiltered["cost_usd"])
 
 
 def test_projects_overview_partial_hour_overlap_scales_filtered_cost(agg_conn):

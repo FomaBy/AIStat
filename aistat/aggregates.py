@@ -348,7 +348,7 @@ def _run_filter_selection(conn: sqlite3.Connection,
     for row in conn.execute(
         """
         SELECT r.issue_id, r.agent_id, COALESCE(r.model, a.model) AS model,
-               r.started_at, r.completed_at
+               r.started_at, r.completed_at, r.dispatched_at, r.created_at
         FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
         WHERE r.issue_id IS NOT NULL
         """
@@ -371,10 +371,19 @@ def _run_filter_selection(conn: sqlite3.Connection,
         # model-less agent — so the unknown part stays unpriced instead of
         # being renormalized onto the known models (FAN-1247).
         model = models.setdefault(issue_id, {}).setdefault(
-            row["model"], {"dur": 0.0, "n": 0, "rate_at": row["started_at"]}
+            row["model"], {"dur": 0.0, "n": 0, "rate_at": None}
         )
         model["dur"] += overlap / (HOURS_PER_DAY * 3600.0)
         model["n"] += 1
+        # rate_at must be the earliest dated event across every matching run,
+        # not whichever row the unordered query happens to visit first — the
+        # same MIN(COALESCE(...)) semantics as the unfiltered _issue_model_stats,
+        # so the priced rate never depends on physical row order (FAN-3550).
+        candidate_rate_at = row["started_at"] or row["dispatched_at"] or row["created_at"]
+        if candidate_rate_at is not None and (
+            model["rate_at"] is None or candidate_rate_at < model["rate_at"]
+        ):
+            model["rate_at"] = candidate_rate_at
     out: Dict[str, Dict[str, Any]] = {}
     for issue_id, total in totals.items():
         share = selected.get(issue_id, 0.0)
@@ -892,31 +901,39 @@ def _model_weights(models: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     )
 
 
-def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]]:
-    """Per issue: weight of each model, from run durations (fallback counts)."""
+def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Per issue: each model's weight and its rate_at, from run durations
+    (fallback counts). Carries ``rate_at`` alongside the weight so a caller
+    can price the model's share at the time it actually ran, not today."""
     return {
-        issue_id: _model_weights(models)
+        issue_id: {
+            model: {"weight": weight, "rate_at": models[model]["rate_at"]}
+            for model, weight in _model_weights(models).items()
+        }
         for issue_id, models in _issue_model_stats(conn).items()
     }
 
 
-def issue_cost_estimate(usage: Dict[str, Any], model_weights: Dict[str, float],
+def issue_cost_estimate(conn: sqlite3.Connection, usage: Dict[str, Any],
+                        model_weights: Dict[str, Dict[str, Any]],
                         rates: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Estimated USD cost of one issue's exact token counts.
 
     Token counts are split across the models that ran the issue and priced
-    with each model's official rates. Tokens landing on an unpriced/unknown
-    model are reported in ``unpriced_tokens`` and NOT priced as 0. An issue
-    with usage but no runs cannot be attributed: cost None, ``attributed``
-    False.
+    with each model's rate at the time it ran (:func:`_pricing_rate_at`), so
+    a closed period never repriced when a later rate is published. Tokens
+    landing on an unpriced/unknown model are reported in ``unpriced_tokens``
+    and NOT priced as 0. An issue with usage but no runs cannot be
+    attributed: cost None, ``attributed`` False.
     """
     if not model_weights:
         return {"cost_usd": None, "attributed": False, "unpriced_tokens": 0}
     usd = 0.0
     unpriced_tokens = 0.0
     total = sum(int(usage[f"total_{k}"] or 0) for k in TOKEN_KINDS)
-    for model, weight in model_weights.items():
-        rate = rates.get(model)
+    for model, entry in model_weights.items():
+        weight = entry["weight"]
+        rate = _pricing_rate_at(conn, rates, model, entry.get("rate_at"))
         if rate is None or rate["unpriced"]:
             unpriced_tokens += total * weight
             continue
@@ -991,7 +1008,10 @@ def projects_overview(conn: sqlite3.Connection,
                 if entry is None:
                     continue
                 factor = entry["fraction"]
-                weights = _model_weights(entry["models"])
+                weights = {
+                    model: {"weight": weight, "rate_at": entry["models"][model]["rate_at"]}
+                    for model, weight in _model_weights(entry["models"]).items()
+                }
             else:
                 factor = 1.0
                 weights = model_weights.get(row["id"], {})
@@ -1008,7 +1028,7 @@ def projects_overview(conn: sqlite3.Connection,
             for kind in TOKEN_KINDS:
                 usage[f"total_{kind}"] = (row[f"total_{kind}"] or 0) * factor
                 tokens[kind] += usage[f"total_{kind}"]
-            est = issue_cost_estimate(usage, weights, rates)
+            est = issue_cost_estimate(conn, usage, weights, rates)
             if est["attributed"]:
                 cost_usd += est["cost_usd"]
                 unpriced_tokens += est["unpriced_tokens"]
