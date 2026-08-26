@@ -25,6 +25,9 @@ CI uses Chrome for Testing `151.0.7922.138`, not a floating `stable` channel;
 the committed baselines are captured with that exact revision.
 The fixture calls `Browser.getVersion` and fails with `Chrome version mismatch`
 if the launched binary does not report the pinned build.
+The harness also fixes the browser timezone to `Europe/Warsaw`, matching the
+committed baseline timezone so UTC sync timestamps render deterministically on
+all runners.
 
 Local runs use the same expected version. Set `AISTAT_CHROME` to the absolute
 Chrome/Chromium path when automatic discovery does not find it. To test a

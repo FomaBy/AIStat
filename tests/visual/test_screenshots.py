@@ -30,6 +30,7 @@ _EXPECTED_CHROME_VERSION = os.environ.get(
     "AISTAT_CHROME_VERSION", "151.0.7922.138")
 _VIEWPORT = {"width": 1440, "height": 1000, "deviceScaleFactor": 1,
              "mobile": False}
+_CAPTURE_TIMEZONE = "Europe/Warsaw"
 _CAPTURE_CLIP = {"x": 0, "y": 0, "width": 1440, "height": 1000,
                  "scale": 1}
 _PAINT_BUDGET_SECONDS = 15
@@ -241,6 +242,12 @@ def _set_viewport(cdp, scrollbar_width=0):
     viewport = dict(_VIEWPORT)
     viewport["width"] += scrollbar_width
     cdp.call("Emulation.setDeviceMetricsOverride", viewport)
+
+
+def _set_capture_timezone(cdp):
+    cdp.call("Emulation.setTimezoneOverride", {
+        "timezoneId": _CAPTURE_TIMEZONE,
+    })
 
 
 def _capture_geometry(cdp):
@@ -536,6 +543,7 @@ def visual_browser():
 def test_metrics_page_matches_visual_baseline(visual_browser):
     cdp, dashboard_base, _ = visual_browser
     cdp.open_page(dashboard_base + "/", preload_script=_locale_preload("en-US"))
+    _set_capture_timezone(cdp)
     _set_viewport(cdp)
     _settle(cdp, _DASHBOARD_READY_JS)
     _capture(cdp, "metrics", _normalize_capture_surface(
@@ -545,6 +553,7 @@ def test_metrics_page_matches_visual_baseline(visual_browser):
 def test_login_page_matches_visual_baseline(visual_browser):
     cdp, _, public_base = visual_browser
     cdp.open_page(public_base + "/login", preload_script=_locale_preload("en-US"))
+    _set_capture_timezone(cdp)
     _set_viewport(cdp)
     _settle(cdp, _LOGIN_READY_JS)
     _capture(cdp, "login", _normalize_capture_surface(cdp, _LOGIN_READY_JS))
@@ -553,7 +562,8 @@ def test_login_page_matches_visual_baseline(visual_browser):
 def test_i18n_switch_matches_visual_baseline(visual_browser):
     cdp, dashboard_base, _ = visual_browser
     cdp.open_page(dashboard_base + "/?project=P1",
-                 preload_script=_locale_preload("en-US"))
+                  preload_script=_locale_preload("en-US"))
+    _set_capture_timezone(cdp)
     _set_viewport(cdp)
     _settle(cdp, _DASHBOARD_READY_JS)
     cdp.eval('document.getElementById("locale-switcher").click()')
