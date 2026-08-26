@@ -113,15 +113,19 @@ class FakeCaptureSurfaceCdp(FakeCdp):
 
 
 class FakeNativeControlCdp(FakeCdp):
-    def __init__(self, controls, multiple_ids=None):
+    def __init__(self, controls, multiple_ids=None, datetime_controls=None):
         super().__init__("Chrome/151.0.7922.138")
         self.controls = controls
         self.multiple_ids = (multiple_ids if multiple_ids is not None else
                              [control["id"] for control in controls])
+        self.datetime_controls = (datetime_controls if datetime_controls is not None
+                                  else _native_datetime_controls())
 
     def eval(self, expression):
         self.expressions.append(expression)
         return {"controls": copy.deepcopy(self.controls),
+                "datetime_controls": copy.deepcopy(self.datetime_controls),
+                "datetime_ids": ["filter-from", "filter-to"],
                 "multiple_ids": list(self.multiple_ids)}
 
 
@@ -155,6 +159,23 @@ def _native_controls():
                         ["m-claude", "m-claude", False, False],
                         ["m-mystery", "m-mystery", False, False],
                         ["m-shared", "m-shared", False, False]],
+        },
+    ]
+
+
+def _native_datetime_controls():
+    return [
+        {
+            "id": "filter-from", "matches": 1, "id_matches": 1,
+            "rect": [45, 507.609375, 291, 542.453125], "value": "",
+            "type": "datetime-local", "step": "60", "disabled": False,
+            "hidden": False, "display": "block", "visibility": "visible",
+        },
+        {
+            "id": "filter-to", "matches": 1, "id_matches": 1,
+            "rect": [45, 577.296875, 291, 612.140625], "value": "",
+            "type": "datetime-local", "step": "60", "disabled": False,
+            "hidden": False, "display": "block", "visibility": "visible",
         },
     ]
 
@@ -292,8 +313,10 @@ def test_native_control_contract_returns_only_documented_interiors():
         (46, 108, 290, 171),
         (46, 208, 290, 288),
         (46, 325, 290, 405),
+        (46, 509, 290, 541),
+        (46, 578, 290, 611),
     ]
-    assert contract["excluded_pixels"] == 54412
+    assert contract["excluded_pixels"] == 70272
     assert len(contract["semantic_digest"]) == 64
 
 
@@ -336,6 +359,23 @@ def test_native_control_contract_rejects_duplicate_id():
     with pytest.raises(AssertionError, match="native control"):
         test_screenshots._native_control_contract(
             FakeNativeControlCdp(controls), "metrics")
+
+
+@pytest.mark.parametrize("mutation", [
+    pytest.param(lambda controls: controls.pop(), id="missing"),
+    pytest.param(lambda controls: controls[0].__setitem__("step", "1"),
+                 id="step"),
+    pytest.param(lambda controls: controls[0]["rect"].__setitem__(1, 508),
+                 id="moved"),
+])
+def test_native_control_contract_rejects_invalid_datetime_control(mutation):
+    controls = _native_datetime_controls()
+    mutation(controls)
+
+    with pytest.raises(AssertionError, match="native control"):
+        test_screenshots._native_control_contract(
+            FakeNativeControlCdp(_native_controls(),
+                                 datetime_controls=controls), "metrics")
 
 
 @pytest.mark.parametrize("index", range(3))

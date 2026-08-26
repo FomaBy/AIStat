@@ -35,6 +35,7 @@ _CAPTURE_CLIP = {"x": 0, "y": 0, "width": 1440, "height": 1000,
                  "scale": 1}
 _PAINT_BUDGET_SECONDS = 15
 _NATIVE_SELECT_IDS = ("filter-project", "filter-agent", "filter-model")
+_NATIVE_DATETIME_IDS = ("filter-from", "filter-to")
 _NATIVE_SELECTS = {
     "metrics": [
         {"id": "filter-project", "matches": 1, "id_matches": 1,
@@ -87,7 +88,29 @@ _NATIVE_SELECTS = {
                      ["m-shared", "m-shared", False, False]]},
     ],
 }
-_NATIVE_SELECT_EXCLUDED_PIXELS = 54412
+_NATIVE_DATETIMES = {
+    "metrics": [
+        {"id": "filter-from", "matches": 1, "id_matches": 1,
+         "rect": [45, 507.609375, 291, 542.453125], "value": "",
+         "type": "datetime-local", "step": "60", "disabled": False,
+         "hidden": False, "display": "block", "visibility": "visible"},
+        {"id": "filter-to", "matches": 1, "id_matches": 1,
+         "rect": [45, 577.296875, 291, 612.140625], "value": "",
+         "type": "datetime-local", "step": "60", "disabled": False,
+         "hidden": False, "display": "block", "visibility": "visible"},
+    ],
+    "i18n-switch": [
+        {"id": "filter-from", "matches": 1, "id_matches": 1,
+         "rect": [45, 507.609375, 291, 542.453125], "value": "",
+         "type": "datetime-local", "step": "60", "disabled": False,
+         "hidden": False, "display": "block", "visibility": "visible"},
+        {"id": "filter-to", "matches": 1, "id_matches": 1,
+         "rect": [45, 577.296875, 291, 612.140625], "value": "",
+         "type": "datetime-local", "step": "60", "disabled": False,
+         "hidden": False, "display": "block", "visibility": "visible"},
+    ],
+}
+_NATIVE_CONTROL_EXCLUDED_PIXELS = 70272
 _NATIVE_SELECT_JS = '''(() => {
   const ids = ["filter-project", "filter-agent", "filter-model"];
   const controls = ids.map(id => {
@@ -110,6 +133,26 @@ _NATIVE_SELECT_JS = '''(() => {
   });
   return {
     controls,
+    datetime_controls: ["filter-from", "filter-to"].map(id => {
+      const matches = [...document.querySelectorAll(
+        `input[type="datetime-local"][id="${id}"]`
+      )];
+      const input = matches[0];
+      const idMatches = document.querySelectorAll(`[id="${id}"]`).length;
+      if (!input) return {id, matches: matches.length, id_matches: idMatches};
+      const rect = input.getBoundingClientRect();
+      const style = getComputedStyle(input);
+      return {
+        id, matches: matches.length, id_matches: idMatches,
+        rect: [rect.left, rect.top, rect.right, rect.bottom],
+        value: input.value, type: input.type, step: input.step,
+        disabled: input.disabled, hidden: input.hidden,
+        display: style.display, visibility: style.visibility,
+      };
+    }),
+    datetime_ids: [...document.querySelectorAll(
+      'input[type="datetime-local"]'
+    )].map(input => input.id),
     multiple_ids: [...document.querySelectorAll("select[multiple]")]
       .map(select => select.id),
   };
@@ -320,19 +363,26 @@ def _native_control_masks(controls):
 def _native_control_contract(cdp, name):
     snapshot = cdp.eval(_NATIVE_SELECT_JS)
     controls = snapshot.get("controls") if isinstance(snapshot, dict) else None
+    datetime_controls = (snapshot.get("datetime_controls")
+                         if isinstance(snapshot, dict) else None)
     expected = _NATIVE_SELECTS[name]
+    expected_datetime = _NATIVE_DATETIMES[name]
     if (snapshot.get("multiple_ids") != list(_NATIVE_SELECT_IDS) or
-            controls != expected):
+            snapshot.get("datetime_ids") != list(_NATIVE_DATETIME_IDS) or
+            controls != expected or datetime_controls != expected_datetime):
         raise AssertionError("native control contract mismatch: %s" % snapshot)
-    masks = _native_control_masks(controls)
+    masks = _native_control_masks(controls + datetime_controls)
     excluded_pixels = sum((right - left) * (bottom - top)
                           for left, top, right, bottom in masks)
-    if excluded_pixels != _NATIVE_SELECT_EXCLUDED_PIXELS:
+    if excluded_pixels != _NATIVE_CONTROL_EXCLUDED_PIXELS:
         raise AssertionError("native control excluded-pixel count: %s" %
                              excluded_pixels)
     semantic = [{key: control[key] for key in (
         "id", "value", "multiple", "disabled", "hidden", "display",
         "visibility", "options")} for control in controls]
+    semantic.extend({key: control[key] for key in (
+        "id", "value", "type", "step", "disabled", "hidden", "display",
+        "visibility")} for control in datetime_controls)
     return {
         "masks": masks,
         "excluded_pixels": excluded_pixels,

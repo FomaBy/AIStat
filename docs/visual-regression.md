@@ -17,7 +17,10 @@ Before capture, the harness waits for the page data condition, a loaded font
 set, and two consecutive identical layout frames. It then freezes only test
 rendering: CSS transitions and animations, the caret, focus, Chart.js
 animations, and the browser color scheme used for native controls. Product
-templates, CSS, screenshot tolerances, and masks are not changed.
+templates, CSS, and screenshot tolerances are not changed. The native-control
+contract verifies the expected IDs, state, geometry and options before masking
+only the platform-owned interiors of documented native controls; product-owned
+borders and layout remain pixel-checked.
 
 ### Browser pin
 
