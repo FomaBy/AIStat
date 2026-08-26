@@ -95,6 +95,71 @@ def test_upsert_records_initial_and_transition_events_idempotently(conn):
     ]
 
 
+def test_run_attribution_is_frozen_and_incomplete_values_are_unknown(conn):
+    observed_at = ts(days=2)
+    complete = {
+        "id": "impl", "status": "todo", "story_points": 5,
+        "attribution_schema_version": 1,
+        "model_revision": "model@v1", "runtime_revision": "runtime@v1",
+        "prompt_revision": "prompt@v1", "skills_revision": "skills@v1",
+        "harness_revision": "harness@v1",
+        "governance_bundle_revision": "bundle@v1",
+    }
+    store.upsert_issues(conn, [complete], synced_at=observed_at)
+    store.upsert_runs(conn, [{"id": "run-1", "issue_id": "impl"}],
+                      synced_at=observed_at)
+    complete["prompt_revision"] = "prompt@v2"
+    store.upsert_issues(conn, [complete], synced_at=ts(days=1))
+    store.upsert_runs(conn, [{"id": "run-1", "issue_id": "impl"}],
+                      synced_at=ts(days=1))
+
+    incomplete = {"id": "incomplete", "status": "todo"}
+    store.upsert_issues(conn, [incomplete], synced_at=observed_at)
+    store.upsert_runs(conn, [{"id": "run-2", "issue_id": "incomplete"}],
+                      synced_at=observed_at)
+
+    rows = conn.execute(
+        "SELECT run_id, prompt_revision, provenance_state "
+        "FROM run_attribution_events ORDER BY run_id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("run-1", "prompt@v1", "observed"),
+        ("run-2", None, "unknown"),
+    ]
+
+
+def test_terminal_qa_lineage_snapshots_acceptance_once(conn):
+    store.upsert_issues(conn, [{"id": "impl", "status": "in_review",
+                                "story_points": 5}], synced_at=ts(days=2))
+    verdict = {
+        "id": "qa", "status": "done", "qa_for_issue_id": "impl",
+        "qa_candidate": "sha-a", "qa_verdict": "PASSED",
+        "qa_verdict_at": ts(days=1),
+    }
+    store.upsert_issues(conn, [verdict], synced_at=ts(days=1))
+    verdict["qa_candidate"] = "sha-b"
+    store.upsert_issues(conn, [verdict], synced_at=ts())
+
+    saved = conn.execute(
+        "SELECT candidate, verdict, accepted_candidate, accepted_story_points "
+        "FROM qa_lineage_events"
+    ).fetchone()
+    assert tuple(saved) == ("sha-a", "PASSED", "sha-a", 5.0)
+
+
+def test_ready_transition_is_append_only_and_not_an_initial_baseline(conn):
+    row = {"id": "i1", "status": "todo", "dispatch_ready": 0}
+    store.upsert_issues(conn, [row], synced_at=ts(days=2))
+    row["dispatch_ready"] = 1
+    store.upsert_issues(conn, [row], synced_at=ts(days=1))
+    store.upsert_issues(conn, [row], synced_at=ts())
+
+    rows = conn.execute(
+        "SELECT observed_at, initial FROM issue_readiness_events"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(ts(days=1), 0)]
+
+
 # -- cycle time ---------------------------------------------------------------
 
 
