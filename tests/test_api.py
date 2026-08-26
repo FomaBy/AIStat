@@ -174,6 +174,20 @@ def test_billing_reconciliation_api_exposes_sanitized_totals_only(api):
     }]}
 
 
+def test_pricing_api_exposes_rate_provenance_and_coverage(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, source_url, loaded_at) "
+        "VALUES ('m', '2026-01-01', 1, 2, .1, 1.25, 0, 'https://vendor/pricing', 'now')"
+    )
+    conn.commit()
+    data = client.get("/api/pricing").json()
+    assert data["rates"][0]["source_url"] == "https://vendor/pricing"
+    assert data["rates"][0]["effective_from"] == "2026-01-01"
+    assert data["coverage"] == {"rows": 4, "priced_rows": 3, "unpriced_rows": 1}
+
+
 def test_hour_and_dimension_filters_are_validated_and_applied(api):
     client, _ = api
     params = [

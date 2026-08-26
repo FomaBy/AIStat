@@ -304,6 +304,29 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         finally:
             conn.close()
 
+    @app.get("/api/pricing")
+    def api_pricing():
+        """Published price revisions and priced/unpriced daily coverage."""
+        conn = db()
+        try:
+            rates = [dict(row) for row in conn.execute(
+                "SELECT model, effective_from, vendor, currency, input_rate, "
+                "output_rate, cache_read_rate, cache_write_rate, unpriced, "
+                "source_url, captured_at FROM model_price_history "
+                "ORDER BY model, effective_from"
+            )]
+            coverage = conn.execute(
+                "SELECT COUNT(*) AS rows, SUM(cost_priced) AS priced_rows "
+                "FROM daily_usage"
+            ).fetchone()
+            return {"rates": rates, "coverage": {
+                "rows": coverage["rows"],
+                "priced_rows": coverage["priced_rows"] or 0,
+                "unpriced_rows": coverage["rows"] - (coverage["priced_rows"] or 0),
+            }}
+        finally:
+            conn.close()
+
     def health_payload():
         conn = db()
         try:
