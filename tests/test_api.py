@@ -640,10 +640,15 @@ def test_flow_endpoint_shape_and_validation(api):
     client, _ = api
     out = client.get("/api/flow?days=7").json()
     assert out["days"] == 7
-    assert set(out) >= {"cycle_time", "rework", "idle", "coverage", "lanes"}
+    assert set(out) >= {
+        "cycle_time", "rework", "idle", "coverage", "lanes", "frontier",
+        "lineage",
+    }
     assert out["cycle_time"]["median_seconds"] is None
     assert out["rework"]["rate"] is None
     assert out["idle"]["share"] is None
+    assert out["frontier"]["pm_p95_seconds"] is None
+    assert out["lineage"]["first_pass_rate"] is None
     assert client.get("/api/flow?days=13").status_code == 422
     assert client.get("/api/flow?days=abc").status_code == 422
 

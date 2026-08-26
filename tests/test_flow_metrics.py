@@ -27,17 +27,18 @@ def ts(**delta):
 
 
 def add_issue(conn, issue_id, status="todo", project_id="p1", lane="dev_high",
-              created_at=None, is_jira=0, dispatch_ready=0, **qa):
+              created_at=None, is_jira=0, dispatch_ready=0, story_points=None,
+              **qa):
     conn.execute(
         """
         INSERT OR REPLACE INTO issues
             (id, status, project_id, dispatch_lane, dispatch_ready, is_jira,
-             created_at, qa_verdict, qa_verdict_at, qa_candidate,
+             story_points, created_at, qa_verdict, qa_verdict_at, qa_candidate,
              qa_for_issue_id, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (issue_id, status, project_id, lane, dispatch_ready, is_jira,
-         created_at or ts(days=80), qa.get("qa_verdict"),
+         story_points, created_at or ts(days=80), qa.get("qa_verdict"),
          qa.get("qa_verdict_at"), qa.get("qa_candidate"),
          qa.get("qa_for_issue_id"), ts()),
     )
@@ -48,6 +49,29 @@ def add_event(conn, issue_id, status, observed_at, initial=0):
         "INSERT INTO issue_status_events (issue_id, status, observed_at, initial) "
         "VALUES (?, ?, ?, ?)",
         (issue_id, status, observed_at, initial),
+    )
+
+
+def add_ready_event(conn, issue_id, observed_at, initial=0):
+    conn.execute(
+        "INSERT INTO issue_readiness_events (issue_id, observed_at, initial) "
+        "VALUES (?, ?, ?)", (issue_id, observed_at, initial),
+    )
+
+
+def add_lineage_event(conn, qa_issue_id, implementation_issue_id, candidate,
+                      verdict, verdict_at, accepted_story_points=None,
+                      initial=0):
+    conn.execute(
+        """
+        INSERT INTO qa_lineage_events
+            (qa_issue_id, implementation_issue_id, candidate, verdict, verdict_at,
+             observed_at, initial, accepted_candidate, accepted_story_points)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (qa_issue_id, implementation_issue_id, candidate, verdict, verdict_at,
+         verdict_at or ts(), initial,
+         candidate if verdict == "PASSED" else None, accepted_story_points),
     )
 
 
@@ -158,6 +182,67 @@ def test_ready_transition_is_append_only_and_not_an_initial_baseline(conn):
         "SELECT observed_at, initial FROM issue_readiness_events"
     ).fetchall()
     assert [tuple(row) for row in rows] == [(ts(days=1), 0)]
+
+
+def test_frontier_reports_ready_pm_p95_and_waiting_age(conn):
+    for hours in range(1, 21):
+        issue_id = "ready-{}".format(hours)
+        add_issue(conn, issue_id, status="todo", dispatch_ready=1,
+                  story_points=1, created_at=ts(days=1, hours=hours))
+        add_ready_event(conn, issue_id, ts(days=1))
+    conn.commit()
+
+    frontier = flow_metrics.flow(conn, days=7, now=NOW)["frontier"]
+
+    assert frontier == {
+        "ready": 20,
+        "ready_story_points": 20.0,
+        "pm_p95_seconds": 19 * 3600.0,
+        "pm_measured": 20,
+        "waiting_median_seconds": 86400.0,
+        "waiting_p95_seconds": 86400.0,
+        "waiting": 20,
+    }
+
+
+def test_lineage_metrics_use_immutable_events_and_explicit_denominators(conn):
+    add_issue(conn, "impl-a", story_points=5)
+    add_issue(conn, "impl-b", story_points=3)
+    add_issue(conn, "impl-c")
+    add_lineage_event(conn, "qa-a", "impl-a", "sha-a", "PASSED", ts(days=2),
+                      accepted_story_points=5)
+    add_lineage_event(conn, "qa-b1", "impl-b", "sha-b", "FAILED", ts(days=4))
+    add_lineage_event(conn, "qa-b2", "impl-b", "sha-c", "PASSED", ts(days=1),
+                      accepted_story_points=3)
+    add_lineage_event(conn, "qa-c", "impl-c", "sha-d", "INCONCLUSIVE", None)
+    conn.executemany(
+        """
+        INSERT INTO run_attribution_events
+            (run_id, issue_id, provenance_state, observed_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            ("run-a", "impl-a", "observed", ts(days=2)),
+            ("run-b", "impl-b", "unknown", ts(days=1)),
+            ("run-legacy", "impl-c", "legacy_unknown", ts(days=1)),
+        ],
+    )
+    conn.commit()
+
+    lineage = flow_metrics.flow(conn, days=7, now=NOW)["lineage"]
+
+    assert lineage == {
+        "attempts": 2,
+        "rework": 1,
+        "accepted_candidates": 2,
+        "accepted_story_points": 8.0,
+        "first_pass_rate": 0.5,
+        "first_passed": 1,
+        "first_pass_denominator": 2,
+        "unwindowed": 1,
+        "unknown": 1,
+        "legacy_unknown": 1,
+    }
 
 
 # -- cycle time ---------------------------------------------------------------
