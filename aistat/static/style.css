@@ -44,6 +44,8 @@ body {
 .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
 .badge-ok { background: rgba(22, 163, 74, 0.12); color: var(--ok); }
 .badge-warn { background: rgba(217, 119, 6, 0.14); color: var(--warn); }
+/* A breached SLO row or a missing/stale lineage link. */
+tr.row-warn td { background: rgba(217, 119, 6, 0.08); }
 .logout-button {
   border: 1px solid var(--line);
   border-radius: 8px;

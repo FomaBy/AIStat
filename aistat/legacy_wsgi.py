@@ -34,6 +34,7 @@ from . import (
     flow_metrics,
     global_stats,
     handoff,
+    lineage,
     oauth,
     release_identity,
     snapshot,
@@ -1998,6 +1999,23 @@ def _api(environ, start_response, path):
                 project_ids=query.get("project") or [],
                 lanes=query.get("lane") or [],
             )
+        elif path == "/api/lineage":
+            try:
+                data = lineage.trace(conn, _first(query, "trace", ""))
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity",
+                    {"detail": str(exc)},
+                )
+        elif path == "/api/slo":
+            try:
+                days = flow_metrics.validate_days(_first(query, "days", "30"))
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity",
+                    {"detail": str(exc)},
+                )
+            data = lineage.slo(conn, days=days)
         elif path in ("/api/health", "/health"):
             data = _health(conn)
         elif path == "/api/sync":

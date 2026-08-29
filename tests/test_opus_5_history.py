@@ -36,7 +36,7 @@ def test_init_db_backfills_legacy_runs_at_exact_opus_cutoff(tmp_path):
     init_db(conn)
     first = dict(conn.execute("SELECT id, model FROM runs ORDER BY id").fetchall())
     assert first == {"new": "claude-opus-5", "old": "claude-opus-4-8"}
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 9
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 10
 
     # Reopening/migrating is idempotent and cannot rewrite stored snapshots.
     conn.execute("UPDATE agents SET model = 'claude-fable-5' WHERE id = ?", (agent_id,))
@@ -52,7 +52,7 @@ def test_real_v4_database_upgrades_to_servable_v5(tmp_path):
     build_v4_database(path)
     conn = connect(path)
     problem = schema_admission_error(conn)
-    assert problem == "unsupported schema version 4; server requires 5-9"
+    assert problem == "unsupported schema version 4; server requires 5-10"
 
     init_db(conn)
     assert schema_admission_error(conn) is None
