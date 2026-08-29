@@ -2342,6 +2342,51 @@ def test_billing_reconciliation_intake_rejects_bad_provider_and_currency(public_
     assert bad_amount.status_code == 422
 
 
+@pytest.mark.parametrize("period", [
+    " 2026-02", "2026-02 ", " 2026-02 ",
+    "\t2026-02", "2026-02\t",
+    "\r2026-02", "2026-02\r",
+    "\n2026-02", "2026-02\n",
+    "\v2026-02", "2026-02\v",
+    "\f2026-02", "2026-02\f",
+    "\u00a02026-02", "2026-02\u00a0",
+])
+def test_billing_reconciliation_rejects_raw_period_whitespace_without_writes(
+    public_app, period
+):
+    app, config = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    before = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+
+    response = _submit_billing(
+        client, csrf, provider="anthropic", period=period,
+        currency="USD", amount="100",
+    )
+
+    assert response.status_code == 422
+    after = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert after == before
+
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM billing_reconciliation WHERE user_id = ?",
+            (config.publish_tenant_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(diagnostic_emitted_at) FROM billing_reconciliation "
+            "WHERE user_id = ?",
+            (config.publish_tenant_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("amount", ["nan", "inf", "-1"])
 def test_billing_reconciliation_intake_rejects_nonfinite_or_negative_amount(
     public_app, amount

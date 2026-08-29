@@ -763,7 +763,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
         if not request_csrf_ok():
             return jsonify({"detail": "invalid CSRF token"}), 400
         provider = (request.form.get("provider") or "").strip()
-        period = (request.form.get("period") or "").strip()
+        period = request.form.get("period") or ""
         currency = (request.form.get("currency") or "").strip()
         amount = request.form.get("amount")
         try:
