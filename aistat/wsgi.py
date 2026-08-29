@@ -33,7 +33,15 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from . import __version__, aggregates, flow_metrics, handoff, oauth, pricing
+from . import (
+    __version__,
+    aggregates,
+    flow_metrics,
+    handoff,
+    oauth,
+    pricing,
+    release_identity,
+)
 from .config import Config
 from .db import connect_readonly, init_db, schema_admission_error
 from .health import snapshot
@@ -58,6 +66,9 @@ from .tenant import canonical_tenant_id
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+# The deployed cPanel package root is this module's parent's parent: the
+# built package puts ``aistat/`` and ``PACKAGE-MANIFEST.json`` as siblings.
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 # Short-lived HttpOnly cookie binding OAuth states to the browser that started
 # them; only its hash is stored server-side with each state row.
@@ -550,6 +561,15 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 "csrf": sess["csrf"] if sess else None,
             }
         )
+
+    @app.get("/api/release-identity")
+    def api_release_identity():
+        try:
+            data = release_identity.load_release_identity(PACKAGE_ROOT)
+        except release_identity.ReleaseIdentityUnavailable:
+            app.logger.error("release_identity_unavailable")
+            return jsonify({"detail": "release identity unavailable"}), 503
+        return jsonify(data)
 
     @app.get("/api/meta")
     def api_meta():
