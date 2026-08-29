@@ -100,6 +100,54 @@ def _insert_qa_lineage(conn: sqlite3.Connection, row: Dict[str, Any],
     )
 
 
+def _insert_lineage_stage(conn: sqlite3.Connection, row: Dict[str, Any],
+                          stage: str, outcome: Optional[str],
+                          reference: Optional[str], ci_status: Optional[str],
+                          initial: int, synced_at: str) -> None:
+    """Record the first observation of one post-QA lineage stage (FAN-3460).
+
+    The implementation issue is the correlation id: a DevOps or QA child names
+    it through ``qa_for_issue_id`` (mirrored from ``implementation_issue_id``),
+    while an implementation card that carries its own outcome is its own root.
+    ``INSERT OR IGNORE`` keeps the first observation immutable, so a metadata
+    rewrite later shows up as a stale link instead of rewriting history.
+    """
+    if outcome is None:
+        return
+    implementation_issue_id = _revision(row.get("qa_for_issue_id")) or row["id"]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO lineage_stage_events
+            (implementation_issue_id, stage, stage_issue_id, outcome,
+             reference, ci_status, observed_at, initial)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (implementation_issue_id, stage, row["id"], outcome, reference,
+         ci_status, synced_at, initial),
+    )
+
+
+def _insert_lineage_stages(conn: sqlite3.Connection, row: Dict[str, Any],
+                           existing: Optional[sqlite3.Row],
+                           synced_at: str) -> None:
+    """Both post-QA stages of one synced card.
+
+    A stage is an observed transition only when this sync is the one that
+    first saw the outcome on an already-known card; a card that arrives with
+    the outcome already set is a collection baseline (``initial = 1``).
+    """
+    for stage, column, reference, ci_status in (
+        ("integration", "integration_outcome",
+         _revision(row.get("integration_sha")),
+         _revision(row.get("integration_ci_status"))),
+        ("release", "release_version", None, None),
+    ):
+        outcome = _revision(row.get(column))
+        initial = 1 if existing is None or existing[column] else 0
+        _insert_lineage_stage(conn, row, stage, outcome, reference, ci_status,
+                              initial, synced_at)
+
+
 def _upsert(
     conn: sqlite3.Connection,
     table: str,
@@ -165,7 +213,8 @@ def upsert_issues(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
     count = 0
     for row in rows:
         existing = conn.execute(
-            "SELECT status, dispatch_ready, qa_verdict FROM issues WHERE id = ?",
+            "SELECT status, dispatch_ready, qa_verdict, integration_outcome, "
+            "release_version FROM issues WHERE id = ?",
             (row["id"],),
         ).fetchone()
         status = row.get("status")
@@ -185,6 +234,7 @@ def upsert_issues(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]],
             )
         _upsert(conn, "issues", ["id"], row, synced_at)
         _insert_qa_lineage(conn, row, existing, synced_at)
+        _insert_lineage_stages(conn, row, existing, synced_at)
         count += 1
     return count
 

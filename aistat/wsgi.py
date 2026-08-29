@@ -33,7 +33,7 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from . import __version__, aggregates, flow_metrics, handoff, oauth, pricing
+from . import __version__, aggregates, flow_metrics, handoff, lineage, oauth, pricing
 from .config import Config
 from .db import connect_readonly, init_db, schema_admission_error
 from .health import snapshot
@@ -727,6 +727,28 @@ def create_app(config: Optional[Config] = None) -> Flask:
                     lanes=request.args.getlist("lane"),
                 )
             )
+        finally:
+            conn.close()
+
+    @app.get("/api/lineage")
+    def api_lineage():
+        conn = data_connection()
+        try:
+            return jsonify(lineage.trace(conn, request.args.get("trace", "")))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        finally:
+            conn.close()
+
+    @app.get("/api/slo")
+    def api_slo():
+        try:
+            days = flow_metrics.validate_days(request.args.get("days", "30"))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(lineage.slo(conn, days=days))
         finally:
             conn.close()
 

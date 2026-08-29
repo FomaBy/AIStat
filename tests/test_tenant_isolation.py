@@ -50,7 +50,13 @@ DETERMINISTIC_DATA_ROUTES = (
 )
 # Flow metrics carry a wall-clock `now`/window boundary (FAN-3306), so the
 # route is checked for isolation and auth, not byte-for-byte determinism.
-NONDETERMINISTIC_DATA_ROUTES = ("/api/flow?days=30",)
+# Lineage and SLO payloads carry the same wall-clock window boundary
+# (FAN-3460) and are checked the same way.
+NONDETERMINISTIC_DATA_ROUTES = (
+    "/api/flow?days=30",
+    "/api/slo?days=30",
+    "/api/lineage?trace=FAN-1",
+)
 # Health carries a generated_at timestamp, so it is checked for sentinel/path
 # absence rather than byte-equality.
 HEALTH_ROUTES = ("/health", "/api/health")
@@ -262,6 +268,8 @@ def test_flask_route_inventory_is_fully_classified(public_app):
         "api_global_model_efficiency",
         "api_efficiency_breakdown",
         "api_flow",
+        "api_lineage",
+        "api_slo",
         "api_health",
         "api_sync",
         "api_events",

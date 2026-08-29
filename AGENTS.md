@@ -16,6 +16,7 @@ and completion transactions live in the bound
 ## Load context on demand
 
 - Usage and efficiency semantics: `docs/metrics-efficiency.md`
+- End-to-end lineage and pipeline SLOs: `docs/lineage-slo.md`
 - Per-user collection and privacy boundaries: `docs/per-user-collection.md`
 - Runtime lifecycle and supervision: `docs/runtime-supervisor.md`
 - Operator recovery: `docs/operations-runbook.md`

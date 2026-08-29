@@ -148,6 +148,38 @@ def extract_qa_verdict(metadata: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# Terminal post-QA integration outcomes recorded by the DevOps lane. Anything
+# else (in-flight notes, free-form dispositions) is treated as "no outcome
+# observed" instead of being guessed into one of these buckets.
+TERMINAL_INTEGRATION_OUTCOMES = ("INTEGRATED", "PASSED", "FAILED", "BLOCKED")
+INTEGRATION_SUCCESS_OUTCOMES = ("INTEGRATED", "PASSED")
+
+# CI conclusions as the forges report them; an unknown word is not a red CI.
+CI_STATUSES = ("success", "failure", "cancelled", "timed_out", "neutral",
+               "skipped", "stale", "action_required")
+
+
+def extract_integration_outcome(metadata: Dict[str, Any]) -> Optional[str]:
+    """Terminal integration outcome of a card, normalized to upper case."""
+    outcome = _meta_str(metadata, "integration_outcome", "integration_result")
+    if outcome is None:
+        return None
+    outcome = outcome.upper()
+    return outcome if outcome in TERMINAL_INTEGRATION_OUTCOMES else None
+
+
+def extract_ci_status(metadata: Dict[str, Any]) -> Optional[str]:
+    """Observed CI conclusion for the integration of a candidate."""
+    status = _meta_str(
+        metadata, "integration_ci_status", "external_ci_status", "ci_status",
+        "ci_conclusion",
+    )
+    if status is None:
+        return None
+    status = status.lower()
+    return status if status in CI_STATUSES else None
+
+
 def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
     metadata = obj.get("metadata") or {}
     return {
@@ -196,6 +228,27 @@ def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
         "governance_bundle_revision": _meta_str(
             metadata, "governance_bundle_revision"
         ),
+        # Post-QA lineage links (FAN-3460). Each key list is the observed
+        # pipeline vocabulary in precedence order (most specific first); the
+        # first non-empty value wins and nothing is derived when all are
+        # absent, so a missing link stays missing.
+        "candidate_sha": _meta_str(
+            metadata, "candidate_sha", "dispatch_candidate_sha",
+        ),
+        "qa_issue_id": _meta_str(metadata, "qa_issue_id"),
+        "integration_required": (
+            1 if _is_true(metadata.get("post_qa_integration_required")) else 0
+        ),
+        "integration_issue_id": _meta_str(
+            metadata, "integration_issue_id", "post_qa_devops_issue_id",
+        ),
+        "integration_outcome": extract_integration_outcome(metadata),
+        "integration_sha": _meta_str(
+            metadata, "integration_result_sha", "integration_sha",
+            "integrated_target_sha", "final_integrated_candidate_sha",
+        ),
+        "integration_ci_status": extract_ci_status(metadata),
+        "release_version": _meta_str(metadata, "release_version"),
         "created_at": obj.get("created_at"),
         "updated_at": _require(obj, "updated_at", "issue"),
     }

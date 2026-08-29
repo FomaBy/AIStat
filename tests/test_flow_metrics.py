@@ -618,8 +618,8 @@ def test_v7_to_v8_migration_keeps_raw_runs_and_marks_legacy_unknown(tmp_path):
 
     init_db(conn)
 
-    assert SCHEMA_VERSION == 9
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert SCHEMA_VERSION == 10
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
     assert [tuple(row) for row in conn.execute("SELECT * FROM runs")] == before
     attribution = conn.execute(
         "SELECT run_id, provenance_state, model_revision, prompt_revision "

@@ -1296,6 +1296,112 @@ function renderFlow(data) {
   $("flow-coverage").textContent = coverage.join(" · ");
 }
 
+// Pipeline SLOs (FAN-3460): window, numerator/denominator, threshold, owner and
+// error budget per objective, plus the dedupe-ready breach events and the
+// on-demand end-to-end trace drill-down.
+function renderSlo(data) {
+  const panel = $("slo-panel");
+  if (!data) {
+    // Older deployment without the endpoint — hide instead of faking a state.
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const tbody = $("table-slo").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const slo of data.slos) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="wrap">${esc(slo.id)}<div class="card-sub">${esc(slo.sli)}</div></td>
+      <td>${esc(slo.owner)}</td>
+      <td>${slo.threshold_seconds == null ? "—" : fmtDuration(slo.threshold_seconds)}</td>
+      <td class="num">${fmtShare(slo.objective)}</td>
+      <td class="num">${slo.measured ? fmtShare(slo.ratio) : t("sloUnmeasured")}</td>
+      <td class="num">${slo.numerator} / ${slo.denominator}</td>
+      <td class="num">${slo.budget_remaining == null ? "—" : fmtShare(slo.budget_remaining)}</td>`;
+    if (slo.breached) tr.className = "row-warn";
+    tbody.appendChild(tr);
+  }
+
+  const alerts = $("slo-alerts");
+  alerts.innerHTML = "";
+  if (!data.alerts.length) {
+    const li = document.createElement("li");
+    li.textContent = t("sloNoAlerts");
+    alerts.appendChild(li);
+  }
+  for (const alert of data.alerts) {
+    const li = document.createElement("li");
+    const subjects = alert.subjects
+      .map((s) => [s.identifier || s.issue_id, s.candidate || s.integration_sha,
+                   s.run_id].filter(Boolean).join(" "))
+      .filter(Boolean);
+    li.innerHTML = esc(t("sloAlertLine", {
+      severity: alert.severity, slo: alert.slo, owner: alert.owner,
+      key: alert.dedupe_key,
+    })) + (subjects.length
+      ? `<div class="card-sub">${esc(subjects.join(" · "))}` +
+        `${alert.subjects_truncated ? " …" : ""}</div>`
+      : "");
+    alerts.appendChild(li);
+  }
+}
+
+// A trace is looked up on demand: one correlation id, one chain, exact ids.
+function lineageLinks(stage) {
+  const parts = [];
+  const push = (label, value) => { if (value) parts.push(label + " " + value); };
+  push("issue", stage.identifier || stage.issue_id);
+  if (stage.run_ids) parts.push(stage.run_ids.join(" "));
+  push("candidate", stage.candidate_sha);
+  if (stage.reviewed_candidates && stage.reviewed_candidates.length) {
+    parts.push("QA " + stage.reviewed_candidates.join(" "));
+  }
+  if (stage.attempts) {
+    for (const attempt of stage.attempts) {
+      parts.push([attempt.identifier || attempt.qa_issue_id, attempt.verdict,
+                  attempt.candidate].filter(Boolean).join(" "));
+    }
+  }
+  push("expected QA", stage.expected_qa_issue_id);
+  push("integration", stage.integration_sha);
+  push("metadata", stage.mirrored_integration_sha);
+  push("CI", stage.ci_status);
+  push("release", stage.release_version);
+  push("metadata", stage.mirrored_release_version);
+  return parts.join(" · ");
+}
+
+async function renderLineage() {
+  const tbody = $("table-lineage").querySelector("tbody");
+  const summary = $("lineage-summary");
+  const trace = $("lineage-trace").value.trim();
+  tbody.innerHTML = "";
+  summary.textContent = "";
+  if (!trace) return;
+  const data = await fetchJSON("/api/lineage?trace=" + encodeURIComponent(trace))
+    .catch(() => null);
+  if (!data || !data.found) {
+    summary.textContent = t("lineageNotFound");
+    return;
+  }
+  for (const stage of data.stages) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(stage.stage)}</td>
+      <td>${esc(stage.status)}</td>
+      <td class="wrap">${esc(lineageLinks(stage))}</td>`;
+    if (stage.status === "missing" || stage.status === "stale") {
+      tr.className = "row-warn";
+    }
+    tbody.appendChild(tr);
+  }
+  summary.textContent = data.complete
+    ? t("lineageComplete", { id: data.identifier || data.correlation_id })
+    : t("lineageGaps", { id: data.identifier || data.correlation_id,
+                         gaps: data.gaps.join(", ") });
+}
+
 // Cost per routing lane plus where its rates came from. The lane table always
 // renders (it rides on the efficiency payload); rate provenance is optional, so
 // an older host that lacks /api/pricing degrades to a note instead of a blank.
@@ -1466,7 +1572,7 @@ async function refreshAll() {
   const chart = fetchJSON("/api/chart" + query({
     dimension: state.chartDimension, measure: state.chartMeasure,
   })).catch(() => null);
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels, flowData, pricing] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels, flowData, pricing, sloData] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
@@ -1479,6 +1585,7 @@ async function refreshAll() {
     fetchJSON("/api/global-model-efficiency").catch(() => null),
     fetchJSON("/api/flow" + flowQuery()).catch(() => null),
     fetchJSON("/api/pricing").catch(() => null),
+    fetchJSON("/api/slo?days=" + state.flowDays).catch(() => null),
   ]);
   // The ≈-note legends the token-attribution markers. Drive it from the real
   // API flags, not merely from the presence of a filter: a unique-agent
@@ -1503,6 +1610,7 @@ async function refreshAll() {
   renderModelEfficiency(modelEfficiency);
   renderGlobalModelEfficiency(globalModels);
   renderFlow(flowData);
+  renderSlo(sloData);
   renderCostProvenance(modelEfficiency, pricing);
   renderEfficiencyBreakdown(efficiencyBreakdown);
   if (chartData) renderConfigurableChart(chartData);
@@ -1874,6 +1982,12 @@ async function boot() {
   $("flow-lane").addEventListener("change", (e) => {
     state.flowLane = e.target.value;
     refreshAll().catch(console.error);
+  });
+  $("lineage-lookup").addEventListener("click", () => {
+    renderLineage().catch(console.error);
+  });
+  $("lineage-trace").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") renderLineage().catch(console.error);
   });
   $("filter-reset").addEventListener("click", resetFilters);
   await refreshAll();
