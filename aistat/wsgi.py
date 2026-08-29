@@ -38,6 +38,7 @@ from . import (
     aggregates,
     flow_metrics,
     handoff,
+    lineage,
     oauth,
     pricing,
     release_identity,
@@ -747,6 +748,28 @@ def create_app(config: Optional[Config] = None) -> Flask:
                     lanes=request.args.getlist("lane"),
                 )
             )
+        finally:
+            conn.close()
+
+    @app.get("/api/lineage")
+    def api_lineage():
+        conn = data_connection()
+        try:
+            return jsonify(lineage.trace(conn, request.args.get("trace", "")))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        finally:
+            conn.close()
+
+    @app.get("/api/slo")
+    def api_slo():
+        try:
+            days = flow_metrics.validate_days(request.args.get("days", "30"))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(lineage.slo(conn, days=days))
         finally:
             conn.close()
 

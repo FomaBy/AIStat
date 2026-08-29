@@ -1449,6 +1449,43 @@ def test_flow_metrics_panel_renders_truthful_empty_state(dashboard):
     assert windows == ["7", "30", "90"]
 
 
+def test_slo_panel_and_lineage_drilldown_render(dashboard):
+    """FAN-3460: the SLO table states owner/objective/denominator for every
+    objective, and the trace lookup resolves one correlation id to its exact
+    stage chain in the browser."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('!document.getElementById("slo-panel").hidden')
+    rows = cdp.eval(
+        '[...document.querySelectorAll("#table-slo tbody tr")]'
+        '.map((tr) => [tr.cells[0].firstChild.textContent,'
+        ' ...[...tr.cells].slice(1).map((td) => td.textContent.trim())])')
+    assert [row[0] for row in rows] == [
+        "pm_readiness_latency", "dispatch_latency",
+        "production_data_freshness", "ci_green", "release_gate",
+    ]
+    assert [row[1] for row in rows] == ["pm", "dispatcher", "ops", "devops",
+                                        "devops"]
+    # No collected history yet: an unmeasured objective says so instead of 0 %.
+    assert rows[0][4] in ("не измерено", "not measured")
+    assert cdp.eval('document.getElementById("slo-alerts").children.length') >= 1
+
+    cdp.eval('document.getElementById("lineage-trace").value = "I1"')
+    cdp.eval('document.getElementById("lineage-lookup").click()')
+    cdp.wait_for('document.querySelectorAll("#table-lineage tbody tr").length === 6')
+    stages = cdp.eval(
+        '[...document.querySelectorAll("#table-lineage tbody tr")]'
+        '.map((tr) => [tr.cells[0].textContent, tr.cells[1].textContent])')
+    assert [stage for stage, _ in stages] == [
+        "issue", "run", "candidate", "qa", "integration", "release",
+    ]
+    assert dict(stages)["qa"] == "observed"
+    assert cdp.eval(
+        'document.getElementById("lineage-summary").textContent'
+    ).startswith("T-1")  # the fixture identifier of issue I1
+
+
 def _pricing_stub(payload=None):
     """Serve /api/pricing from the test instead of the host, so the empty and
     degraded provenance states are observable in a real browser."""

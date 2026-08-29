@@ -302,6 +302,44 @@
       <p class="note" data-i18n="flowNote">Метрики считаются только по наблюдаемым событиям. До включения provenance старые запуски остаются неизвестными, без догадок. Простой флота — по всему воркспейсу; фильтр проектов на него не влияет.</p>
     </section>
 
+    <section id="slo-panel" class="panel panel-wide" hidden>
+      <h2 data-i18n="sloTitle">SLO конвейера и сквозной след</h2>
+      <div class="table-wrap">
+        <table id="table-slo" aria-label="SLO конвейера, бюджеты ошибок и владельцы">
+          <thead><tr>
+            <th data-i18n="sloName">SLO</th>
+            <th data-i18n="sloOwner">Владелец</th>
+            <th data-i18n="sloThreshold">Порог</th>
+            <th class="num" data-i18n="sloObjective">Цель</th>
+            <th class="num" data-i18n="sloActual">Факт</th>
+            <th class="num" data-i18n="sloMeasured">Числитель / знаменатель</th>
+            <th class="num" data-i18n="sloBudget">Бюджет ошибок</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <h3 data-i18n="sloAlerts">События нарушений</h3>
+      <ul id="slo-alerts" class="note"></ul>
+      <div class="chart-controls">
+        <label for="lineage-trace"><span data-i18n="lineageLookup">Сквозной след по correlation ID</span>
+          <input id="lineage-trace" type="text" placeholder="FAN-3460" autocomplete="off">
+        </label>
+        <button id="lineage-lookup" type="button" data-i18n="lineageShow">Показать цепочку</button>
+      </div>
+      <div class="table-wrap">
+        <table id="table-lineage" aria-label="Цепочка задача → запуски → кандидат → QA → интеграция → релиз">
+          <thead><tr>
+            <th data-i18n="lineageStage">Этап</th>
+            <th data-i18n="lineageStatus">Состояние</th>
+            <th data-i18n="lineageDetail">Ссылки</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="lineage-summary" class="note"></p>
+      <p class="note" data-i18n="sloNote">Каждый SLO показывает окно, числитель, знаменатель, порог и владельца. Отсутствующая или расходящаяся связь помечается явно (missing / stale) и не заменяется предположением.</p>
+    </section>
+
     <section id="cost-provenance-panel" class="panel panel-wide">
       <h2 data-i18n="costByLane">Стоимость по лейнам</h2>
       <p id="cost-period" class="note"></p>

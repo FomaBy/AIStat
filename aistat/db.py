@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
@@ -24,8 +24,9 @@ SCHEMA_VERSION = 9
 # v7 (FAN-3349), and v8 (FAN-3454) only add flow-metrics data, so a v5 snapshot stays
 # fully servable: every pre-existing aggregate works unchanged and the flow
 # endpoint truthfully reports "no data" instead of failing. Schema v9 adds
-# optional pricing and QA-provenance tables, which use the same neutral
-# fallbacks for older admitted snapshots. Snapshot
+# optional pricing and QA-provenance tables, and v10 (FAN-3460) adds the
+# post-QA lineage stage table and its mirrored issue columns; both use the same
+# neutral fallbacks for older admitted snapshots. Snapshot
 # admission, owner migration admission and both WSGI serving surfaces all
 # consult this single definition via :func:`schema_admission_error` so the
 # surfaces cannot drift. The public host never mutates authenticated snapshot
@@ -124,6 +125,21 @@ CREATE TABLE IF NOT EXISTS issues (
     skills_revision    TEXT,
     harness_revision   TEXT,
     governance_bundle_revision TEXT,
+    -- Post-QA lineage links (FAN-3460), mirrored from issue metadata at
+    -- ingest. candidate_sha is the card's own immutable candidate;
+    -- qa_issue_id / integration_issue_id are the forward links to the QA and
+    -- DevOps children; integration_required records that a post-QA
+    -- integration is expected, so an absent integration is reported as a
+    -- missing link rather than as "not applicable". Every field is NULL when
+    -- the card never carried the metadata — nothing is inferred.
+    candidate_sha      TEXT,
+    qa_issue_id        TEXT,
+    integration_required INTEGER NOT NULL DEFAULT 0,
+    integration_issue_id TEXT,
+    integration_outcome  TEXT,
+    integration_sha    TEXT,
+    integration_ci_status TEXT,
+    release_version    TEXT,
     created_at         TEXT,
     updated_at         TEXT,
     synced_at          TEXT NOT NULL,
@@ -329,6 +345,26 @@ CREATE TABLE IF NOT EXISTS qa_lineage_events (
 CREATE INDEX IF NOT EXISTS idx_qa_lineage_impl
     ON qa_lineage_events(implementation_issue_id);
 
+-- Post-QA lineage stages (FAN-3460): the first observed terminal integration
+-- outcome and the first observed release version of an implementation issue.
+-- Keyed by (implementation issue, stage) so a later metadata rewrite cannot
+-- restate closed history: the mirrored issue columns stay current, this table
+-- stays immutable, and /api/lineage reports a divergence between the two as a
+-- `stale` link instead of silently preferring one of them.
+CREATE TABLE IF NOT EXISTS lineage_stage_events (
+    implementation_issue_id TEXT NOT NULL,
+    stage                   TEXT NOT NULL,
+    stage_issue_id          TEXT,
+    outcome                 TEXT NOT NULL,
+    reference               TEXT,
+    ci_status               TEXT,
+    observed_at             TEXT NOT NULL,
+    initial                 INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (implementation_issue_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_stage_observed
+    ON lineage_stage_events(stage, observed_at);
+
 -- Official per-1M-token rates, loaded from pricing.json (+ optional override).
 -- Rates are NULL for an unpriced model; source_url/captured_at record where
 -- and when each rate was taken from the vendor's official pricing page.
@@ -417,6 +453,14 @@ _ADDED_COLUMNS = {
         ("skills_revision", "TEXT"),
         ("harness_revision", "TEXT"),
         ("governance_bundle_revision", "TEXT"),
+        ("candidate_sha", "TEXT"),
+        ("qa_issue_id", "TEXT"),
+        ("integration_required", "INTEGER NOT NULL DEFAULT 0"),
+        ("integration_issue_id", "TEXT"),
+        ("integration_outcome", "TEXT"),
+        ("integration_sha", "TEXT"),
+        ("integration_ci_status", "TEXT"),
+        ("release_version", "TEXT"),
     ],
     "runs": [
         ("model", "TEXT"),
