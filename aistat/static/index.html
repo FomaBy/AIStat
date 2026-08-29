@@ -76,6 +76,7 @@
     <div class="card"><div class="card-label">Story Points</div><div class="card-value" id="card-sp">—</div><div class="card-sub" id="card-sp-sub"></div></div>
     <div class="card"><div class="card-label">Эффективность токенов</div><div class="card-value" id="card-eff">—</div><div class="card-sub">токенов на 1 SP · меньше — лучше</div></div>
     <div class="card"><div class="card-label">Эффективность стоимости</div><div class="card-value" id="card-cost-eff">—</div><div class="card-sub">USD на 1 SP · меньше — лучше</div></div>
+    <div class="card"><div class="card-label" data-i18n="qualityAdjustedCost">Качество-скорректированная стоимость</div><div class="card-value" id="card-quality-cost">—</div><div class="card-sub" id="card-quality-cost-sub"></div></div>
     <div class="card"><div class="card-label">Взвешенная эффективность</div><div class="card-value" id="card-weighted-eff">—</div><div class="card-sub">USD/час на 1 SP · меньше — лучше</div></div>
     <div class="card"><div class="card-label">Агентов</div><div class="card-value" id="card-agent-count">—</div><div class="card-sub">выполняли работу за период</div></div>
     <div class="card"><div class="card-label">Время работы агентов</div><div class="card-value" id="card-agent-time">—</div><div class="card-sub" id="card-agent-time-sub">суммарно по всем агентам</div></div>
@@ -299,6 +300,47 @@
       </div>
       <p id="flow-coverage" class="note"></p>
       <p class="note" data-i18n="flowNote">Метрики считаются только по наблюдаемым событиям. До включения provenance старые запуски остаются неизвестными, без догадок. Простой флота — по всему воркспейсу; фильтр проектов на него не влияет.</p>
+    </section>
+
+    <section id="cost-provenance-panel" class="panel panel-wide">
+      <h2 data-i18n="costByLane">Стоимость по лейнам</h2>
+      <p id="cost-period" class="note"></p>
+      <div class="table-wrap">
+        <table id="table-lane-cost" aria-label="Стоимость по лейнам и принятым story points">
+          <thead><tr>
+            <th data-i18n="flowLane">Лейн</th>
+            <th class="num" data-i18n="issues">Задачи</th>
+            <th class="num">SP</th>
+            <th class="num" data-i18n="acceptedSp">Принятые SP</th>
+            <th class="num" data-i18n="estimatedCost">Стоимость ≈</th>
+            <th class="num" data-i18n="costPerSpHeader">Стоимость / SP ≈</th>
+            <th class="num" data-i18n="qualityAdjustedHeader">Качество-скорр. / SP ≈</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note" data-i18n="laneCostNote">Разрез по лейну маршрутизации среди задач со story points, загруженной статистикой и запусками. Знаменатель качества — только принятые QA story points; числитель — полная стоимость задачи со всеми попытками и доработками. Лейн с неоценённой моделью помечен * и не показывает частичную сумму как стоимость.</p>
+    </section>
+
+    <section id="rate-provenance-panel" class="panel panel-wide">
+      <h2 data-i18n="rateProvenance">Происхождение тарифов</h2>
+      <div id="rate-provenance-block">
+        <div class="table-wrap">
+          <table id="table-rate-provenance" aria-label="Опубликованные ревизии тарифов">
+            <thead><tr>
+              <th data-i18n="model">Модель</th>
+              <th data-i18n="rateEffectiveFrom">Действует с</th>
+              <th class="num" data-i18n="rateInput">Ввод / 1M</th>
+              <th class="num" data-i18n="rateOutput">Вывод / 1M</th>
+              <th data-i18n="rateSource">Источник</th>
+              <th data-i18n="rateCapturedAt">Зафиксировано</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="pricing-coverage" class="note"></p>
+      </div>
+      <p id="pricing-degraded" class="note" hidden data-i18n="pricingUnavailable">Происхождение тарифов недоступно на этом хосте; стоимость по лейнам показана без него.</p>
     </section>
   </main>
 
