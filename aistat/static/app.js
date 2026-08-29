@@ -1296,6 +1296,69 @@ function renderFlow(data) {
   $("flow-coverage").textContent = coverage.join(" · ");
 }
 
+// Cost per routing lane plus where its rates came from. The lane table always
+// renders (it rides on the efficiency payload); rate provenance is optional, so
+// an older host that lacks /api/pricing degrades to a note instead of a blank.
+function renderCostProvenance(efficiency, pricing) {
+  const lanes = (efficiency && efficiency.lanes) || [];
+  const period = (efficiency && efficiency.period) || {};
+  $("cost-period").textContent = period.from || period.to
+    ? t("costPeriod", { from: period.from || "…", to: period.to || "…" })
+    : t("costPeriodAllTime");
+
+  const laneBody = $("table-lane-cost").querySelector("tbody");
+  laneBody.innerHTML = "";
+  for (const row of lanes) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(row.lane)}${row.has_unpriced ? " *" : ""}</td>
+      <td class="num">${fmtNum(row.issues)}</td>
+      <td class="num">${fmtNum(row.story_points)}</td>
+      <td class="num">${fmtNum(row.accepted_story_points)}</td>
+      <td class="num">${fmtUSD(row.cost_usd)}</td>
+      <td class="num">${fmtUSDFine(row.cost_per_sp)}</td>
+      <td class="num">${fmtUSDFine(row.quality_adjusted_cost_per_sp)}</td>`;
+    laneBody.appendChild(tr);
+  }
+  if (!lanes.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="7" class="note">${t("noData")}</td>`;
+    laneBody.appendChild(tr);
+  }
+
+  $("rate-provenance-block").hidden = !pricing;
+  $("pricing-degraded").hidden = Boolean(pricing);
+  if (!pricing) return;
+
+  const rates = pricing.rates || [];
+  const rateBody = $("table-rate-provenance").querySelector("tbody");
+  rateBody.innerHTML = "";
+  for (const rate of rates) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(rate.model)}${rate.unpriced ? " *" : ""}</td>
+      <td>${esc(rate.effective_from || "—")}</td>
+      <td class="num">${fmtUSDFine(rate.input_rate)}</td>
+      <td class="num">${fmtUSDFine(rate.output_rate)}</td>
+      <td class="wrap">${esc(rate.source_url || "—")}</td>
+      <td>${esc(rate.captured_at || "—")}</td>`;
+    rateBody.appendChild(tr);
+  }
+  if (!rates.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="6" class="note">${t("noPublishedRates")}</td>`;
+    rateBody.appendChild(tr);
+  }
+
+  const coverage = pricing.coverage || {};
+  $("pricing-coverage").textContent = coverage.rows
+    ? t("pricingCoverage", {
+        priced: fmtNum(coverage.priced_rows), rows: fmtNum(coverage.rows),
+        unpriced: fmtNum(coverage.unpriced_rows),
+      })
+    : t("pricingCoverageEmpty");
+}
+
 function renderEfficiencyBreakdown(data) {
   const agents = (data && data.agents) || [];
   const models = (data && data.models) || [];
@@ -1368,6 +1431,12 @@ function renderSummary(s) {
   const effStar = s.efficiency_has_unpriced ? " *" : "";
   $("card-cost-eff").textContent =
     s.cost_per_sp == null ? "—" : "≈ " + fmtUSDFine(s.cost_per_sp) + effStar;
+  // Quality-adjusted cost divides the whole (all-attempt) cost by terminally
+  // accepted SP only, so it stays "—" until QA acceptance is observed.
+  $("card-quality-cost").textContent =
+    s.quality_adjusted_cost_per_sp == null
+      ? "—" : "≈ " + fmtUSDFine(s.quality_adjusted_cost_per_sp) + effStar;
+  $("card-quality-cost-sub").textContent = t("qualityAdjustedSub");
   $("card-weighted-eff").textContent =
     s.weighted_efficiency == null ? "—" : "≈ " + fmtUSDFine(s.weighted_efficiency) + effStar;
   // Agent participation and total agent-time — any eligible run over the
@@ -1397,7 +1466,7 @@ async function refreshAll() {
   const chart = fetchJSON("/api/chart" + query({
     dimension: state.chartDimension, measure: state.chartMeasure,
   })).catch(() => null);
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels, flowData] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels, flowData, pricing] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
@@ -1409,6 +1478,7 @@ async function refreshAll() {
     chart,
     fetchJSON("/api/global-model-efficiency").catch(() => null),
     fetchJSON("/api/flow" + flowQuery()).catch(() => null),
+    fetchJSON("/api/pricing").catch(() => null),
   ]);
   // The ≈-note legends the token-attribution markers. Drive it from the real
   // API flags, not merely from the presence of a filter: a unique-agent
@@ -1433,6 +1503,7 @@ async function refreshAll() {
   renderModelEfficiency(modelEfficiency);
   renderGlobalModelEfficiency(globalModels);
   renderFlow(flowData);
+  renderCostProvenance(modelEfficiency, pricing);
   renderEfficiencyBreakdown(efficiencyBreakdown);
   if (chartData) renderConfigurableChart(chartData);
   else renderConfigurableChartError();

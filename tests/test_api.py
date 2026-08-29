@@ -211,6 +211,31 @@ def test_pricing_api_exposes_rate_provenance_and_coverage(api):
     assert data["coverage"] == {"rows": 4, "priced_rows": 3, "unpriced_rows": 1}
 
 
+def test_model_efficiency_exposes_cost_by_lane_and_period(api):
+    """AC5: cost by lane and accepted SP, alongside the period it covers."""
+    client, conn = api
+    conn.execute("UPDATE issues SET dispatch_lane = 'dev_medium' WHERE id = 'I1'")
+    conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    conn.commit()
+
+    data = client.get("/api/model-efficiency").json()
+    assert data["period"] == {"from": None, "to": None}
+    assert [row["lane"] for row in data["lanes"]] == ["dev_medium"]
+    lane = data["lanes"][0]
+    assert lane["cost_usd"] == pytest.approx(0.0025)
+    assert lane["accepted_story_points"] == 3.0
+    assert lane["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+    assert lane["has_unpriced"] is False
+
+    windowed = client.get("/api/model-efficiency", params={
+        "from": "2026-01-01T00:00Z", "to": "2026-01-02T00:00Z"}).json()
+    assert windowed["period"] == {"from": "2026-01-01", "to": "2026-01-01"}
+
+
 @pytest.mark.parametrize("schema_version", [5, 6, 7, 8])
 def test_legacy_snapshot_without_new_cost_tables_keeps_api_neutral(api, schema_version):
     """v5-v8 snapshots predate these optional v9 tables but remain servable."""
@@ -231,6 +256,20 @@ def test_legacy_snapshot_without_new_cost_tables_keeps_api_neutral(api, schema_v
     assert client.get("/api/billing-reconciliation").json() == {
         "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0},
     }
+    lanes = client.get("/api/model-efficiency").json()["lanes"]
+    assert [row["lane"] for row in lanes] == ["unknown"]
+    assert lanes[0]["quality_adjusted_cost_per_sp"] is None
+
+
+def test_pre_routing_snapshot_still_serves_cost_by_lane(api):
+    """A snapshot older than dispatch_lane degrades instead of failing."""
+    client, conn = api
+    conn.execute("ALTER TABLE issues DROP COLUMN dispatch_lane")
+    conn.commit()
+    response = client.get("/api/model-efficiency")
+    assert response.status_code == 200
+    assert [row["lane"] for row in response.json()["lanes"]] == ["unknown"]
+    assert client.get("/api/summary").status_code == 200
 
 
 def test_hour_and_dimension_filters_are_validated_and_applied(api):
