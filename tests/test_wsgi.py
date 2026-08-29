@@ -2495,7 +2495,11 @@ def test_billing_reconciliation_is_purged_with_tenant(public_app):
 
 
 @pytest.mark.parametrize(
-    "period", ["2026-00", "2026-13", "2026-99", "0000-01", "2026-1"]
+    "period", [
+        "2026-00", "2026-13", "2026-99", "0000-01", "2026-1",
+        "２０２６-01",  # full-width Unicode digits
+        "٢٠٢٦-01",  # Arabic-Indic digits
+    ]
 )
 def test_billing_reconciliation_rejects_invalid_calendar_period(public_app, period):
     app, _ = public_app
@@ -2504,6 +2508,30 @@ def test_billing_reconciliation_rejects_invalid_calendar_period(public_app, peri
     response = _submit_billing(
         client, csrf, provider="anthropic", period=period,
         currency="USD", amount="100",
+    )
+    assert response.status_code == 422
+    assert client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()["rows"] == []
+
+
+@pytest.mark.parametrize(
+    "amount", [
+        "1_000", "1_000.5",  # underscores
+        "１０",  # full-width Unicode digits
+        "٥",  # Arabic-Indic digit
+        " 100", "100 ",  # surrounding whitespace
+        "+100", "1e5",  # sign / exponent notation
+        "", "Infinity", "NaN",
+    ]
+)
+def test_billing_reconciliation_rejects_non_canonical_amount(public_app, amount):
+    app, _ = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    response = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount=amount,
     )
     assert response.status_code == 422
     assert client.get(

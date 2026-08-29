@@ -447,7 +447,8 @@ def unpriced_models_in_usage(conn: sqlite3.Connection,
 
 
 _BILLING_PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_BILLING_PERIOD = re.compile(r"^(?!0000-)\d{4}-(?:0[1-9]|1[0-2])$")
+_BILLING_PERIOD = re.compile(r"^(?!0000-)[0-9]{4}-(?:0[1-9]|1[0-2])$")
+_BILLING_AMOUNT = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _BILLING_CURRENCY = "USD"
 
 
@@ -458,6 +459,18 @@ def validate_billing_reconciliation(
         raise PricingError("provider and period must use canonical identifiers")
     if currency != _BILLING_CURRENCY:
         raise PricingError("currency must be USD; no conversion is performed")
+
+
+def parse_billing_amount(raw: Optional[str]) -> float:
+    """Parse a canonical unsigned ASCII decimal amount, e.g. ``"12.50"``.
+
+    Rejects anything ``float()`` would otherwise accept but that isn't
+    canonical decimal syntax: underscores, Unicode digits, surrounding
+    whitespace, signs, exponents, and non-finite spellings like ``"inf"``.
+    """
+    if raw is None or not _BILLING_AMOUNT.fullmatch(raw):
+        raise PricingError("amount must be an unsigned ASCII decimal number")
+    return float(raw)
 
 
 def calculated_cost_for_period(conn: sqlite3.Connection, provider: str,

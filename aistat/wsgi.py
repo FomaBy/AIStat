@@ -767,9 +767,9 @@ def create_app(config: Optional[Config] = None) -> Flask:
         currency = (request.form.get("currency") or "").strip()
         amount = request.form.get("amount")
         try:
-            actual_usd = float(amount)
-        except (TypeError, ValueError):
-            return jsonify({"detail": "amount must be a number"}), 422
+            actual_usd = pricing.parse_billing_amount(amount)
+        except pricing.PricingError:
+            return jsonify({"detail": "amount must be an unsigned ASCII decimal number"}), 422
         try:
             pricing.validate_billing_reconciliation(provider, period, currency)
         except pricing.PricingError as exc:
