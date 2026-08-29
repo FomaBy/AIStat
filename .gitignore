@@ -13,10 +13,15 @@ dist/
 *.zip
 
 # Multica runtime artifacts (generated per agent run, not part of the app)
-CLAUDE.md
+# /CLAUDE.md and the Graphify skill below are the tracked exception: reviewed,
+# static agent-instruction files, not per-run generated content.
 .multica/
 .agent_context/
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/graphify/
 # Agent scratch files for issue/comment bodies (see AGENTS.md / CLAUDE.md)
 description.md
 reply.md
@@ -25,6 +30,9 @@ reply.md
 adminpanel.txt
 # Deploy-host SSL certificate bundle (host-specific, never publish)
 aistat_app/
+
+# Graphify generated knowledge graph (rebuildable locally, not source)
+graphify-out/
 
 # Editor / OS
 .DS_Store
