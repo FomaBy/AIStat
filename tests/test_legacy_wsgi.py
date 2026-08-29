@@ -118,7 +118,10 @@ def legacy_open(tmp_path, monkeypatch):
     return _boot_legacy(tmp_path)
 
 
-def request(app, path, method="GET", body=b"", headers=None, cookie=None, secure=True):
+def request(
+    app, path, method="GET", body=b"", headers=None, cookie=None, secure=True,
+    errors=None,
+):
     query = ""
     if "?" in path:
         path, query = path.split("?", 1)
@@ -135,6 +138,7 @@ def request(app, path, method="GET", body=b"", headers=None, cookie=None, secure
             "REMOTE_ADDR": "127.0.0.1",
             "wsgi.input": io.BytesIO(body),
             "CONTENT_LENGTH": str(len(body)),
+            "wsgi.errors": errors if errors is not None else io.StringIO(),
         }
     )
     if cookie:
@@ -695,8 +699,18 @@ def test_release_identity_endpoint_requires_login(legacy, tmp_path):
     root = os.path.join(str(tmp_path), "package")
     _write_release_manifest(root)
     legacy.PACKAGE_ROOT = root
-    status, _, _ = request(legacy.application, "/api/release-identity")
+    status, headers, body = request(legacy.application, "/api/release-identity")
     assert status == "401 Unauthorized"
+    assert header_values(headers, "Cache-Control") == ["no-store"]
+    assert header_values(headers, "Vary") == ["Cookie"]
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "authentication required"
+    }
+    denial = body.decode("utf-8")
+    assert str(root) not in denial
+    assert "PACKAGE-MANIFEST" not in denial
+    assert "source_commit_sha" not in denial
+    assert "Traceback" not in denial
 
 
 def test_release_identity_endpoint_returns_exact_fields_from_deployed_root(
@@ -711,6 +725,7 @@ def test_release_identity_endpoint_returns_exact_fields_from_deployed_root(
     )
     assert status == "200 OK"
     assert header_values(headers, "Cache-Control") == ["no-store"]
+    assert header_values(headers, "Vary") == ["Cookie"]
     data = json.loads(body.decode("utf-8"))
     assert set(data) == {"source_commit_sha", "source_tree_sha", "manifest_sha256"}
     assert data["source_commit_sha"] == "a" * 40
@@ -721,13 +736,18 @@ def test_release_identity_endpoint_returns_exact_fields_from_deployed_root(
 def test_release_identity_endpoint_missing_manifest_is_generic_503(legacy, tmp_path):
     legacy.PACKAGE_ROOT = os.path.join(str(tmp_path), "package")
     cookies = login(legacy)
-    status, _, body = request(
-        legacy.application, "/api/release-identity", cookie=cookies
+    errors = io.StringIO()
+    status, headers, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies, errors=errors
     )
     assert status == "503 Service Unavailable"
+    assert header_values(headers, "Cache-Control") == ["no-store"]
+    assert header_values(headers, "Vary") == ["Cookie"]
     assert json.loads(body.decode("utf-8")) == {
         "detail": "release identity unavailable"
     }
+    assert errors.getvalue() == "release_identity_unavailable\n"
+    assert str(tmp_path) not in errors.getvalue()
 
 
 def test_release_identity_endpoint_malformed_manifest_is_generic_503(

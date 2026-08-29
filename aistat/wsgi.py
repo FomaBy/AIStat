@@ -236,6 +236,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
     @app.after_request
     def security_headers(response):
         response.headers["Cache-Control"] = "no-store"
+        response.headers["Vary"] = "Cookie"
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; "
             "script-src 'self'; "

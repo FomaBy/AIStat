@@ -908,6 +908,7 @@ class _LegacyOAuthStore(object):
 def _secure_headers(environ):
     headers = [
         ("Cache-Control", "no-store"),
+        ("Vary", "Cookie"),
         (
             "Content-Security-Policy",
             "default-src 'none'; script-src 'self'; "

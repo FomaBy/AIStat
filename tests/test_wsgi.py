@@ -873,6 +873,14 @@ def test_release_identity_requires_login(public_app, tmp_path, monkeypatch):
     client = app.test_client()
     response = client.get("/api/release-identity")
     assert response.status_code == 401
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Vary"] == "Cookie"
+    assert response.get_json() == {"detail": "authentication required"}
+    denial = response.get_data(as_text=True)
+    assert str(root) not in denial
+    assert "PACKAGE-MANIFEST" not in denial
+    assert "source_commit_sha" not in denial
+    assert "Traceback" not in denial
 
 
 def test_release_identity_returns_exact_fields_from_deployed_root(
@@ -887,6 +895,7 @@ def test_release_identity_returns_exact_fields_from_deployed_root(
     response = client.get("/api/release-identity", base_url="https://localhost")
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Vary"] == "Cookie"
     data = response.get_json()
     assert set(data) == {"source_commit_sha", "source_tree_sha", "manifest_sha256"}
     assert data["source_commit_sha"] == "a" * 40
@@ -895,7 +904,7 @@ def test_release_identity_returns_exact_fields_from_deployed_root(
 
 
 def test_release_identity_missing_manifest_is_generic_503(
-    public_app, tmp_path, monkeypatch
+    public_app, tmp_path, monkeypatch, caplog
 ):
     app, _ = public_app
     monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", tmp_path / "package")
@@ -903,7 +912,13 @@ def test_release_identity_missing_manifest_is_generic_503(
     login(client)
     response = client.get("/api/release-identity", base_url="https://localhost")
     assert response.status_code == 503
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Vary"] == "Cookie"
     assert response.get_json() == {"detail": "release identity unavailable"}
+    assert [record.getMessage() for record in caplog.records] == [
+        "release_identity_unavailable"
+    ]
+    assert str(tmp_path) not in caplog.text
 
 
 def test_release_identity_malformed_manifest_is_generic_503(
