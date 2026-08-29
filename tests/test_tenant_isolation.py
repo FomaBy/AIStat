@@ -250,6 +250,7 @@ def test_flask_route_inventory_is_fully_classified(public_app):
     session_scoped = {
         "logout",
             "api_session",
+            "api_release_identity",
             "api_meta",
             "api_chart_catalog",
             "api_chart",

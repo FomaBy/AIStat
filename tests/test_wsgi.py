@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -840,6 +841,115 @@ def test_installed_v4_tenant_db_returns_controlled_503(public_app, tmp_path):
     summary = client.get("/api/summary", base_url="https://localhost")
     assert summary.status_code == 200
     assert summary.get_json()["total_tokens"] == 4_700_000
+
+
+VALID_RELEASE_MANIFEST = {
+    "files": [{"path": "aistat/__init__.py", "sha256": "0" * 64,
+               "size_bytes": 1, "mode": "0644"}],
+    "format": "aistat-cpanel-package",
+    "format_version": 1,
+    "hash_algorithm": "sha256",
+    "source_commit_sha": "a" * 40,
+    "source_tree_sha": "b" * 40,
+}
+
+
+def _write_release_manifest(root: Path, payload=None, raw=None) -> bytes:
+    root.mkdir(parents=True, exist_ok=True)
+    if raw is None:
+        raw = json.dumps(
+            payload if payload is not None else VALID_RELEASE_MANIFEST,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    (root / "PACKAGE-MANIFEST.json").write_bytes(raw)
+    return raw
+
+
+def test_release_identity_requires_login(public_app, tmp_path, monkeypatch):
+    app, _ = public_app
+    root = tmp_path / "package"
+    _write_release_manifest(root)
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    response = client.get("/api/release-identity")
+    assert response.status_code == 401
+
+
+def test_release_identity_returns_exact_fields_from_deployed_root(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    raw = _write_release_manifest(root)
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    data = response.get_json()
+    assert set(data) == {"source_commit_sha", "source_tree_sha", "manifest_sha256"}
+    assert data["source_commit_sha"] == "a" * 40
+    assert data["source_tree_sha"] == "b" * 40
+    assert data["manifest_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_release_identity_missing_manifest_is_generic_503(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", tmp_path / "package")
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
+
+
+def test_release_identity_malformed_manifest_is_generic_503(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    _write_release_manifest(root, raw=b"not json")
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
+
+
+def test_release_identity_bad_format_version_is_generic_503(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    bad = dict(VALID_RELEASE_MANIFEST, format_version=2)
+    _write_release_manifest(root, payload=bad)
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
+
+
+def test_release_identity_rejects_symlinked_manifest(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    _write_release_manifest(outside)
+    (root / "PACKAGE-MANIFEST.json").symlink_to(outside / "PACKAGE-MANIFEST.json")
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
 
 
 def test_model_efficiency_endpoint_behind_auth(public_app):
