@@ -29,6 +29,9 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+# One spelling of the "no routing class recorded" lane across cost and flow.
+from .flow_metrics import UNKNOWN_LANE
+
 TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
 # The configurable chart is deliberately a closed contract.  These keys are
@@ -851,6 +854,12 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    # Table name is a module constant at every call site, never request input.
+    return any(row[1] == column
+               for row in conn.execute("PRAGMA table_info(%s)" % table))
+
+
 def _pricing_rate_at(conn: sqlite3.Connection, rates: Dict[str, Dict[str, Any]],
                      model: str, event_at: Optional[str]) -> Optional[Dict[str, Any]]:
     """Rate published for a run's UTC day, with current pricing as fallback."""
@@ -1371,6 +1380,12 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     the counted issues (story points and tokens split by run duration, cost by
     the model's official rate), sorted cheapest cost-per-SP first so it is
     obvious which model delivers a story point for less.
+
+    The per-lane rows group the same cost-attributable issues by their
+    ``dispatch_lane`` (routing class), so cost and quality-adjusted cost can be
+    compared per lane the way they already are per model. A snapshot older than
+    the routing columns reports every issue under ``unknown`` rather than
+    failing (FAN-3543). ``period`` echoes the resolved window the numbers cover.
     """
     filters = _coerce_filters(project_id=project_id, filters=filters)
     needs_run_filter, selection = _run_filter_selection(conn, filters)
@@ -1389,9 +1404,14 @@ def efficiency_breakdown(conn: sqlite3.Connection,
              "AND i.story_points > 0")
     params: List[Any] = []
     where += _where_values("i.project_id", filters["projects"], params)
+    # A pre-routing snapshot has no dispatch_lane column; every issue then
+    # reports the same "unknown" lane the flow endpoint already uses.
+    lane_select = ("COALESCE(i.dispatch_lane, '{0}')".format(UNKNOWN_LANE)
+                   if _has_column(conn, "issues", "dispatch_lane")
+                   else "'{0}'".format(UNKNOWN_LANE))
     rows = conn.execute(
         f"""
-        SELECT i.id, i.story_points,
+        SELECT i.id, i.story_points, {lane_select} AS lane,
                u.total_input_tokens, u.total_output_tokens,
                u.total_cache_read_tokens, u.total_cache_write_tokens
         FROM issues i JOIN issue_usage u ON u.issue_id = i.id
@@ -1413,12 +1433,19 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     accepted_cost = 0.0
     accepted_sp = 0.0
     models: Dict[str, Dict[str, Any]] = {}
+    lanes: Dict[str, Dict[str, Any]] = {}
 
     def bucket(model: str) -> Dict[str, Any]:
         return models.setdefault(model, {
             "tokens": {k: 0.0 for k in TOKEN_KINDS},
             "story_points": 0.0, "cost_usd": 0.0, "active_hours": 0.0,
             "weighted_num": 0.0, "weighted_den": 0.0, "priced": True,
+        })
+
+    def lane_bucket(lane: str) -> Dict[str, Any]:
+        return lanes.setdefault(lane, {
+            "issues": 0, "story_points": 0.0, "cost_usd": 0.0,
+            "accepted_story_points": 0.0, "accepted_cost": 0.0, "priced": True,
         })
 
     for row in rows:
@@ -1492,12 +1519,23 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         if issue_priced and issue_hours > 0 and sp > 0:
             weighted_num += issue_cost / issue_hours
             weighted_den += sp
+        # The lane row groups the same cost-attributable issue by its routing
+        # class; a single unpriced share makes the whole lane unpriced rather
+        # than reporting a partial sum as the lane's cost.
+        lane = lane_bucket(row["lane"])
+        lane["issues"] += 1
+        lane["story_points"] += sp
+        lane["cost_usd"] += issue_cost
+        if not issue_priced:
+            lane["priced"] = False
         # A quality-adjusted denominator comes only from terminal QA
         # acceptance.  The numerator stays the whole implementation cost,
         # including failed attempts and rework represented by its runs.
         if issue_priced and row["id"] in accepted:
             accepted_cost += issue_cost
             accepted_sp += accepted[row["id"]] * factor
+            lane["accepted_cost"] += issue_cost
+            lane["accepted_story_points"] += accepted[row["id"]] * factor
 
     model_rows = []
     for model, b in models.items():
@@ -1523,6 +1561,29 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     # Cheapest cost per story point first; unpriced models sink to the bottom.
     model_rows.sort(key=lambda m: (m["cost_per_sp"] is None, m["cost_per_sp"] or 0.0))
 
+    lane_rows = []
+    for lane_name, b in sorted(lanes.items()):
+        priced = b["priced"]
+        lane_sp = b["story_points"]
+        lane_accepted = b["accepted_story_points"]
+        lane_rows.append({
+            "lane": lane_name,
+            "issues": b["issues"],
+            "story_points": lane_sp,
+            "accepted_story_points": lane_accepted,
+            "cost_usd": b["cost_usd"] if priced else None,
+            "cost_per_sp": (
+                b["cost_usd"] / lane_sp if (priced and lane_sp > 0) else None
+            ),
+            "quality_adjusted_cost_per_sp": (
+                b["accepted_cost"] / lane_accepted if lane_accepted > 0 else None
+            ),
+            "has_unpriced": not priced,
+        })
+    # Cheapest cost per story point first, exactly as the model rows sort.
+    lane_rows.sort(key=lambda r: (r["cost_per_sp"] is None, r["cost_per_sp"] or 0.0))
+
+    period_from, period_to = _filter_dates(filters)
     total_tokens = sum(tokens.values())
     return {
         "estimated": True,
@@ -1546,7 +1607,9 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         "quality_adjusted_cost_per_sp": (
             accepted_cost / accepted_sp if accepted_sp > 0 else None
         ),
+        "period": {"from": period_from, "to": period_to},
         "models": model_rows,
+        "lanes": lane_rows,
     }
 
 
