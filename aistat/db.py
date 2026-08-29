@@ -424,6 +424,11 @@ _ADDED_COLUMNS = {
     "fleet_snapshots": [
         ("pause_observed", "INTEGER NOT NULL DEFAULT 0"),
     ],
+    "billing_reconciliation": [
+        ("currency", "TEXT NOT NULL DEFAULT 'USD'"),
+        ("submitted_by", "INTEGER"),
+        ("submitted_at", "TEXT"),
+    ],
 }
 
 

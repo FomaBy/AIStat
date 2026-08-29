@@ -268,6 +268,8 @@ def test_flask_route_inventory_is_fully_classified(public_app):
         "api_connection",
         "api_connection_submit",
         "api_connection_revoke",
+        "api_billing_reconciliation",
+        "api_billing_reconciliation_submit",
         "dashboard",
         "dashboard_asset",
     }
