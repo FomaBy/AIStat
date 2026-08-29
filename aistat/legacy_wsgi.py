@@ -35,6 +35,7 @@ from . import (
     global_stats,
     handoff,
     oauth,
+    release_identity,
     snapshot,
     snapshot_recovery,
 )
@@ -46,6 +47,9 @@ from .tenant import (
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+# The deployed cPanel package root is this module's parent's parent: the
+# built package puts ``aistat/`` and ``PACKAGE-MANIFEST.json`` as siblings.
+PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 REQUIRED_TABLES = {
     "runtimes",
@@ -1877,6 +1881,18 @@ def _api(environ, start_response, path):
                 "csrf": session["csrf"],
             },
         )
+    if path == "/api/release-identity":
+        try:
+            data = release_identity.load_release_identity(PACKAGE_ROOT)
+        except release_identity.ReleaseIdentityUnavailable:
+            error_stream = environ.get("wsgi.errors")
+            if error_stream is not None:
+                error_stream.write("release_identity_unavailable\n")
+            return _json_response(
+                environ, start_response, "503 Service Unavailable",
+                {"detail": "release identity unavailable"},
+            )
+        return _json_response(environ, start_response, "200 OK", data)
     if path == "/api/global-model-efficiency":
         # Anonymized sums across every tenant (FAN-2392): no filters, no
         # per-tenant breakdown, only cost-relevant fields. Cohorts under the

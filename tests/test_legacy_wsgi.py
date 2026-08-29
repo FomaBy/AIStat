@@ -216,6 +216,7 @@ def test_source_parses_as_python_36():
         "aistat/legacy_wsgi.py",
         "aistat/migrate.py",
         "aistat/oauth.py",
+        "aistat/release_identity.py",
         "aistat/snapshot.py",
         "aistat/snapshot_recovery.py",
         "aistat/tenant.py",
@@ -663,6 +664,104 @@ def test_login_api_and_security_headers(legacy):
     assert [p["title"] for p in data["projects"]] == ["Alpha", "Beta"]
     assert header_values(headers, "X-Frame-Options") == ["DENY"]
     assert "Secure" in cookies or "aistat_session=" in cookies
+
+
+VALID_RELEASE_MANIFEST = {
+    "files": [{"path": "aistat/__init__.py", "sha256": "0" * 64,
+               "size_bytes": 1, "mode": "0644"}],
+    "format": "aistat-cpanel-package",
+    "format_version": 1,
+    "hash_algorithm": "sha256",
+    "source_commit_sha": "a" * 40,
+    "source_tree_sha": "b" * 40,
+}
+
+
+def _write_release_manifest(root, payload=None, raw=None):
+    os.makedirs(root, exist_ok=True)
+    if raw is None:
+        raw = json.dumps(
+            payload if payload is not None else VALID_RELEASE_MANIFEST,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    with open(os.path.join(root, "PACKAGE-MANIFEST.json"), "wb") as stream:
+        stream.write(raw)
+    return raw
+
+
+def test_release_identity_endpoint_requires_login(legacy, tmp_path):
+    root = os.path.join(str(tmp_path), "package")
+    _write_release_manifest(root)
+    legacy.PACKAGE_ROOT = root
+    status, _, _ = request(legacy.application, "/api/release-identity")
+    assert status == "401 Unauthorized"
+
+
+def test_release_identity_endpoint_returns_exact_fields_from_deployed_root(
+    legacy, tmp_path
+):
+    root = os.path.join(str(tmp_path), "package")
+    raw = _write_release_manifest(root)
+    legacy.PACKAGE_ROOT = root
+    cookies = login(legacy)
+    status, headers, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "200 OK"
+    assert header_values(headers, "Cache-Control") == ["no-store"]
+    data = json.loads(body.decode("utf-8"))
+    assert set(data) == {"source_commit_sha", "source_tree_sha", "manifest_sha256"}
+    assert data["source_commit_sha"] == "a" * 40
+    assert data["source_tree_sha"] == "b" * 40
+    assert data["manifest_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_release_identity_endpoint_missing_manifest_is_generic_503(legacy, tmp_path):
+    legacy.PACKAGE_ROOT = os.path.join(str(tmp_path), "package")
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "503 Service Unavailable"
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "release identity unavailable"
+    }
+
+
+def test_release_identity_endpoint_malformed_manifest_is_generic_503(
+    legacy, tmp_path
+):
+    root = os.path.join(str(tmp_path), "package")
+    _write_release_manifest(root, raw=b"not json")
+    legacy.PACKAGE_ROOT = root
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "503 Service Unavailable"
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "release identity unavailable"
+    }
+
+
+def test_release_identity_endpoint_rejects_symlinked_manifest(legacy, tmp_path):
+    root = os.path.join(str(tmp_path), "package")
+    os.makedirs(root)
+    outside = os.path.join(str(tmp_path), "outside")
+    _write_release_manifest(outside)
+    os.symlink(
+        os.path.join(outside, "PACKAGE-MANIFEST.json"),
+        os.path.join(root, "PACKAGE-MANIFEST.json"),
+    )
+    legacy.PACKAGE_ROOT = root
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "503 Service Unavailable"
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "release identity unavailable"
+    }
 
 
 def test_model_efficiency_endpoint(legacy):
