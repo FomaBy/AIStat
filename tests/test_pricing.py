@@ -480,6 +480,42 @@ def test_calculated_cost_for_period_sums_provider_month(conn):
         pricing.calculated_cost_for_period(conn, "ANTHROPIC", "2026-02")
 
 
+@pytest.mark.parametrize("period", [
+    "2026-01", "2026-12", "0001-01", "9999-12",
+])
+def test_validate_billing_reconciliation_accepts_canonical_period(period):
+    pricing.validate_billing_reconciliation("anthropic", period)
+
+
+@pytest.mark.parametrize("period", [
+    "2026-13", "2026-00", "0000-01", "26-01", "2026-1", "2026/01",
+    "2026-01 ", " 2026-01", "2026-01\n", "",
+    "２０２６-01",  # full-width Unicode digits
+    "٢٠٢٦-01",  # Arabic-Indic digits
+])
+def test_validate_billing_reconciliation_rejects_non_canonical_period(period):
+    with pytest.raises(pricing.PricingError):
+        pricing.validate_billing_reconciliation("anthropic", period)
+
+
+@pytest.mark.parametrize("amount", [
+    "0", "0.5", "12.50", "1000000", "3.14159",
+])
+def test_parse_billing_amount_accepts_canonical_syntax(amount):
+    assert pricing.parse_billing_amount(amount) == float(amount)
+
+
+@pytest.mark.parametrize("amount", [
+    None, "", "1_000", "1_000.5", "1,000", "-5", "+5", "5.", ".5",
+    "1e5", "1E5", "inf", "Infinity", "nan", "NaN",
+    " 5", "5 ", "5\n", "１０",  # full-width Unicode digits
+    "٥",  # Arabic-Indic digit
+])
+def test_parse_billing_amount_rejects_non_canonical_syntax(amount):
+    with pytest.raises(pricing.PricingError):
+        pricing.parse_billing_amount(amount)
+
+
 def test_reconcile_billing_actual_rejects_non_usd_currency(conn):
     with pytest.raises(pricing.PricingError):
         pricing.reconcile_billing_actual(
