@@ -1,6 +1,7 @@
 """Isolated executable proof for exact and atomic cPanel deployment."""
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from test_post_deploy_smoke import FixtureOrigin, write_cookie_jar
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +25,7 @@ FIXTURE_INPUTS = (
     "deploy/cpanel_deploy.sh",
     "deploy/namecheap.htaccess",
     "scripts/build_cpanel_package.sh",
+    "scripts/post_deploy_smoke.py",
 )
 
 # Mirrors what aistat.cgi does on every request: put the live symlink on
@@ -198,6 +202,15 @@ class DeployHarness:
         self.app = self.home / "aistat_app"
         self.releases = self.home / "aistat_releases"
         self.lock = self.private / "cpanel-deploy.lock"
+
+        # Stands in for the deployed site the mandatory post-deploy smoke calls.
+        # It reports the identity of whatever the live symlink currently points
+        # at, so every deploy in this file exercises the real admission gate.
+        self.site = FixtureOrigin(identity=self.live_identity)
+        self.cookie_file = write_cookie_jar(
+            self.private / "smoke-cookies.txt", self.site.base_url
+        )
+
         self.env = dict(
             os.environ,
             HOME=str(self.home),
@@ -205,7 +218,26 @@ class DeployHarness:
             AISTAT_RELEASES_DIR=str(self.releases),
             AISTAT_DEPLOY_LOCK_FILE=str(self.lock),
             AISTAT_KEEP_RELEASES="2",
+            AISTAT_SMOKE_BASE_URL=self.site.base_url,
+            AISTAT_SMOKE_COOKIE_FILE=str(self.cookie_file),
         )
+
+    def live_identity(self):
+        """Release identity served through the live symlink, as the app does."""
+        manifest = self.app / "PACKAGE-MANIFEST.json"
+        try:
+            raw = manifest.read_bytes()
+            values = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return {
+            "source_commit_sha": values.get("source_commit_sha"),
+            "source_tree_sha": values.get("source_tree_sha"),
+            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    def close(self):
+        self.site.close()
 
     def identity(self, repo=None, ref="HEAD"):
         repo = repo or self.source
@@ -340,7 +372,9 @@ class DeployHarness:
 
 @pytest.fixture
 def harness(tmp_path):
-    return DeployHarness(tmp_path)
+    built = DeployHarness(tmp_path)
+    yield built
+    built.close()
 
 
 @pytest.fixture
@@ -355,7 +389,9 @@ def symlinked_harness(tmp_path):
     real.mkdir()
     link = tmp_path / "linked-workspace"
     link.symlink_to(real, target_is_directory=True)
-    return DeployHarness(link)
+    built = DeployHarness(link)
+    yield built
+    built.close()
 
 
 def _manifest(release):
@@ -1129,3 +1165,110 @@ def test_tampered_manifest_blocks_rollback_and_preserves_live(harness):
     assert result.returncode != 0
     assert "manifest verification failed" in result.stderr
     assert os.readlink(str(harness.app)) == str(release2)
+
+
+# --- Mandatory post-deploy HTTP smoke and its rollback path (FAN-3466) --------
+
+
+@pytest.mark.parametrize(
+    "missing,expected",
+    [
+        ("AISTAT_SMOKE_BASE_URL", "AISTAT_SMOKE_BASE_URL is required"),
+        ("AISTAT_SMOKE_COOKIE_FILE", "AISTAT_SMOKE_COOKIE_FILE is required"),
+    ],
+)
+def test_deploy_without_smoke_configuration_never_touches_the_host(
+    harness, missing, expected
+):
+    env = {key: value for key, value in harness.env.items() if key != missing}
+    result = harness.deploy(*harness.identity(), env)
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not harness.app.exists() and not harness.app.is_symlink()
+    assert not harness.releases.exists()
+    assert not harness.lock.exists()
+
+
+def test_successful_deploy_logs_bounded_smoke_evidence_without_the_cookie(harness):
+    sha, tree = harness.identity()
+    result = harness.deploy(sha, tree)
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(
+        re.search(r"post-deploy smoke evidence: (\{.*\})", result.stdout).group(1)
+    )
+    assert evidence["result"] == "PASS"
+    assert evidence["observed_commit_sha"] == sha
+    assert evidence["observed_tree_sha"] == tree
+    assert evidence["cache_control_no_store"] is True
+    assert harness.cookie_file.read_text("utf-8").split("\t")[-1].strip() not in (
+        result.stdout + result.stderr
+    )
+    assert "deploy complete" in result.stdout
+
+
+def test_failed_smoke_rolls_the_live_link_back_to_the_previous_release(harness):
+    sha1, tree1 = harness.identity()
+    assert harness.deploy(sha1, tree1).returncode == 0
+    release1 = Path(os.readlink(str(harness.app)))
+
+    sha2, tree2 = harness.commit("candidate two")
+    harness.site.server.config["identity_status"] = 503
+    result = harness.deploy(sha2, tree2)
+
+    assert result.returncode != 0
+    assert "post-deploy smoke FAILED" in result.stdout
+    assert "ROLLED BACK after post-deploy smoke failure" in result.stdout
+    assert "deploy complete" not in result.stdout
+    assert os.readlink(str(harness.app)) == str(release1)
+    assert not list(harness.home.glob(".aistat_app.next.*"))
+
+
+def test_failed_smoke_without_a_previous_release_surfaces_the_rollback_command(
+    harness,
+):
+    harness.site.server.config["identity_status"] = 503
+    sha, tree = harness.identity()
+    result = harness.deploy(sha, tree)
+
+    assert result.returncode != 0
+    assert "NOT ROLLED BACK" in result.stdout
+    assert "deploy complete" not in result.stdout
+    assert "rollback <exact-absolute-release-target>" in result.stderr
+    # The unverified release is left live and named, not silently accepted.
+    assert Path(os.readlink(str(harness.app))).is_dir()
+
+
+def test_smoke_rejects_a_live_release_reporting_the_wrong_identity(harness):
+    sha1, tree1 = harness.identity()
+    assert harness.deploy(sha1, tree1).returncode == 0
+    release1 = Path(os.readlink(str(harness.app)))
+
+    sha2, tree2 = harness.commit("candidate two")
+    # A host that answers with stale identity — a cached or half-restarted
+    # interpreter still serving the previous release.
+    harness.site.server.config["identity"] = harness.live_identity()
+    result = harness.deploy(sha2, tree2)
+
+    assert result.returncode != 0
+    assert '"reason": "identity_mismatch"' in result.stdout
+    assert os.readlink(str(harness.app)) == str(release1)
+
+
+def test_a_permissive_cookie_file_fails_the_deploy_and_rolls_back(harness):
+    sha1, tree1 = harness.identity()
+    assert harness.deploy(sha1, tree1).returncode == 0
+    release1 = Path(os.readlink(str(harness.app)))
+
+    sha2, tree2 = harness.commit("candidate two")
+    permissive_cookie = write_cookie_jar(
+        harness.private / "permissive-smoke-cookies.txt",
+        harness.site.base_url,
+        mode=0o644,
+    )
+    assert permissive_cookie.stat().st_mode & 0o777 == 0o644
+    env = dict(harness.env, AISTAT_SMOKE_COOKIE_FILE=str(permissive_cookie))
+    result = harness.deploy(sha2, tree2, env)
+
+    assert result.returncode != 0
+    assert '"reason": "cookie_file_permissive"' in result.stdout
+    assert os.readlink(str(harness.app)) == str(release1)

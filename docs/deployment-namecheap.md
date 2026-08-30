@@ -437,14 +437,44 @@ Command (одной строкой; заменить оба placeholder точн
 `$HOME` cPanel подставит сам):
 
 ```bash
-LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" deploy <FULL_COMMIT_SHA> <FULL_TREE_SHA> >> "$HOME/aistat-private/deploy.log" 2>&1
+LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && AISTAT_SMOKE_BASE_URL=https://aistat.app AISTAT_SMOKE_COOKIE_FILE="$HOME/aistat-private/smoke-cookies.txt" /bin/bash "$HOME/repositories/AIStat/deploy/cpanel_deploy.sh" deploy <FULL_COMMIT_SHA> <FULL_TREE_SHA> >> "$HOME/aistat-private/deploy.log" 2>&1
 ```
+
+Обе переменные `AISTAT_SMOKE_*` **обязательны**: без них deploy отказывает до
+lock и до любых изменений на хосте (см. шаг 4). Задавать их именно в строке
+cron, а не только в `aistat.env`: этот cron не читает env-файл приложения.
 
 При принятии следующего кандидата заменить в cron **оба** значения одной
 операцией. До этого сайт остаётся на прежнем approved-кандидате независимо от
 движения `main`, а ежедневный запуск на уже живом кандидате остаётся тихим
 (`ALREADY LIVE`, exit 0). Строка `ERROR` в `deploy.log` означает реальную
 проблему, а не то, что `main` ушёл вперёд.
+
+### Шаг 4. Подготовить cookie-jar для обязательного post-deploy smoke
+
+После publish deploy проверяет **сам сайт**, а не только код: публичный
+`/healthz` и авторизованный `/api/release-identity`, который обязан вернуть
+ровно опубликованные commit SHA, tree SHA и `manifest_sha256` с заголовком
+`Cache-Control: no-store`. Для авторизованного запроса нужна живая сессия
+владельца — она берётся **только** из файла cookie-jar, который создаёт
+оператор. Cookie никогда не передаётся аргументом команды и не попадает в лог.
+
+Один раз завести файл вне web root и с правами `0600`:
+
+```bash
+umask 077
+touch "$HOME/aistat-private/smoke-cookies.txt"
+chmod 600 "$HOME/aistat-private/smoke-cookies.txt"
+```
+
+Наполнить его обычным входом владельца, сохранив jar в тот же файл (формат
+Netscape, как у `curl -c`). Требования, любое нарушение — терминальный отказ
+deploy: обычный файл (не symlink, не FIFO), владелец — пользователь cPanel,
+никаких прав для group/other.
+
+Ротация: session-cookie рано или поздно истекает, и тогда deploy падает с
+`"reason": "identity_status_unexpected"`. Лечение — перезаписать тот же файл
+свежим jar; менять команду cron не нужно.
 
 ### Что делает `deploy/cpanel_deploy.sh`
 
@@ -484,6 +514,26 @@ LC_ALL=C TZ=Europe/Vilnius /bin/date | /bin/grep -q ' 05:' && /bin/bash "$HOME/r
    default `5` — до валидации формата оно не доходит. Значения `1`,
    отрицательные, с ведущим нулём, дробные и нечисловые отклоняются до
    каких-либо изменений на диске.
+
+8. **Post-deploy HTTP smoke (обязателен).** Сразу после switch запускается
+   `scripts/post_deploy_smoke.py` против живого сайта. PASS требует всего
+   сразу: `/healthz` отвечает `200 {"status":"ok"}`; авторизованный
+   `/api/release-identity` отвечает `200` с `Cache-Control: no-store` и ровно
+   опубликованными commit/tree/`manifest_sha256`; ответ не из кеша (`Age`
+   больше порога или расхождение `Date` — отказ); redirect за пределы
+   ожидаемого origin отсутствует; повтор запроса с подставными
+   `X-Forwarded-Host`/`X-Forwarded-Proto` даёт тот же ответ. 4xx/5xx, ошибка
+   TLS и timeout — тоже терминальный отказ. Строка `deploy complete` печатается
+   **только** после PASS.
+9. **Откат при провале smoke.** Если smoke не прошёл, скрипт возвращает live
+   link на release, который обслуживал трафик до этой публикации: тем же
+   валидатором target, той же проверкой манифеста в режиме `runtime` и тем же
+   атомарным rename (`ROLLED BACK after post-deploy smoke failure ...`), после
+   чего завершается ненулевым кодом. Если возвращать не на что — первая
+   установка либо прежний release больше не проходит проверку — скрипт печатает
+   `NOT ROLLED BACK`, называет живой непроверенный release и точную команду
+   `rollback`, и всё равно завершается ошибкой. Непроверенный release никогда
+   не объявляется успешным.
 
 Любая ошибка до `os.replace` прекращает deploy без изменения live target.
 После switch cleanup retention является best-effort и никогда не удаляет live
@@ -525,11 +575,22 @@ live-symlink внутрь опубликованного release. Это нор�
 
 ### Переменные окружения deploy-инструментов
 
-Все переменные ниже опциональны: в обычной cPanel-инсталляции ни одна не
-задаётся и работают значения по умолчанию.
+Две переменные post-deploy smoke обязательны для команды `deploy`; все
+остальные опциональны и в обычной cPanel-инсталляции работают значениями по
+умолчанию.
 
 `deploy/cpanel_deploy.sh`:
 
+- `AISTAT_SMOKE_BASE_URL` — **обязательна для `deploy`**, default нет. Origin
+  живого сайта, например `https://aistat.app`. Он же становится единственным
+  разрешённым origin: redirect на любой другой отклоняется до перехода, поэтому
+  сессионная cookie не может уйти на чужой хост.
+- `AISTAT_SMOKE_COOKIE_FILE` — **обязательна для `deploy`**, default нет. Путь к
+  cookie-jar владельца в формате Netscape (шаг 4). Принимается только обычный
+  файл, принадлежащий текущему пользователю, без прав group/other. Значение
+  cookie в командной строке не принимается ни в каком виде.
+- `AISTAT_SMOKE_TIMEOUT` — таймаут одного HTTP-запроса smoke в секундах;
+  default `10`. Истёкший таймаут — терминальный отказ, а не повтор.
 - `AISTAT_APP_ROOT` — путь live-symlink приложения; default `$HOME/aistat_app`.
   Это не только деплойный, но и **runtime-knob**: он также есть в
   `.env.example` для CGI-окружения, а `aistat.cgi` читает его на каждом запросе,
@@ -573,6 +634,23 @@ curl -I https://aistat.app/             # сайт отвечает (редир�
 
 Успешная строка `PUBLISHED` содержит full commit SHA, tree SHA, exact previous
 и new release paths и SHA-256 самого manifest без секретов.
+
+Но `PUBLISHED` — это факт о symlink, а не об успехе. Признак успеха — пара
+строк ниже неё:
+
+```
+[aistat-deploy] ... post-deploy smoke evidence: {"cache_control_no_store": true, ..., "result": "PASS", ...}
+[aistat-deploy] ... deploy complete: commit=... tree=... live=...
+```
+
+Строка evidence — одна JSON-строка с фиксированным набором полей: `timestamp`,
+`run_id`, `result`, `reason`, ожидаемые и наблюдённые `commit`/`tree`/
+`manifest_sha256`, статусы обеих точек, `cache_control_no_store`, `freshness`.
+Тела ответов, заголовки, cookie, пути и значения окружения в неё не попадают,
+поэтому её безопасно хранить в `deploy.log` и дедуплицировать по `run_id`.
+Наблюдённые SHA печатаются только после проверки формата hex — враждебный ответ
+не может подмешать в лог произвольные байты. Разбор `reason` при провале — в
+`docs/operations-runbook.md`.
 
 ### Первый переход с ручного каталога
 
