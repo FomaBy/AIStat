@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -96,10 +97,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         spoofed = self.headers.get("X-Forwarded-Host")
         if spoofed and config.get("trusts_forwarded_headers"):
-            # A misconfigured host reflects the attacker's origin instead of
-            # answering identically.
+            # A misconfigured host redirects off-origin. Keep the fixture's
+            # response fixed so it never reflects the spoofed header bytes.
             self.send_response(302)
-            self.send_header("Location", "https://%s/api/release-identity" % spoofed)
+            self.send_header(
+                "Location", "https://elsewhere.invalid/api/release-identity"
+            )
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -144,13 +147,16 @@ class FixtureOrigin:
 def write_cookie_jar(path, url, value=SESSION_VALUE, mode=0o600):
     """A Netscape jar exactly as the caller is expected to supply one."""
     host = url.split("//", 1)[1].split(":", 1)[0]
-    path.write_text(
-        "# Netscape HTTP Cookie File\n"
-        + "\t".join([host, "FALSE", "/", "FALSE", "0", SESSION_COOKIE, value])
-        + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(str(path), mode)
+    previous_umask = os.umask(0o666 ^ mode)
+    try:
+        path.write_text(
+            "# Netscape HTTP Cookie File\n"
+            + "\t".join([host, "FALSE", "/", "FALSE", "0", SESSION_COOKIE, value])
+            + "\n",
+            encoding="utf-8",
+        )
+    finally:
+        os.umask(previous_umask)
     return path
 
 
@@ -324,6 +330,28 @@ def test_host_that_honours_spoofed_forwarded_headers_is_terminal(tmp_path):
     try:
         jar = write_cookie_jar(tmp_path / "cookies.txt", origin.base_url)
         result, evidence = run_smoke(origin, jar)
+        assert any(
+            path == "/api/release-identity"
+            and headers.get("X-Forwarded-Host") == "post-deploy-smoke.invalid"
+            for path, headers in origin.requests
+        )
+        connection = HTTPConnection(*origin.server.server_address)
+        try:
+            connection.request(
+                "GET",
+                "/api/release-identity",
+                headers={
+                    "Cookie": "%s=%s" % (SESSION_COOKIE, SESSION_VALUE),
+                    "X-Forwarded-Host": "post-deploy-smoke.invalid",
+                },
+            )
+            response = connection.getresponse()
+            assert response.getheader("Location") == (
+                "https://elsewhere.invalid/api/release-identity"
+            )
+            response.read()
+        finally:
+            connection.close()
     finally:
         origin.close()
     assert result.returncode == 1

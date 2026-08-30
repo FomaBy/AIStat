@@ -1260,8 +1260,14 @@ def test_a_permissive_cookie_file_fails_the_deploy_and_rolls_back(harness):
     release1 = Path(os.readlink(str(harness.app)))
 
     sha2, tree2 = harness.commit("candidate two")
-    os.chmod(str(harness.cookie_file), 0o644)
-    result = harness.deploy(sha2, tree2)
+    permissive_cookie = write_cookie_jar(
+        harness.private / "permissive-smoke-cookies.txt",
+        harness.site.base_url,
+        mode=0o644,
+    )
+    assert permissive_cookie.stat().st_mode & 0o777 == 0o644
+    env = dict(harness.env, AISTAT_SMOKE_COOKIE_FILE=str(permissive_cookie))
+    result = harness.deploy(sha2, tree2, env)
 
     assert result.returncode != 0
     assert '"reason": "cookie_file_permissive"' in result.stdout
