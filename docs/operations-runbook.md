@@ -246,6 +246,54 @@ approval and rollback plan. Preserve `input/`, both `output-*` directories and
 the `self-test` evidence unchanged for that QA; do not delete or overwrite them
 while a verdict is pending.
 
+## Провал обязательного post-deploy HTTP smoke
+
+После каждой публикации `deploy/cpanel_deploy.sh` проверяет живой сайт и
+печатает в `~/aistat-private/deploy.log` одну JSON-строку evidence. `deploy
+complete` появляется только после `"result": "PASS"`. Настройка cookie-jar и
+переменных — в `docs/deployment-namecheap.md`.
+
+Что делать при `"result": "FAIL"`:
+
+1. Определить, откатился ли сайт. `ROLLED BACK after post-deploy smoke failure`
+   означает, что live link уже вернулся на прежний release и сайт работает —
+   срочности нет, разбирать причину можно спокойно. `NOT ROLLED BACK` означает,
+   что сайт остался на **непроверенном** release: это инцидент. Выбрать
+   проверенный release и выполнить обычный `rollback` из
+   `docs/deployment-namecheap.md`.
+2. Прочитать `reason` — он всегда из фиксированного набора:
+
+   - `cookie_file_missing` / `cookie_file_symlink` / `cookie_file_not_regular` /
+     `cookie_file_not_owned` / `cookie_file_permissive` /
+     `cookie_file_unreadable` — проблема в самом файле jar, а не в сайте.
+     Пересоздать его по шагу 4 инструкции развёртывания с правами `0600`.
+   - `identity_status_unexpected` — сайт ответил 4xx/5xx. Самая частая причина —
+     истёкшая сессия в jar; вторая — приложение действительно не поднялось.
+     Проверить `curl -I https://aistat.app/` перед перевыпуском jar.
+   - `identity_mismatch` — сайт отдаёт **не тот** release. Обычно это
+     недоперезапущенный Passenger или кеш перед приложением. Сверить
+     `readlink ~/aistat_app` с ожидаемым SHA из лога.
+   - `identity_cache_control_missing` — с ответа пропал `Cache-Control:
+     no-store`; ищите кеширующий слой или reverse proxy перед приложением.
+   - `identity_stale` — ответ пришёл из кеша (`Age`) или часы/`Date` разошлись
+     больше порога. Ответ из кеша ничего не доказывает о живом release.
+   - `identity_redirect_off_origin` / `proxy_spoof_redirect_off_origin` /
+     `proxy_spoof_honored` — хост уводит запрос на чужой origin или доверяет
+     подставленным `X-Forwarded-*`. Это **security-регрессия**: проверить
+     `AISTAT_PROXY_TRUST_HOPS` и конфигурацию proxy до повторного deploy.
+   - `healthz_*` с суффиксами `_transport_failed`, `_timeout`, `_tls_failed` —
+     сайт недоступен, отвалился TLS или истёк таймаут.
+   - `base_url_invalid` / `base_url_insecure` — `AISTAT_SMOKE_BASE_URL` задан
+     неверно. Плейнтекстовый `http://` разрешён только для loopback: на
+     production origin он отклоняется, а не понижает защиту молча.
+   - `usage_invalid` (exit `2`) — неверные аргументы; smoke до сайта не дошёл.
+3. Ничего не «чинить» ослаблением gate. Запрещено запускать deploy без
+   `AISTAT_SMOKE_*`, повышать `AISTAT_SMOKE_TIMEOUT` вместо диагностики
+   недоступности и считать публикацию успешной по строке `PUBLISHED`.
+
+Строка evidence не содержит cookie, тел ответов, заголовков, путей и значений
+окружения — её можно целиком передавать в задачу Multica как есть.
+
 ## Безопасная диагностика HTTP 409 freshness
 
 Если подписанная отправка snapshot получила `HTTP 409`, сначала сохраните обе

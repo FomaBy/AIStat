@@ -15,6 +15,12 @@ RELEASES_DIR="${AISTAT_RELEASES_DIR:-$HOME_DIR/aistat_releases}"
 LOCK_FILE="${AISTAT_DEPLOY_LOCK_FILE:-$HOME_DIR/aistat-private/cpanel-deploy.lock}"
 KEEP_RELEASES="${AISTAT_KEEP_RELEASES:-5}"
 MANIFEST_NAME="PACKAGE-MANIFEST.json"
+# Post-deploy HTTP smoke (FAN-3466). Both are mandatory for `deploy`: a publish
+# is never reported successful on an unverified release. The cookie jar is a
+# caller-owned file — never a cookie or token value on the command line.
+SMOKE_BASE_URL="${AISTAT_SMOKE_BASE_URL:-}"
+SMOKE_COOKIE_FILE="${AISTAT_SMOKE_COOKIE_FILE:-}"
+SMOKE_TIMEOUT="${AISTAT_SMOKE_TIMEOUT:-10}"
 
 VALIDATION_ROOT=""
 NEXT_LINK=""
@@ -507,12 +513,66 @@ for unused_mtime, path in managed:
 PY
 }
 
+# Verifies the *served* site, not the command's own exit status: public
+# /healthz plus an authenticated /api/release-identity that must report exactly
+# the published commit, tree and manifest digest, uncacheable and unaffected by
+# spoofed forwarded headers. The helper prints one bounded allowlist JSON line;
+# it never prints the cookie, a response body or a credential, so logging it
+# verbatim is safe.
+run_post_deploy_smoke() {
+  local sha="$1" tree="$2" manifest_hash="$3" evidence status=0
+  evidence="$(python3 "$REPO_DIR/scripts/post_deploy_smoke.py" \
+    --base-url "$SMOKE_BASE_URL" \
+    --cookie-file "$SMOKE_COOKIE_FILE" \
+    --expected-commit "$sha" \
+    --expected-tree "$tree" \
+    --expected-manifest-sha256 "$manifest_hash" \
+    --timeout "$SMOKE_TIMEOUT")" || status=$?
+  [ -z "$evidence" ] || log "post-deploy smoke evidence: $evidence"
+  [ "$status" -eq 0 ] || log "post-deploy smoke FAILED (exit $status)"
+  return "$status"
+}
+
+# The one deterministic reviewed recovery path after a failed smoke: switch the
+# live link back to the release that was serving before this publish, using the
+# same target validation and atomic rename as `rollback`. When there is no such
+# release — a first install, or a previous target that no longer verifies — the
+# operator command is surfaced instead. Either way the deploy exits non-zero and
+# the unverified release is never reported successful.
+rollback_after_failed_smoke() {
+  local failed="$1"
+  if [ -z "$PREVIOUS_TARGET" ] || [ "$LIVE_TARGET_BROKEN" = "1" ] \
+     || [ ! -d "$PREVIOUS_TARGET" ] || [ ! -f "$PREVIOUS_TARGET/$MANIFEST_NAME" ]; then
+    log "NOT ROLLED BACK: no verifiable previous release was captured before this publish"
+    die "post-deploy smoke failed for $failed and no automatic rollback target exists; the site is serving an unverified release — choose a verified release and run: $0 rollback <exact-absolute-release-target>"
+  fi
+  local previous_identity previous_sha previous_tree
+  previous_identity="$(manifest_identity "$PREVIOUS_TARGET")" \
+    || die "post-deploy smoke failed for $failed and the previous release identity is unreadable; run: $0 rollback <exact-absolute-release-target>"
+  read -r previous_sha previous_tree <<<"$previous_identity"
+  if ! is_full_sha "$previous_sha" || ! is_full_sha "$previous_tree" \
+     || ! verify_manifest "$PREVIOUS_TARGET" "$previous_sha" "$previous_tree" runtime; then
+    die "post-deploy smoke failed for $failed and the previous release no longer verifies; run: $0 rollback <exact-absolute-release-target>"
+  fi
+  atomic_switch "$PREVIOUS_TARGET"
+  log "ROLLED BACK after post-deploy smoke failure app=$APP_LINK failed=$failed new=$PREVIOUS_TARGET commit=$previous_sha tree=$previous_tree"
+  die "post-deploy smoke failed for $failed; live link restored to $PREVIOUS_TARGET"
+}
+
 cmd_deploy() {
   [ "$#" -eq 2 ] || usage
   local expected_sha="$1" expected_tree="$2" head_sha head_tree package
   local release manifest_hash live_identity live_sha live_tree
   is_full_sha "$expected_sha" || die "deploy requires a full lowercase 40-character commit SHA"
   is_full_sha "$expected_tree" || die "deploy requires a full lowercase 40-character tree SHA"
+  # Refused before the lock and before any host mutation: an unrunnable smoke
+  # would otherwise only be discovered after the live link had already moved.
+  [ -n "$SMOKE_BASE_URL" ] \
+    || die "AISTAT_SMOKE_BASE_URL is required: the post-deploy HTTP smoke is mandatory"
+  [ -n "$SMOKE_COOKIE_FILE" ] \
+    || die "AISTAT_SMOKE_COOKIE_FILE is required: the post-deploy HTTP smoke is mandatory"
+  [ -f "$REPO_DIR/scripts/post_deploy_smoke.py" ] \
+    || die "post-deploy smoke helper is missing: $REPO_DIR/scripts/post_deploy_smoke.py"
   validate_keep_releases
   acquire_lock
   mkdir -p "$RELEASES_DIR"
@@ -564,6 +624,11 @@ cmd_deploy() {
   atomic_switch "$release"
   STAGED_RELEASE=""
   log "PUBLISHED app=$APP_LINK previous=${PREVIOUS_TARGET:-none} new=$release commit=$expected_sha tree=$expected_tree manifest_sha256=$manifest_hash"
+
+  # The switch is only a fact about the symlink. Success is claimed below, and
+  # only after the live site has proved its own identity over HTTP.
+  run_post_deploy_smoke "$expected_sha" "$expected_tree" "$manifest_hash" \
+    || rollback_after_failed_smoke "$release"
 
   if ! prune_releases "$release" "$PREVIOUS_TARGET"; then
     log "WARNING: publish succeeded but retention cleanup failed; live and previous targets were preserved"
