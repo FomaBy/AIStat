@@ -152,3 +152,80 @@ def test_missing_required_key_raises():
         normalize.normalize_issue({"id": "no-updated-at"})
     with pytest.raises(normalize.NormalizationError):
         normalize.normalize_issue_usage("x", {"task_count": "not-a-number"})
+
+
+def test_normalize_issue_flow_metadata_fields():
+    """FAN-3306: dispatch/QA metadata lands in dedicated columns; the exact
+    SHA is preferred over the artifact-revision fallback, verdicts normalize
+    to upper case and unexpected verdict strings are dropped, not guessed."""
+    issue = {
+        "id": "q1",
+        "updated_at": "2026-08-15T00:00:00Z",
+        "metadata": {
+            "dispatch_lane": "qa_high",
+            "dispatch_ready": True,
+            "qa_verdict": "failed",
+            "qa_verdict_at": "2026-08-15T20:19:05Z",
+            "qa_candidate_sha": "abc123",
+            "qa_candidate_artifact_revisions": "skill:x@2026",
+            "implementation_issue_id": "impl-1",
+        },
+    }
+    row = normalize.normalize_issue(issue)
+    assert row["dispatch_lane"] == "qa_high"
+    assert row["dispatch_ready"] == 1
+    assert row["qa_verdict"] == "FAILED"
+    assert row["qa_verdict_at"] == "2026-08-15T20:19:05Z"
+    assert row["qa_candidate"] == "abc123"
+    assert row["qa_for_issue_id"] == "impl-1"
+
+    bare = normalize.normalize_issue(
+        {"id": "x", "updated_at": "2026-08-15T00:00:00Z"})
+    assert bare["dispatch_lane"] is None
+    assert bare["dispatch_ready"] == 0
+    assert bare["qa_verdict"] is None
+    assert bare["qa_candidate"] is None
+
+    odd = normalize.normalize_issue({
+        "id": "y", "updated_at": "2026-08-15T00:00:00Z",
+        "metadata": {"qa_verdict": "in_review", "dispatch_ready": "true",
+                     "qa_candidate_artifact_revisions": "rev@1",
+                     "qa_for_issue_id": "impl-2"},
+    })
+    assert odd["qa_verdict"] is None  # unexpected verdicts are not guessed
+    assert odd["dispatch_ready"] == 1  # string "true" tolerated
+    assert odd["qa_candidate"] == "rev@1"  # artifact fallback
+    assert odd["qa_for_issue_id"] == "impl-2"
+
+
+def test_normalize_issue_keeps_versioned_attribution_revisions():
+    issue = {
+        "id": "i1",
+        "updated_at": "2026-08-26T00:00:00Z",
+        "metadata": {
+            "attribution_schema_version": 1,
+            "model_revision": "model@v1",
+            "runtime_revision": "runtime@v1",
+            "prompt_revision": "prompt@v1",
+            "skills_revision": "skills@v1",
+            "harness_revision": "harness@v1",
+            "governance_bundle_revision": "bundle@v1",
+        },
+    }
+
+    row = normalize.normalize_issue(issue)
+
+    assert row["attribution_schema_version"] == 1
+    assert row["model_revision"] == "model@v1"
+    assert row["runtime_revision"] == "runtime@v1"
+    assert row["prompt_revision"] == "prompt@v1"
+    assert row["skills_revision"] == "skills@v1"
+    assert row["harness_revision"] == "harness@v1"
+    assert row["governance_bundle_revision"] == "bundle@v1"
+
+    invalid = normalize.normalize_issue({
+        "id": "i2",
+        "updated_at": "2026-08-26T00:00:00Z",
+        "metadata": {"attribution_schema_version": "one"},
+    })
+    assert invalid["attribution_schema_version"] is None

@@ -73,13 +73,10 @@ def invalid_endpoint(case):
 
 def valid_config(tmp_path):
     config = Config()
-    config.publish_tenant_id = 7
     config.publish_url = "https://aistat.app/api/ingest/snapshot"
     config.worker_sync_url = "https://aistat.app"
     config.ingest_secret = "i" * 40
     config.worker_secret = "w" * 40
-    config.session_secret = "s" * 40
-    config.publish_interval_seconds = 300
     config.worker_pull_interval_seconds = 300
     config.worker_collect_interval_seconds = 300
     config.worker_key_path = tmp_path / "key" / "worker.key"
@@ -97,12 +94,15 @@ def test_valid_config_passes(tmp_path):
     assert report.failures == []
 
 
-def test_missing_tenant_id_fails(tmp_path):
+def test_owner_publisher_settings_are_not_required(tmp_path):
     config = valid_config(tmp_path)
     config.publish_tenant_id = None
+    config.session_secret = None
     report = preflight.run_preflight(config, check_imports=False)
-    assert not report.ok
-    assert not verdict(report, "tenant_id").ok
+    assert report.ok, report.render()
+    assert {check.name for check in report.checks}.isdisjoint(
+        {"tenant_id", "session_secret"}
+    )
 
 
 @pytest.mark.parametrize("field", ["publish_url", "worker_sync_url"])
@@ -163,48 +163,14 @@ def test_short_ingest_secret_fails(tmp_path):
     assert not verdict(report, "ingest_secret").ok
 
 
-@pytest.mark.parametrize(
-    "session_secret",
-    [None, "", "s" * 31],
-    ids=["missing", "empty", "31-bytes"],
-)
-def test_invalid_session_secret_fails(tmp_path, session_secret):
+def test_reused_transport_secret_pair_fails_independence(tmp_path):
     config = valid_config(tmp_path)
-    config.session_secret = session_secret
-    report = preflight.run_preflight(config, check_imports=False)
-    assert not report.ok
-    assert not verdict(report, "session_secret").ok
-
-
-def test_session_secret_exactly_32_bytes_passes(tmp_path):
-    config = valid_config(tmp_path)
-    config.session_secret = "s" * 32
-    report = preflight.run_preflight(config, check_imports=False)
-    assert report.ok, report.render()
-    assert verdict(report, "session_secret").ok
-
-
-@pytest.mark.parametrize(
-    ("left", "right"),
-    [
-        ("session_secret", "ingest_secret"),
-        ("session_secret", "worker_secret"),
-        ("ingest_secret", "worker_secret"),
-    ],
-    ids=["session-ingest", "session-worker", "ingest-worker"],
-)
-def test_reused_secret_pair_fails_independence(tmp_path, left, right):
-    config = valid_config(tmp_path)
-    setattr(config, right, getattr(config, left))
+    config.worker_secret = config.ingest_secret
     report = preflight.run_preflight(config, check_imports=False)
     assert not verdict(report, "secret_independence").ok
 
 
-@pytest.mark.parametrize("field", [
-    "publish_interval_seconds",
-    "worker_pull_interval_seconds",
-    "worker_collect_interval_seconds",
-])
+@pytest.mark.parametrize("field", ["worker_pull_interval_seconds", "worker_collect_interval_seconds"])
 def test_sub_minute_interval_fails(tmp_path, field):
     config = valid_config(tmp_path)
     setattr(config, field, 30)
@@ -367,7 +333,7 @@ def test_load_effective_env_malformed_file_fails(tmp_path, restore_environ):
 def test_import_checks_pass_for_real_modules(tmp_path):
     report = preflight.run_preflight(valid_config(tmp_path), check_imports=True)
     import_checks = [c for c in report.checks if c.name.startswith("import:")]
-    assert len(import_checks) == 4
+    assert len(import_checks) == 2
     assert all(c.ok for c in import_checks)
     assert verdict(report, "dependency:cryptography").ok
 
@@ -377,16 +343,6 @@ def test_render_never_contains_secret_values(tmp_path):
     text = preflight.run_preflight(config, check_imports=False).render()
     assert config.ingest_secret not in text
     assert config.worker_secret not in text
-    assert config.session_secret not in text
-
-
-def test_invalid_session_secret_render_never_contains_value(tmp_path):
-    config = valid_config(tmp_path)
-    config.session_secret = "q" * 31
-    text = preflight.run_preflight(config, check_imports=False).render()
-    assert config.session_secret not in text
-    assert "FAIL session_secret" in text
-    assert "AISTAT_SESSION_SECRET must contain at least 32 bytes" in text
 
 
 def test_cli_exit_code(tmp_path, monkeypatch):

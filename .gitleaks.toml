@@ -1,0 +1,13 @@
+# FAN-3458: full-history secret scan configuration.
+#
+# `.env.example` documents the configuration surface with explicit
+# REPLACE_WITH_* placeholder values; it never carries a real secret (the file
+# itself instructs operators to generate their own). The two historical
+# generic-api-key hits are these placeholders; allowlisting the path keeps the
+# required scan meaningful for every other file and commit.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented placeholder examples in .env.example"
+paths = ['''^\.env\.example$''']

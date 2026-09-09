@@ -200,6 +200,14 @@ def test_snapshot_is_fresh_enough_blocks_backwards_usage(tmp_path):
     _monotonic_usage_db(
         same, [("R1", "m1", "2026-07-22", 10, 20, 30, 40)]
     )
+    grown = tmp_path / "grown.db"
+    _monotonic_usage_db(
+        grown,
+        [
+            ("R1", "m1", "2026-07-19", 10, 20, 30, 40),
+            ("R1", "m1", "2026-07-22", 10, 20, 30, 40),
+        ],
+    )
     empty = tmp_path / "degraded.db"
     _monotonic_usage_db(empty, [])
     empty_target = tmp_path / "empty-target.db"
@@ -212,8 +220,11 @@ def test_snapshot_is_fresh_enough_blocks_backwards_usage(tmp_path):
     assert snapshot_is_fresh_enough(empty, fresh) is False
     # Same latest day -> accepted (re-publish / newer within-day is fine).
     assert snapshot_is_fresh_enough(same, fresh) is True
-    # Newer data over older -> accepted.
-    assert snapshot_is_fresh_enough(fresh, stale) is True
+    # A newer day on top of the history already recorded -> accepted.
+    assert snapshot_is_fresh_enough(grown, stale) is True
+    # A newer day that *drops* the recorded older day -> rejected: a new
+    # latest date is no licence to lose history.
+    assert snapshot_is_fresh_enough(fresh, stale) is False
     # First ingest / valid empty target accepts a valid (even empty) snapshot.
     assert snapshot_is_fresh_enough(stale, missing) is True
     assert snapshot_is_fresh_enough(empty, missing) is True
@@ -282,6 +293,62 @@ def test_snapshot_is_fresh_enough_same_day_row_matrix(tmp_path):
         ],
     )
     assert snapshot_is_fresh_enough(mixed, target) is False
+
+
+HISTORY_ROWS = [
+    ("R1", "m1", "2026-07-20", 100, 20, 30, 40),
+    ("R1", "m1", "2026-07-21", 200, 20, 30, 40),
+    ("R1", "m1", "2026-07-22", 300, 20, 30, 40),
+]
+
+
+def _history_variant(path, mutate):
+    rows = [list(row) for row in HISTORY_ROWS]
+    mutate(rows)
+    _monotonic_usage_db(path, [tuple(row) for row in rows])
+    return path
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        # FAN-2031: the latest day is untouched in every case below, which is
+        # exactly what let a rewritten history through before.
+        ("lowered-oldest-day", lambda rows: rows[0].__setitem__(3, 50)),
+        ("lowered-middle-day", lambda rows: rows[1].__setitem__(4, 19)),
+        ("dropped-oldest-day", lambda rows: rows.pop(0)),
+        ("dropped-middle-day", lambda rows: rows.pop(1)),
+    ],
+)
+def test_freshness_rejects_a_rewritten_history_under_an_unchanged_latest_day(
+    tmp_path, name, mutate
+):
+    target = tmp_path / "target.db"
+    _monotonic_usage_db(target, HISTORY_ROWS)
+    incoming = _history_variant(tmp_path / (name + ".db"), mutate)
+
+    report = freshness_report(incoming, target)
+    assert report["verdict"] == "reject"
+    assert report["reason"] in ("missing_rows", "decreased_counters")
+    assert snapshot_is_fresh_enough(incoming, target) is False
+
+
+def test_freshness_accepts_growth_across_the_whole_history(tmp_path):
+    target = tmp_path / "target.db"
+    _monotonic_usage_db(target, HISTORY_ROWS)
+
+    # Equal history, a historical counter that grew, a genuinely new
+    # historical row and a new latest day are all legitimate.
+    for name, mutate in (
+        ("equal", lambda rows: None),
+        ("grown-history", lambda rows: rows[0].__setitem__(3, 101)),
+        ("new-historical-row",
+         lambda rows: rows.append(["R2", "m2", "2026-07-21", 1, 2, 3, 4])),
+        ("new-latest-day",
+         lambda rows: rows.append(["R1", "m1", "2026-07-23", 1, 2, 3, 4])),
+    ):
+        incoming = _history_variant(tmp_path / (name + ".db"), mutate)
+        assert freshness_report(incoming, target)["verdict"] == "accept", name
 
 
 def test_snapshot_is_fresh_enough_ignores_derived_and_sync_fields(tmp_path):
@@ -370,8 +437,8 @@ def test_freshness_report_classifies_rejections_without_telemetry(tmp_path, caps
     for incoming, current, reason in (
         (older, target, "incoming_older_day"),
         (empty, target, "incoming_empty_over_populated"),
-        (missing, target, "missing_same_day_rows"),
-        (decreased, target, "decreased_same_day_counters"),
+        (missing, target, "missing_rows"),
+        (decreased, target, "decreased_counters"),
         (invalid, target, "incoming_unreadable"),
         (older, invalid, "target_unreadable"),
     ):
@@ -379,10 +446,10 @@ def test_freshness_report_classifies_rejections_without_telemetry(tmp_path, caps
         assert report["verdict"] == "reject"
         assert report["reason"] == reason
         assert set(report["summary"]) == {
-            "incoming_latest_rows",
-            "target_latest_rows",
-            "missing_same_day_rows",
-            "decreased_same_day_rows",
+            "incoming_rows",
+            "target_rows",
+            "missing_rows",
+            "decreased_rows",
         }
         assert all(isinstance(value, int) for value in report["summary"].values())
         assert snapshot_is_fresh_enough(incoming, current) is False
@@ -391,7 +458,7 @@ def test_freshness_report_classifies_rejections_without_telemetry(tmp_path, caps
     target_before = target.read_bytes()
     assert snapshot_module.main([str(decreased), str(target)]) == 1
     rendered = capsys.readouterr().out
-    assert json.loads(rendered)["reason"] == "decreased_same_day_counters"
+    assert json.loads(rendered)["reason"] == "decreased_counters"
     assert decreased.read_bytes() == incoming_before
     assert target.read_bytes() == target_before
     assert not list(tmp_path.glob("*.db-*"))

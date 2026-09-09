@@ -1,6 +1,6 @@
 """Dependency-free tenant identifiers, paths and snapshot signatures.
 
-This module is intentionally Python 3.6-compatible because the legacy cPanel
+This module is dependency-free and legacy-interpreter compatible because the cPanel
 WSGI entry point imports it without third-party dependencies.
 """
 

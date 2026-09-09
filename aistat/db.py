@@ -15,18 +15,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 10
 
 # Serving contract for hosted tenant databases (FAN-1734). The run-attributed
 # aggregates introduced with schema v5 physically require ``runs.model``, so
-# only the current schema may be admitted for serving: an older upload (e.g. a
-# valid v4 snapshot) or an unknown future version must be rejected before it
-# can reach aggregate SQL. Snapshot admission, owner migration admission and
-# both WSGI serving surfaces all consult this single definition via
-# :func:`schema_admission_error` so the surfaces cannot drift. The public host
-# never mutates authenticated snapshot bytes; a v4 database becomes servable
-# only by running :func:`init_db` on the writable source and re-publishing.
-MIN_SERVABLE_SCHEMA_VERSION = SCHEMA_VERSION
+# uploads older than v5 (e.g. a valid v4 snapshot) or unknown future versions
+# must be rejected before they can reach aggregate SQL. Schemas v6 (FAN-3306),
+# v7 (FAN-3349), and v8 (FAN-3454) only add flow-metrics data, so a v5 snapshot stays
+# fully servable: every pre-existing aggregate works unchanged and the flow
+# endpoint truthfully reports "no data" instead of failing. Schema v9 adds
+# optional pricing and QA-provenance tables, and v10 (FAN-3460) adds the
+# post-QA lineage stage table and its mirrored issue columns; both use the same
+# neutral fallbacks for older admitted snapshots. Snapshot
+# admission, owner migration admission and both WSGI serving surfaces all
+# consult this single definition via :func:`schema_admission_error` so the
+# surfaces cannot drift. The public host never mutates authenticated snapshot
+# bytes; an inadmissible database becomes servable only by running
+# :func:`init_db` on the writable source and re-publishing.
+MIN_SERVABLE_SCHEMA_VERSION = 5
 REQUIRED_SERVABLE_COLUMNS = {"runs": ("model",)}
 
 # Multica's run payload does not carry a model snapshot.  The one documented
@@ -97,6 +103,43 @@ CREATE TABLE IF NOT EXISTS issues (
     -- jira_key keeps the original Jira key (e.g. SCRUM-1078) for reference.
     is_jira            INTEGER NOT NULL DEFAULT 0,
     jira_key           TEXT,
+    -- Flow-metrics fields (FAN-3306), sourced from Multica issue metadata at
+    -- ingest. dispatch_lane/dispatch_ready describe routing; the qa_* fields
+    -- mirror the durable QA verdict a QA card carries once review finished
+    -- (qa_candidate is the immutable candidate SHA or artifact revision the
+    -- verdict applies to, qa_for_issue_id links back to the implementation
+    -- issue). All are NULL/0 for issues that never carried the metadata.
+    dispatch_lane      TEXT,
+    dispatch_ready     INTEGER NOT NULL DEFAULT 0,
+    qa_verdict         TEXT,
+    qa_verdict_at      TEXT,
+    qa_candidate       TEXT,
+    qa_for_issue_id    TEXT,
+    -- Versioned control-plane provenance. These values arrive from issue
+    -- metadata and are copied into a first-seen run attribution event; they
+    -- never repair or relabel older raw runs.
+    attribution_schema_version INTEGER,
+    model_revision     TEXT,
+    runtime_revision   TEXT,
+    prompt_revision    TEXT,
+    skills_revision    TEXT,
+    harness_revision   TEXT,
+    governance_bundle_revision TEXT,
+    -- Post-QA lineage links (FAN-3460), mirrored from issue metadata at
+    -- ingest. candidate_sha is the card's own immutable candidate;
+    -- qa_issue_id / integration_issue_id are the forward links to the QA and
+    -- DevOps children; integration_required records that a post-QA
+    -- integration is expected, so an absent integration is reported as a
+    -- missing link rather than as "not applicable". Every field is NULL when
+    -- the card never carried the metadata — nothing is inferred.
+    candidate_sha      TEXT,
+    qa_issue_id        TEXT,
+    integration_required INTEGER NOT NULL DEFAULT 0,
+    integration_issue_id TEXT,
+    integration_outcome  TEXT,
+    integration_sha    TEXT,
+    integration_ci_status TEXT,
+    release_version    TEXT,
     created_at         TEXT,
     updated_at         TEXT,
     synced_at          TEXT NOT NULL,
@@ -130,6 +173,7 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     cost_credits        REAL,
     cost_priced         INTEGER NOT NULL DEFAULT 0,
     cost_computed_at    TEXT,
+    rate_effective_from TEXT,
     PRIMARY KEY (runtime_id, model, date)
 );
 
@@ -206,6 +250,121 @@ CREATE TABLE IF NOT EXISTS poll_cycles (
     notes           TEXT
 );
 
+-- Observed issue status transitions (FAN-3306). One row per (issue, status,
+-- observation time), written by store.upsert_issues when a freshly synced
+-- status differs from the stored one. `initial` marks the first observation
+-- of an issue (a collection baseline, not a real transition): cycle-time
+-- aggregation only trusts an initial in_progress row when the issue was
+-- created after collection began, so pre-existing history is reported as
+-- uncovered instead of being backdated to the first sync.
+CREATE TABLE IF NOT EXISTS issue_status_events (
+    issue_id     TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,
+    initial      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (issue_id, status, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_status_events_status
+    ON issue_status_events(status, observed_at);
+
+-- Durable fleet capacity snapshots (FAN-3306), one row per successful poll
+-- cycle. `starved_idle` counts eligible delivery agents that were idle while
+-- no lane-compatible dispatch_ready card existed — the idle-fleet condition,
+-- resolved at snapshot time from live agents/runs/issues. `paused` records a
+-- manual workspace pause when one is observable (none is today; the column
+-- keeps historical rows honest if a pause signal appears later). The old
+-- ``done -> next in_progress`` approximation is deliberately not derivable
+-- from this table: intervals without snapshots stay uncovered.
+CREATE TABLE IF NOT EXISTS fleet_snapshots (
+    at            TEXT PRIMARY KEY,
+    eligible      INTEGER NOT NULL,
+    idle          INTEGER NOT NULL,
+    starved_idle  INTEGER NOT NULL,
+    ready_cards   INTEGER NOT NULL,
+    paused        INTEGER NOT NULL DEFAULT 0,
+    -- Whether `paused` came from the authoritative workspace observation.
+    -- A missing observation is not evidence of an active workspace.
+    pause_observed INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-lane breakdown of each fleet snapshot (agents attributed to their
+-- native lane; ready_cards counted by the card's dispatch_lane).
+CREATE TABLE IF NOT EXISTS fleet_snapshot_lanes (
+    at            TEXT NOT NULL,
+    lane          TEXT NOT NULL,
+    eligible      INTEGER NOT NULL,
+    idle          INTEGER NOT NULL,
+    starved_idle  INTEGER NOT NULL,
+    ready_cards   INTEGER NOT NULL,
+    PRIMARY KEY (at, lane)
+);
+
+-- Immutable provenance captured when a run is first observed. Existing runs
+-- are backfilled only as legacy_unknown so the original run rows remain raw.
+CREATE TABLE IF NOT EXISTS run_attribution_events (
+    run_id                       TEXT PRIMARY KEY,
+    issue_id                     TEXT,
+    attribution_schema_version   INTEGER,
+    provenance_state             TEXT NOT NULL,
+    model_revision               TEXT,
+    runtime_revision             TEXT,
+    prompt_revision              TEXT,
+    skills_revision              TEXT,
+    harness_revision             TEXT,
+    governance_bundle_revision  TEXT,
+    observed_at                  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_attribution_issue
+    ON run_attribution_events(issue_id);
+
+-- A readiness baseline is explicitly marked initial when v8 first sees a
+-- card that was already ready. Only later observed transitions measure PM
+-- preparation and current waiting time.
+CREATE TABLE IF NOT EXISTS issue_readiness_events (
+    issue_id     TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,
+    initial      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (issue_id, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_readiness_events_observed
+    ON issue_readiness_events(observed_at);
+
+-- One immutable terminal QA observation per QA issue. A row first seen after
+-- collection but already terminal is marked initial by the collector.
+CREATE TABLE IF NOT EXISTS qa_lineage_events (
+    qa_issue_id            TEXT PRIMARY KEY,
+    implementation_issue_id TEXT NOT NULL,
+    candidate              TEXT NOT NULL,
+    verdict                TEXT NOT NULL,
+    verdict_at             TEXT,
+    observed_at            TEXT NOT NULL,
+    initial                INTEGER NOT NULL DEFAULT 0,
+    accepted_candidate     TEXT,
+    accepted_story_points  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_qa_lineage_impl
+    ON qa_lineage_events(implementation_issue_id);
+
+-- Post-QA lineage stages (FAN-3460): the first observed terminal integration
+-- outcome and the first observed release version of an implementation issue.
+-- Keyed by (implementation issue, stage) so a later metadata rewrite cannot
+-- restate closed history: the mirrored issue columns stay current, this table
+-- stays immutable, and /api/lineage reports a divergence between the two as a
+-- `stale` link instead of silently preferring one of them.
+CREATE TABLE IF NOT EXISTS lineage_stage_events (
+    implementation_issue_id TEXT NOT NULL,
+    stage                   TEXT NOT NULL,
+    stage_issue_id          TEXT,
+    outcome                 TEXT NOT NULL,
+    reference               TEXT,
+    ci_status               TEXT,
+    observed_at             TEXT NOT NULL,
+    initial                 INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (implementation_issue_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_stage_observed
+    ON lineage_stage_events(stage, observed_at);
+
 -- Official per-1M-token rates, loaded from pricing.json (+ optional override).
 -- Rates are NULL for an unpriced model; source_url/captured_at record where
 -- and when each rate was taken from the vendor's official pricing page.
@@ -224,6 +383,41 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     notes                TEXT,
     loaded_at            TEXT NOT NULL
 );
+
+-- Append-only price revisions.  The first observed rate for a model/date is
+-- retained so a later catalog publication cannot rewrite closed history.
+CREATE TABLE IF NOT EXISTS model_price_history (
+    model                TEXT NOT NULL,
+    effective_from       TEXT NOT NULL,
+    vendor               TEXT,
+    currency             TEXT,
+    input_rate           REAL,
+    output_rate          REAL,
+    cache_read_rate      REAL,
+    cache_write_rate     REAL,
+    cache_write_1h_rate  REAL,
+    credit_input_rate    REAL,
+    credit_cache_read_rate REAL,
+    credit_output_rate   REAL,
+    unpriced             INTEGER NOT NULL DEFAULT 0,
+    source_url           TEXT,
+    captured_at          TEXT,
+    loaded_at            TEXT NOT NULL,
+    PRIMARY KEY (model, effective_from)
+);
+
+-- Sanitized billing reconciliation totals only: no provider export or invoice
+-- payload is stored in the application database.
+CREATE TABLE IF NOT EXISTS billing_reconciliation (
+    provider               TEXT NOT NULL,
+    period                 TEXT NOT NULL,
+    calculated_usd         REAL NOT NULL,
+    actual_usd             REAL NOT NULL,
+    variance_ratio         REAL NOT NULL,
+    over_threshold         INTEGER NOT NULL,
+    diagnostic_emitted_at  TEXT,
+    PRIMARY KEY (provider, period)
+);
 """
 
 # Columns added to pre-existing tables after their first release. init_db adds
@@ -235,13 +429,49 @@ _ADDED_COLUMNS = {
         ("cost_credits", "REAL"),
         ("cost_priced", "INTEGER NOT NULL DEFAULT 0"),
         ("cost_computed_at", "TEXT"),
+        ("rate_effective_from", "TEXT"),
+    ],
+    "model_price_history": [
+        ("cache_write_1h_rate", "REAL"),
+        ("credit_input_rate", "REAL"),
+        ("credit_cache_read_rate", "REAL"),
+        ("credit_output_rate", "REAL"),
     ],
     "issues": [
         ("is_jira", "INTEGER NOT NULL DEFAULT 0"),
         ("jira_key", "TEXT"),
+        ("dispatch_lane", "TEXT"),
+        ("dispatch_ready", "INTEGER NOT NULL DEFAULT 0"),
+        ("qa_verdict", "TEXT"),
+        ("qa_verdict_at", "TEXT"),
+        ("qa_candidate", "TEXT"),
+        ("qa_for_issue_id", "TEXT"),
+        ("attribution_schema_version", "INTEGER"),
+        ("model_revision", "TEXT"),
+        ("runtime_revision", "TEXT"),
+        ("prompt_revision", "TEXT"),
+        ("skills_revision", "TEXT"),
+        ("harness_revision", "TEXT"),
+        ("governance_bundle_revision", "TEXT"),
+        ("candidate_sha", "TEXT"),
+        ("qa_issue_id", "TEXT"),
+        ("integration_required", "INTEGER NOT NULL DEFAULT 0"),
+        ("integration_issue_id", "TEXT"),
+        ("integration_outcome", "TEXT"),
+        ("integration_sha", "TEXT"),
+        ("integration_ci_status", "TEXT"),
+        ("release_version", "TEXT"),
     ],
     "runs": [
         ("model", "TEXT"),
+    ],
+    "fleet_snapshots": [
+        ("pause_observed", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    "billing_reconciliation": [
+        ("currency", "TEXT NOT NULL DEFAULT 'USD'"),
+        ("submitted_by", "INTEGER"),
+        ("submitted_at", "TEXT"),
     ],
 }
 
@@ -307,6 +537,30 @@ def _backfill_run_models(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_legacy_attribution(conn: sqlite3.Connection) -> None:
+    """Mark pre-v8 raw rows unknown without altering their source columns."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO run_attribution_events
+            (run_id, issue_id, provenance_state, observed_at)
+        SELECT id, issue_id, 'legacy_unknown', ? FROM runs
+        """,
+        (utcnow_iso(),),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO issue_readiness_events
+            (issue_id, observed_at, initial)
+        SELECT i.id, ?, 1 FROM issues i
+        WHERE i.dispatch_ready = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM issue_readiness_events e WHERE e.issue_id = i.id
+          )
+        """,
+        (utcnow_iso(),),
+    )
+
+
 def schema_admission_error(conn: sqlite3.Connection):
     """Why ``conn``'s database may not be served, or ``None`` when it may.
 
@@ -317,8 +571,8 @@ def schema_admission_error(conn: sqlite3.Connection):
     """
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version < MIN_SERVABLE_SCHEMA_VERSION or version > SCHEMA_VERSION:
-        return "unsupported schema version {}; server requires {}".format(
-            version, SCHEMA_VERSION
+        return "unsupported schema version {}; server requires {}-{}".format(
+            version, MIN_SERVABLE_SCHEMA_VERSION, SCHEMA_VERSION
         )
     for table in sorted(REQUIRED_SERVABLE_COLUMNS):
         existing = {
@@ -362,5 +616,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _add_missing_columns(conn)
     _backfill_run_models(conn)
+    _backfill_legacy_attribution(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

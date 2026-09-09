@@ -27,7 +27,7 @@
 | Сторона | Код | Роль |
 |---|---|---|
 | Публичный хост | `aistat/wsgi.py`, `aistat/legacy_wsgi.py` | приём токена, pull-канал worker'а |
-| Общая логика | `aistat/handoff.py` | подпись канала, валидация, state machine (Python 3.6, только stdlib — грузится в оба контура) |
+| Общая логика | `aistat/handoff.py` | подпись канала, валидация, state machine (только stdlib — грузится в оба контура) |
 | Worker (локальная машина) | `aistat/worker_sync.py`, `aistat/worker_store.py` | pull, шифрованное хранение, ack |
 
 Оба публичных контура (Flask и dependency-free legacy для cPanel) используют
@@ -204,7 +204,8 @@ per-user данных — отдельный этап, FAN-1221).
 старого деплоя, она должна быть byte-exact `https://multica.ai`, иначе процесс
 fail-closed не запускает connection lifecycle.
 
-Локальная машина (рядом с publisher'ом в `~/.config/aistat/production.env`):
+Локальная машина (в private runtime env-файле
+`~/.config/aistat/production.env`):
 `AISTAT_WORKER_SYNC_URL=https://aistat.app`, тот же `AISTAT_WORKER_SECRET`,
 опционально `AISTAT_WORKER_KEY_PATH` (по умолчанию
 `~/.config/aistat/worker.key`), `AISTAT_WORKER_STORE_PATH` (по умолчанию

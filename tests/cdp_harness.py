@@ -554,6 +554,13 @@ def launch_chrome(chrome=CHROME, *, clock=time.monotonic, context=None,
     for path in (home, tmp, profile):
         path.mkdir()
 
+    # Environment-supplied extra flags (whitespace-split, no quoting): the CI
+    # browser lane passes --no-sandbox there, where Chrome-for-Testing aborts
+    # inside its namespace sandbox. Local runs keep the default of none.
+    extra_args = tuple(extra_args) + tuple(
+        os.environ.get("AISTAT_CHROME_EXTRA_ARGS", "").split()
+    )
+
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)

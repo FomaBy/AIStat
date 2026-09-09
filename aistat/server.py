@@ -9,6 +9,9 @@ Endpoints:
     GET /api/efficiency  — per-issue tokens/SP, worst first (?project&limit)
     GET /api/model-efficiency — per-model token/cost/weighted efficiency (?project)
     GET /api/efficiency-breakdown — token/SP cuts by agent, model and time
+    GET /api/flow        — flow metrics: cycle time, rework, idle fleet (?days&project&lane)
+    GET /api/lineage     — one end-to-end delivery chain by correlation id (?trace)
+    GET /api/slo         — pipeline SLOs, error budgets and breach alerts (?days)
     GET /api/health      — health snapshot (alias of /health)
     GET /api/events      — SSE: `update` after every poller data batch
                            (live phase or full cycle), `cycle` on full cycles
@@ -32,7 +35,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, aggregates
+from . import __version__, aggregates, flow_metrics, lineage, pricing
 from .config import Config
 from .db import connect, init_db
 from .health import snapshot
@@ -261,6 +264,83 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        finally:
+            conn.close()
+
+    @app.get("/api/flow")
+    def api_flow(
+        days: str = Query("30"),
+        project: Optional[List[str]] = Query(None),
+        lane: Optional[List[str]] = Query(None),
+    ):
+        try:
+            window = flow_metrics.validate_days(days)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        conn = db()
+        try:
+            return flow_metrics.flow(
+                conn, days=window,
+                project_ids=project or [], lanes=lane or [],
+            )
+        finally:
+            conn.close()
+
+    @app.get("/api/lineage")
+    def api_lineage(trace: str = Query("")):
+        conn = db()
+        try:
+            return lineage.trace(conn, trace)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        finally:
+            conn.close()
+
+    @app.get("/api/slo")
+    def api_slo(days: str = Query("30")):
+        try:
+            window = flow_metrics.validate_days(days)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        conn = db()
+        try:
+            return lineage.slo(conn, days=window)
+        finally:
+            conn.close()
+
+    @app.get("/api/billing-reconciliation")
+    def api_billing_reconciliation():
+        """Sanitized billing totals and coverage; provider exports stay outside AIStat."""
+        conn = db()
+        try:
+            return pricing.billing_reconciliation_snapshot(conn)
+        finally:
+            conn.close()
+
+    @app.get("/api/pricing")
+    def api_pricing():
+        """Published price revisions and priced/unpriced daily coverage."""
+        conn = db()
+        try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_price_history'"
+            ).fetchone() is None:
+                return {"rates": [], "coverage": {"rows": 0, "priced_rows": 0, "unpriced_rows": 0}}
+            rates = [dict(row) for row in conn.execute(
+                "SELECT model, effective_from, vendor, currency, input_rate, "
+                "output_rate, cache_read_rate, cache_write_rate, unpriced, "
+                "source_url, captured_at FROM model_price_history "
+                "ORDER BY model, effective_from"
+            )]
+            coverage = conn.execute(
+                "SELECT COUNT(*) AS rows, SUM(cost_priced) AS priced_rows "
+                "FROM daily_usage"
+            ).fetchone()
+            return {"rates": rates, "coverage": {
+                "rows": coverage["rows"],
+                "priced_rows": coverage["priced_rows"] or 0,
+                "unpriced_rows": coverage["rows"] - (coverage["priced_rows"] or 0),
+            }}
         finally:
             conn.close()
 

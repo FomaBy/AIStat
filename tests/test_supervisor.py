@@ -93,7 +93,7 @@ def contours(*names):
 def make_supervisor(tmp_path, spawner, clock, **kw):
     kw.setdefault("sleep", lambda _d: None)
     return Supervisor(
-        contours("poller", "publisher", "worker_sync", "collector"),
+        contours("worker_sync", "collector"),
         runtime_root=tmp_path,
         spawn=spawner,
         clock=clock,
@@ -103,13 +103,10 @@ def make_supervisor(tmp_path, spawner, clock, **kw):
 
 def valid_preflight_config(tmp_path):
     config = Config()
-    config.publish_tenant_id = 7
     config.publish_url = "https://aistat.app/api/ingest/snapshot"
     config.worker_sync_url = "https://aistat.app"
     config.ingest_secret = "i" * 40
     config.worker_secret = "w" * 40
-    config.session_secret = "s" * 40
-    config.publish_interval_seconds = 300
     config.worker_pull_interval_seconds = 300
     config.worker_collect_interval_seconds = 300
     config.worker_key_path = tmp_path / "key" / "worker.key"
@@ -118,17 +115,7 @@ def valid_preflight_config(tmp_path):
 
 
 def invalidate_secret_config(config, case):
-    if case == "session-missing":
-        config.session_secret = None
-    elif case == "session-empty":
-        config.session_secret = ""
-    elif case == "session-31-bytes":
-        config.session_secret = "s" * 31
-    elif case == "session-ingest":
-        config.session_secret = config.ingest_secret
-    elif case == "session-worker":
-        config.session_secret = config.worker_secret
-    elif case == "ingest-worker":
+    if case == "ingest-worker":
         config.worker_secret = config.ingest_secret
     else:  # pragma: no cover - keeps new matrix entries honest
         raise AssertionError("unknown secret case: {}".format(case))
@@ -203,11 +190,6 @@ def invalid_endpoint(case):
 @pytest.mark.parametrize(
     "case",
     [
-        "session-missing",
-        "session-empty",
-        "session-31-bytes",
-        "session-ingest",
-        "session-worker",
         "ingest-worker",
     ],
 )
@@ -243,7 +225,6 @@ def test_invalid_secrets_never_start_supervisor(
     for secret in (
         config.ingest_secret,
         config.worker_secret,
-        config.session_secret,
     ):
         if secret:
             assert secret not in caplog.text
@@ -338,12 +319,12 @@ def test_removed_skip_preflight_is_rejected_before_runtime_construction(
         assert secret not in caplog.text
 
 
-def test_valid_exact_32_byte_session_secret_starts_once(
+def test_runtime_starts_without_session_or_owner_tenant(
     tmp_path, monkeypatch
 ):
     config = valid_preflight_config(tmp_path)
-    config.session_secret = "é" * 16
-    assert len(config.session_secret.encode("utf-8")) == 32
+    config.session_secret = None
+    config.publish_tenant_id = None
     real_run_preflight = sv.preflight.run_preflight
     runtime_calls = []
 
@@ -402,14 +383,14 @@ def test_start_spawns_every_contour(tmp_path):
     sup = make_supervisor(tmp_path, spawner, Clock())
     sup.start()
     try:
-        assert len(spawner.spawned) == 4
+        assert len(spawner.spawned) == 2
         status_file = tmp_path / "run" / "supervisor.status.json"
         assert status_file.exists()
         # Status file is owner-only and lists every contour by name only.
         import json
         payload = json.loads(status_file.read_text())
         assert {c["name"] for c in payload["contours"]} == {
-            "poller", "publisher", "worker_sync", "collector"}
+            "worker_sync", "collector"}
         assert (os.stat(status_file).st_mode & 0o077) == 0
     finally:
         sup.stop()
@@ -424,13 +405,13 @@ def test_dead_child_is_restarted_after_backoff(tmp_path):
                           backoff_base=1.0, backoff_cap=30.0)
     sup.start()
     try:
-        poller = spawner.by_name("poller")[0]
-        poller.exit(1)
+        worker = spawner.by_name("worker_sync")[0]
+        worker.exit(1)
         sup.poll_once()  # notices exit, schedules restart
-        assert len(spawner.by_name("poller")) == 1  # not yet restarted
+        assert len(spawner.by_name("worker_sync")) == 1  # not yet restarted
         clock.advance(2.0)
         sup.poll_once()  # backoff elapsed -> respawn
-        assert len(spawner.by_name("poller")) == 2
+        assert len(spawner.by_name("worker_sync")) == 2
     finally:
         sup.stop()
 

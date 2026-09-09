@@ -2,7 +2,7 @@
 
 Namecheap's generic Passenger application currently runs ``/usr/bin/python3``
 with a package index capped at Flask 2.0.3. This entry point deliberately uses
-only the Python 3.6 standard library, while preserving the security contract of
+only the Python standard library, while preserving the security contract of
 the modern Flask WSGI app:
 
 * opaque HttpOnly/Secure/SameSite sessions resolved server-side;
@@ -28,7 +28,18 @@ import traceback
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import __version__, aggregates, handoff, oauth, snapshot, snapshot_recovery
+from . import (
+    __version__,
+    aggregates,
+    flow_metrics,
+    global_stats,
+    handoff,
+    lineage,
+    oauth,
+    release_identity,
+    snapshot,
+    snapshot_recovery,
+)
 from .db import SCHEMA_VERSION, init_db, schema_admission_error
 from .tenant import (
     canonical_tenant_id,
@@ -37,6 +48,9 @@ from .tenant import (
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+# The deployed cPanel package root is this module's parent's parent: the
+# built package puts ``aistat/`` and ``PACKAGE-MANIFEST.json`` as siblings.
+PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 REQUIRED_TABLES = {
     "runtimes",
@@ -85,6 +99,11 @@ ALLOWED_HOSTS = {
 }
 FORCE_HTTPS = _env_bool("AISTAT_FORCE_HTTPS", False)
 COOKIE_SECURE = _env_bool("AISTAT_SESSION_COOKIE_SECURE", FORCE_HTTPS)
+# Match the Flask ProxyFix contour: 0 trusts no client-supplied forwarded
+# value; N trusts only the N-th value from the right (the proxy-appended end).
+PROXY_TRUST_HOPS = max(
+    0, int(os.environ.get("AISTAT_PROXY_TRUST_HOPS", "0") or "0")
+)
 ADMIN_USERNAME = os.environ.get("AISTAT_ADMIN_USERNAME", "admin")
 ADMIN_EMAIL = os.environ.get("AISTAT_ADMIN_EMAIL") or None
 PASSWORD_HASH = os.environ.get("AISTAT_PASSWORD_HASH", "")
@@ -237,6 +256,7 @@ def _bootstrap():
         )
         conn.executescript(handoff.CONNECTIONS_SCHEMA)
         conn.executescript(snapshot_recovery.INSTALL_JOURNAL_SCHEMA)
+        conn.executescript(global_stats.GLOBAL_STATS_SCHEMA)
         # Serialize the inspect-and-alter migration across WSGI workers.
         conn.execute("BEGIN IMMEDIATE")
         columns = {
@@ -322,6 +342,10 @@ def _recover_snapshot_installs():
         conn = _security_connection()
         try:
             snapshot_recovery.recover_pending_installs(conn, TENANTS_DIR)
+            # Aggregate any installed snapshot the anonymized cross-tenant
+            # stats do not reflect yet (pre-feature tenants, or a crash
+            # between snapshot install and aggregation) — FAN-2392.
+            global_stats.sync_tenants(conn, TENANTS_DIR)
         finally:
             conn.close()
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -675,7 +699,7 @@ class _LegacyOAuthStore(object):
 
     Mirrors ``aistat.security.SecurityStore``'s account methods with the same
     SQL and one-time semantics, kept inline so ``legacy_wsgi`` stays free of the
-    ``dataclasses``-based config import and remains Python 3.6-clean.
+    ``dataclasses``-based config import and stays clean on legacy interpreters.
     """
 
     def put_oauth_state(
@@ -814,7 +838,7 @@ class _LegacyOAuthStore(object):
         """Subject-first resolution + atomic first registration.
 
         Mirrors ``SecurityStore.register_or_link_identity`` byte-for-byte in
-        behaviour so the Python 3.6 cPanel contour registers, links and gates
+        behaviour so the stdlib-only cPanel contour registers, links and gates
         identically. Returns ``{"user_id", "outcome"}`` with ``outcome`` in
         ``existing`` / ``linked_owner`` / ``created`` / ``denied``; a denied new
         subject writes nothing and yields ``user_id`` ``None``.
@@ -884,6 +908,7 @@ class _LegacyOAuthStore(object):
 def _secure_headers(environ):
     headers = [
         ("Cache-Control", "no-store"),
+        ("Vary", "Cookie"),
         (
             "Content-Security-Policy",
             "default-src 'none'; script-src 'self'; "
@@ -932,7 +957,18 @@ def _json_response(environ, start_response, status, data, headers=None):
 
 
 def _is_secure(environ):
-    forwarded = environ.get("HTTP_X_FORWARDED_PROTO", "").split(",", 1)[0].strip()
+    forwarded = []
+    if PROXY_TRUST_HOPS:
+        forwarded = [
+            value.strip().lower()
+            for value in environ.get("HTTP_X_FORWARDED_PROTO", "").split(",")
+            if value.strip()
+        ]
+    forwarded = (
+        forwarded[-PROXY_TRUST_HOPS]
+        if PROXY_TRUST_HOPS and len(forwarded) >= PROXY_TRUST_HOPS
+        else ""
+    )
     return (
         forwarded == "https"
         or environ.get("HTTPS", "").lower() in ("on", "1", "true")
@@ -1581,6 +1617,21 @@ def _ingest(environ, start_response):
                     "500 Internal Server Error",
                     {"detail": "snapshot install failed"},
                 )
+            # Best-effort: the snapshot is already installed, so an aggregation
+            # failure must not fail the ingest. The boot-time sync self-heals
+            # via the recorded snapshot sha (FAN-2392).
+            try:
+                stats_conn = _security_connection()
+                try:
+                    global_stats.refresh_tenant(
+                        stats_conn, tenant_id, target_path, info["sha256"]
+                    )
+                finally:
+                    stats_conn.close()
+            except Exception:
+                error_stream = environ.get("wsgi.errors")
+                if error_stream is not None:
+                    traceback.print_exc(file=error_stream)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     info["status"] = "ok"
@@ -1832,6 +1883,29 @@ def _api(environ, start_response, path):
                 "csrf": session["csrf"],
             },
         )
+    if path == "/api/release-identity":
+        try:
+            data = release_identity.load_release_identity(PACKAGE_ROOT)
+        except release_identity.ReleaseIdentityUnavailable:
+            error_stream = environ.get("wsgi.errors")
+            if error_stream is not None:
+                error_stream.write("release_identity_unavailable\n")
+            return _json_response(
+                environ, start_response, "503 Service Unavailable",
+                {"detail": "release identity unavailable"},
+            )
+        return _json_response(environ, start_response, "200 OK", data)
+    if path == "/api/global-model-efficiency":
+        # Anonymized sums across every tenant (FAN-2392): no filters, no
+        # per-tenant breakdown, only cost-relevant fields. Cohorts under the
+        # k>=5 minimum are suppressed and no contributor count is exposed, so
+        # the store's result is served verbatim (FAN-2397).
+        conn = _security_connection()
+        try:
+            data = global_stats.model_efficiency(conn)
+        finally:
+            conn.close()
+        return _json_response(environ, start_response, "200 OK", data)
     try:
         filters = aggregates.make_filters(
             _first(query, "from"), _first(query, "to"),
@@ -1913,6 +1987,36 @@ def _api(environ, start_response, path):
             data = aggregates.efficiency_breakdown(conn, filters=filters)
         elif path == "/api/efficiency-breakdown":
             data = aggregates.efficiency_chart_breakdown(conn, filters=filters)
+        elif path == "/api/flow":
+            try:
+                days = flow_metrics.validate_days(_first(query, "days", "30"))
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity",
+                    {"detail": str(exc)},
+                )
+            data = flow_metrics.flow(
+                conn, days=days,
+                project_ids=query.get("project") or [],
+                lanes=query.get("lane") or [],
+            )
+        elif path == "/api/lineage":
+            try:
+                data = lineage.trace(conn, _first(query, "trace", ""))
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity",
+                    {"detail": str(exc)},
+                )
+        elif path == "/api/slo":
+            try:
+                days = flow_metrics.validate_days(_first(query, "days", "30"))
+            except ValueError as exc:
+                return _json_response(
+                    environ, start_response, "422 Unprocessable Entity",
+                    {"detail": str(exc)},
+                )
+            data = lineage.slo(conn, days=days)
         elif path in ("/api/health", "/health"):
             data = _health(conn)
         elif path == "/api/sync":

@@ -5,7 +5,7 @@ it only until the trusted local worker collects it over an authenticated pull
 channel; after the worker's acknowledgement the host copy is physically erased
 and only an ``active`` marker remains.
 
-This module is intentionally Python 3.6-compatible and imports only the
+This module is dependency-free (standard library only) and imports only the
 standard library, because the legacy cPanel WSGI entry point uses it. It holds
 everything both public contours must agree on byte-for-byte:
 

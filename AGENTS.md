@@ -16,6 +16,7 @@ and completion transactions live in the bound
 ## Load context on demand
 
 - Usage and efficiency semantics: `docs/metrics-efficiency.md`
+- End-to-end lineage and pipeline SLOs: `docs/lineage-slo.md`
 - Per-user collection and privacy boundaries: `docs/per-user-collection.md`
 - Runtime lifecycle and supervision: `docs/runtime-supervisor.md`
 - Operator recovery: `docs/operations-runbook.md`
@@ -26,6 +27,16 @@ and completion transactions live in the bound
 Read only the references needed by the assigned scope. Do not copy transient
 quota state, incident details, worker IDs, or task-specific exceptions into this
 file.
+
+## Where/how questions
+
+For "where is X", "who calls Y", "how is Z connected" questions, try
+`graphify query "<question>"` (or `graphify path`/`graphify explain`) first when
+`graphify-out/graph.json` exists — it's usually a smaller, more targeted answer
+than grepping or reading whole files. Verify any returned location against the
+actual source before relying on it. Fall back to direct search/read when the
+graph is missing, stale, incomplete, or the relevant code isn't in an indexed
+language.
 
 ## Repository gotchas
 

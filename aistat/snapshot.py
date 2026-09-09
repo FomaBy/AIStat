@@ -38,7 +38,7 @@ class SnapshotError(ValueError):
 
 # A frozen, keyword-constructed value object. Uses ``typing.NamedTuple`` rather
 # than ``@dataclass(frozen=True)`` so this module — part of the ``aistat.backup``
-# import chain — stays importable on the production host's Python 3.6.8, which
+# import chain — stays importable on legacy stdlib-only shared-host interpreters, which
 # has no ``dataclasses`` module (FAN-1435).
 class SnapshotInfo(NamedTuple):
     sha256: str
@@ -58,10 +58,14 @@ FRESHNESS_REJECTION_REASONS = frozenset(
     (
         "incoming_older_day",
         "incoming_empty_over_populated",
-        "missing_same_day_rows",
-        "decreased_same_day_counters",
+        "missing_rows",
+        "decreased_counters",
         "incoming_unreadable",
         "target_unreadable",
+        # A host still running the previous generation reports the same two
+        # verdicts under their old, latest-day-only names.
+        "missing_same_day_rows",
+        "decreased_same_day_counters",
     )
 )
 
@@ -83,7 +87,7 @@ def _cleanup_snapshot_temp_files(temp_path: Path) -> None:
     """Remove a temporary SQLite file and every sidecar it may have created."""
     for suffix in ("",) + _SQLITE_SIDECAR_SUFFIXES:
         # ``Path.unlink(missing_ok=True)`` is Python 3.8+; the production host
-        # runs 3.6.8, so swallow the missing-file case explicitly instead.
+        # is a legacy interpreter, so swallow the missing-file case explicitly instead.
         try:
             Path(str(temp_path) + suffix).unlink()
         except FileNotFoundError:
@@ -102,7 +106,7 @@ def _path_has_open_owner(path: Path) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             # ``text=`` is the Python 3.7+ spelling; ``universal_newlines`` is the
-            # identical, 3.6-compatible option (the host runs 3.6.8).
+            # identical, legacy-compatible option.
             universal_newlines=True,
             check=False,
             timeout=2,
@@ -143,7 +147,7 @@ def cleanup_orphan_snapshot_sidecars(parent: Path) -> int:
 
 
 # ``sqlite3.Connection.backup()`` — SQLite's online backup API — exists only on
-# Python 3.7+. The production host runs 3.6.8, so a lock-guarded file copy stands
+# Python 3.7+; older interpreters lack it, so a lock-guarded file copy stands
 # in there (FAN-1435). Detected once at import; the owner-publisher on Python
 # 3.9+ keeps using the backup API unchanged.
 _HAS_SQLITE_BACKUP = hasattr(sqlite3.Connection, "backup")
@@ -165,7 +169,7 @@ def _snapshot_with_backup_api(db_path: Path, temp_path: Path) -> None:
 
 
 def _snapshot_with_file_copy(db_path: Path, temp_path: Path) -> None:
-    """Coherent copy for Python 3.6, which lacks ``Connection.backup()``.
+    """Coherent copy for interpreters that lack ``Connection.backup()``.
 
     Holds a write lock (``BEGIN IMMEDIATE``) on the source so no concurrent
     writer or checkpoint can move it while the main database and any ``-wal``
@@ -204,7 +208,7 @@ def create_compressed_snapshot(db_path: Path) -> bytes:
     """Copy a possibly WAL-backed database coherently, gzip-compressed.
 
     Uses SQLite's online backup API on Python 3.7+; on the production host's
-    Python 3.6.8 (no ``Connection.backup()``) it falls back to a lock-guarded
+    a legacy interpreter (no ``Connection.backup()``) it falls back to a lock-guarded
     file copy (FAN-1435). Both paths yield a self-contained, integrity-checkable
     rollback-journal database.
     """
@@ -315,7 +319,7 @@ def daily_usage_max_date(path: Path):
     Read-only and deliberately defensive: a missing file, a missing or empty
     ``daily_usage`` table, or any read error all yield ``None`` so a caller
     reads that as "this database carries no usage data". Standard-library only
-    and Python 3.6 compatible so the Flask app and the legacy cPanel WSGI entry
+    and dependency-free so the Flask app and the legacy cPanel WSGI entry
     point share one identical check (the ingest freshness guard below).
     """
     path = Path(path)
@@ -335,7 +339,11 @@ def daily_usage_max_date(path: Path):
 
 
 def _daily_usage_state(path: Path):
-    """Return the latest day and its keyed token counters, or unreadable.
+    """Return the latest day and every keyed token counter, or unreadable.
+
+    The whole history is read, not just the latest day: usage already recorded
+    for an older date must never disappear or shrink either, and a snapshot
+    that drops it is as damaging as one that rewinds today.
 
     Cost and sync columns are deliberately excluded: costs are derived from
     pricing and may be recomputed, while sync timestamps describe collection
@@ -358,10 +366,7 @@ def _daily_usage_state(path: Path):
             if not row or row[0] is None:
                 return None, {}
             latest = str(row[0])
-            rows = conn.execute(
-                "SELECT %s FROM daily_usage WHERE date = ?" % columns,
-                (latest,),
-            ).fetchall()
+            rows = conn.execute("SELECT %s FROM daily_usage" % columns).fetchall()
         finally:
             conn.close()
     except (OSError, sqlite3.Error):
@@ -389,10 +394,10 @@ def freshness_report(incoming_path: Path, target_path: Path):
     migration, or watermark is created or changed.
     """
     summary = {
-        "incoming_latest_rows": 0,
-        "target_latest_rows": 0,
-        "missing_same_day_rows": 0,
-        "decreased_same_day_rows": 0,
+        "incoming_rows": 0,
+        "target_rows": 0,
+        "missing_rows": 0,
+        "decreased_rows": 0,
     }
     incoming_state = _daily_usage_state(incoming_path)
     if incoming_state is _UNREADABLE_DAILY_USAGE:
@@ -402,7 +407,7 @@ def freshness_report(incoming_path: Path, target_path: Path):
             "summary": summary,
         }
     incoming_date, incoming_rows = incoming_state
-    summary["incoming_latest_rows"] = len(incoming_rows)
+    summary["incoming_rows"] = len(incoming_rows)
 
     target_path = Path(target_path)
     try:
@@ -423,7 +428,7 @@ def freshness_report(incoming_path: Path, target_path: Path):
             "summary": summary,
         }
     current_date, current_rows = current_state
-    summary["target_latest_rows"] = len(current_rows)
+    summary["target_rows"] = len(current_rows)
     if current_date is None:
         return {"verdict": "accept", "reason": None, "summary": summary}
     if incoming_date is None:
@@ -438,9 +443,9 @@ def freshness_report(incoming_path: Path, target_path: Path):
             "reason": "incoming_older_day",
             "summary": summary,
         }
-    if incoming_date > current_date:
-        return {"verdict": "accept", "reason": None, "summary": summary}
 
+    # Every row the target already holds must survive, whatever its date: a
+    # newer latest day is no licence to drop or lower recorded history.
     missing_rows = 0
     decreased_rows = 0
     for key, current_counters in current_rows.items():
@@ -454,18 +459,18 @@ def freshness_report(incoming_path: Path, target_path: Path):
             )
         ):
             decreased_rows += 1
-    summary["missing_same_day_rows"] = missing_rows
-    summary["decreased_same_day_rows"] = decreased_rows
+    summary["missing_rows"] = missing_rows
+    summary["decreased_rows"] = decreased_rows
     if missing_rows:
         return {
             "verdict": "reject",
-            "reason": "missing_same_day_rows",
+            "reason": "missing_rows",
             "summary": summary,
         }
     if decreased_rows:
         return {
             "verdict": "reject",
-            "reason": "decreased_same_day_counters",
+            "reason": "decreased_counters",
             "summary": summary,
         }
     return {"verdict": "accept", "reason": None, "summary": summary}

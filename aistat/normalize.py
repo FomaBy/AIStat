@@ -108,6 +108,78 @@ def is_jira_issue(obj: Dict[str, Any]) -> bool:
     return str(metadata.get("historical_import", "")).strip().lower() == "true"
 
 
+def _is_true(value: Any) -> bool:
+    """Metadata booleans arrive as JSON true or as the string "true"."""
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def _meta_str(metadata: Dict[str, Any], *keys: str) -> Optional[str]:
+    """First non-empty string value among `keys` in issue metadata."""
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _meta_positive_int(metadata: Dict[str, Any], key: str) -> Optional[int]:
+    """A numeric metadata version, without coercing strings or booleans."""
+    value = metadata.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def extract_qa_verdict(metadata: Dict[str, Any]) -> Optional[str]:
+    """Terminal QA verdict recorded on a QA card, normalized to upper case.
+
+    Only the three documented terminal verdicts are accepted; anything else
+    (typos, in-flight markers) is treated as "no verdict" rather than being
+    guessed into a category.
+    """
+    verdict = _meta_str(metadata, "qa_verdict")
+    if verdict is None:
+        return None
+    verdict = verdict.upper()
+    if verdict in ("PASSED", "FAILED", "INCONCLUSIVE"):
+        return verdict
+    return None
+
+
+# Terminal post-QA integration outcomes recorded by the DevOps lane. Anything
+# else (in-flight notes, free-form dispositions) is treated as "no outcome
+# observed" instead of being guessed into one of these buckets.
+TERMINAL_INTEGRATION_OUTCOMES = ("INTEGRATED", "PASSED", "FAILED", "BLOCKED")
+INTEGRATION_SUCCESS_OUTCOMES = ("INTEGRATED", "PASSED")
+
+# CI conclusions as the forges report them; an unknown word is not a red CI.
+CI_STATUSES = ("success", "failure", "cancelled", "timed_out", "neutral",
+               "skipped", "stale", "action_required")
+
+
+def extract_integration_outcome(metadata: Dict[str, Any]) -> Optional[str]:
+    """Terminal integration outcome of a card, normalized to upper case."""
+    outcome = _meta_str(metadata, "integration_outcome", "integration_result")
+    if outcome is None:
+        return None
+    outcome = outcome.upper()
+    return outcome if outcome in TERMINAL_INTEGRATION_OUTCOMES else None
+
+
+def extract_ci_status(metadata: Dict[str, Any]) -> Optional[str]:
+    """Observed CI conclusion for the integration of a candidate."""
+    status = _meta_str(
+        metadata, "integration_ci_status", "external_ci_status", "ci_status",
+        "ci_conclusion",
+    )
+    if status is None:
+        return None
+    status = status.lower()
+    return status if status in CI_STATUSES else None
+
+
 def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
     metadata = obj.get("metadata") or {}
     return {
@@ -126,6 +198,57 @@ def normalize_issue(obj: Dict[str, Any]) -> Dict[str, Any]:
         "estimation_model": metadata.get("estimation_model"),
         "is_jira": 1 if is_jira_issue(obj) else 0,
         "jira_key": extract_jira_key(obj),
+        # Flow-metrics fields (FAN-3306). qa_candidate prefers the exact
+        # commit SHA and falls back to the artifact-revision string used by
+        # non-repository QA; qa_for_issue_id takes the first metadata key the
+        # pipeline has historically used to link a QA card to its
+        # implementation issue.
+        "dispatch_lane": _meta_str(metadata, "dispatch_lane"),
+        "dispatch_ready": 1 if _is_true(metadata.get("dispatch_ready")) else 0,
+        "qa_verdict": extract_qa_verdict(metadata),
+        "qa_verdict_at": _meta_str(metadata, "qa_verdict_at"),
+        "qa_candidate": _meta_str(
+            metadata, "qa_candidate_sha", "candidate_sha",
+            "qa_candidate_artifact_revisions",
+        ),
+        "qa_for_issue_id": _meta_str(
+            metadata, "qa_for_issue_id", "implementation_issue_id",
+            "source_issue_id",
+        ),
+        "attribution_schema_version": _meta_positive_int(
+            metadata, "attribution_schema_version"
+        ),
+        "model_revision": _meta_str(metadata, "model_revision"),
+        "runtime_revision": _meta_str(metadata, "runtime_revision"),
+        "prompt_revision": _meta_str(metadata, "prompt_revision"),
+        "skills_revision": _meta_str(
+            metadata, "skills_revision", "skill_revision"
+        ),
+        "harness_revision": _meta_str(metadata, "harness_revision"),
+        "governance_bundle_revision": _meta_str(
+            metadata, "governance_bundle_revision"
+        ),
+        # Post-QA lineage links (FAN-3460). Each key list is the observed
+        # pipeline vocabulary in precedence order (most specific first); the
+        # first non-empty value wins and nothing is derived when all are
+        # absent, so a missing link stays missing.
+        "candidate_sha": _meta_str(
+            metadata, "candidate_sha", "dispatch_candidate_sha",
+        ),
+        "qa_issue_id": _meta_str(metadata, "qa_issue_id"),
+        "integration_required": (
+            1 if _is_true(metadata.get("post_qa_integration_required")) else 0
+        ),
+        "integration_issue_id": _meta_str(
+            metadata, "integration_issue_id", "post_qa_devops_issue_id",
+        ),
+        "integration_outcome": extract_integration_outcome(metadata),
+        "integration_sha": _meta_str(
+            metadata, "integration_result_sha", "integration_sha",
+            "integrated_target_sha", "final_integrated_candidate_sha",
+        ),
+        "integration_ci_status": extract_ci_status(metadata),
+        "release_version": _meta_str(metadata, "release_version"),
         "created_at": obj.get("created_at"),
         "updated_at": _require(obj, "updated_at", "issue"),
     }
@@ -167,6 +290,13 @@ def normalize_run(obj: Dict[str, Any]) -> Dict[str, Any]:
         # Present on some future/extended payloads.  Standard Multica run
         # responses currently omit it; store.upsert_runs snapshots then.
         "model": obj.get("model"),
+        "model_revision": obj.get("model_revision"),
+        "runtime_revision": obj.get("runtime_revision"),
+        "prompt_revision": obj.get("prompt_revision"),
+        "skills_revision": obj.get("skills_revision"),
+        "harness_revision": obj.get("harness_revision"),
+        "governance_bundle_revision": obj.get("governance_bundle_revision"),
+        "attribution_schema_version": obj.get("attribution_schema_version"),
         "kind": obj.get("kind"),
         "status": obj.get("status"),
         "attempt": obj.get("attempt"),

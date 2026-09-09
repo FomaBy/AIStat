@@ -38,12 +38,19 @@ SESSION_SECRET = "legacy-session-" + "s" * 48
 INGEST_SECRET = "legacy-ingest-" + "i" * 48
 
 
-def configure_legacy_env(tmp_path, monkeypatch, allowed_emails="allowed@example.com"):
+def configure_legacy_env(
+    tmp_path,
+    monkeypatch,
+    allowed_emails="allowed@example.com",
+    force_https=False,
+    proxy_trust_hops=0,
+):
     monkeypatch.setenv("AISTAT_DB_PATH", str(tmp_path / "public.db"))
     monkeypatch.setenv("AISTAT_SECURITY_DB_PATH", str(tmp_path / "security.db"))
     monkeypatch.setenv("AISTAT_TENANTS_DIR", str(tmp_path / "tenants"))
     monkeypatch.setenv("AISTAT_ALLOWED_HOSTS", "localhost,aistat.app")
-    monkeypatch.setenv("AISTAT_FORCE_HTTPS", "0")
+    monkeypatch.setenv("AISTAT_FORCE_HTTPS", "1" if force_https else "0")
+    monkeypatch.setenv("AISTAT_PROXY_TRUST_HOPS", str(proxy_trust_hops))
     monkeypatch.setenv("AISTAT_SESSION_COOKIE_SECURE", "1")
     monkeypatch.setenv("AISTAT_ADMIN_USERNAME", "sergey")
     monkeypatch.setenv(
@@ -111,7 +118,10 @@ def legacy_open(tmp_path, monkeypatch):
     return _boot_legacy(tmp_path)
 
 
-def request(app, path, method="GET", body=b"", headers=None, cookie=None):
+def request(
+    app, path, method="GET", body=b"", headers=None, cookie=None, secure=True,
+    errors=None,
+):
     query = ""
     if "?" in path:
         path, query = path.split("?", 1)
@@ -123,11 +133,12 @@ def request(app, path, method="GET", body=b"", headers=None, cookie=None):
             "PATH_INFO": path,
             "QUERY_STRING": query,
             "HTTP_HOST": "localhost",
-            "HTTPS": "on",
-            "wsgi.url_scheme": "https",
+            "HTTPS": "on" if secure else "",
+            "wsgi.url_scheme": "https" if secure else "http",
             "REMOTE_ADDR": "127.0.0.1",
             "wsgi.input": io.BytesIO(body),
             "CONTENT_LENGTH": str(len(body)),
+            "wsgi.errors": errors if errors is not None else io.StringIO(),
         }
     )
     if cookie:
@@ -203,10 +214,15 @@ def test_source_parses_as_python_36():
         "aistat/aggregates.py",
         "aistat/db.py",
         "aistat/endpoints.py",
+        "aistat/flow_metrics.py",
+        "aistat/global_stats.py",
         "aistat/handoff.py",
         "aistat/legacy_wsgi.py",
+        "aistat/lineage.py",
         "aistat/migrate.py",
+        "aistat/normalize.py",
         "aistat/oauth.py",
+        "aistat/release_identity.py",
         "aistat/snapshot.py",
         "aistat/snapshot_recovery.py",
         "aistat/tenant.py",
@@ -214,6 +230,77 @@ def test_source_parses_as_python_36():
     ):
         source = open(path, encoding="utf-8").read()
         ast.parse(source, filename=path, feature_version=(3, 6))
+
+
+def _legacy_proxy_app(tmp_path, monkeypatch, hops):
+    configure_legacy_env(
+        tmp_path,
+        monkeypatch,
+        force_https=True,
+        proxy_trust_hops=hops,
+    )
+    return _boot_legacy(tmp_path)
+
+
+def test_legacy_untrusted_forwarded_proto_cannot_bypass_https_or_enable_hsts(
+    tmp_path, monkeypatch
+):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=0)
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "https"},
+        secure=False,
+    )
+    assert status == "308 Permanent Redirect"
+    assert header_values(headers, "Strict-Transport-Security") == []
+
+
+def test_legacy_proxy_hop_1_uses_the_rightmost_forwarded_proto(
+    tmp_path, monkeypatch
+):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=1)
+    status, _, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "https, http"},
+        secure=False,
+    )
+    assert status == "308 Permanent Redirect"
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "http, https"},
+        secure=False,
+    )
+    assert status == "200 OK"
+    assert header_values(headers, "Strict-Transport-Security")
+
+
+def test_legacy_proxy_hop_2_uses_the_second_value_from_the_right(
+    tmp_path, monkeypatch
+):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=2)
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "http, https, http"},
+        secure=False,
+    )
+    assert status == "200 OK"
+    assert header_values(headers, "Strict-Transport-Security")
+
+
+def test_legacy_proxy_ignores_an_insufficient_forwarded_chain(tmp_path, monkeypatch):
+    legacy = _legacy_proxy_app(tmp_path, monkeypatch, hops=2)
+    status, headers, _ = request(
+        legacy.application,
+        "/healthz",
+        headers={"X-Forwarded-Proto": "https"},
+        secure=False,
+    )
+    assert status == "308 Permanent Redirect"
+    assert header_values(headers, "Strict-Transport-Security") == []
 
 
 def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
@@ -271,10 +358,10 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
         assert report["detail"] == "snapshot freshness rejected"
         assert report["reason"] == reason
         assert set(report["summary"]) == {
-            "incoming_latest_rows",
-            "target_latest_rows",
-            "missing_same_day_rows",
-            "decreased_same_day_rows",
+            "incoming_rows",
+            "target_rows",
+            "missing_rows",
+            "decreased_rows",
         }
         rendered = json.dumps(report, sort_keys=True)
         for forbidden in (
@@ -298,14 +385,25 @@ def test_ingest_rejects_snapshot_with_older_usage_data(legacy, tmp_path):
         "DELETE FROM daily_usage WHERE runtime_id = 'R2' "
         "AND model = 'm-mystery' AND date = '2026-01-02';"
     )
-    assert_rejected(post(degraded, base_ts + 10), "missing_same_day_rows")
+    assert_rejected(post(degraded, base_ts + 10), "missing_rows")
 
     lower = build(
         "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
         "WHERE runtime_id = 'R4' AND model = 'm-claude' "
         "AND date = '2026-01-02';"
     )
-    assert_rejected(post(lower, base_ts + 20), "decreased_same_day_counters")
+    assert_rejected(post(lower, base_ts + 20), "decreased_counters")
+
+    # FAN-2031: the legacy 3.6 contour enforces the same all-history contract —
+    # a rewritten *earlier* day is rejected even though the latest day matches.
+    lower_history = build(
+        "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
+        "WHERE date = '2026-01-01';"
+    )
+    assert_rejected(post(lower_history, base_ts + 21), "decreased_counters")
+
+    dropped_history = build("DELETE FROM daily_usage WHERE date = '2026-01-01';")
+    assert_rejected(post(dropped_history, base_ts + 22), "missing_rows")
 
     empty = build("DELETE FROM daily_usage;")
     assert_rejected(post(empty, base_ts + 25), "incoming_empty_over_populated")
@@ -572,6 +670,120 @@ def test_login_api_and_security_headers(legacy):
     assert [p["title"] for p in data["projects"]] == ["Alpha", "Beta"]
     assert header_values(headers, "X-Frame-Options") == ["DENY"]
     assert "Secure" in cookies or "aistat_session=" in cookies
+
+
+VALID_RELEASE_MANIFEST = {
+    "files": [{"path": "aistat/__init__.py", "sha256": "0" * 64,
+               "size_bytes": 1, "mode": "0644"}],
+    "format": "aistat-cpanel-package",
+    "format_version": 1,
+    "hash_algorithm": "sha256",
+    "source_commit_sha": "a" * 40,
+    "source_tree_sha": "b" * 40,
+}
+
+
+def _write_release_manifest(root, payload=None, raw=None):
+    os.makedirs(root, exist_ok=True)
+    if raw is None:
+        raw = json.dumps(
+            payload if payload is not None else VALID_RELEASE_MANIFEST,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    with open(os.path.join(root, "PACKAGE-MANIFEST.json"), "wb") as stream:
+        stream.write(raw)
+    return raw
+
+
+def test_release_identity_endpoint_requires_login(legacy, tmp_path):
+    root = os.path.join(str(tmp_path), "package")
+    _write_release_manifest(root)
+    legacy.PACKAGE_ROOT = root
+    status, headers, body = request(legacy.application, "/api/release-identity")
+    assert status == "401 Unauthorized"
+    assert header_values(headers, "Cache-Control") == ["no-store"]
+    assert header_values(headers, "Vary") == ["Cookie"]
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "authentication required"
+    }
+    denial = body.decode("utf-8")
+    assert str(root) not in denial
+    assert "PACKAGE-MANIFEST" not in denial
+    assert "source_commit_sha" not in denial
+    assert "Traceback" not in denial
+
+
+def test_release_identity_endpoint_returns_exact_fields_from_deployed_root(
+    legacy, tmp_path
+):
+    root = os.path.join(str(tmp_path), "package")
+    raw = _write_release_manifest(root)
+    legacy.PACKAGE_ROOT = root
+    cookies = login(legacy)
+    status, headers, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "200 OK"
+    assert header_values(headers, "Cache-Control") == ["no-store"]
+    assert header_values(headers, "Vary") == ["Cookie"]
+    data = json.loads(body.decode("utf-8"))
+    assert set(data) == {"source_commit_sha", "source_tree_sha", "manifest_sha256"}
+    assert data["source_commit_sha"] == "a" * 40
+    assert data["source_tree_sha"] == "b" * 40
+    assert data["manifest_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_release_identity_endpoint_missing_manifest_is_generic_503(legacy, tmp_path):
+    legacy.PACKAGE_ROOT = os.path.join(str(tmp_path), "package")
+    cookies = login(legacy)
+    errors = io.StringIO()
+    status, headers, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies, errors=errors
+    )
+    assert status == "503 Service Unavailable"
+    assert header_values(headers, "Cache-Control") == ["no-store"]
+    assert header_values(headers, "Vary") == ["Cookie"]
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "release identity unavailable"
+    }
+    assert errors.getvalue() == "release_identity_unavailable\n"
+    assert str(tmp_path) not in errors.getvalue()
+
+
+def test_release_identity_endpoint_malformed_manifest_is_generic_503(
+    legacy, tmp_path
+):
+    root = os.path.join(str(tmp_path), "package")
+    _write_release_manifest(root, raw=b"not json")
+    legacy.PACKAGE_ROOT = root
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "503 Service Unavailable"
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "release identity unavailable"
+    }
+
+
+def test_release_identity_endpoint_rejects_symlinked_manifest(legacy, tmp_path):
+    root = os.path.join(str(tmp_path), "package")
+    os.makedirs(root)
+    outside = os.path.join(str(tmp_path), "outside")
+    _write_release_manifest(outside)
+    os.symlink(
+        os.path.join(outside, "PACKAGE-MANIFEST.json"),
+        os.path.join(root, "PACKAGE-MANIFEST.json"),
+    )
+    legacy.PACKAGE_ROOT = root
+    cookies = login(legacy)
+    status, _, body = request(
+        legacy.application, "/api/release-identity", cookie=cookies
+    )
+    assert status == "503 Service Unavailable"
+    assert json.loads(body.decode("utf-8")) == {
+        "detail": "release identity unavailable"
+    }
 
 
 def test_model_efficiency_endpoint(legacy):
@@ -2276,3 +2488,17 @@ def test_legacy_rejects_symlink_target_without_touching_state(
     assert os.path.islink(target)
     assert _legacy_watermark(legacy, uid) == old_wm
     assert _legacy_journal_count(legacy) == 0
+
+
+def test_flow_endpoint_served_on_legacy_contour(legacy):
+    """FAN-3306: the dependency-free cPanel contour serves /api/flow with the
+    same payload contract and 422 validation."""
+    cookie = login(legacy)
+    status, _, body = request(legacy.application, "/api/flow", cookie=cookie)
+    assert status == "200 OK"
+    out = json.loads(body)
+    assert out["days"] == 30
+    assert set(out) >= {"cycle_time", "rework", "idle", "coverage"}
+    status, _, _ = request(
+        legacy.application, "/api/flow?days=45", cookie=cookie)
+    assert status == "422 Unprocessable Entity"

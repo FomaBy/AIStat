@@ -140,6 +140,9 @@ const state = {
   chartCatalog: null,
   chartDimension: "time",
   chartMeasure: "total_tokens",
+  flowDays: "30",
+  flowLane: "",
+  metaProjects: [],
   lastDate: null, // max date present in daily_usage (from /api/meta)
   charts: {},
   csrf: null,
@@ -726,6 +729,16 @@ function query(params) {
   return s ? "?" + s : "";
 }
 
+// The flow endpoint takes rolling UTC windows (7/30/90 days), not from/to:
+// only the global project filter and the panel's own controls apply.
+function flowQuery() {
+  const q = new URLSearchParams();
+  q.set("days", state.flowDays);
+  for (const project of state.projects) q.append("project", project);
+  if (state.flowLane) q.append("lane", state.flowLane);
+  return "?" + q.toString();
+}
+
 function chartPair(dimension, measure) {
   return state.chartCatalog && state.chartCatalog.compatibility[dimension]
     && state.chartCatalog.compatibility[dimension][measure];
@@ -1070,6 +1083,64 @@ function renderModelEfficiency(data) {
   }
 }
 
+// Anonymized cross-tenant "Efficiency by models" (FAN-2392): cost per SP over
+// every AIStat user's data. The endpoint only exists on the hosted multi-user
+// surfaces, so a missing/failed response hides the panel instead of erroring.
+// The API already suppressed every model cohort under k>=5 and exposes no
+// contributor count, so this renders exactly what it is given — it must never
+// re-introduce a per-model user count column (FAN-2397).
+function renderGlobalModelEfficiency(data) {
+  const panel = $("global-models-panel");
+  if (!data || !Array.isArray(data.models)) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const models = data.models;
+  const label = (m) => (m.model == null ? t("unattributed") : m.model);
+  $("empty-global-models").hidden = models.some((m) => m.cost_per_sp != null);
+  const tbody = $("table-global-models-data").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const m of models) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(label(m))}${m.has_unpriced ? " *" : ""}</td>
+      <td class="num">${fmtNum(m.story_points)}</td>
+      <td class="num">${fmtTokens(m.total_tokens)}</td>
+      <td class="num">${m.cost_usd == null ? "—" : fmtUSDFine(m.cost_usd)}</td>
+      <td class="num">${m.cost_per_sp == null ? "—" : fmtUSDFine(m.cost_per_sp)}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!models.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="5" class="note">${t("noGlobalModels")}</td>`;
+    tbody.appendChild(tr);
+  }
+  const priced = models.filter((m) => m.cost_per_sp != null);
+  upsertChart("chart-global-models", {
+    type: "bar",
+    data: {
+      labels: priced.map(label),
+      datasets: [{
+        data: priced.map((m) => m.cost_per_sp),
+        backgroundColor: priced.map((m) => entityColor("model", m.model)),
+        borderWidth: 0,
+        maxBarThickness: 36,
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => fmtUSDFine(ctx.parsed.x) + " / SP" } },
+      },
+      scales: { x: { ticks: { callback: (v) => fmtUSDFine(v) } } },
+    },
+  });
+}
+
 function efficiencyBarConfig(rows, type) {
   return {
     type: "bar",
@@ -1113,6 +1184,285 @@ function renderBreakdownTable(id, rows) {
       <td class="num">${r.tokens_per_sp == null ? "—" : fmtTokens(r.tokens_per_sp)}</td>`;
     tbody.appendChild(tr);
   }
+}
+
+function fmtShare(value) {
+  return value == null ? "—" : (100 * value).toFixed(1) + "%";
+}
+
+function renderFlow(data) {
+  const panel = $("flow-panel");
+  if (!data) {
+    // The endpoint is absent on this host (older deployment) — hide the panel.
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const cycle = data.cycle_time;
+  const rework = data.rework;
+  const idle = data.idle;
+  const frontier = data.frontier || {};
+  const lineage = data.lineage || {};
+
+  $("card-flow-cycle").textContent = fmtDuration(cycle.median_seconds);
+  $("card-flow-cycle-sub").textContent = t("flowMeasuredSub", {
+    measured: cycle.measured, done: cycle.done_total,
+  });
+  $("card-flow-p90").textContent = fmtDuration(cycle.p90_seconds);
+  $("card-flow-p90-sub").textContent = t("flowP90Sub", {
+    censored: cycle.open_censored,
+  });
+  $("card-flow-rework").textContent = fmtShare(rework.rate);
+  $("card-flow-rework-sub").textContent = t("flowReworkSub", {
+    reworked: rework.reworked, candidates: rework.candidates,
+  });
+  $("card-flow-idle").textContent = fmtShare(idle.share);
+  $("card-flow-idle-sub").textContent = t("flowIdleSub", {
+    pct: idle.coverage_pct,
+  });
+  $("card-flow-ready").textContent = fmtNum(frontier.ready);
+  $("card-flow-ready-sub").textContent = t("flowReadySub", {
+    ready: frontier.ready == null ? 0 : frontier.ready,
+    points: fmtNum(frontier.ready_story_points),
+  });
+  $("card-flow-pm-p95").textContent = fmtDuration(frontier.pm_p95_seconds);
+  $("card-flow-pm-p95-sub").textContent = t("flowPmP95Sub", {
+    measured: frontier.pm_measured == null ? 0 : frontier.pm_measured,
+  });
+  $("card-flow-waiting").textContent = fmtDuration(frontier.waiting_median_seconds);
+  $("card-flow-waiting-sub").textContent = t("flowWaitingSub", {
+    waiting: frontier.waiting == null ? 0 : frontier.waiting,
+  });
+  $("card-flow-first-pass").textContent = fmtShare(lineage.first_pass_rate);
+  $("card-flow-first-pass-sub").textContent = t("flowFirstPassSub", {
+    passed: lineage.first_passed == null ? 0 : lineage.first_passed,
+    denominator: lineage.first_pass_denominator == null ? 0 : lineage.first_pass_denominator,
+  });
+
+  // Lane selector: observed lanes, preserving the current choice.
+  const laneSelect = $("flow-lane");
+  const lanes = data.lanes || [];
+  while (laneSelect.options.length) laneSelect.remove(0);
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = t("allLanes");
+  all.selected = !state.flowLane;
+  laneSelect.appendChild(all);
+  const options = lanes.includes(state.flowLane) || !state.flowLane
+    ? lanes : lanes.concat([state.flowLane]);
+  for (const lane of options) {
+    const option = document.createElement("option");
+    option.value = lane;
+    option.textContent = lane;
+    option.selected = lane === state.flowLane;
+    laneSelect.appendChild(option);
+  }
+
+  const titles = new Map(state.metaProjects.map((p) => [p.id, p.title]));
+  const tbody = $("table-flow-groups").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const group of cycle.groups) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(titles.get(group.project_id) || group.project_id || t("unknown"))}</td>
+      <td>${esc(group.lane)}</td>
+      <td class="num">${group.count}</td>
+      <td class="num">${fmtDuration(group.median_seconds)}</td>
+      <td class="num">${fmtDuration(group.p90_seconds)}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!cycle.groups.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="5" class="note">${t("noData")}</td>`;
+    tbody.appendChild(tr);
+  }
+
+  const coverage = [];
+  coverage.push(data.coverage.events_start
+    ? t("flowCoverageEvents", { start: data.coverage.events_start })
+    : t("flowCoverageNoEvents"));
+  coverage.push(data.coverage.snapshots_start
+    ? t("flowCoverageSnapshots", { start: data.coverage.snapshots_start })
+    : t("flowCoverageNoSnapshots"));
+  coverage.push(t("flowCoverageDetail", {
+    noStart: cycle.excluded_no_start,
+    cancelled: cycle.cancelled,
+    unwindowed: rework.unwindowed,
+  }));
+  coverage.push(t("flowAttributionCoverage", {
+    unknown: lineage.unknown == null ? 0 : lineage.unknown,
+    legacy: lineage.legacy_unknown == null ? 0 : lineage.legacy_unknown,
+  }));
+  $("flow-coverage").textContent = coverage.join(" · ");
+}
+
+// Pipeline SLOs (FAN-3460): window, numerator/denominator, threshold, owner and
+// error budget per objective, plus the dedupe-ready breach events and the
+// on-demand end-to-end trace drill-down.
+function renderSlo(data) {
+  const panel = $("slo-panel");
+  if (!data) {
+    // Older deployment without the endpoint — hide instead of faking a state.
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const tbody = $("table-slo").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const slo of data.slos) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="wrap">${esc(slo.id)}<div class="card-sub">${esc(slo.sli)}</div></td>
+      <td>${esc(slo.owner)}</td>
+      <td>${slo.threshold_seconds == null ? "—" : fmtDuration(slo.threshold_seconds)}</td>
+      <td class="num">${fmtShare(slo.objective)}</td>
+      <td class="num">${slo.measured ? fmtShare(slo.ratio) : t("sloUnmeasured")}</td>
+      <td class="num">${slo.numerator} / ${slo.denominator}</td>
+      <td class="num">${slo.budget_remaining == null ? "—" : fmtShare(slo.budget_remaining)}</td>`;
+    if (slo.breached) tr.className = "row-warn";
+    tbody.appendChild(tr);
+  }
+
+  const alerts = $("slo-alerts");
+  alerts.innerHTML = "";
+  if (!data.alerts.length) {
+    const li = document.createElement("li");
+    li.textContent = t("sloNoAlerts");
+    alerts.appendChild(li);
+  }
+  for (const alert of data.alerts) {
+    const li = document.createElement("li");
+    const subjects = alert.subjects
+      .map((s) => [s.identifier || s.issue_id, s.candidate || s.integration_sha,
+                   s.run_id].filter(Boolean).join(" "))
+      .filter(Boolean);
+    li.innerHTML = esc(t("sloAlertLine", {
+      severity: alert.severity, slo: alert.slo, owner: alert.owner,
+      key: alert.dedupe_key,
+    })) + (subjects.length
+      ? `<div class="card-sub">${esc(subjects.join(" · "))}` +
+        `${alert.subjects_truncated ? " …" : ""}</div>`
+      : "");
+    alerts.appendChild(li);
+  }
+}
+
+// A trace is looked up on demand: one correlation id, one chain, exact ids.
+function lineageLinks(stage) {
+  const parts = [];
+  const push = (label, value) => { if (value) parts.push(label + " " + value); };
+  push("issue", stage.identifier || stage.issue_id);
+  if (stage.run_ids) parts.push(stage.run_ids.join(" "));
+  push("candidate", stage.candidate_sha);
+  if (stage.reviewed_candidates && stage.reviewed_candidates.length) {
+    parts.push("QA " + stage.reviewed_candidates.join(" "));
+  }
+  if (stage.attempts) {
+    for (const attempt of stage.attempts) {
+      parts.push([attempt.identifier || attempt.qa_issue_id, attempt.verdict,
+                  attempt.candidate].filter(Boolean).join(" "));
+    }
+  }
+  push("expected QA", stage.expected_qa_issue_id);
+  push("integration", stage.integration_sha);
+  push("metadata", stage.mirrored_integration_sha);
+  push("CI", stage.ci_status);
+  push("release", stage.release_version);
+  push("metadata", stage.mirrored_release_version);
+  return parts.join(" · ");
+}
+
+async function renderLineage() {
+  const tbody = $("table-lineage").querySelector("tbody");
+  const summary = $("lineage-summary");
+  const trace = $("lineage-trace").value.trim();
+  tbody.innerHTML = "";
+  summary.textContent = "";
+  if (!trace) return;
+  const data = await fetchJSON("/api/lineage?trace=" + encodeURIComponent(trace))
+    .catch(() => null);
+  if (!data || !data.found) {
+    summary.textContent = t("lineageNotFound");
+    return;
+  }
+  for (const stage of data.stages) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(stage.stage)}</td>
+      <td>${esc(stage.status)}</td>
+      <td class="wrap">${esc(lineageLinks(stage))}</td>`;
+    if (stage.status === "missing" || stage.status === "stale") {
+      tr.className = "row-warn";
+    }
+    tbody.appendChild(tr);
+  }
+  summary.textContent = data.complete
+    ? t("lineageComplete", { id: data.identifier || data.correlation_id })
+    : t("lineageGaps", { id: data.identifier || data.correlation_id,
+                         gaps: data.gaps.join(", ") });
+}
+
+// Cost per routing lane plus where its rates came from. The lane table always
+// renders (it rides on the efficiency payload); rate provenance is optional, so
+// an older host that lacks /api/pricing degrades to a note instead of a blank.
+function renderCostProvenance(efficiency, pricing) {
+  const lanes = (efficiency && efficiency.lanes) || [];
+  const period = (efficiency && efficiency.period) || {};
+  $("cost-period").textContent = period.from || period.to
+    ? t("costPeriod", { from: period.from || "…", to: period.to || "…" })
+    : t("costPeriodAllTime");
+
+  const laneBody = $("table-lane-cost").querySelector("tbody");
+  laneBody.innerHTML = "";
+  for (const row of lanes) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(row.lane)}${row.has_unpriced ? " *" : ""}</td>
+      <td class="num">${fmtNum(row.issues)}</td>
+      <td class="num">${fmtNum(row.story_points)}</td>
+      <td class="num">${fmtNum(row.accepted_story_points)}</td>
+      <td class="num">${fmtUSD(row.cost_usd)}</td>
+      <td class="num">${fmtUSDFine(row.cost_per_sp)}</td>
+      <td class="num">${fmtUSDFine(row.quality_adjusted_cost_per_sp)}</td>`;
+    laneBody.appendChild(tr);
+  }
+  if (!lanes.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="7" class="note">${t("noData")}</td>`;
+    laneBody.appendChild(tr);
+  }
+
+  $("rate-provenance-block").hidden = !pricing;
+  $("pricing-degraded").hidden = Boolean(pricing);
+  if (!pricing) return;
+
+  const rates = pricing.rates || [];
+  const rateBody = $("table-rate-provenance").querySelector("tbody");
+  rateBody.innerHTML = "";
+  for (const rate of rates) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(rate.model)}${rate.unpriced ? " *" : ""}</td>
+      <td>${esc(rate.effective_from || "—")}</td>
+      <td class="num">${fmtUSDFine(rate.input_rate)}</td>
+      <td class="num">${fmtUSDFine(rate.output_rate)}</td>
+      <td class="wrap">${esc(rate.source_url || "—")}</td>
+      <td>${esc(rate.captured_at || "—")}</td>`;
+    rateBody.appendChild(tr);
+  }
+  if (!rates.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="6" class="note">${t("noPublishedRates")}</td>`;
+    rateBody.appendChild(tr);
+  }
+
+  const coverage = pricing.coverage || {};
+  $("pricing-coverage").textContent = coverage.rows
+    ? t("pricingCoverage", {
+        priced: fmtNum(coverage.priced_rows), rows: fmtNum(coverage.rows),
+        unpriced: fmtNum(coverage.unpriced_rows),
+      })
+    : t("pricingCoverageEmpty");
 }
 
 function renderEfficiencyBreakdown(data) {
@@ -1187,6 +1537,12 @@ function renderSummary(s) {
   const effStar = s.efficiency_has_unpriced ? " *" : "";
   $("card-cost-eff").textContent =
     s.cost_per_sp == null ? "—" : "≈ " + fmtUSDFine(s.cost_per_sp) + effStar;
+  // Quality-adjusted cost divides the whole (all-attempt) cost by terminally
+  // accepted SP only, so it stays "—" until QA acceptance is observed.
+  $("card-quality-cost").textContent =
+    s.quality_adjusted_cost_per_sp == null
+      ? "—" : "≈ " + fmtUSDFine(s.quality_adjusted_cost_per_sp) + effStar;
+  $("card-quality-cost-sub").textContent = t("qualityAdjustedSub");
   $("card-weighted-eff").textContent =
     s.weighted_efficiency == null ? "—" : "≈ " + fmtUSDFine(s.weighted_efficiency) + effStar;
   // Agent participation and total agent-time — any eligible run over the
@@ -1216,7 +1572,7 @@ async function refreshAll() {
   const chart = fetchJSON("/api/chart" + query({
     dimension: state.chartDimension, measure: state.chartMeasure,
   })).catch(() => null);
-  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData] = await Promise.all([
+  const [summary, daily, agents, projects, efficiency, modelEfficiency, efficiencyBreakdown, health, chartData, globalModels, flowData, pricing, sloData] = await Promise.all([
     fetchJSON("/api/summary" + query()),
     fetchJSON("/api/daily" + query({ group: state.group })),
     fetchJSON("/api/agents" + query()),
@@ -1226,6 +1582,10 @@ async function refreshAll() {
     fetchJSON("/api/efficiency-breakdown" + query()),
     fetchJSON("/api/health"),
     chart,
+    fetchJSON("/api/global-model-efficiency").catch(() => null),
+    fetchJSON("/api/flow" + flowQuery()).catch(() => null),
+    fetchJSON("/api/pricing").catch(() => null),
+    fetchJSON("/api/slo?days=" + state.flowDays).catch(() => null),
   ]);
   // The ≈-note legends the token-attribution markers. Drive it from the real
   // API flags, not merely from the presence of a filter: a unique-agent
@@ -1248,6 +1608,10 @@ async function refreshAll() {
   renderProjects(projects.projects);
   renderEfficiency(efficiency.issues);
   renderModelEfficiency(modelEfficiency);
+  renderGlobalModelEfficiency(globalModels);
+  renderFlow(flowData);
+  renderSlo(sloData);
+  renderCostProvenance(modelEfficiency, pricing);
   renderEfficiencyBreakdown(efficiencyBreakdown);
   if (chartData) renderConfigurableChart(chartData);
   else renderConfigurableChartError();
@@ -1375,6 +1739,7 @@ async function refreshMeta() {
   registerEntityColors("agent", meta.agents.map((agent) => agent.id));
   registerEntityColors("model", meta.models);
   state.lastDate = meta.date_span.last;
+  state.metaProjects = meta.projects;
   populateMultiSelect("filter-project", meta.projects, (p) => p.id, (p) => p.title, state.projects);
   populateMultiSelect("filter-agent", meta.agents, (a) => a.id, (a) => a.name, state.agents);
   populateMultiSelect("filter-model", meta.models, (m) => m, (m) => m, state.models);
@@ -1609,6 +1974,20 @@ async function boot() {
     state.chartMeasure = e.target.value;
     syncFiltersToUrl();
     refreshAll().catch(console.error);
+  });
+  $("flow-days").addEventListener("change", (e) => {
+    state.flowDays = e.target.value;
+    refreshAll().catch(console.error);
+  });
+  $("flow-lane").addEventListener("change", (e) => {
+    state.flowLane = e.target.value;
+    refreshAll().catch(console.error);
+  });
+  $("lineage-lookup").addEventListener("click", () => {
+    renderLineage().catch(console.error);
+  });
+  $("lineage-trace").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") renderLineage().catch(console.error);
   });
   $("filter-reset").addEventListener("click", resetFilters);
   await refreshAll();

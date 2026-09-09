@@ -32,7 +32,7 @@ Every crash point therefore recovers to exactly one of two consistent states:
 states are impossible.
 
 The module is deliberately dependency-free (standard library only) and Python
-3.6 compatible so both the Flask app and the legacy cPanel WSGI entry point can
+dependency-free so both the Flask app and the legacy cPanel WSGI entry point can
 share one identical recovery contract.
 """
 

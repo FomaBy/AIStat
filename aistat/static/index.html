@@ -76,6 +76,7 @@
     <div class="card"><div class="card-label">Story Points</div><div class="card-value" id="card-sp">—</div><div class="card-sub" id="card-sp-sub"></div></div>
     <div class="card"><div class="card-label">Эффективность токенов</div><div class="card-value" id="card-eff">—</div><div class="card-sub">токенов на 1 SP · меньше — лучше</div></div>
     <div class="card"><div class="card-label">Эффективность стоимости</div><div class="card-value" id="card-cost-eff">—</div><div class="card-sub">USD на 1 SP · меньше — лучше</div></div>
+    <div class="card"><div class="card-label" data-i18n="qualityAdjustedCost">Качество-скорректированная стоимость</div><div class="card-value" id="card-quality-cost">—</div><div class="card-sub" id="card-quality-cost-sub"></div></div>
     <div class="card"><div class="card-label">Взвешенная эффективность</div><div class="card-value" id="card-weighted-eff">—</div><div class="card-sub">USD/час на 1 SP · меньше — лучше</div></div>
     <div class="card"><div class="card-label">Агентов</div><div class="card-value" id="card-agent-count">—</div><div class="card-sub">выполняли работу за период</div></div>
     <div class="card"><div class="card-label">Время работы агентов</div><div class="card-value" id="card-agent-time">—</div><div class="card-sub" id="card-agent-time-sub">суммарно по всем агентам</div></div>
@@ -225,6 +226,27 @@
       <p class="note" data-i18n="modelEfficiencyNote"></p>
     </section>
 
+    <section id="global-models-panel" class="panel panel-wide" hidden>
+      <h2>Эффективность по моделям — все пользователи <span class="est-mark">≈ стоимость на 1 SP · меньше — лучше</span></h2>
+      <div class="chart-box chart-box-small">
+        <canvas id="chart-global-models" role="img" aria-label="График: эффективность по моделям на данных всех пользователей, стоимость на 1 story point">Значения графика — в таблице «Данные таблицей» ниже.</canvas>
+        <p class="chart-empty" id="empty-global-models" hidden>Пока нет данных, которыми можно поделиться анонимно.</p>
+      </div>
+      <details class="chart-data">
+        <summary>Данные таблицей</summary>
+        <div class="table-wrap">
+          <table id="table-global-models-data" aria-label="Эффективность по моделям, все пользователи">
+            <thead><tr>
+              <th>Модель</th><th class="num">SP</th><th class="num">Токены</th>
+              <th class="num">Стоимость ≈</th><th class="num">Стоимость / SP ≈</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+      <p class="note" data-i18n="globalModelsNote"></p>
+    </section>
+
     <section class="panel panel-wide">
       <h2>Эффективность по задачам <span class="est-mark">токены ÷ SP · меньше — лучше</span></h2>
       <div class="table-wrap">
@@ -237,6 +259,126 @@
         </table>
       </div>
       <p class="note">Задачи без story points исключены из метрики (не считаются как 0). Показаны топ-15 по расходу на 1 SP с учётом фильтра проекта.</p>
+    </section>
+
+    <section id="flow-panel" class="panel panel-wide" hidden>
+      <h2 data-i18n="flowMetrics">Метрики потока конвейера</h2>
+      <div class="chart-controls">
+        <label for="flow-days"><span data-i18n="flowWindow">Окно</span>
+          <select id="flow-days">
+            <option value="7">7 дней</option>
+            <option value="30" selected>30 дней</option>
+            <option value="90">90 дней</option>
+          </select>
+        </label>
+        <label for="flow-lane"><span data-i18n="flowLane">Лейн</span>
+          <select id="flow-lane">
+            <option value="">Все лейны</option>
+          </select>
+        </label>
+      </div>
+      <section class="cards flow-cards">
+        <div class="card"><div class="card-label" data-i18n="flowCycleMedian">Цикл: медиана</div><div class="card-value" id="card-flow-cycle">—</div><div class="card-sub" id="card-flow-cycle-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowCycleP90">Цикл: p90</div><div class="card-value" id="card-flow-p90">—</div><div class="card-sub" id="card-flow-p90-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowRework">Доля доработок</div><div class="card-value" id="card-flow-rework">—</div><div class="card-sub" id="card-flow-rework-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowIdle">Простой флота</div><div class="card-value" id="card-flow-idle">—</div><div class="card-sub" id="card-flow-idle-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowReady">Готовый фронтир</div><div class="card-value" id="card-flow-ready">—</div><div class="card-sub" id="card-flow-ready-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowPmP95">PM: p95 до готовности</div><div class="card-value" id="card-flow-pm-p95">—</div><div class="card-sub" id="card-flow-pm-p95-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowWaiting">Возраст ожидания: медиана</div><div class="card-value" id="card-flow-waiting">—</div><div class="card-sub" id="card-flow-waiting-sub"></div></div>
+        <div class="card"><div class="card-label" data-i18n="flowFirstPass">QA с первой попытки</div><div class="card-value" id="card-flow-first-pass">—</div><div class="card-sub" id="card-flow-first-pass-sub"></div></div>
+      </section>
+      <div class="table-wrap">
+        <table id="table-flow-groups" aria-label="Время цикла по проектам и лейнам">
+          <thead><tr>
+            <th data-i18n="project">Проект</th><th data-i18n="flowLane">Лейн</th>
+            <th class="num" data-i18n="flowMeasuredCount">Измерено задач</th>
+            <th class="num" data-i18n="flowMedian">Медиана</th>
+            <th class="num">p90</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="flow-coverage" class="note"></p>
+      <p class="note" data-i18n="flowNote">Метрики считаются только по наблюдаемым событиям. До включения provenance старые запуски остаются неизвестными, без догадок. Простой флота — по всему воркспейсу; фильтр проектов на него не влияет.</p>
+    </section>
+
+    <section id="slo-panel" class="panel panel-wide" hidden>
+      <h2 data-i18n="sloTitle">SLO конвейера и сквозной след</h2>
+      <div class="table-wrap">
+        <table id="table-slo" aria-label="SLO конвейера, бюджеты ошибок и владельцы">
+          <thead><tr>
+            <th data-i18n="sloName">SLO</th>
+            <th data-i18n="sloOwner">Владелец</th>
+            <th data-i18n="sloThreshold">Порог</th>
+            <th class="num" data-i18n="sloObjective">Цель</th>
+            <th class="num" data-i18n="sloActual">Факт</th>
+            <th class="num" data-i18n="sloMeasured">Числитель / знаменатель</th>
+            <th class="num" data-i18n="sloBudget">Бюджет ошибок</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <h3 data-i18n="sloAlerts">События нарушений</h3>
+      <ul id="slo-alerts" class="note"></ul>
+      <div class="chart-controls">
+        <label for="lineage-trace"><span data-i18n="lineageLookup">Сквозной след по correlation ID</span>
+          <input id="lineage-trace" type="text" placeholder="FAN-3460" autocomplete="off">
+        </label>
+        <button id="lineage-lookup" type="button" data-i18n="lineageShow">Показать цепочку</button>
+      </div>
+      <div class="table-wrap">
+        <table id="table-lineage" aria-label="Цепочка задача → запуски → кандидат → QA → интеграция → релиз">
+          <thead><tr>
+            <th data-i18n="lineageStage">Этап</th>
+            <th data-i18n="lineageStatus">Состояние</th>
+            <th data-i18n="lineageDetail">Ссылки</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="lineage-summary" class="note"></p>
+      <p class="note" data-i18n="sloNote">Каждый SLO показывает окно, числитель, знаменатель, порог и владельца. Отсутствующая или расходящаяся связь помечается явно (missing / stale) и не заменяется предположением.</p>
+    </section>
+
+    <section id="cost-provenance-panel" class="panel panel-wide">
+      <h2 data-i18n="costByLane">Стоимость по лейнам</h2>
+      <p id="cost-period" class="note"></p>
+      <div class="table-wrap">
+        <table id="table-lane-cost" aria-label="Стоимость по лейнам и принятым story points">
+          <thead><tr>
+            <th data-i18n="flowLane">Лейн</th>
+            <th class="num" data-i18n="issues">Задачи</th>
+            <th class="num">SP</th>
+            <th class="num" data-i18n="acceptedSp">Принятые SP</th>
+            <th class="num" data-i18n="estimatedCost">Стоимость ≈</th>
+            <th class="num" data-i18n="costPerSpHeader">Стоимость / SP ≈</th>
+            <th class="num" data-i18n="qualityAdjustedHeader">Качество-скорр. / SP ≈</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note" data-i18n="laneCostNote">Разрез по лейну маршрутизации среди задач со story points, загруженной статистикой и запусками. Знаменатель качества — только принятые QA story points; числитель — полная стоимость задачи со всеми попытками и доработками. Лейн с неоценённой моделью помечен * и не показывает частичную сумму как стоимость.</p>
+    </section>
+
+    <section id="rate-provenance-panel" class="panel panel-wide">
+      <h2 data-i18n="rateProvenance">Происхождение тарифов</h2>
+      <div id="rate-provenance-block">
+        <div class="table-wrap">
+          <table id="table-rate-provenance" aria-label="Опубликованные ревизии тарифов">
+            <thead><tr>
+              <th data-i18n="model">Модель</th>
+              <th data-i18n="rateEffectiveFrom">Действует с</th>
+              <th class="num" data-i18n="rateInput">Ввод / 1M</th>
+              <th class="num" data-i18n="rateOutput">Вывод / 1M</th>
+              <th data-i18n="rateSource">Источник</th>
+              <th data-i18n="rateCapturedAt">Зафиксировано</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="pricing-coverage" class="note"></p>
+      </div>
+      <p id="pricing-degraded" class="note" hidden data-i18n="pricingUnavailable">Происхождение тарифов недоступно на этом хосте; стоимость по лейнам показана без него.</p>
     </section>
   </main>
 

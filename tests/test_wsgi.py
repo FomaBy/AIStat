@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -667,10 +668,10 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         assert report["detail"] == "snapshot freshness rejected"
         assert report["reason"] == reason
         assert set(report["summary"]) == {
-            "incoming_latest_rows",
-            "target_latest_rows",
-            "missing_same_day_rows",
-            "decreased_same_day_rows",
+            "incoming_rows",
+            "target_rows",
+            "missing_rows",
+            "decreased_rows",
         }
         rendered = json.dumps(report, sort_keys=True)
         for forbidden in (
@@ -693,7 +694,7 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "AND model = 'm-mystery' AND date = '2026-01-02';"
     )
     rejected = post(degraded, base_ts + 10)
-    assert_rejected(rejected, "missing_same_day_rows")
+    assert_rejected(rejected, "missing_rows")
 
     lower = build(
         "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
@@ -701,7 +702,18 @@ def test_ingest_rejects_snapshot_with_older_usage_data(public_app, tmp_path):
         "AND date = '2026-01-02';"
     )
     rejected = post(lower, base_ts + 20)
-    assert_rejected(rejected, "decreased_same_day_counters")
+    assert_rejected(rejected, "decreased_counters")
+
+    # FAN-2031: a rewritten *earlier* day is rejected too — the latest day
+    # matching the target is no longer enough to pass the guard.
+    lower_history = build(
+        "UPDATE daily_usage SET input_tokens = input_tokens - 1 "
+        "WHERE date = '2026-01-01';"
+    )
+    assert_rejected(post(lower_history, base_ts + 21), "decreased_counters")
+
+    dropped_history = build("DELETE FROM daily_usage WHERE date = '2026-01-01';")
+    assert_rejected(post(dropped_history, base_ts + 22), "missing_rows")
 
     empty = build("DELETE FROM daily_usage;")
     rejected = post(empty, base_ts + 25)
@@ -829,6 +841,130 @@ def test_installed_v4_tenant_db_returns_controlled_503(public_app, tmp_path):
     summary = client.get("/api/summary", base_url="https://localhost")
     assert summary.status_code == 200
     assert summary.get_json()["total_tokens"] == 4_700_000
+
+
+VALID_RELEASE_MANIFEST = {
+    "files": [{"path": "aistat/__init__.py", "sha256": "0" * 64,
+               "size_bytes": 1, "mode": "0644"}],
+    "format": "aistat-cpanel-package",
+    "format_version": 1,
+    "hash_algorithm": "sha256",
+    "source_commit_sha": "a" * 40,
+    "source_tree_sha": "b" * 40,
+}
+
+
+def _write_release_manifest(root: Path, payload=None, raw=None) -> bytes:
+    root.mkdir(parents=True, exist_ok=True)
+    if raw is None:
+        raw = json.dumps(
+            payload if payload is not None else VALID_RELEASE_MANIFEST,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    (root / "PACKAGE-MANIFEST.json").write_bytes(raw)
+    return raw
+
+
+def test_release_identity_requires_login(public_app, tmp_path, monkeypatch):
+    app, _ = public_app
+    root = tmp_path / "package"
+    _write_release_manifest(root)
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    response = client.get("/api/release-identity")
+    assert response.status_code == 401
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Vary"] == "Cookie"
+    assert response.get_json() == {"detail": "authentication required"}
+    denial = response.get_data(as_text=True)
+    assert str(root) not in denial
+    assert "PACKAGE-MANIFEST" not in denial
+    assert "source_commit_sha" not in denial
+    assert "Traceback" not in denial
+
+
+def test_release_identity_returns_exact_fields_from_deployed_root(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    raw = _write_release_manifest(root)
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Vary"] == "Cookie"
+    data = response.get_json()
+    assert set(data) == {"source_commit_sha", "source_tree_sha", "manifest_sha256"}
+    assert data["source_commit_sha"] == "a" * 40
+    assert data["source_tree_sha"] == "b" * 40
+    assert data["manifest_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_release_identity_missing_manifest_is_generic_503(
+    public_app, tmp_path, monkeypatch, caplog
+):
+    app, _ = public_app
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", tmp_path / "package")
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Vary"] == "Cookie"
+    assert response.get_json() == {"detail": "release identity unavailable"}
+    assert [record.getMessage() for record in caplog.records] == [
+        "release_identity_unavailable"
+    ]
+    assert str(tmp_path) not in caplog.text
+
+
+def test_release_identity_malformed_manifest_is_generic_503(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    _write_release_manifest(root, raw=b"not json")
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
+
+
+def test_release_identity_bad_format_version_is_generic_503(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    bad = dict(VALID_RELEASE_MANIFEST, format_version=2)
+    _write_release_manifest(root, payload=bad)
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
+
+
+def test_release_identity_rejects_symlinked_manifest(
+    public_app, tmp_path, monkeypatch
+):
+    app, _ = public_app
+    root = tmp_path / "package"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    _write_release_manifest(outside)
+    (root / "PACKAGE-MANIFEST.json").symlink_to(outside / "PACKAGE-MANIFEST.json")
+    monkeypatch.setattr("aistat.wsgi.PACKAGE_ROOT", root)
+    client = app.test_client()
+    login(client)
+    response = client.get("/api/release-identity", base_url="https://localhost")
+    assert response.status_code == 503
+    assert response.get_json() == {"detail": "release identity unavailable"}
 
 
 def test_model_efficiency_endpoint_behind_auth(public_app):
@@ -2189,3 +2325,404 @@ def test_concurrent_same_tenant_ingests_are_serialized(public_app, tmp_path):
     assert login(client).status_code == 303
     summary = client.get("/api/summary", base_url="https://localhost").get_json()
     assert summary["total_tokens"] == 6_700_000
+
+
+def _login_csrf(client):
+    assert login(client).status_code == 303
+    return client.get("/api/session", base_url="https://localhost").get_json()["csrf"]
+
+
+def _submit_billing(client, csrf, **fields):
+    return client.post(
+        "/api/billing-reconciliation",
+        data=fields,
+        headers={"X-CSRF-Token": csrf},
+        base_url="https://localhost",
+    )
+
+
+def test_billing_reconciliation_get_requires_session(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).status_code == 401
+    assert login(client).status_code == 303
+    data = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert data == {"rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}}
+
+
+def test_billing_reconciliation_intake_is_owner_only_and_authenticated(public_app):
+    app, config = public_app
+    client = app.test_client()
+
+    # No session at all.
+    assert client.post(
+        "/api/billing-reconciliation",
+        data={"provider": "anthropic", "period": "2026-02",
+              "currency": "USD", "amount": "100"},
+        base_url="https://localhost",
+    ).status_code == 401
+
+    store = SecurityStore(config.security_db_path)
+    guest_id = store.find_or_create_user_by_identity(
+        "google", "guest-subject", email="guest@example.com"
+    )
+    store.ensure_tenant(guest_id)
+    sid = store.create_session(guest_id, 3600)
+    guest_csrf = store.resolve_session(sid)["csrf"]
+    denied = app.test_client(use_cookies=False).post(
+        "/api/billing-reconciliation",
+        data={"provider": "anthropic", "period": "2026-02",
+              "currency": "USD", "amount": "100"},
+        headers={"X-CSRF-Token": guest_csrf, "Cookie": "aistat_session=" + sid},
+        base_url="https://localhost",
+    )
+    assert denied.status_code == 403
+
+
+def test_billing_reconciliation_intake_rejects_missing_or_bad_csrf(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    assert login(client).status_code == 303
+    response = client.post(
+        "/api/billing-reconciliation",
+        data={"provider": "anthropic", "period": "2026-02",
+              "currency": "USD", "amount": "100"},
+        headers={"X-CSRF-Token": "wrong"},
+        base_url="https://localhost",
+    )
+    assert response.status_code == 400
+
+
+def test_billing_reconciliation_intake_stores_sanitized_totals_and_is_idempotent(public_app):
+    app, config = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    conn = connect(config.tenant_db_path(config.publish_tenant_id))
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES ('rt', 'm', '2026-02-10', 'anthropic', "
+        "0, 0, 0, 0, '2026-02-10T00:00:00Z', 90.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    first = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert first.status_code == 200
+    body = first.get_json()
+    assert body["provider"] == "anthropic"
+    assert body["variance_ratio"] == pytest.approx(0.1)
+    assert body["over_threshold"] is True
+    assert body["diagnostic_emitted"] is True
+    assert body["currency"] == "USD"
+    assert "invoice" not in json.dumps(body)
+
+    replay = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert replay.status_code == 200
+    assert replay.get_json()["diagnostic_emitted"] is False
+
+    rows = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert rows["rows"] == [{
+        "provider": "anthropic", "period": "2026-02", "calculated_usd": 90.0,
+        "actual_usd": 100.0, "variance_ratio": pytest.approx(0.1),
+        "over_threshold": True, "diagnostic_emitted": True, "currency": "USD",
+        "submitted_by": config.publish_tenant_id,
+        "submitted_at": rows["rows"][0]["submitted_at"],
+    }]
+    assert rows["coverage"] == {"periods_submitted": 1, "periods_total": 1}
+
+
+def test_billing_reconciliation_intake_rejects_bad_provider_and_currency(public_app):
+    app, _ = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    bad_provider = _submit_billing(
+        client, csrf, provider="Not Canonical!", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert bad_provider.status_code == 422
+
+    bad_currency = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="EUR", amount="100",
+    )
+    assert bad_currency.status_code == 422
+
+    bad_amount = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="not-a-number",
+    )
+    assert bad_amount.status_code == 422
+
+
+@pytest.mark.parametrize("period", [
+    " 2026-02", "2026-02 ", " 2026-02 ",
+    "\t2026-02", "2026-02\t",
+    "\r2026-02", "2026-02\r",
+    "\n2026-02", "2026-02\n",
+    "\v2026-02", "2026-02\v",
+    "\f2026-02", "2026-02\f",
+    "\u00a02026-02", "2026-02\u00a0",
+])
+def test_billing_reconciliation_rejects_raw_period_whitespace_without_writes(
+    public_app, period
+):
+    app, config = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    before = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+
+    response = _submit_billing(
+        client, csrf, provider="anthropic", period=period,
+        currency="USD", amount="100",
+    )
+
+    assert response.status_code == 422
+    after = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert after == before
+
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM billing_reconciliation WHERE user_id = ?",
+            (config.publish_tenant_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(diagnostic_emitted_at) FROM billing_reconciliation "
+            "WHERE user_id = ?",
+            (config.publish_tenant_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("amount", ["nan", "inf", "-1"])
+def test_billing_reconciliation_intake_rejects_nonfinite_or_negative_amount(
+    public_app, amount
+):
+    app, _ = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    response = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount=amount,
+    )
+    assert response.status_code == 422
+
+
+def test_billing_reconciliation_survives_snapshot_replacement_and_restart(
+    public_app, tmp_path
+):
+    app, config = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    owner_path = config.tenant_db_path(config.publish_tenant_id)
+    usage = (
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES "
+        "('rt-billing', 'm', '2026-02-10', 'anthropic', 0, 0, 0, 0, "
+        "'2026-02-10T00:00:00Z', 90.0)"
+    )
+    conn = connect(owner_path)
+    conn.execute(usage)
+    conn.commit()
+    conn.close()
+
+    submitted = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert submitted.status_code == 200
+
+    source = tmp_path / "routine-snapshot.db"
+    conn = connect(source)
+    init_db(conn)
+    seed_aggregate_fixture(conn)
+    conn.execute(usage)
+    conn.commit()
+    conn.close()
+    payload = create_compressed_snapshot(source)
+    timestamp = int(time.time())
+    installed = client.post(
+        "/api/ingest/snapshot",
+        data=payload,
+        content_type="application/vnd.aistat.snapshot+gzip",
+        headers={
+            "X-AIStat-Tenant": str(config.publish_tenant_id),
+            "X-AIStat-Timestamp": str(timestamp),
+            "X-AIStat-Signature": snapshot_signature(
+                INGEST_SECRET, config.publish_tenant_id, timestamp, payload
+            ),
+        },
+        base_url="https://localhost",
+    )
+    assert installed.status_code == 200
+
+    restarted = create_app(config)
+    restarted.config.update(TESTING=True)
+    restarted_client = restarted.test_client()
+    assert _login_csrf(restarted_client)
+    rows = restarted_client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()
+    assert rows["rows"][0]["actual_usd"] == 100.0
+    assert rows["rows"][0]["calculated_usd"] == 90.0
+
+
+def test_billing_reconciliation_legacy_tenant_without_table_is_degraded_then_durable(
+    public_app,
+):
+    app, config = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    conn = connect(config.tenant_db_path(config.publish_tenant_id))
+    conn.execute("DROP TABLE billing_reconciliation")
+    conn.commit()
+    conn.close()
+
+    before = client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    )
+    assert before.status_code == 200
+    assert before.get_json()["rows"] == []
+
+    submitted = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    )
+    assert submitted.status_code == 200
+    assert client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()["rows"][0]["actual_usd"] == 100.0
+
+
+def test_billing_reconciliation_durable_rows_are_tenant_scoped(public_app):
+    app, config = public_app
+    owner_client = app.test_client()
+    owner_csrf = _login_csrf(owner_client)
+    assert _submit_billing(
+        owner_client, owner_csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount="100",
+    ).status_code == 200
+
+    store = SecurityStore(config.security_db_path)
+    guest_id = store.find_or_create_user_by_identity(
+        "google", "billing-guest", email="billing-guest@example.com"
+    )
+    store.ensure_tenant(guest_id)
+    store.record_billing_reconciliation(
+        guest_id, "openai", "2026-03", 0.0, 1.0,
+    )
+    guest_client = app.test_client()
+    guest_client.set_cookie(
+        "aistat_session", store.create_session(guest_id, 3600)
+    )
+    guest_rows = guest_client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()["rows"]
+    assert [(row["provider"], row["period"]) for row in guest_rows] == [
+        ("openai", "2026-03")
+    ]
+
+
+def test_billing_reconciliation_is_purged_with_tenant(public_app):
+    _, config = public_app
+    store = SecurityStore(config.security_db_path)
+    guest_id = store.find_or_create_user_by_identity(
+        "google", "billing-delete", email="billing-delete@example.com"
+    )
+    store.ensure_tenant(guest_id)
+    store.record_billing_reconciliation(
+        guest_id, "anthropic", "2026-02", 1.0, 1.0,
+    )
+    store.delete_user(guest_id)
+
+    conn = sqlite3.connect(str(config.security_db_path))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM billing_reconciliation WHERE user_id = ?",
+            (guest_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "period", [
+        "2026-00", "2026-13", "2026-99", "0000-01", "2026-1",
+        "２０２６-01",  # full-width Unicode digits
+        "٢٠٢٦-01",  # Arabic-Indic digits
+    ]
+)
+def test_billing_reconciliation_rejects_invalid_calendar_period(public_app, period):
+    app, _ = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    response = _submit_billing(
+        client, csrf, provider="anthropic", period=period,
+        currency="USD", amount="100",
+    )
+    assert response.status_code == 422
+    assert client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()["rows"] == []
+
+
+@pytest.mark.parametrize(
+    "amount", [
+        "1_000", "1_000.5",  # underscores
+        "１０",  # full-width Unicode digits
+        "٥",  # Arabic-Indic digit
+        " 100", "100 ",  # surrounding whitespace
+        "+100", "1e5",  # sign / exponent notation
+        "", "Infinity", "NaN",
+    ]
+)
+def test_billing_reconciliation_rejects_non_canonical_amount(public_app, amount):
+    app, _ = public_app
+    client = app.test_client()
+    csrf = _login_csrf(client)
+    response = _submit_billing(
+        client, csrf, provider="anthropic", period="2026-02",
+        currency="USD", amount=amount,
+    )
+    assert response.status_code == 422
+    assert client.get(
+        "/api/billing-reconciliation", base_url="https://localhost"
+    ).get_json()["rows"] == []
+
+
+def test_flow_endpoint_requires_session_and_validates_days(public_app):
+    """FAN-3306: /api/flow is session-guarded, serves the flow payload and
+    rejects non-contract windows with 422."""
+    app, _ = public_app
+    client = app.test_client()
+    assert client.get(
+        "/api/flow", base_url="https://localhost"
+    ).status_code == 401
+    assert login(client).status_code == 303
+    response = client.get("/api/flow?days=90", base_url="https://localhost")
+    assert response.status_code == 200
+    out = response.get_json()
+    assert out["days"] == 90
+    assert set(out) >= {"cycle_time", "rework", "idle", "coverage"}
+    assert client.get(
+        "/api/flow?days=1", base_url="https://localhost"
+    ).status_code == 422

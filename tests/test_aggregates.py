@@ -24,6 +24,120 @@ def test_weights_fall_back_to_counts_then_equal():
     assert ag._weights(["a", "b"], {}, {}) == {"a": 0.5, "b": 0.5}
 
 
+def test_quality_adjusted_cost_uses_accepted_sp_and_all_attempt_cost(agg_conn):
+    """A terminal acceptance supplies the denominator; the issue cost is whole."""
+    agg_conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    out = ag.efficiency_breakdown(agg_conn)
+    assert out["accepted_story_points"] == 3.0
+    # I1's input/output are split equally: $0.0005 + $0.002 = $0.0025.
+    assert out["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+
+
+# -- cost by lane ----------------------------------------------------------------
+
+
+def _seed_second_lane_issue(conn, lane):
+    """A second cost-attributable issue routed to its own lane.
+
+    I7 has 8 SP and one full A1/m-claude hour, so it prices at
+    2000 input tokens x $1/M = $0.002 with no shared-model split —
+    $0.00025 per SP, half of I1's $0.0005.
+    """
+    now = "2026-01-06T00:00:00Z"
+    conn.executescript(f"""
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        dispatch_lane, updated_at, synced_at) VALUES
+      ('I7', 'T-7', 'second lane', 'done', 'P1', 8, '{lane}', '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I7', 1, 2000, 0, 0, 0, '{now}');
+    INSERT INTO runs (id, issue_id, agent_id, runtime_id, status,
+                      started_at, completed_at, synced_at) VALUES
+      ('run7', 'I7', 'A1', 'R1', 'completed',
+       '2026-01-06T10:00:00Z', '2026-01-06T11:00:00Z', '{now}');
+    """)
+    conn.commit()
+
+
+def test_lane_cost_groups_cost_attributable_issues_by_dispatch_lane(agg_conn):
+    """AC: cost per routing lane, cheapest cost-per-SP first."""
+    agg_conn.execute("UPDATE issues SET dispatch_lane = 'dev_medium' WHERE id = 'I1'")
+    _seed_second_lane_issue(agg_conn, "qa_high")
+
+    lanes = {row["lane"]: row for row in ag.efficiency_breakdown(agg_conn)["lanes"]}
+    assert set(lanes) == {"dev_medium", "qa_high"}
+    assert lanes["dev_medium"]["issues"] == 1
+    assert lanes["dev_medium"]["story_points"] == 5.0
+    assert lanes["dev_medium"]["cost_usd"] == pytest.approx(0.0025)
+    assert lanes["dev_medium"]["cost_per_sp"] == pytest.approx(0.0025 / 5)
+    assert lanes["qa_high"]["cost_usd"] == pytest.approx(0.002)
+    assert lanes["qa_high"]["cost_per_sp"] == pytest.approx(0.002 / 8)
+    # Cheapest cost per story point leads, as the model rows already do.
+    assert [row["lane"] for row in ag.efficiency_breakdown(agg_conn)["lanes"]] == [
+        "qa_high", "dev_medium"]
+
+
+def test_lane_cost_reports_unrouted_issues_as_unknown(agg_conn):
+    """The seeded issues carry no dispatch_lane; they must stay visible."""
+    lanes = ag.efficiency_breakdown(agg_conn)["lanes"]
+    assert [row["lane"] for row in lanes] == ["unknown"]
+    assert lanes[0]["cost_usd"] == pytest.approx(0.0025)
+
+
+def test_lane_cost_survives_a_snapshot_without_the_routing_column(agg_conn):
+    """A pre-routing snapshot degrades to one unknown lane, never a 500."""
+    agg_conn.execute("ALTER TABLE issues DROP COLUMN dispatch_lane")
+    agg_conn.commit()
+    lanes = ag.efficiency_breakdown(agg_conn)["lanes"]
+    assert [row["lane"] for row in lanes] == ["unknown"]
+    assert lanes[0]["cost_usd"] == pytest.approx(0.0025)
+
+
+def test_lane_with_an_unpriced_share_reports_no_cost_instead_of_a_partial_sum(agg_conn):
+    """An unpriced model share never silently shrinks a lane's cost."""
+    seed_model_less_fixture(agg_conn)
+    agg_conn.execute("UPDATE issues SET dispatch_lane = 'dev_low' WHERE id = 'I8'")
+    agg_conn.commit()
+
+    lanes = {row["lane"]: row for row in ag.efficiency_breakdown(agg_conn)["lanes"]}
+    assert lanes["dev_low"]["has_unpriced"] is True
+    assert lanes["dev_low"]["cost_usd"] is None
+    assert lanes["dev_low"]["cost_per_sp"] is None
+    assert lanes["dev_low"]["issues"] == 1
+    assert lanes["unknown"]["has_unpriced"] is False
+
+
+def test_lane_quality_adjusted_cost_uses_accepted_sp_and_all_attempt_cost(agg_conn):
+    """The lane denominator is terminal acceptance only; the numerator is whole."""
+    agg_conn.execute("UPDATE issues SET dispatch_lane = 'dev_medium' WHERE id = 'I1'")
+    agg_conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    _seed_second_lane_issue(agg_conn, "qa_high")
+
+    lanes = {row["lane"]: row for row in ag.efficiency_breakdown(agg_conn)["lanes"]}
+    assert lanes["dev_medium"]["accepted_story_points"] == 3.0
+    assert lanes["dev_medium"]["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+    # No terminal acceptance for I7: no invented denominator, no invented cost.
+    assert lanes["qa_high"]["accepted_story_points"] == 0.0
+    assert lanes["qa_high"]["quality_adjusted_cost_per_sp"] is None
+
+
+def test_efficiency_breakdown_reports_the_period_it_covers(agg_conn):
+    """Cost by lane/model is only readable next to the window it covers."""
+    assert ag.efficiency_breakdown(agg_conn)["period"] == {"from": None, "to": None}
+    windowed = ag.efficiency_breakdown(
+        agg_conn, filters=ag.make_filters("2026-01-01T00:00Z", "2026-01-02T00:00Z"))
+    assert windowed["period"] == {"from": "2026-01-01", "to": "2026-01-01"}
+
+
 # -- daily series ----------------------------------------------------------------
 
 
@@ -652,6 +766,30 @@ def test_projects_overview_cost_estimate(agg_conn):
     assert projects["Beta"]["cost_unattributed_issues"] == 1
 
 
+def test_projects_overview_uses_rate_effective_when_the_run_started(agg_conn):
+    """FAN-3550 FAIL-1: publishing a later catalog rate must not reprice a
+    closed project's cost, the same invariant efficiency_breakdown already
+    holds (test_efficiency_uses_rate_effective_when_the_run_started)."""
+    before = {p["title"]: p for p in ag.projects_overview(agg_conn)}
+
+    agg_conn.executemany(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, loaded_at) "
+        "VALUES (?, '2026-01-01', ?, ?, ?, ?, 0, 'now')",
+        [("m-claude", 1.0, 0.0, 0.0, 0.0), ("m-shared", 2.0, 4.0, 0.2, 2.5)],
+    )
+    agg_conn.execute(
+        "UPDATE model_pricing SET input_rate = 30.8, output_rate = 30.8, "
+        "cache_read_rate = 30.8, cache_write_rate = 30.8"
+    )
+    agg_conn.commit()
+
+    after = {p["title"]: p for p in ag.projects_overview(agg_conn)}
+    assert after["Alpha"]["cost_usd"] == pytest.approx(before["Alpha"]["cost_usd"])
+    assert after["Alpha"]["cost_credits"] == pytest.approx(before["Alpha"]["cost_credits"])
+    assert after["Beta"]["cost_usd"] == pytest.approx(before["Beta"]["cost_usd"])
+
+
 def test_projects_overview_filtered_cost_uses_matching_run_models(agg_conn):
     """FAN-1251: a run filter must price project cost from the matching runs'
     models — the same run-overlap set that feeds tokens, SP and
@@ -689,6 +827,67 @@ def test_projects_overview_filtered_cost_uses_matching_run_models(agg_conn):
     row, f = alpha(agent_ids=["A1", "A2"])
     assert row["cost_usd"] == pytest.approx(0.0025)
     assert ag.efficiency_breakdown(agg_conn, filters=f)["cost_usd"] == pytest.approx(0.0025)
+
+
+def _seed_two_run_history_fixture(conn, run_order):
+    """One issue, one model, two dated runs — a January run priced at 1.0
+    and an August run priced at 30.8 after a later catalog rate is
+    published. ``run_order`` controls the physical insertion order of the
+    two run rows, which must never influence the priced rate."""
+    now = "2026-08-10T00:00:00Z"
+    conn.executescript(f"""
+    INSERT INTO runtimes (id, name, provider, status, synced_at) VALUES
+      ('R1', 'RT', 'claude', 'online', '{now}');
+    INSERT INTO agents (id, name, model, runtime_id, synced_at) VALUES
+      ('A1', 'Solo', 'm1', 'R1', '{now}');
+    INSERT INTO projects (id, title, status, synced_at) VALUES
+      ('P1', 'Alpha', 'in_progress', '{now}');
+    INSERT INTO issues (id, identifier, title, status, project_id, story_points,
+                        updated_at, synced_at) VALUES
+      ('I1', 'T-1', 'two dated runs', 'done', 'P1', 5, '{now}', '{now}');
+    INSERT INTO issue_usage (issue_id, task_count, total_input_tokens,
+                             total_output_tokens, total_cache_read_tokens,
+                             total_cache_write_tokens, synced_at) VALUES
+      ('I1', 2, 1000000, 0, 0, 0, '{now}');
+    INSERT INTO model_pricing (model, input_rate, output_rate, cache_read_rate,
+                               cache_write_rate, unpriced, loaded_at) VALUES
+      ('m1', 30.8, 0.0, 0.0, 0.0, 0, '{now}');
+    INSERT INTO model_price_history (model, effective_from, input_rate,
+                                     output_rate, cache_read_rate,
+                                     cache_write_rate, unpriced, loaded_at) VALUES
+      ('m1', '2026-01-01', 1.0, 0.0, 0.0, 0.0, 0, '{now}'),
+      ('m1', '2026-08-01', 30.8, 0.0, 0.0, 0.0, 0, '{now}');
+    """)
+    runs = {
+        "jan": ("run-jan", "2026-01-05T10:00:00Z", "2026-01-05T11:00:00Z"),
+        "aug": ("run-aug", "2026-08-10T10:00:00Z", "2026-08-10T11:00:00Z"),
+    }
+    for key in run_order:
+        run_id, started, completed = runs[key]
+        conn.execute(
+            "INSERT INTO runs (id, issue_id, agent_id, runtime_id, status, "
+            "started_at, completed_at, synced_at) VALUES "
+            "(?, 'I1', 'A1', 'R1', 'completed', ?, ?, ?)",
+            (run_id, started, completed, now),
+        )
+    conn.commit()
+
+
+@pytest.mark.parametrize("run_order", [("aug", "jan"), ("jan", "aug")])
+def test_run_filter_rate_at_is_earliest_run_regardless_of_row_order(conn, run_order):
+    """FAN-3550 FAIL-2: an agent filter selecting every one of an issue's runs
+    must price the same as the unfiltered view, and that price must not
+    depend on the physical insertion order of the run rows — both must use
+    the earliest dated run (January, rate 1.0), never the first row visited
+    by an unordered scan."""
+    _seed_two_run_history_fixture(conn, run_order)
+
+    unfiltered = ag.efficiency_breakdown(conn)
+    f = ag.make_filters(None, None, agent_ids=["A1"])
+    filtered = ag.efficiency_breakdown(conn, filters=f)
+
+    assert filtered["cost_usd"] == pytest.approx(1.0)
+    assert filtered["cost_usd"] == pytest.approx(unfiltered["cost_usd"])
 
 
 def test_projects_overview_partial_hour_overlap_scales_filtered_cost(agg_conn):
@@ -891,6 +1090,24 @@ def test_efficiency_breakdown_tokens_cost_weighted(agg_conn):
     assert eff["weighted_efficiency"] == pytest.approx(0.00025)
     assert eff["has_unpriced"] is False
     assert eff["cost_issues"] == 1
+
+
+def test_efficiency_uses_rate_effective_when_the_run_started(agg_conn):
+    """A later catalog price cannot reprice the January issue metrics."""
+    agg_conn.executemany(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, loaded_at) "
+        "VALUES (?, '2026-01-01', ?, ?, 0, 0, 0, 'now')",
+        [("m-claude", 1.0, 0.0), ("m-shared", 1.0, 1.0)],
+    )
+    agg_conn.execute("UPDATE model_pricing SET input_rate = 30.8, output_rate = 30.8")
+    agg_conn.commit()
+
+    out = ag.efficiency_breakdown(agg_conn)
+    # Half of I1's 1,000 input + 500 output tokens belongs to each January run.
+    assert out["cost_usd"] == pytest.approx(0.00125)
+    assert out["cost_per_sp"] == pytest.approx(0.00025)
+    assert out["weighted_efficiency"] == pytest.approx(0.000125)
 
 
 def test_efficiency_breakdown_per_model_cheapest_first(agg_conn):

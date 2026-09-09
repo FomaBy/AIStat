@@ -67,10 +67,10 @@ class Config:
 
     Formerly a ``@dataclass``; rewritten as a plain class with an explicit
     ``__init__`` so the whole ``aistat.backup`` import chain stays importable on
-    the production host's Python 3.6.8, which ships no ``dataclasses`` module
-    (FAN-1435). Every field keeps its per-instance, environment-driven default
-    and its keyword-argument override, so ``Config()`` and ``Config(db_path=...)``
-    behave exactly as they did under the dataclass.
+    legacy stdlib-only shared-host interpreters that ship no ``dataclasses``
+    module (FAN-1435). Every field keeps its per-instance, environment-driven
+    default and its keyword-argument override, so ``Config()`` and
+    ``Config(db_path=...)`` behave exactly as they did under the dataclass.
     """
 
     def __init__(
@@ -97,6 +97,7 @@ class Config:
         security_db_path=_UNSET,
         tenants_dir=_UNSET,
         allowed_hosts=_UNSET,
+        proxy_trust_hops=_UNSET,
         oauth_providers=_UNSET,
         oauth_allowed_emails=_UNSET,
         force_https=_UNSET,
@@ -121,6 +122,8 @@ class Config:
         worker_collect_interval_seconds=_UNSET,
         backup_dir=_UNSET,
         backup_retention=_UNSET,
+        offsite_backup_dir=_UNSET,
+        offsite_retention=_UNSET,
     ):
         # Path to the SQLite database file.
         self.db_path = (
@@ -161,7 +164,7 @@ class Config:
             if cli_timeout_seconds is _UNSET
             else cli_timeout_seconds
         )
-        # Durable credential for the owner poller's `multica` CLI calls. When set,
+        # Compatibility credential for an explicitly invoked direct poller. When set,
         # the poller scrubs the ambient MULTICA_* identity and authenticates with
         # this long-lived PAT instead, so collection no longer depends on an
         # interactive `multica login` session that silently expires (FAN-1442).
@@ -171,7 +174,7 @@ class Config:
             if multica_token is _UNSET
             else multica_token
         )
-        # Host + workspace the durable owner credential authenticates against.
+        # Host + workspace the compatibility direct credential authenticates against.
         # server_url defaults to the CLI's own default when unset; workspace_id
         # falls back to the ambient MULTICA_WORKSPACE_ID so an existing runtime
         # env keeps working unchanged.
@@ -275,6 +278,19 @@ class Config:
             if force_https is _UNSET
             else force_https
         )
+        # Number of trusted reverse-proxy hops in front of the app (FAN-3458).
+        # 0 (default) trusts no proxy: every ``X-Forwarded-*`` header is client
+        # input and ignored, so a spoofed header can never forge the host,
+        # scheme or client address the request boundary and login throttling
+        # rely on. Set it to exactly the number of proxies that terminate TLS
+        # in front of the app (typically 1 on the shared host); Werkzeug's
+        # ``ProxyFix`` then consumes only that many values from the right end
+        # of each forwarded header, discarding anything a client prepended.
+        self.proxy_trust_hops = (
+            max(0, _env_int("AISTAT_PROXY_TRUST_HOPS", 0))
+            if proxy_trust_hops is _UNSET
+            else proxy_trust_hops
+        )
         # The hosted app receives only signed SQLite snapshots. The Multica CLI
         # token remains on the trusted local machine.
         self.ingest_secret = (
@@ -292,8 +308,8 @@ class Config:
             if max_snapshot_bytes is _UNSET
             else max_snapshot_bytes
         )
-        # Optional local publisher. When configured, run.sh starts it alongside
-        # the Multica poller and sends a fresh snapshot at most every five minutes.
+        # Optional direct publisher settings, retained for explicit maintenance
+        # commands. The canonical runtime publishes through the per-user collector.
         self.publish_url = (
             (os.environ.get("AISTAT_PUBLISH_URL") or None)
             if publish_url is _UNSET
@@ -436,9 +452,26 @@ class Config:
             if backup_retention is _UNSET
             else backup_retention
         )
+        # Independent off-site copy of each local backup generation (FAN-3462).
+        # Must point outside the local backup tree — a mounted external volume,
+        # a free-tier rclone/SSHFS mount, or another machine's disk. Bundles are
+        # encrypted (AES-256-CBC + PBKDF2) before they are written here; the key
+        # lives only in AISTAT_BACKUP_ENCRYPTION_KEY and is never stored on Config
+        # so it cannot leak through logs or repr.
+        self.offsite_backup_dir = (
+            _env_path("AISTAT_OFFSITE_BACKUP_DIR", PROJECT_ROOT / "data" / "backups-offsite")
+            if offsite_backup_dir is _UNSET
+            else offsite_backup_dir
+        )
+        # How many encrypted off-site bundles to keep (oldest pruned first).
+        self.offsite_retention = (
+            max(1, _env_int("AISTAT_OFFSITE_RETENTION", 7))
+            if offsite_retention is _UNSET
+            else offsite_retention
+        )
 
     def poller_cli_env(self) -> Optional[Dict[str, str]]:
-        """Environment for the owner poller's ``multica`` CLI subprocesses.
+        """Environment for an explicitly invoked direct poller's CLI subprocesses.
 
         Returns ``None`` to inherit the ambient environment — the historical
         behaviour, kept for tests and for installs that still rely on an
@@ -446,7 +479,7 @@ class Config:
 
         When ``AISTAT_MULTICA_TOKEN`` is configured, returns a copy of the
         environment with every ambient ``MULTICA_*`` key scrubbed and only the
-        configured durable credential re-injected. The poller then authenticates
+        configured compatibility credential re-injected. The poller then authenticates
         with a long-lived PAT instead of an interactive session that expires and
         silently freezes collection (FAN-1442). ``PATH``/``HOME`` are preserved
         so the CLI binary resolves and reads its own profile directory.

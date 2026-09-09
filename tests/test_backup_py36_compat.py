@@ -1,10 +1,11 @@
-"""The ``python -m aistat.backup`` chain must stay Python 3.6.8 compatible.
+"""The ``python -m aistat.backup`` chain must stay legacy-interpreter clean.
 
-FAN-1435. The production host (Namecheap shared, ``server386``) ships only
-Python 3.6.8 — no ``python3.7+`` and no ``dataclasses`` module. The public CGI
-contour is deliberately kept 3.6-clean, but the FAN-1185 backup/restore CLI and
-every module it imports must be too, or ``python -m aistat.backup <cmd>`` dies
-on the host. Blockers already hit and fixed:
+FAN-1435. The stdlib-only shared-host contour historically ran CPython 3.6.8
+(no ``dataclasses`` module); 3.6.8 is no longer a target runtime (FAN-3458,
+supported runtimes are Python 3.11/3.12), but the public CGI contour is
+deliberately kept 3.6-clean so it keeps importing on legacy interpreters.
+The FAN-1185 backup/restore CLI and every module it imports must be too.
+Blockers already hit and fixed:
 
 * import-time ``ModuleNotFoundError: No module named 'dataclasses'`` (3.7+);
 * ``Path.unlink(missing_ok=...)`` (3.8+) and ``subprocess(..., text=...)`` (3.7+);
@@ -81,7 +82,7 @@ def test_backup_import_chain_avoids_dataclasses():
     )
     assert result.returncode == 0, (
         "importing aistat.backup pulled in 'dataclasses' (a Python 3.7+ module); "
-        "the production host runs Python 3.6.8 where it does not exist.\n"
+        "a legacy interpreter without that API is still supported for the contour.\n"
         + result.stderr
     )
 
@@ -112,7 +113,7 @@ def test_backup_chain_has_no_post_36_constructs():
                         offenders.append((path.name, node.lineno, "add_subparsers(required=) (3.7+)"))
     assert not offenders, (
         "Python 3.6-incompatible constructs in the aistat.backup chain "
-        "(host runs 3.6.8): " + "; ".join("%s:%d %s" % o for o in offenders)
+        "(legacy-interpreter contour): " + "; ".join("%s:%d %s" % o for o in offenders)
     )
 
 

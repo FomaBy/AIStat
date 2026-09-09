@@ -30,8 +30,9 @@ Opus 4.8 = GPT-5.6 Terra) per owner directive FAN-1427.
 """
 
 import json
+import math
+import re
 import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -44,7 +45,6 @@ class PricingError(ValueError):
     """pricing.json (or an override) did not match the expected contract."""
 
 
-@dataclass
 class CreditRate:
     """Per-1M-token credit rates for one model (OpenAI Codex rate card unit).
 
@@ -52,39 +52,73 @@ class CreditRate:
     not part of the credit rate card.
     """
 
-    input: float
-    cache_read: float
-    output: float
-    source: Optional[str] = None
-    captured_at: Optional[str] = None
-    notes: Optional[str] = None
+    def __init__(
+        self,
+        input: float,
+        cache_read: float,
+        output: float,
+        source: Optional[str] = None,
+        captured_at: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        self.input = input
+        self.cache_read = cache_read
+        self.output = output
+        self.source = source
+        self.captured_at = captured_at
+        self.notes = notes
 
 
-@dataclass
 class Rate:
     """Per-1M-token rates for one model, with provenance."""
 
-    model: str
-    input: float = 0.0
-    output: float = 0.0
-    cache_read: float = 0.0
-    cache_write: float = 0.0
-    cache_write_1h: Optional[float] = None
-    currency: str = "USD"
-    vendor: Optional[str] = None
-    source_url: Optional[str] = None
-    captured_at: Optional[str] = None
-    notes: Optional[str] = None
-    unpriced: bool = False
-    credits: Optional[CreditRate] = None
+    def __init__(
+        self,
+        model: str,
+        input: float = 0.0,
+        output: float = 0.0,
+        cache_read: float = 0.0,
+        cache_write: float = 0.0,
+        cache_write_1h: Optional[float] = None,
+        currency: str = "USD",
+        vendor: Optional[str] = None,
+        source_url: Optional[str] = None,
+        captured_at: Optional[str] = None,
+        notes: Optional[str] = None,
+        unpriced: bool = False,
+        credits: Optional[CreditRate] = None,
+        effective_from: Optional[str] = None,
+    ) -> None:
+        self.model = model
+        self.input = input
+        self.output = output
+        self.cache_read = cache_read
+        self.cache_write = cache_write
+        self.cache_write_1h = cache_write_1h
+        self.currency = currency
+        self.vendor = vendor
+        self.source_url = source_url
+        self.captured_at = captured_at
+        self.notes = notes
+        self.unpriced = unpriced
+        self.credits = credits
+        self.effective_from = effective_from
 
 
-@dataclass
+class PriceCatalog(dict):
+    """Current rates plus their immutable effective-dated revisions."""
+
+    def __init__(self, rates, revisions):
+        super().__init__(rates)
+        self.revisions = revisions
+
+
 class CostResult:
     """Cost of a usage row. ``usd`` is None for an unpriced model."""
 
-    usd: Optional[float]
-    priced: bool
+    def __init__(self, usd: Optional[float], priced: bool) -> None:
+        self.usd = usd
+        self.priced = priced
 
 
 _RATE_FIELDS = ("input", "output", "cache_read", "cache_write")
@@ -115,49 +149,48 @@ def _parse_credits(entry: Dict[str, Any], model: str,
     )
 
 
-def _parse_models(doc: Dict[str, Any], source: str) -> Dict[str, Rate]:
+def _parse_rate(entry: Dict[str, Any], model: str, source: str,
+                default_currency: str) -> Rate:
+    if not isinstance(entry, dict):
+        raise PricingError(f"{source}: model '{model}' is not an object")
+    credits = _parse_credits(entry, model, source)
+    if entry.get("unpriced"):
+        return Rate(model=model, unpriced=True,
+                    currency=entry.get("currency", default_currency),
+                    vendor=entry.get("vendor"), source_url=entry.get("source_url"),
+                    captured_at=entry.get("captured_at"), notes=entry.get("notes"),
+                    credits=credits, effective_from=entry.get("effective_from"))
+    values = {}
+    for field in _RATE_FIELDS:
+        value = entry.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise PricingError(f"{source}: model '{model}' missing numeric rate '{field}'")
+        values[field] = float(value)
+    cw_1h = entry.get("cache_write_1h")
+    return Rate(model=model,
+                cache_write_1h=float(cw_1h) if isinstance(cw_1h, (int, float)) else None,
+                currency=entry.get("currency", default_currency),
+                vendor=entry.get("vendor"), source_url=entry.get("source_url"),
+                captured_at=entry.get("captured_at"), notes=entry.get("notes"),
+                credits=credits, effective_from=entry.get("effective_from"), **values)
+
+
+def _parse_models(doc: Dict[str, Any], source: str) -> PriceCatalog:
     models = doc.get("models")
     if not isinstance(models, dict):
         raise PricingError(f"{source}: top-level 'models' object is missing")
     default_currency = doc.get("currency", "USD")
     rates: Dict[str, Rate] = {}
+    revisions: Dict[str, List[Rate]] = {}
     for model, entry in models.items():
-        if not isinstance(entry, dict):
-            raise PricingError(f"{source}: model '{model}' is not an object")
-        credits = _parse_credits(entry, model, source)
-        if entry.get("unpriced"):
-            rates[model] = Rate(
-                model=model,
-                unpriced=True,
-                currency=entry.get("currency", default_currency),
-                vendor=entry.get("vendor"),
-                source_url=entry.get("source_url"),
-                captured_at=entry.get("captured_at"),
-                notes=entry.get("notes"),
-                credits=credits,
-            )
-            continue
-        values = {}
-        for field in _RATE_FIELDS:
-            value = entry.get(field)
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise PricingError(
-                    f"{source}: model '{model}' missing numeric rate '{field}'"
-                )
-            values[field] = float(value)
-        cw_1h = entry.get("cache_write_1h")
-        rates[model] = Rate(
-            model=model,
-            cache_write_1h=float(cw_1h) if isinstance(cw_1h, (int, float)) else None,
-            currency=entry.get("currency", default_currency),
-            vendor=entry.get("vendor"),
-            source_url=entry.get("source_url"),
-            captured_at=entry.get("captured_at"),
-            notes=entry.get("notes"),
-            credits=credits,
-            **values,
-        )
-    return rates
+        entries = entry if isinstance(entry, list) else [entry]
+        parsed = [_parse_rate(item, model, source, default_currency) for item in entries]
+        if len(parsed) > 1 and any(not rate.effective_from for rate in parsed):
+            raise PricingError(f"{source}: dated model '{model}' needs effective_from")
+        parsed.sort(key=lambda rate: rate.effective_from or "0001-01-01")
+        revisions[model] = parsed
+        rates[model] = parsed[-1]
+    return PriceCatalog(rates, revisions)
 
 
 def _load_file(path: Union[str, Path]) -> Dict[str, Any]:
@@ -173,7 +206,7 @@ def _load_file(path: Union[str, Path]) -> Dict[str, Any]:
 def load_pricing(
     path: Union[str, Path],
     override_path: Optional[Union[str, Path]] = None,
-) -> Dict[str, Rate]:
+) -> PriceCatalog:
     """Load the base pricing file, then merge an optional override file.
 
     An override entry for a model replaces the base entry wholesale (so an
@@ -182,8 +215,20 @@ def load_pricing(
     """
     rates = _parse_models(_load_file(path), str(path))
     if override_path is not None and Path(override_path).exists():
-        rates.update(_parse_models(_load_file(override_path), str(override_path)))
+        override = _parse_models(_load_file(override_path), str(override_path))
+        rates.update(override)
+        rates.revisions.update(override.revisions)
     return rates
+
+
+def effective_rate(pricing: Dict[str, Rate], model: str, usage_date: str) -> Optional[Rate]:
+    """Select the last published rate effective on a UTC usage date."""
+    revisions = getattr(pricing, "revisions", {}).get(model)
+    if not revisions:
+        return pricing.get(model)
+    candidates = [rate for rate in revisions
+                  if not rate.effective_from or rate.effective_from <= usage_date]
+    return candidates[-1] if candidates else None
 
 
 # -- pure cost computation ---------------------------------------------------
@@ -296,7 +341,62 @@ def upsert_model_pricing(conn: sqlite3.Connection, pricing: Dict[str, Rate],
                 rate.source_url, rate.captured_at, rate.notes, loaded_at,
             ),
         )
+    for model, revisions in getattr(pricing, "revisions", {}).items():
+        for rate in revisions:
+            if not rate.effective_from:
+                continue
+            # Price history is deliberately insert-only. Correcting a published
+            # rate requires a new effective date, never a silent rewrite.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO model_price_history (
+                    model, effective_from, vendor, currency, input_rate,
+                    output_rate, cache_read_rate, cache_write_rate,
+                    cache_write_1h_rate, credit_input_rate,
+                    credit_cache_read_rate, credit_output_rate, unpriced,
+                    source_url, captured_at, loaded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (rate.model, rate.effective_from, rate.vendor, rate.currency,
+                 None if rate.unpriced else rate.input,
+                 None if rate.unpriced else rate.output,
+                 None if rate.unpriced else rate.cache_read,
+                 None if rate.unpriced else rate.cache_write,
+                 rate.cache_write_1h,
+                 rate.credits.input if rate.credits else None,
+                 rate.credits.cache_read if rate.credits else None,
+                 rate.credits.output if rate.credits else None,
+                 1 if rate.unpriced else 0, rate.source_url, rate.captured_at,
+                 loaded_at),
+            )
     return len(pricing)
+
+
+def _historical_rate(conn: sqlite3.Connection, pricing: Dict[str, Rate],
+                     model: str, usage_date: str) -> Optional[Rate]:
+    """Use persisted history when present, otherwise the supplied catalog."""
+    row = conn.execute(
+        "SELECT * FROM model_price_history WHERE model = ? "
+        "AND effective_from <= ? ORDER BY effective_from DESC LIMIT 1",
+        (model, usage_date),
+    ).fetchone()
+    if row is None:
+        # A catalog's first confirmed historical revision cannot make earlier
+        # already-priced usage silently become unpriced. Until a matching
+        # revision exists, retain the catalog's compatibility rate.
+        return effective_rate(pricing, model, usage_date) or pricing.get(model)
+    credits = None
+    if row["credit_input_rate"] is not None:
+        credits = CreditRate(row["credit_input_rate"], row["credit_cache_read_rate"],
+                             row["credit_output_rate"])
+    return Rate(model=model, input=row["input_rate"] or 0.0,
+                output=row["output_rate"] or 0.0,
+                cache_read=row["cache_read_rate"] or 0.0,
+                cache_write=row["cache_write_rate"] or 0.0,
+                cache_write_1h=row["cache_write_1h_rate"], credits=credits,
+                unpriced=bool(row["unpriced"]), vendor=row["vendor"],
+                currency=row["currency"] or "USD", source_url=row["source_url"],
+                captured_at=row["captured_at"], effective_from=row["effective_from"])
 
 
 def recompute_daily_costs(conn: sqlite3.Connection, pricing: Dict[str, Rate],
@@ -310,10 +410,10 @@ def recompute_daily_costs(conn: sqlite3.Connection, pricing: Dict[str, Rate],
     computed_at = computed_at or utcnow_iso()
     rows = conn.execute(
         "SELECT rowid, model, input_tokens, output_tokens, "
-        "cache_read_tokens, cache_write_tokens FROM daily_usage"
+        "cache_read_tokens, cache_write_tokens, date FROM daily_usage"
     ).fetchall()
     for row in rows:
-        rate = pricing.get(row["model"])
+        rate = _historical_rate(conn, pricing, row["model"], row["date"])
         result = compute_cost(
             row["input_tokens"], row["output_tokens"],
             row["cache_read_tokens"], row["cache_write_tokens"],
@@ -325,12 +425,13 @@ def recompute_daily_costs(conn: sqlite3.Connection, pricing: Dict[str, Rate],
         )
         conn.execute(
             "UPDATE daily_usage SET cost_usd = ?, cost_credits = ?, "
-            "cost_priced = ?, cost_computed_at = ? WHERE rowid = ?",
+            "cost_priced = ?, cost_computed_at = ?, rate_effective_from = ? WHERE rowid = ?",
             (
                 result.usd,
                 credits,
                 1 if result.priced else 0,
                 computed_at,
+                rate.effective_from if rate else None,
                 row["rowid"],
             ),
         )
@@ -343,3 +444,210 @@ def unpriced_models_in_usage(conn: sqlite3.Connection,
     priced = {m for m, r in pricing.items() if not r.unpriced}
     rows = conn.execute("SELECT DISTINCT model FROM daily_usage ORDER BY model")
     return [r["model"] for r in rows if r["model"] not in priced]
+
+
+_BILLING_PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_BILLING_PERIOD = re.compile(r"^(?!0000-)[0-9]{4}-(?:0[1-9]|1[0-2])$")
+_BILLING_AMOUNT = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+_BILLING_CURRENCY = "USD"
+
+
+def validate_billing_reconciliation(
+    provider: str, period: str, currency: str = "USD"
+) -> None:
+    if not _BILLING_PROVIDER.fullmatch(provider) or not _BILLING_PERIOD.fullmatch(period):
+        raise PricingError("provider and period must use canonical identifiers")
+    if currency != _BILLING_CURRENCY:
+        raise PricingError("currency must be USD; no conversion is performed")
+
+
+def parse_billing_amount(raw: Optional[str]) -> float:
+    """Parse a canonical unsigned ASCII decimal amount, e.g. ``"12.50"``.
+
+    Rejects anything ``float()`` would otherwise accept but that isn't
+    canonical decimal syntax: underscores, Unicode digits, surrounding
+    whitespace, signs, exponents, and non-finite spellings like ``"inf"``.
+    """
+    if raw is None or not _BILLING_AMOUNT.fullmatch(raw):
+        raise PricingError("amount must be an unsigned ASCII decimal number")
+    return float(raw)
+
+
+def calculated_cost_for_period(conn: sqlite3.Connection, provider: str,
+                               period: str) -> float:
+    """Sum this provider's own recorded ``daily_usage`` cost for one month.
+
+    This is the system's own tally to reconcile against a submitted actual
+    total; it is never accepted from the caller.
+    """
+    validate_billing_reconciliation(provider, period)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM daily_usage "
+        "WHERE provider = ? AND substr(date, 1, 7) = ?",
+        (provider, period),
+    ).fetchone()
+    return float(row["total"])
+
+
+def reconcile_billing_actual(conn: sqlite3.Connection, provider: str, period: str,
+                             calculated_usd: float, actual_usd: float,
+                             threshold: float = 0.05, currency: str = "USD",
+                             submitted_by: Optional[int] = None,
+                             submitted_at: Optional[str] = None,
+                             user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Store sanitized provider totals and emit one diagnostic per variance.
+
+    Callers retain the export/invoice outside the repository; this table holds
+    only period totals, currency and submission provenance required to
+    explain a cost mismatch.
+    """
+    validate_billing_reconciliation(provider, period, currency)
+    values = (calculated_usd, actual_usd, threshold)
+    if any(not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in values) or calculated_usd < 0 or actual_usd < 0 or threshold < 0:
+        raise PricingError("billing totals and threshold must be finite non-negative numbers")
+    if user_id is not None and (
+        not isinstance(user_id, int) or isinstance(user_id, bool) or user_id < 1
+    ):
+        raise PricingError("user id must be a positive integer")
+    variance = abs(calculated_usd - actual_usd) / actual_usd if actual_usd else (
+        0.0 if calculated_usd == 0 else 1.0
+    )
+    over = variance > threshold
+    if user_id is None:
+        identity_columns = "provider, period"
+        identity_values = (provider, period)
+        identity_placeholders = "?, ?"
+        identity_conflict = "provider, period"
+        identity_where = "provider = ? AND period = ?"
+    else:
+        identity_columns = "user_id, provider, period"
+        identity_values = (user_id, provider, period)
+        identity_placeholders = "?, ?, ?"
+        identity_conflict = "user_id, provider, period"
+        identity_where = "user_id = ? AND provider = ? AND period = ?"
+    # These SQL fragments are fixed by the internal storage shape, never input.
+    previous = conn.execute(
+        "SELECT over_threshold, diagnostic_emitted_at "
+        "FROM billing_reconciliation WHERE " + identity_where,
+        identity_values,
+    ).fetchone()
+    emitted = bool(over and (previous is None or not previous["over_threshold"]))
+    submitted_at = submitted_at or utcnow_iso()
+    conn.execute(
+        """
+        INSERT INTO billing_reconciliation (
+            {identity_columns}, calculated_usd, actual_usd, variance_ratio,
+            over_threshold, diagnostic_emitted_at, currency, submitted_by,
+            submitted_at
+        ) VALUES ({identity_placeholders}, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT({identity_conflict}) DO UPDATE SET
+            calculated_usd = excluded.calculated_usd,
+            actual_usd = excluded.actual_usd,
+            variance_ratio = excluded.variance_ratio,
+            over_threshold = excluded.over_threshold,
+            diagnostic_emitted_at = CASE
+                WHEN excluded.over_threshold = 1
+                 AND billing_reconciliation.over_threshold = 0 THEN excluded.diagnostic_emitted_at
+                WHEN excluded.over_threshold = 0 THEN NULL
+                ELSE billing_reconciliation.diagnostic_emitted_at END,
+            currency = excluded.currency,
+            submitted_by = excluded.submitted_by,
+            submitted_at = excluded.submitted_at
+        """.format(
+            identity_columns=identity_columns,
+            identity_placeholders=identity_placeholders,
+            identity_conflict=identity_conflict,
+        ),
+        identity_values + (
+            float(calculated_usd), float(actual_usd), variance, 1 if over else 0,
+            utcnow_iso() if emitted else None, currency, submitted_by, submitted_at,
+        ),
+    )
+    return {"provider": provider, "period": period, "variance_ratio": variance,
+            "over_threshold": over, "diagnostic_emitted": emitted,
+            "currency": currency, "submitted_by": submitted_by,
+            "submitted_at": submitted_at}
+
+
+def billing_reconciliation_snapshot(
+    conn: sqlite3.Connection,
+    durable_conn: Optional[sqlite3.Connection] = None,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Persisted reconciliation rows plus provider/period submission coverage.
+
+    Degrades to an empty snapshot on a legacy database that predates the
+    ``billing_reconciliation`` table, rather than raising.
+    """
+    storage_conn = durable_conn or conn
+    if storage_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'billing_reconciliation'"
+    ).fetchone() is None:
+        return {"rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}}
+    storage_columns = {
+        row[1] for row in storage_conn.execute(
+            "PRAGMA table_info(billing_reconciliation)"
+        )
+    }
+    required_columns = {
+        "provider", "period", "calculated_usd", "actual_usd",
+        "variance_ratio", "over_threshold", "diagnostic_emitted_at",
+    }
+    if user_id is not None:
+        required_columns.add("user_id")
+    if not required_columns <= storage_columns:
+        return {"rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}}
+    currency_column = "currency" if "currency" in storage_columns else "'USD' AS currency"
+    submitted_by_column = (
+        "submitted_by" if "submitted_by" in storage_columns else "NULL AS submitted_by"
+    )
+    submitted_at_column = (
+        "submitted_at" if "submitted_at" in storage_columns else "NULL AS submitted_at"
+    )
+    if user_id is None:
+        rows = storage_conn.execute(
+            "SELECT provider, period, calculated_usd, actual_usd, variance_ratio, "
+            "over_threshold, diagnostic_emitted_at, {currency_column}, "
+            "{submitted_by_column}, {submitted_at_column} "
+            "FROM billing_reconciliation ORDER BY period DESC, provider".format(
+                currency_column=currency_column,
+                submitted_by_column=submitted_by_column,
+                submitted_at_column=submitted_at_column,
+            )
+        ).fetchall()
+    else:
+        rows = storage_conn.execute(
+            "SELECT provider, period, calculated_usd, actual_usd, variance_ratio, "
+            "over_threshold, diagnostic_emitted_at, {currency_column}, "
+            "{submitted_by_column}, {submitted_at_column} "
+            "FROM billing_reconciliation WHERE user_id = ? "
+            "ORDER BY period DESC, provider".format(
+                currency_column=currency_column,
+                submitted_by_column=submitted_by_column,
+                submitted_at_column=submitted_at_column,
+            ),
+            (user_id,),
+        ).fetchall()
+    usage_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(daily_usage)")
+    }
+    if {"provider", "cost_usd"} <= usage_columns:
+        periods_total = conn.execute(
+            "SELECT COUNT(DISTINCT provider || ':' || substr(date, 1, 7)) "
+            "FROM daily_usage WHERE provider IS NOT NULL AND cost_usd IS NOT NULL"
+        ).fetchone()[0]
+    else:
+        periods_total = 0
+    return {"rows": [{
+        "provider": row["provider"], "period": row["period"],
+        "calculated_usd": row["calculated_usd"], "actual_usd": row["actual_usd"],
+        "variance_ratio": row["variance_ratio"],
+        "over_threshold": bool(row["over_threshold"]),
+        "diagnostic_emitted": row["diagnostic_emitted_at"] is not None,
+        "currency": row["currency"], "submitted_by": row["submitted_by"],
+        "submitted_at": row["submitted_at"],
+    } for row in rows], "coverage": {
+        "periods_submitted": len(rows), "periods_total": periods_total,
+    }}

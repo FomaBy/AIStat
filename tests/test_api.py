@@ -147,6 +147,131 @@ def test_summary_endpoint(api):
     assert filtered["total_tokens"] == 3_400_000
 
 
+def test_summary_exposes_accepted_sp_quality_cost(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    conn.commit()
+    data = client.get("/api/summary").json()
+    assert data["accepted_story_points"] == 3.0
+    assert data["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+
+
+def test_billing_reconciliation_api_exposes_sanitized_totals_only(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO billing_reconciliation (provider, period, calculated_usd, "
+        "actual_usd, variance_ratio, over_threshold, diagnostic_emitted_at, "
+        "currency, submitted_by, submitted_at) VALUES "
+        "('anthropic', '2026-02', 90, 100, 0.1, 1, '2026-02-28T00:00:00Z', "
+        "'USD', 1, '2026-02-28T00:00:00Z')"
+    )
+    conn.commit()
+    data = client.get("/api/billing-reconciliation").json()
+    assert data["rows"] == [{
+        "provider": "anthropic", "period": "2026-02", "calculated_usd": 90.0,
+        "actual_usd": 100.0, "variance_ratio": 0.1, "over_threshold": True,
+        "diagnostic_emitted": True, "currency": "USD", "submitted_by": 1,
+        "submitted_at": "2026-02-28T00:00:00Z",
+    }]
+    assert data["coverage"] == {"periods_submitted": 1, "periods_total": 0}
+
+
+def test_billing_reconciliation_api_degrades_old_table_shape(api):
+    client, conn = api
+    conn.execute("DROP TABLE billing_reconciliation")
+    conn.execute(
+        "CREATE TABLE billing_reconciliation ("
+        "provider TEXT, period TEXT, calculated_usd REAL, actual_usd REAL, "
+        "variance_ratio REAL, over_threshold INTEGER, "
+        "diagnostic_emitted_at TEXT)"
+    )
+    conn.commit()
+    response = client.get("/api/billing-reconciliation")
+    assert response.status_code == 200
+    assert response.json() == {
+        "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}
+    }
+
+
+def test_pricing_api_exposes_rate_provenance_and_coverage(api):
+    client, conn = api
+    conn.execute(
+        "INSERT INTO model_price_history (model, effective_from, input_rate, "
+        "output_rate, cache_read_rate, cache_write_rate, unpriced, source_url, loaded_at) "
+        "VALUES ('m', '2026-01-01', 1, 2, .1, 1.25, 0, 'https://vendor/pricing', 'now')"
+    )
+    conn.commit()
+    data = client.get("/api/pricing").json()
+    assert data["rates"][0]["source_url"] == "https://vendor/pricing"
+    assert data["rates"][0]["effective_from"] == "2026-01-01"
+    assert data["coverage"] == {"rows": 4, "priced_rows": 3, "unpriced_rows": 1}
+
+
+def test_model_efficiency_exposes_cost_by_lane_and_period(api):
+    """AC5: cost by lane and accepted SP, alongside the period it covers."""
+    client, conn = api
+    conn.execute("UPDATE issues SET dispatch_lane = 'dev_medium' WHERE id = 'I1'")
+    conn.execute(
+        "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+        "candidate, verdict, observed_at, accepted_candidate, accepted_story_points) "
+        "VALUES ('QA-1', 'I1', 'sha', 'PASSED', '2026-01-02T00:00:00Z', 'sha', 3)"
+    )
+    conn.commit()
+
+    data = client.get("/api/model-efficiency").json()
+    assert data["period"] == {"from": None, "to": None}
+    assert [row["lane"] for row in data["lanes"]] == ["dev_medium"]
+    lane = data["lanes"][0]
+    assert lane["cost_usd"] == pytest.approx(0.0025)
+    assert lane["accepted_story_points"] == 3.0
+    assert lane["quality_adjusted_cost_per_sp"] == pytest.approx(0.0025 / 3)
+    assert lane["has_unpriced"] is False
+
+    windowed = client.get("/api/model-efficiency", params={
+        "from": "2026-01-01T00:00Z", "to": "2026-01-02T00:00Z"}).json()
+    assert windowed["period"] == {"from": "2026-01-01", "to": "2026-01-01"}
+
+
+@pytest.mark.parametrize("schema_version", [5, 6, 7, 8])
+def test_legacy_snapshot_without_new_cost_tables_keeps_api_neutral(api, schema_version):
+    """v5-v8 snapshots predate these optional v9 tables but remain servable."""
+    client, conn = api
+    conn.executescript("""
+    DROP TABLE qa_lineage_events;
+    DROP TABLE model_price_history;
+    DROP TABLE billing_reconciliation;
+    """)
+    conn.execute("PRAGMA user_version = {}".format(schema_version))
+    conn.commit()
+
+    summary = client.get("/api/summary")
+    assert summary.status_code == 200
+    assert summary.json()["accepted_story_points"] == 0.0
+    assert summary.json()["quality_adjusted_cost_per_sp"] is None
+    assert client.get("/api/pricing").json()["rates"] == []
+    assert client.get("/api/billing-reconciliation").json() == {
+        "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0},
+    }
+    lanes = client.get("/api/model-efficiency").json()["lanes"]
+    assert [row["lane"] for row in lanes] == ["unknown"]
+    assert lanes[0]["quality_adjusted_cost_per_sp"] is None
+
+
+def test_pre_routing_snapshot_still_serves_cost_by_lane(api):
+    """A snapshot older than dispatch_lane degrades instead of failing."""
+    client, conn = api
+    conn.execute("ALTER TABLE issues DROP COLUMN dispatch_lane")
+    conn.commit()
+    response = client.get("/api/model-efficiency")
+    assert response.status_code == 200
+    assert [row["lane"] for row in response.json()["lanes"]] == ["unknown"]
+    assert client.get("/api/summary").status_code == 200
+
+
 def test_hour_and_dimension_filters_are_validated_and_applied(api):
     client, _ = api
     params = [
@@ -632,3 +757,53 @@ def test_sse_endpoint_is_registered(api):
     client, _ = api
     routes = {r.path for r in client.app.routes}
     assert "/api/events" in routes
+
+
+def test_flow_endpoint_shape_and_validation(api):
+    """FAN-3306: /api/flow serves truthful nulls + coverage on a database
+    without flow history, and rejects a non-contract window."""
+    client, _ = api
+    out = client.get("/api/flow?days=7").json()
+    assert out["days"] == 7
+    assert set(out) >= {
+        "cycle_time", "rework", "idle", "coverage", "lanes", "frontier",
+        "lineage",
+    }
+    assert out["cycle_time"]["median_seconds"] is None
+    assert out["rework"]["rate"] is None
+    assert out["idle"]["share"] is None
+    assert out["frontier"]["pm_p95_seconds"] is None
+    assert out["lineage"]["first_pass_rate"] is None
+    assert client.get("/api/flow?days=13").status_code == 422
+    assert client.get("/api/flow?days=abc").status_code == 422
+
+
+def test_dashboard_flow_panel_static_contract():
+    """Static contract (FAN-3306): the flow panel exists with its window/lane
+    controls and tiles, and renderFlow never coerces a missing metric to 0 —
+    N/A stays an explicit dash with the coverage line spelled out."""
+    static = Path(server_module.__file__).parent / "static"
+    index_html = (static / "index.html").read_text(encoding="utf-8")
+    assert 'id="flow-panel"' in index_html
+    for control in ("flow-days", "flow-lane"):
+        assert f'id="{control}"' in index_html
+    for card in ("card-flow-cycle", "card-flow-p90", "card-flow-rework",
+                 "card-flow-idle", "card-flow-ready", "card-flow-pm-p95",
+                 "card-flow-waiting", "card-flow-first-pass"):
+        assert f'id="{card}"' in index_html
+    assert 'id="table-flow-groups"' in index_html
+    assert 'id="flow-coverage"' in index_html
+
+    app_js = (static / "app.js").read_text(encoding="utf-8")
+    render = _js_function(app_js, "renderFlow")
+    assert "|| 0" not in render
+    assert 't("noData")' in render
+    assert "flowCoverageNoEvents" in render  # absent history is spelled out
+    assert "flowFirstPassSub" in render
+    share = _js_function(app_js, "fmtShare")
+    assert "—" in share  # null share/rate renders as a dash, not 0%
+
+    i18n_js = (static / "i18n.js").read_text(encoding="utf-8")
+    for key in ("flowMetrics", "flowLane", "allLanes", "flowCoverageDetail",
+                "flowFirstPassSub", "flowReady", "flowPmP95", "flowWaiting"):
+        assert key + ":" in i18n_js

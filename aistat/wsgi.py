@@ -33,7 +33,16 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from . import __version__, aggregates, handoff, oauth
+from . import (
+    __version__,
+    aggregates,
+    flow_metrics,
+    handoff,
+    lineage,
+    oauth,
+    pricing,
+    release_identity,
+)
 from .config import Config
 from .db import connect_readonly, init_db, schema_admission_error
 from .health import snapshot
@@ -58,6 +67,9 @@ from .tenant import canonical_tenant_id
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+# The deployed cPanel package root is this module's parent's parent: the
+# built package puts ``aistat/`` and ``PACKAGE-MANIFEST.json`` as siblings.
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 # Short-lived HttpOnly cookie binding OAuth states to the browser that started
 # them; only its hash is stored server-side with each state row.
@@ -87,9 +99,20 @@ def create_app(config: Optional[Config] = None) -> Flask:
         static_folder=None,
         template_folder=str(TEMPLATE_DIR),
     )
-    app.wsgi_app = ProxyFix(
-        app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1
-    )
+    # Explicit, configured proxy trust (FAN-3458): the default of 0 trusts no
+    # proxy, so spoofed ``X-Forwarded-*`` headers are ignored entirely. An
+    # operator behind exactly N terminating proxies sets
+    # ``AISTAT_PROXY_TRUST_HOPS=N`` and ProxyFix consumes only the N right-most
+    # forwarded values, discarding anything a direct client prepended.
+    if config.proxy_trust_hops > 0:
+        hops = config.proxy_trust_hops
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=hops,
+            x_proto=hops,
+            x_host=hops,
+            x_port=hops,
+        )
     # No Flask client-side session is used: the auth cookie is set and read
     # directly below, so the framework never serializes identity into a signed
     # cookie. ``MAX_CONTENT_LENGTH`` still bounds snapshot uploads.
@@ -213,6 +236,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
     @app.after_request
     def security_headers(response):
         response.headers["Cache-Control"] = "no-store"
+        response.headers["Vary"] = "Cookie"
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; "
             "script-src 'self'; "
@@ -299,9 +323,12 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     # Reconcile any snapshot install a crash left half-applied before this
     # worker serves a request. Under the ingest lock so it cannot race a live
-    # ingest or another worker's recovery pass.
+    # ingest or another worker's recovery pass. The global-stats sync then
+    # aggregates any installed snapshot the anonymized cross-tenant rows do
+    # not reflect yet (pre-feature tenants, or a crash mid-refresh).
     with ingest_lock():
         security_store.recover_snapshot_installs(config.tenants_dir)
+        security_store.sync_global_stats(config.tenants_dir)
 
     def last_sync_state() -> dict:
         conn = data_connection()
@@ -537,6 +564,15 @@ def create_app(config: Optional[Config] = None) -> Flask:
             }
         )
 
+    @app.get("/api/release-identity")
+    def api_release_identity():
+        try:
+            data = release_identity.load_release_identity(PACKAGE_ROOT)
+        except release_identity.ReleaseIdentityUnavailable:
+            app.logger.error("release_identity_unavailable")
+            return jsonify({"detail": "release identity unavailable"}), 503
+        return jsonify(data)
+
     @app.get("/api/meta")
     def api_meta():
         conn = data_connection()
@@ -678,6 +714,14 @@ def create_app(config: Optional[Config] = None) -> Flask:
         finally:
             conn.close()
 
+    @app.get("/api/global-model-efficiency")
+    def api_global_model_efficiency():
+        # Anonymized sums across every tenant (FAN-2392): no filters, no
+        # per-tenant breakdown, only cost-relevant fields. Cohorts under the
+        # k>=5 minimum are suppressed and no contributor count is exposed, so
+        # the store's result is served verbatim (FAN-2397).
+        return jsonify(security_store.global_model_efficiency())
+
     @app.get("/api/efficiency-breakdown")
     def api_efficiency_breakdown():
         try:
@@ -689,6 +733,131 @@ def create_app(config: Optional[Config] = None) -> Flask:
             return jsonify(aggregates.efficiency_chart_breakdown(conn, filters=filters))
         finally:
             conn.close()
+
+    @app.get("/api/flow")
+    def api_flow():
+        try:
+            days = flow_metrics.validate_days(request.args.get("days", "30"))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(
+                flow_metrics.flow(
+                    conn, days=days,
+                    project_ids=request.args.getlist("project"),
+                    lanes=request.args.getlist("lane"),
+                )
+            )
+        finally:
+            conn.close()
+
+    @app.get("/api/lineage")
+    def api_lineage():
+        conn = data_connection()
+        try:
+            return jsonify(lineage.trace(conn, request.args.get("trace", "")))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        finally:
+            conn.close()
+
+    @app.get("/api/slo")
+    def api_slo():
+        try:
+            days = flow_metrics.validate_days(request.args.get("days", "30"))
+        except ValueError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        conn = data_connection()
+        try:
+            return jsonify(lineage.slo(conn, days=days))
+        finally:
+            conn.close()
+
+    @app.get("/api/billing-reconciliation")
+    def api_billing_reconciliation():
+        user_id = current_user_id()
+        if user_id is None:
+            return jsonify({"detail": "authentication required"}), 401
+        try:
+            conn = data_connection()
+        except SchemaUpgradeRequired:
+            # Reconciliation rows live in security.db, so an old tenant
+            # snapshot can still be read with degraded usage coverage.
+            conn = empty_data_connection()
+        try:
+            return jsonify(
+                security_store.billing_reconciliation_snapshot(user_id, conn)
+            )
+        finally:
+            conn.close()
+
+    @app.post("/api/billing-reconciliation")
+    def api_billing_reconciliation_submit():
+        """Owner-only aggregate intake: period totals only, never invoices.
+
+        Accepts a provider's already-known period/currency/actual total,
+        recomputes this instance's own calculated total from stored usage and
+        stores the sanitized comparison — the provider export itself never
+        reaches AIStat.
+        """
+        user_id = current_user_id()
+        if user_id != owner_user_id:
+            return jsonify({"detail": "owner account required"}), 403
+        if not request_csrf_ok():
+            return jsonify({"detail": "invalid CSRF token"}), 400
+        provider = (request.form.get("provider") or "").strip()
+        period = request.form.get("period") or ""
+        currency = (request.form.get("currency") or "").strip()
+        amount = request.form.get("amount")
+        try:
+            actual_usd = pricing.parse_billing_amount(amount)
+        except pricing.PricingError:
+            return jsonify({"detail": "amount must be an unsigned ASCII decimal number"}), 422
+        try:
+            pricing.validate_billing_reconciliation(provider, period, currency)
+        except pricing.PricingError as exc:
+            return jsonify({"detail": str(exc)}), 422
+        path = config.tenant_db_path(user_id)
+        if not path.is_file():
+            return jsonify({"detail": "no usage snapshot ingested yet"}), 503
+        probe = connect_readonly(path)
+        try:
+            problem = schema_admission_error(probe)
+        finally:
+            probe.close()
+        if problem is not None:
+            return jsonify({"detail": "database schema upgrade required"}), 503
+        with ingest_lock():
+            # A plain connection, never the WAL-forcing ``db.connect()``: the
+            # hosted tenant file is distributed and served as a single
+            # checkpointed DELETE-journal file (snapshot.py, migrate.py), and
+            # flipping it to WAL here would strand a -wal/-shm pair that a
+            # later read-only ``mode=ro`` open cannot reopen.
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            try:
+                calculated_usd = pricing.calculated_cost_for_period(
+                    conn, provider, period
+                )
+            except pricing.PricingError as exc:
+                conn.rollback()
+                return jsonify({"detail": str(exc)}), 422
+            except sqlite3.OperationalError:
+                conn.rollback()
+                return jsonify({"detail": "database schema upgrade required"}), 503
+            finally:
+                conn.close()
+            try:
+                result = security_store.record_billing_reconciliation(
+                    user_id, provider, period, calculated_usd, actual_usd,
+                    currency=currency,
+                )
+            except pricing.PricingError as exc:
+                return jsonify({"detail": str(exc)}), 422
+            except sqlite3.OperationalError:
+                return jsonify({"detail": "billing storage unavailable"}), 503
+        return jsonify(result)
 
     def health_payload():
         conn = data_connection()
@@ -759,7 +928,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
             except SnapshotError:
                 return jsonify({"detail": "invalid snapshot"}), 422
             # Data-freshness guard: never let a stale or degraded snapshot move
-            # this tenant's usage backwards in time (e.g. a lapsed owner poller
+            # this tenant's usage backwards in time (e.g. a lapsed direct poller
             # overwriting a newer connected-collector snapshot). Independent of
             # the timestamp replay check above, which only bounds the signature.
             report = freshness_report(staged_path, target_path)
@@ -795,6 +964,17 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 # already swapped, so a stuck watermark here is a broken
                 # invariant, not a replay — surface it loudly.
                 return jsonify({"detail": "snapshot install failed"}), 500
+            # Best-effort: the snapshot is already installed, so an aggregation
+            # failure must not fail the ingest. The boot-time sync self-heals
+            # via the recorded snapshot sha (FAN-2392).
+            try:
+                security_store.refresh_global_stats(
+                    tenant_id, target_path, info.sha256
+                )
+            except Exception:
+                app.logger.exception(
+                    "global stats refresh failed for tenant %s", tenant_id
+                )
         return jsonify(
             {
                 "status": "ok",

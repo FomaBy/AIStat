@@ -1,6 +1,7 @@
 """Tests for the pricing / cost / credits module (stage 2)."""
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,11 @@ def test_repo_gpt_5_6_standard_rates_and_credits_are_current():
         assert rate.captured_at == rate.credits.captured_at == "2026-07-30"
 
 
+def test_repo_pricing_has_an_effective_date_for_each_confirmed_rate():
+    rates = pricing.load_pricing(PRICING_JSON)
+    assert all(rate.effective_from for rate in rates.values())
+
+
 def test_repo_sonnet_rates_match_official_table():
     # FAN-2161: Sonnet rows from the official Anthropic pricing table.
     # Sonnet 5 carries introductory pricing through 2026-08-31 ($3/$15 after);
@@ -360,6 +366,213 @@ def test_recompute_current_luna_cost_is_idempotent(conn):
     assert first["cost_usd"] == pytest.approx(1.67)
     assert first["cost_credits"] == pytest.approx(35.5)
     assert first["cost_priced"] == 1
+
+
+def test_effective_rate_keeps_prior_usage_on_its_historical_price(conn, tmp_path):
+    """A later catalog revision must not reprice a closed usage day."""
+    catalog = tmp_path / "dated-pricing.json"
+    catalog.write_text(json.dumps({"models": {"vendor/m": [
+        {"effective_from": "2026-01-01", "input": 1, "output": 1,
+         "cache_read": 1, "cache_write": 1, "source_url": "https://vendor/pricing"},
+        {"effective_from": "2026-02-01", "input": 2, "output": 2,
+         "cache_read": 2, "cache_write": 2, "source_url": "https://vendor/pricing"},
+    ]}}), encoding="utf-8")
+    _insert_usage(conn, "rt", "vendor/m", "2026-01-31", 1_000_000, 0, 0, 0)
+    _insert_usage(conn, "rt", "vendor/m", "2026-02-01", 1_000_000, 0, 0, 0)
+
+    rates = pricing.load_pricing(catalog)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0)
+    first = conn.execute(
+        "SELECT date, cost_usd, rate_effective_from FROM daily_usage ORDER BY date"
+    ).fetchall()
+    assert [(r["date"], r["cost_usd"], r["rate_effective_from"]) for r in first] == [
+        ("2026-01-31", 1.0, "2026-01-01"),
+        ("2026-02-01", 2.0, "2026-02-01"),
+    ]
+
+    # Publishing a new future rate preserves the stored historical result.
+    catalog.write_text(json.dumps({"models": {"vendor/m": [
+        {"effective_from": "2026-01-01", "input": 99, "output": 99,
+         "cache_read": 99, "cache_write": 99, "source_url": "https://vendor/pricing"},
+        {"effective_from": "2026-02-01", "input": 2, "output": 2,
+         "cache_read": 2, "cache_write": 2, "source_url": "https://vendor/pricing"},
+    ]}}), encoding="utf-8")
+    pricing.recompute_daily_costs(conn, pricing.load_pricing(catalog), credits_per_usd=1.0)
+    assert [r["cost_usd"] for r in conn.execute(
+        "SELECT cost_usd FROM daily_usage ORDER BY date"
+    )] == [1.0, 2.0]
+
+
+def test_historical_rate_preserves_credit_card_and_cache_write_1h(conn, tmp_path):
+    catalog = tmp_path / "dated-credits.json"
+    catalog.write_text(json.dumps({"models": {"vendor/m": [{
+        "effective_from": "2026-01-01", "input": 1, "output": 1,
+        "cache_read": 1, "cache_write": 1, "cache_write_1h": 2,
+        "credits": {"input": 1, "cache_read": 2, "output": 4},
+    }]}}), encoding="utf-8")
+    _insert_usage(conn, "rt", "vendor/m", "2026-01-01", 1_000_000, 1_000_000, 0, 0)
+    rates = pricing.load_pricing(catalog)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=2.0)
+
+    stored = conn.execute(
+        "SELECT cache_write_1h_rate, credit_input_rate, credit_cache_read_rate, "
+        "credit_output_rate FROM model_price_history"
+    ).fetchone()
+    assert tuple(stored) == (2.0, 1.0, 2.0, 4.0)
+    assert conn.execute("SELECT cost_credits FROM daily_usage").fetchone()[0] == 5.0
+
+
+def test_reconciliation_deduplicates_sanitized_variance_diagnostic(conn):
+    """The same high variance alerts once and stores no invoice payload."""
+    first = pricing.reconcile_billing_actual(
+        conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
+        threshold=0.05,
+    )
+    assert first["submitted_by"] is None
+    del first["submitted_at"]
+    del first["submitted_by"]
+    assert first == {"provider": "anthropic", "period": "2026-02",
+                     "variance_ratio": 0.1, "over_threshold": True,
+                     "diagnostic_emitted": True, "currency": "USD"}
+    assert pricing.reconcile_billing_actual(
+        conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
+        threshold=0.05,
+    )["diagnostic_emitted"] is False
+    stored = conn.execute("SELECT * FROM billing_reconciliation").fetchone()
+    assert set(stored.keys()) == {"provider", "period", "calculated_usd",
+                                  "actual_usd", "variance_ratio", "over_threshold",
+                                  "diagnostic_emitted_at", "currency",
+                                  "submitted_by", "submitted_at"}
+
+
+def test_calculated_cost_for_period_sums_provider_month(conn):
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt1", "claude-opus-4-8", "2026-02-14", "anthropic", utcnow_iso(), 40.0),
+    )
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt2", "claude-opus-4-8", "2026-02-20", "anthropic", utcnow_iso(), 50.0),
+    )
+    # Different month and different provider must not be counted.
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt3", "claude-opus-4-8", "2026-03-01", "anthropic", utcnow_iso(), 999.0),
+    )
+    conn.execute(
+        "INSERT INTO daily_usage (runtime_id, model, date, provider, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "synced_at, cost_usd) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?)",
+        ("rt4", "gpt-5.6", "2026-02-10", "openai", utcnow_iso(), 999.0),
+    )
+    assert pricing.calculated_cost_for_period(conn, "anthropic", "2026-02") == 90.0
+    assert pricing.calculated_cost_for_period(conn, "anthropic", "2026-04") == 0.0
+
+    with pytest.raises(pricing.PricingError):
+        pricing.calculated_cost_for_period(conn, "ANTHROPIC", "2026-02")
+
+
+@pytest.mark.parametrize("period", [
+    "2026-01", "2026-12", "0001-01", "9999-12",
+])
+def test_validate_billing_reconciliation_accepts_canonical_period(period):
+    pricing.validate_billing_reconciliation("anthropic", period)
+
+
+@pytest.mark.parametrize("period", [
+    "2026-13", "2026-00", "0000-01", "26-01", "2026-1", "2026/01",
+    "2026-01 ", " 2026-01", "2026-01\n", "",
+    "２０２６-01",  # full-width Unicode digits
+    "٢٠٢٦-01",  # Arabic-Indic digits
+])
+def test_validate_billing_reconciliation_rejects_non_canonical_period(period):
+    with pytest.raises(pricing.PricingError):
+        pricing.validate_billing_reconciliation("anthropic", period)
+
+
+@pytest.mark.parametrize("amount", [
+    "0", "0.5", "12.50", "1000000", "3.14159",
+])
+def test_parse_billing_amount_accepts_canonical_syntax(amount):
+    assert pricing.parse_billing_amount(amount) == float(amount)
+
+
+@pytest.mark.parametrize("amount", [
+    None, "", "1_000", "1_000.5", "1,000", "-5", "+5", "5.", ".5",
+    "1e5", "1E5", "inf", "Infinity", "nan", "NaN",
+    " 5", "5 ", "5\n", "１０",  # full-width Unicode digits
+    "٥",  # Arabic-Indic digit
+])
+def test_parse_billing_amount_rejects_non_canonical_syntax(amount):
+    with pytest.raises(pricing.PricingError):
+        pricing.parse_billing_amount(amount)
+
+
+def test_reconcile_billing_actual_rejects_non_usd_currency(conn):
+    with pytest.raises(pricing.PricingError):
+        pricing.reconcile_billing_actual(
+            conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=100.0,
+            currency="EUR",
+        )
+
+
+def test_reconcile_billing_actual_stores_provenance(conn):
+    result = pricing.reconcile_billing_actual(
+        conn, "anthropic", "2026-02", calculated_usd=90.0, actual_usd=95.0,
+        submitted_by=7, submitted_at="2026-02-15T00:00:00Z",
+    )
+    assert result["currency"] == "USD"
+    assert result["submitted_by"] == 7
+    assert result["submitted_at"] == "2026-02-15T00:00:00Z"
+    stored = conn.execute(
+        "SELECT currency, submitted_by, submitted_at FROM billing_reconciliation "
+        "WHERE provider = 'anthropic' AND period = '2026-02'"
+    ).fetchone()
+    assert tuple(stored) == ("USD", 7, "2026-02-15T00:00:00Z")
+
+
+def test_billing_snapshot_degrades_without_optional_usage_columns():
+    usage = sqlite3.connect(":memory:")
+    usage.row_factory = sqlite3.Row
+    usage.execute("CREATE TABLE daily_usage (date TEXT)")
+    durable = sqlite3.connect(":memory:")
+    durable.row_factory = sqlite3.Row
+    durable.execute(
+        "CREATE TABLE billing_reconciliation ("
+        "user_id INTEGER, provider TEXT, period TEXT, calculated_usd REAL, "
+        "actual_usd REAL, variance_ratio REAL, over_threshold INTEGER, "
+        "diagnostic_emitted_at TEXT, currency TEXT, submitted_by INTEGER, "
+        "submitted_at TEXT)"
+    )
+    try:
+        assert pricing.billing_reconciliation_snapshot(
+            usage, durable_conn=durable, user_id=1
+        ) == {
+            "rows": [], "coverage": {"periods_submitted": 0, "periods_total": 0}
+        }
+    finally:
+        usage.close()
+        durable.close()
+
+
+def test_replaying_dated_catalog_is_idempotent(conn, tmp_path):
+    catalog = tmp_path / "dated.json"
+    catalog.write_text(json.dumps({"models": {"vendor/m": [
+        {"effective_from": "2026-01-01", "input": 1, "output": 1,
+         "cache_read": 1, "cache_write": 1},
+    ]}}), encoding="utf-8")
+    rates = pricing.load_pricing(catalog)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.upsert_model_pricing(conn, rates)
+    assert conn.execute("SELECT COUNT(*) FROM model_price_history").fetchone()[0] == 1
 
 
 def test_upsert_model_pricing_idempotent(conn):

@@ -8,10 +8,13 @@ task-owned HOME/TMPDIR/profile isolation and the ``--use-mock-keychain``
 clean-HOME fix (FAN-1346) live in ``cdp_harness``; the pure protocol/deadline/
 cleanup tests that need no browser live in ``test_cdp_protocol``. The suite
 skips cleanly on machines without a Chrome/Chromium binary; everything else in
-the test run stays unaffected.
+the test run stays unaffected. In a certifying run
+(``AISTAT_REQUIRE_BROWSER=1``) a missing Chrome is a hard failure instead of
+a skip, so a required lane can never pass without driving a real browser.
 """
 
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -30,7 +33,23 @@ from conftest import seed_aggregate_fixture
 from cdp_harness import (
     BOOTED_JS, CHROME, DashboardSession, NO_CHROME_REASON, launch_chrome)
 
-pytestmark = pytest.mark.skipif(CHROME is None, reason=NO_CHROME_REASON)
+_REQUIRE_BROWSER = os.environ.get("AISTAT_REQUIRE_BROWSER", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def _require_real_chrome():
+    """Skip without Chrome — unless the run is certifying, then fail hard."""
+    if CHROME is not None:
+        return
+    if _REQUIRE_BROWSER:
+        pytest.fail(
+            NO_CHROME_REASON
+            + " — the real-browser dashboard regression was NOT executed; a "
+            "certifying run (AISTAT_REQUIRE_BROWSER=1) requires a real Chrome "
+            "so an all-skipped suite is never mistaken for green."
+        )
+    pytest.skip(NO_CHROME_REASON)
 
 
 def _free_port():
@@ -43,6 +62,7 @@ def _free_port():
 
 @pytest.fixture(scope="module")
 def dashboard():
+    _require_real_chrome()
     """The dashboard on a real HTTP port over a seeded database, plus one
     headless Chrome the tests navigate page-by-page. Every resource is owned by
     a :class:`DashboardSession` so teardown stays failure-safe and idempotent."""
@@ -57,6 +77,22 @@ def dashboard():
         conn = connect(config.db_path)
         init_db(conn)
         seed_aggregate_fixture(conn)
+        # Terminal QA acceptance and one published price revision, so the
+        # quality-adjusted card and rate provenance have real values to assert
+        # (FAN-3543). The revision repeats m-claude's catalogue rates and the
+        # fixture stays unrouted, so no pre-existing assertion moves.
+        conn.execute(
+            "INSERT INTO qa_lineage_events (qa_issue_id, implementation_issue_id, "
+            "candidate, verdict, observed_at, accepted_candidate, "
+            "accepted_story_points) VALUES ('QA-1', 'I1', 'sha', 'PASSED', "
+            "'2026-01-02T00:00:00Z', 'sha', 3)")
+        conn.execute(
+            "INSERT INTO model_price_history (model, effective_from, input_rate, "
+            "output_rate, cache_read_rate, cache_write_rate, unpriced, "
+            "source_url, captured_at, loaded_at) VALUES ('m-claude', "
+            "'2026-01-01', 1.0, 0.0, 0.0, 0.0, 0, 'https://vendor/pricing', "
+            "'2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')")
+        conn.commit()
         conn.close()
 
         port = _free_port()
@@ -89,6 +125,7 @@ def dashboard():
 
 @pytest.fixture
 def public_page():
+    _require_real_chrome()
     """The public Flask login page on a real HTTP port and headless Chrome."""
     with tempfile.TemporaryDirectory(prefix="aistat-public-browser-") as path:
         root = Path(path)
@@ -1382,3 +1419,215 @@ def test_clear_button_returns_to_canonical_dashboard(dashboard):
     # The default 30-day window sees the whole fixture again.
     cdp.wait_for('document.getElementById("card-tokens").textContent'
                  '.includes("млн")')
+
+
+def test_flow_metrics_panel_renders_truthful_empty_state(dashboard):
+    """FAN-3306: the flow panel renders from live /api/flow data; with no
+    collected flow history every metric is an explicit dash (never 0) and the
+    coverage line states that transitions/snapshots are not observed yet."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('!document.getElementById("flow-panel").hidden')
+    assert cdp.eval(
+        'document.getElementById("card-flow-ready").textContent') == "0"
+    for card in ("card-flow-cycle", "card-flow-p90", "card-flow-rework",
+                 "card-flow-idle", "card-flow-pm-p95", "card-flow-waiting",
+                 "card-flow-first-pass"):
+        assert cdp.eval(
+            f'document.getElementById("{card}").textContent') == "—", card
+    coverage = cdp.eval(
+        'document.getElementById("flow-coverage").textContent')
+    assert coverage  # the sparse-history state is spelled out, not blank
+    lanes = cdp.eval(
+        '[...document.getElementById("flow-lane").options]'
+        '.map((o) => o.value)')
+    assert lanes == [""]  # only "all lanes" until a lane is observed
+    windows = cdp.eval(
+        '[...document.getElementById("flow-days").options]'
+        '.map((o) => o.value)')
+    assert windows == ["7", "30", "90"]
+
+
+def test_slo_panel_and_lineage_drilldown_render(dashboard):
+    """FAN-3460: the SLO table states owner/objective/denominator for every
+    objective, and the trace lookup resolves one correlation id to its exact
+    stage chain in the browser."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    cdp.wait_for('!document.getElementById("slo-panel").hidden')
+    rows = cdp.eval(
+        '[...document.querySelectorAll("#table-slo tbody tr")]'
+        '.map((tr) => [tr.cells[0].firstChild.textContent,'
+        ' ...[...tr.cells].slice(1).map((td) => td.textContent.trim())])')
+    assert [row[0] for row in rows] == [
+        "pm_readiness_latency", "dispatch_latency",
+        "production_data_freshness", "ci_green", "release_gate",
+    ]
+    assert [row[1] for row in rows] == ["pm", "dispatcher", "ops", "devops",
+                                        "devops"]
+    # No collected history yet: an unmeasured objective says so instead of 0 %.
+    assert rows[0][4] in ("не измерено", "not measured")
+    assert cdp.eval('document.getElementById("slo-alerts").children.length') >= 1
+
+    cdp.eval('document.getElementById("lineage-trace").value = "I1"')
+    cdp.eval('document.getElementById("lineage-lookup").click()')
+    cdp.wait_for('document.querySelectorAll("#table-lineage tbody tr").length === 6')
+    stages = cdp.eval(
+        '[...document.querySelectorAll("#table-lineage tbody tr")]'
+        '.map((tr) => [tr.cells[0].textContent, tr.cells[1].textContent])')
+    assert [stage for stage, _ in stages] == [
+        "issue", "run", "candidate", "qa", "integration", "release",
+    ]
+    assert dict(stages)["qa"] == "observed"
+    assert cdp.eval(
+        'document.getElementById("lineage-summary").textContent'
+    ).startswith("T-1")  # the fixture identifier of issue I1
+
+
+def _pricing_stub(payload=None):
+    """Serve /api/pricing from the test instead of the host, so the empty and
+    degraded provenance states are observable in a real browser."""
+    response = "return new Response('', {status: 404});" if payload is None else (
+        "return new Response(JSON.stringify(%s), {headers: "
+        "{'Content-Type': 'application/json'}});" % json.dumps(payload)
+    )
+    return r'''(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, options = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url, location.href);
+        if (url.pathname === "/api/pricing") { %s }
+        return originalFetch(input, options);
+      };
+    })();''' % response
+
+
+def _lane_row(cdp):
+    return cdp.eval(
+        '[...document.querySelectorAll("#table-lane-cost tbody tr")]'
+        '.map((tr) => [...tr.children].map((td) => td.textContent))')
+
+
+# The quality-adjusted card is rendered only by a completed refresh, and its
+# decimal separator is locale-specific — so it settles both the language switch
+# and the data reload that follows it.
+_QUALITY_CARD = {"en": "≈ $0.0008", "ru": "≈ $0,0008"}
+
+
+def _set_locale(cdp, locale):
+    if cdp.eval("document.documentElement.lang") != locale:
+        cdp.eval('document.getElementById("locale-switcher").click()')
+        cdp.wait_for(f'document.documentElement.lang === "{locale}"')
+    cdp.wait_for('document.getElementById("card-quality-cost").textContent === %s'
+                 % json.dumps(_QUALITY_CARD[locale]))
+
+
+def test_cost_by_lane_provenance_and_quality_card_render_in_both_languages(dashboard):
+    """FAN-3543: the KPI card, cost by lane, rate provenance and coverage all
+    render from live API data and follow the language switch."""
+    cdp, base = dashboard
+    cdp.open_page(base + "/")
+    cdp.wait_for(BOOTED_JS)
+    started = cdp.eval("document.documentElement.lang")
+    try:
+        _set_locale(cdp, "en")
+        # I1 costs $0.0025 across all attempts; QA accepted 3 of its 5 SP.
+        assert cdp.eval(
+            'document.getElementById("card-quality-cost").textContent'
+        ) == "≈ $0.0008"
+        assert cdp.eval(
+            'document.getElementById("card-quality-cost-sub").textContent'
+        ) == "USD per accepted SP · all attempts included"
+        assert cdp.eval(
+            'document.querySelector("#cost-provenance-panel h2").textContent'
+        ) == "Cost by lane"
+        # The default window is anchored to the newest data date, and the panel
+        # states which period the costs below it cover.
+        assert cdp.eval(
+            'document.getElementById("cost-period").textContent'
+        ) == "period: 2025-12-04 — 2026-01-02"
+        # The fixture carries no routing, so the one cost-attributable issue
+        # reports under the explicit unknown lane rather than disappearing.
+        assert _lane_row(cdp) == [
+            ["unknown", "1", "5", "3", "$0.00", "$0.0005", "$0.0008"]]
+        assert cdp.eval(
+            '[...document.querySelectorAll("#table-rate-provenance tbody tr")]'
+            '.map((tr) => [...tr.children].map((td) => td.textContent))'
+        ) == [["m-claude", "2026-01-01", "$1.00", "$0.00",
+               "https://vendor/pricing", "2026-01-01T00:00:00Z"]]
+        assert cdp.eval(
+            'document.getElementById("pricing-coverage").textContent'
+        ) == "coverage: 3 of 4 daily rows priced, 1 unpriced"
+        assert cdp.eval('document.getElementById("pricing-degraded").hidden') is True
+
+        _set_locale(cdp, "ru")
+        assert cdp.eval(
+            'document.querySelector("#cost-provenance-panel h2").textContent'
+        ) == "Стоимость по лейнам"
+        assert cdp.eval(
+            'document.querySelector("#rate-provenance-panel h2").textContent'
+        ) == "Происхождение тарифов"
+        assert cdp.eval(
+            'document.getElementById("cost-period").textContent'
+        ) == "период: 2025-12-04 — 2026-01-02"
+        assert cdp.eval(
+            'document.getElementById("card-quality-cost-sub").textContent'
+        ) == "USD на принятый SP · все попытки включены"
+        # The lane token is the API's own routing vocabulary; the shared
+        # by-text locale pass relabels the unrouted bucket, as it already does
+        # for the flow panel's lane column.
+        assert _lane_row(cdp)[0][0] == "неизвестно"
+        assert cdp.eval(
+            'document.getElementById("pricing-coverage").textContent'
+        ) == "покрытие: 3 из 4 дневных строк оценено, 1 — без тарифа"
+
+        # An unbounded selection says so instead of printing an empty range.
+        cdp.open_page(base + "/?days=all")
+        cdp.wait_for(BOOTED_JS)
+        _set_locale(cdp, "en")
+        assert cdp.eval(
+            'document.getElementById("cost-period").textContent'
+        ) == "period: all time"
+    finally:
+        _set_locale(cdp, started)
+
+
+def test_cost_panel_states_the_empty_and_degraded_provenance_truthfully(dashboard):
+    """No published revisions is spelled out; an absent endpoint degrades the
+    provenance block without hiding the lane costs it does not depend on."""
+    cdp, base = dashboard
+    started = cdp.eval("document.documentElement.lang")
+    try:
+        cdp.open_page(base + "/", preload_script=_pricing_stub(
+            {"rates": [], "coverage": {"rows": 0, "priced_rows": 0,
+                                       "unpriced_rows": 0}}))
+        cdp.wait_for(BOOTED_JS)
+        _set_locale(cdp, "en")
+        assert cdp.eval(
+            '[...document.querySelectorAll("#table-rate-provenance tbody tr")]'
+            '.map((tr) => tr.textContent)'
+        ) == ["No dated rates published yet: cost uses the current catalogue."]
+        assert cdp.eval(
+            'document.getElementById("pricing-coverage").textContent'
+        ) == "coverage: no daily usage rows yet"
+        assert cdp.eval('document.getElementById("pricing-degraded").hidden') is True
+
+        cdp.open_page(base + "/", preload_script=_pricing_stub())
+        cdp.wait_for(BOOTED_JS)
+        _set_locale(cdp, "en")
+        assert cdp.eval(
+            'document.getElementById("rate-provenance-block").hidden') is True
+        assert cdp.eval(
+            'document.getElementById("pricing-degraded").hidden') is False
+        assert cdp.eval(
+            'document.getElementById("pricing-degraded").textContent'
+        ) == ("Rate provenance is unavailable on this host; cost by lane is "
+              "shown without it.")
+        # The lane costs do not come from /api/pricing, so they stay.
+        assert _lane_row(cdp) == [
+            ["unknown", "1", "5", "3", "$0.00", "$0.0005", "$0.0008"]]
+    finally:
+        cdp.open_page(base + "/")
+        cdp.wait_for(BOOTED_JS)
+        _set_locale(cdp, started)

@@ -1,6 +1,6 @@
 """Dependency-free owner migration from one legacy DB to a tenant DB.
 
-The command is Python 3.6-compatible so it can run directly on the shared
+The command is standard-library-only so it can run directly on the shared
 hosting environment before the dependency-free legacy WSGI app is restarted.
 """
 
@@ -203,7 +203,7 @@ def _copy_database(source_path, temp_path):
             target.execute("PRAGMA journal_mode = DELETE")
             target.commit()
         else:
-            # Python 3.6 has no Connection.backup(). The hosted source is
+            # Legacy interpreters have no Connection.backup(). The hosted source is
             # read-only between signed ingests; under ingest.lock a full WAL
             # checkpoint followed by a file copy is coherent.
             target.close()

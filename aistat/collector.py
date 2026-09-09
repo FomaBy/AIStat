@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import handoff
+from . import handoff, preflight
 from .cli_profile import (
     CliProfileError,
     ConnectionCliProfile,
@@ -648,11 +648,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--once", action="store_true", help="run a single collection cycle and exit"
     )
+    parser.add_argument(
+        "--env-file", help="owner-only runtime env file to validate and load"
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.env_file:
+        failure = preflight.load_effective_env(Path(args.env_file))
+        if failure is not None:
+            logger.error("refusing to run: %s", failure.detail)
+            return 1
     config = Config()
     try:
         if not args.once:

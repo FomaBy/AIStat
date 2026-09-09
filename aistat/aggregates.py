@@ -29,6 +29,9 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+# One spelling of the "no routing class recorded" lane across cost and flow.
+from .flow_metrics import UNKNOWN_LANE
+
 TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
 # The configurable chart is deliberately a closed contract.  These keys are
@@ -348,7 +351,7 @@ def _run_filter_selection(conn: sqlite3.Connection,
     for row in conn.execute(
         """
         SELECT r.issue_id, r.agent_id, COALESCE(r.model, a.model) AS model,
-               r.started_at, r.completed_at
+               r.started_at, r.completed_at, r.dispatched_at, r.created_at
         FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
         WHERE r.issue_id IS NOT NULL
         """
@@ -371,10 +374,19 @@ def _run_filter_selection(conn: sqlite3.Connection,
         # model-less agent — so the unknown part stays unpriced instead of
         # being renormalized onto the known models (FAN-1247).
         model = models.setdefault(issue_id, {}).setdefault(
-            row["model"], {"dur": 0.0, "n": 0}
+            row["model"], {"dur": 0.0, "n": 0, "rate_at": None}
         )
         model["dur"] += overlap / (HOURS_PER_DAY * 3600.0)
         model["n"] += 1
+        # rate_at must be the earliest dated event across every matching run,
+        # not whichever row the unordered query happens to visit first — the
+        # same MIN(COALESCE(...)) semantics as the unfiltered _issue_model_stats,
+        # so the priced rate never depends on physical row order (FAN-3550).
+        candidate_rate_at = row["started_at"] or row["dispatched_at"] or row["created_at"]
+        if candidate_rate_at is not None and (
+            model["rate_at"] is None or candidate_rate_at < model["rate_at"]
+        ):
+            model["rate_at"] = candidate_rate_at
     out: Dict[str, Dict[str, Any]] = {}
     for issue_id, total in totals.items():
         share = selected.get(issue_id, 0.0)
@@ -836,6 +848,33 @@ def _pricing_rates(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    # Table name is a module constant at every call site, never request input.
+    return any(row[1] == column
+               for row in conn.execute("PRAGMA table_info(%s)" % table))
+
+
+def _pricing_rate_at(conn: sqlite3.Connection, rates: Dict[str, Dict[str, Any]],
+                     model: str, event_at: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Rate published for a run's UTC day, with current pricing as fallback."""
+    if event_at and _has_table(conn, "model_price_history"):
+        row = conn.execute(
+            "SELECT input_rate, output_rate, cache_read_rate, cache_write_rate, unpriced "
+            "FROM model_price_history WHERE model = ? AND effective_from <= ? "
+            "ORDER BY effective_from DESC LIMIT 1",
+            (model, event_at[:10]),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+    return rates.get(model)
+
+
 def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Per issue: ``{model: {'dur': run-duration-in-days, 'n': run-count}}``.
 
@@ -848,14 +887,15 @@ def _issue_model_stats(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str
         """
         SELECT r.issue_id, COALESCE(r.model, a.model) AS model,
                COUNT(*) AS n,
-               SUM(MAX(COALESCE(julianday(r.completed_at) - julianday(r.started_at), 0), 0)) AS dur
+               SUM(MAX(COALESCE(julianday(r.completed_at) - julianday(r.started_at), 0), 0)) AS dur,
+               MIN(COALESCE(r.started_at, r.dispatched_at, r.created_at)) AS rate_at
         FROM runs r LEFT JOIN agents a ON a.id = r.agent_id
         GROUP BY r.issue_id, COALESCE(r.model, a.model)
         """
     )
     for row in rows:
         stats.setdefault(row["issue_id"], {})[row["model"]] = {
-            "dur": row["dur"] or 0.0, "n": row["n"],
+            "dur": row["dur"] or 0.0, "n": row["n"], "rate_at": row["rate_at"],
         }
     return stats
 
@@ -870,31 +910,39 @@ def _model_weights(models: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     )
 
 
-def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]]:
-    """Per issue: weight of each model, from run durations (fallback counts)."""
+def _issue_model_weights(conn: sqlite3.Connection) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Per issue: each model's weight and its rate_at, from run durations
+    (fallback counts). Carries ``rate_at`` alongside the weight so a caller
+    can price the model's share at the time it actually ran, not today."""
     return {
-        issue_id: _model_weights(models)
+        issue_id: {
+            model: {"weight": weight, "rate_at": models[model]["rate_at"]}
+            for model, weight in _model_weights(models).items()
+        }
         for issue_id, models in _issue_model_stats(conn).items()
     }
 
 
-def issue_cost_estimate(usage: Dict[str, Any], model_weights: Dict[str, float],
+def issue_cost_estimate(conn: sqlite3.Connection, usage: Dict[str, Any],
+                        model_weights: Dict[str, Dict[str, Any]],
                         rates: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Estimated USD cost of one issue's exact token counts.
 
     Token counts are split across the models that ran the issue and priced
-    with each model's official rates. Tokens landing on an unpriced/unknown
-    model are reported in ``unpriced_tokens`` and NOT priced as 0. An issue
-    with usage but no runs cannot be attributed: cost None, ``attributed``
-    False.
+    with each model's rate at the time it ran (:func:`_pricing_rate_at`), so
+    a closed period never repriced when a later rate is published. Tokens
+    landing on an unpriced/unknown model are reported in ``unpriced_tokens``
+    and NOT priced as 0. An issue with usage but no runs cannot be
+    attributed: cost None, ``attributed`` False.
     """
     if not model_weights:
         return {"cost_usd": None, "attributed": False, "unpriced_tokens": 0}
     usd = 0.0
     unpriced_tokens = 0.0
     total = sum(int(usage[f"total_{k}"] or 0) for k in TOKEN_KINDS)
-    for model, weight in model_weights.items():
-        rate = rates.get(model)
+    for model, entry in model_weights.items():
+        weight = entry["weight"]
+        rate = _pricing_rate_at(conn, rates, model, entry.get("rate_at"))
         if rate is None or rate["unpriced"]:
             unpriced_tokens += total * weight
             continue
@@ -969,7 +1017,10 @@ def projects_overview(conn: sqlite3.Connection,
                 if entry is None:
                     continue
                 factor = entry["fraction"]
-                weights = _model_weights(entry["models"])
+                weights = {
+                    model: {"weight": weight, "rate_at": entry["models"][model]["rate_at"]}
+                    for model, weight in _model_weights(entry["models"]).items()
+                }
             else:
                 factor = 1.0
                 weights = model_weights.get(row["id"], {})
@@ -986,7 +1037,7 @@ def projects_overview(conn: sqlite3.Connection,
             for kind in TOKEN_KINDS:
                 usage[f"total_{kind}"] = (row[f"total_{kind}"] or 0) * factor
                 tokens[kind] += usage[f"total_{kind}"]
-            est = issue_cost_estimate(usage, weights, rates)
+            est = issue_cost_estimate(conn, usage, weights, rates)
             if est["attributed"]:
                 cost_usd += est["cost_usd"]
                 unpriced_tokens += est["unpriced_tokens"]
@@ -1329,19 +1380,38 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     the counted issues (story points and tokens split by run duration, cost by
     the model's official rate), sorted cheapest cost-per-SP first so it is
     obvious which model delivers a story point for less.
+
+    The per-lane rows group the same cost-attributable issues by their
+    ``dispatch_lane`` (routing class), so cost and quality-adjusted cost can be
+    compared per lane the way they already are per model. A snapshot older than
+    the routing columns reports every issue under ``unknown`` rather than
+    failing (FAN-3543). ``period`` echoes the resolved window the numbers cover.
     """
     filters = _coerce_filters(project_id=project_id, filters=filters)
     needs_run_filter, selection = _run_filter_selection(conn, filters)
     rates = _pricing_rates(conn)
     stats = {} if needs_run_filter else _issue_model_stats(conn)
+    accepted = {
+        row["implementation_issue_id"]: row["accepted_story_points"]
+        for row in conn.execute(
+            "SELECT implementation_issue_id, accepted_story_points "
+            "FROM qa_lineage_events WHERE accepted_candidate IS NOT NULL "
+            "AND accepted_story_points > 0"
+        )
+    } if _has_table(conn, "qa_lineage_events") else {}
 
     where = ("i.is_jira = 0 AND i.story_points IS NOT NULL "
              "AND i.story_points > 0")
     params: List[Any] = []
     where += _where_values("i.project_id", filters["projects"], params)
+    # A pre-routing snapshot has no dispatch_lane column; every issue then
+    # reports the same "unknown" lane the flow endpoint already uses.
+    lane_select = ("COALESCE(i.dispatch_lane, '{0}')".format(UNKNOWN_LANE)
+                   if _has_column(conn, "issues", "dispatch_lane")
+                   else "'{0}'".format(UNKNOWN_LANE))
     rows = conn.execute(
         f"""
-        SELECT i.id, i.story_points,
+        SELECT i.id, i.story_points, {lane_select} AS lane,
                u.total_input_tokens, u.total_output_tokens,
                u.total_cache_read_tokens, u.total_cache_write_tokens
         FROM issues i JOIN issue_usage u ON u.issue_id = i.id
@@ -1360,13 +1430,22 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     cost_issues = 0
     weighted_num = 0.0   # Σ cost_i / hours_i over fully priced issues
     weighted_den = 0.0   # Σ sp_i over those same issues
+    accepted_cost = 0.0
+    accepted_sp = 0.0
     models: Dict[str, Dict[str, Any]] = {}
+    lanes: Dict[str, Dict[str, Any]] = {}
 
     def bucket(model: str) -> Dict[str, Any]:
         return models.setdefault(model, {
             "tokens": {k: 0.0 for k in TOKEN_KINDS},
             "story_points": 0.0, "cost_usd": 0.0, "active_hours": 0.0,
             "weighted_num": 0.0, "weighted_den": 0.0, "priced": True,
+        })
+
+    def lane_bucket(lane: str) -> Dict[str, Any]:
+        return lanes.setdefault(lane, {
+            "issues": 0, "story_points": 0.0, "cost_usd": 0.0,
+            "accepted_story_points": 0.0, "accepted_cost": 0.0, "priced": True,
         })
 
     for row in rows:
@@ -1411,7 +1490,7 @@ def efficiency_breakdown(conn: sqlite3.Connection,
             b["story_points"] += sp * weight
             model_hours = issue_models[model]["dur"] * HOURS_PER_DAY
             b["active_hours"] += model_hours
-            rate = rates.get(model)
+            rate = _pricing_rate_at(conn, rates, model, issue_models[model].get("rate_at"))
             if rate is None or rate["unpriced"]:
                 # Unknown cost: surface the tokens, never price them as $0, and
                 # keep this share's SP out of the cost denominator (QA FAN-1188).
@@ -1440,6 +1519,23 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         if issue_priced and issue_hours > 0 and sp > 0:
             weighted_num += issue_cost / issue_hours
             weighted_den += sp
+        # The lane row groups the same cost-attributable issue by its routing
+        # class; a single unpriced share makes the whole lane unpriced rather
+        # than reporting a partial sum as the lane's cost.
+        lane = lane_bucket(row["lane"])
+        lane["issues"] += 1
+        lane["story_points"] += sp
+        lane["cost_usd"] += issue_cost
+        if not issue_priced:
+            lane["priced"] = False
+        # A quality-adjusted denominator comes only from terminal QA
+        # acceptance.  The numerator stays the whole implementation cost,
+        # including failed attempts and rework represented by its runs.
+        if issue_priced and row["id"] in accepted:
+            accepted_cost += issue_cost
+            accepted_sp += accepted[row["id"]] * factor
+            lane["accepted_cost"] += issue_cost
+            lane["accepted_story_points"] += accepted[row["id"]] * factor
 
     model_rows = []
     for model, b in models.items():
@@ -1465,6 +1561,29 @@ def efficiency_breakdown(conn: sqlite3.Connection,
     # Cheapest cost per story point first; unpriced models sink to the bottom.
     model_rows.sort(key=lambda m: (m["cost_per_sp"] is None, m["cost_per_sp"] or 0.0))
 
+    lane_rows = []
+    for lane_name, b in sorted(lanes.items()):
+        priced = b["priced"]
+        lane_sp = b["story_points"]
+        lane_accepted = b["accepted_story_points"]
+        lane_rows.append({
+            "lane": lane_name,
+            "issues": b["issues"],
+            "story_points": lane_sp,
+            "accepted_story_points": lane_accepted,
+            "cost_usd": b["cost_usd"] if priced else None,
+            "cost_per_sp": (
+                b["cost_usd"] / lane_sp if (priced and lane_sp > 0) else None
+            ),
+            "quality_adjusted_cost_per_sp": (
+                b["accepted_cost"] / lane_accepted if lane_accepted > 0 else None
+            ),
+            "has_unpriced": not priced,
+        })
+    # Cheapest cost per story point first, exactly as the model rows sort.
+    lane_rows.sort(key=lambda r: (r["cost_per_sp"] is None, r["cost_per_sp"] or 0.0))
+
+    period_from, period_to = _filter_dates(filters)
     total_tokens = sum(tokens.values())
     return {
         "estimated": True,
@@ -1484,7 +1603,13 @@ def efficiency_breakdown(conn: sqlite3.Connection,
         "weighted_efficiency": (
             weighted_num / weighted_den if weighted_den > 0 else None
         ),
+        "accepted_story_points": accepted_sp,
+        "quality_adjusted_cost_per_sp": (
+            accepted_cost / accepted_sp if accepted_sp > 0 else None
+        ),
+        "period": {"from": period_from, "to": period_to},
         "models": model_rows,
+        "lanes": lane_rows,
     }
 
 
@@ -1633,6 +1758,8 @@ def summary(conn: sqlite3.Connection, date_from: Optional[str] = None,
         "weighted_efficiency": eff["weighted_efficiency"],
         "efficiency_cost_usd": eff["cost_usd"],
         "efficiency_cost_sp": eff["cost_story_points"],
+        "accepted_story_points": eff["accepted_story_points"],
+        "quality_adjusted_cost_per_sp": eff["quality_adjusted_cost_per_sp"],
         "efficiency_hours": eff["active_hours"],
         "efficiency_has_unpriced": eff["has_unpriced"],
         "agent_count": len(work_seconds),

@@ -44,8 +44,18 @@ DETERMINISTIC_DATA_ROUTES = (
     "/api/projects",
     "/api/efficiency",
     "/api/model-efficiency",
+    "/api/global-model-efficiency",
     "/api/efficiency-breakdown",
     "/api/sync",
+)
+# Flow metrics carry a wall-clock `now`/window boundary (FAN-3306), so the
+# route is checked for isolation and auth, not byte-for-byte determinism.
+# Lineage and SLO payloads carry the same wall-clock window boundary
+# (FAN-3460) and are checked the same way.
+NONDETERMINISTIC_DATA_ROUTES = (
+    "/api/flow?days=30",
+    "/api/slo?days=30",
+    "/api/lineage?trace=FAN-1",
 )
 # Health carries a generated_at timestamp, so it is checked for sentinel/path
 # absence rather than byte-equality.
@@ -113,7 +123,7 @@ def test_flask_fuzz_params_never_change_owner_tenant(public_app):
 
     fuzz = _fuzz_query(b_id)
     header = {"X-AIStat-Tenant": str(b_id)}
-    for route in DETERMINISTIC_DATA_ROUTES + HEALTH_ROUTES:
+    for route in DETERMINISTIC_DATA_ROUTES + NONDETERMINISTIC_DATA_ROUTES + HEALTH_ROUTES:
         base = client.get(route, base_url="https://localhost")
         sep = "&" if "?" in route else "?"
         fuzzed = client.get(
@@ -246,6 +256,7 @@ def test_flask_route_inventory_is_fully_classified(public_app):
     session_scoped = {
         "logout",
             "api_session",
+            "api_release_identity",
             "api_meta",
             "api_chart_catalog",
             "api_chart",
@@ -255,13 +266,19 @@ def test_flask_route_inventory_is_fully_classified(public_app):
         "api_projects",
         "api_efficiency",
         "api_model_efficiency",
+        "api_global_model_efficiency",
         "api_efficiency_breakdown",
+        "api_flow",
+        "api_lineage",
+        "api_slo",
         "api_health",
         "api_sync",
         "api_events",
         "api_connection",
         "api_connection_submit",
         "api_connection_revoke",
+        "api_billing_reconciliation",
+        "api_billing_reconciliation_submit",
         "dashboard",
         "dashboard_asset",
     }
@@ -274,7 +291,7 @@ def test_flask_route_inventory_is_fully_classified(public_app):
 
     # Every session-scoped GET data route rejects an unauthenticated request.
     client = app.test_client()
-    for route in DETERMINISTIC_DATA_ROUTES + HEALTH_ROUTES:
+    for route in DETERMINISTIC_DATA_ROUTES + NONDETERMINISTIC_DATA_ROUTES + HEALTH_ROUTES:
         resp = client.get(route, base_url="https://localhost")
         assert resp.status_code in (401, 303), route
 
@@ -300,7 +317,7 @@ def test_legacy_fuzz_params_never_change_owner_tenant(legacy):
     cookie = legacy_login(legacy)
     fuzz = _fuzz_query(b_id)
     header = {"X-AIStat-Tenant": str(b_id)}
-    for route in DETERMINISTIC_DATA_ROUTES + HEALTH_ROUTES:
+    for route in DETERMINISTIC_DATA_ROUTES + NONDETERMINISTIC_DATA_ROUTES + HEALTH_ROUTES:
         status, _, base = legacy_request(legacy.application, route, cookie=cookie)
         sep = "&" if "?" in route else "?"
         fstatus, _, fbody = legacy_request(

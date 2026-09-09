@@ -11,6 +11,8 @@
 | Операция | Команда | Периодичность | Владелец |
 |---|---|---|---|
 | Резервная копия данных | `python -m aistat.backup create` | ежедневно | Сергей Фомин |
+| Off-site копия (зашифрованная) | `python -m aistat.backup_offsite push` | ежедневно, после `create` | Сергей Фомин |
+| Изолированный restore drill | `python -m aistat.backup_offsite drill` | еженедельно + перед каждым релизом | Сергей Фомин |
 | Тест восстановления | `python -m aistat.backup self-test` | еженедельно + перед каждым релизом | Сергей Фомин |
 | Проверка логов/артефактов на секреты | `scripts/scan_secrets.sh` | после каждого деплоя | Сергей Фомин |
 | Очистка orphan-сайдкаров snapshot | `python -m aistat.backup clean --apply` | по мере необходимости | Сергей Фомин |
@@ -31,7 +33,13 @@
 - `data/worker_connections.db` — **зашифрованный** store токенов (ключ живёт вне
   `data/`, в `~/.config/aistat/worker.key`, и в копию не попадает — без ключа
   копия бесполезна);
-- каждый `*.db` из `data/tenants/`.
+- каждый `*.db` из `data/tenants/` — snapshot'ы, которые отдаются подключённому
+  tenant'у (в манифесте помечаются как `tenants/<файл>.db`);
+- каждый `*.db` из `data/worker_tenants/` — **канонические** БД per-user
+  сборщика, куда пишет collector (в манифесте — `worker_tenants/<файл>.db`).
+  Оба каталога ключуются по id пользователя, поэтому один и тот же basename
+  законно встречается в обоих; префикс в метке разводит их и при `restore`
+  каждая база возвращается в свой каталог.
 
 Каждая база копируется через SQLite backup API (коэрентно даже при активном WAL),
 сжимается gzip, проверяется полным `PRAGMA integrity_check`, а `aistat.db`
@@ -41,12 +49,18 @@
 `data/backups/aistat-<UTC>/` с файлами `*.db.gz` и `manifest.json` (sha256, размер,
 версия схемы, счётчики строк по каждой таблице).
 
+`create` завершается с ошибкой до чтения tenant DB, если настроенный tenant-store
+или любой компонент управляемого пути является symlink. Такой путь нельзя
+использовать для включения внешней базы в backup.
+
 Каталог `data/backups/` лежит внутри `data/`, поэтому он **gitignored** и никогда
 не попадает в репозиторий или в cPanel-пакет. Права — owner-only (`0700`/`0600`).
 
 Пути и ретенция переопределяются переменными окружения `AISTAT_BACKUP_DIR`,
-`AISTAT_BACKUP_RETENTION`, `AISTAT_DB_PATH`, `AISTAT_SECURITY_DB_PATH`,
-`AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`.
+`AISTAT_BACKUP_RETENTION`, `AISTAT_OFFSITE_BACKUP_DIR`,
+`AISTAT_OFFSITE_RETENTION`, `AISTAT_BACKUP_ENCRYPTION_KEY`, `AISTAT_DB_PATH`,
+`AISTAT_SECURITY_DB_PATH`, `AISTAT_WORKER_STORE_PATH`, `AISTAT_TENANTS_DIR`,
+`AISTAT_WORKER_TENANTS_DIR`.
 
 ### Расписание
 
@@ -68,7 +82,79 @@ cPanel (Cron Jobs, ежедневно; без SSH — одноразовый з�
 
 ```
 15 3 * * * cd $HOME/aistat && python -m aistat.backup create >> $HOME/aistat/data/backup.log 2>&1
+30 3 * * * cd $HOME/aistat && python -m aistat.backup_offsite push >> $HOME/aistat/data/offsite-backup.log 2>&1
 ```
+
+## RPO / RTO / retention / владелец
+
+| Параметр | Значение | Чем измеряется/гарантируется |
+|---|---|---|
+| RPO (локальная копия) | ≤ 24 ч | ежедневный `aistat.backup create` (launchd/cron) |
+| RPO (off-site копия) | ≤ 24 ч | ежедневный `aistat.backup_offsite push` после `create` |
+| RTO | цель ≤ 4 ч | измеряется каждым `drill` (`measured_rto_seconds` в `drill-report.json`) |
+| Retention локально | 14 поколений | `AISTAT_BACKUP_RETENTION`, prune при каждом `create` |
+| Retention off-site | 7 бандлов | `AISTAT_OFFSITE_RETENTION`, prune при каждом `push` |
+| Шифрование off-site | AES-256-CBC + PBKDF2 | системный `openssl`, ключ только в `AISTAT_BACKUP_ENCRYPTION_KEY` |
+| Владелец | Сергей Фомин | таблица выше |
+| Escalation | провал `create`/`push`/`drill` → событие в `alerts.jsonl` (dedupe-ready) → владелец разбирает в течение 24 ч; два подряд неудачных ежедневных push или любой неудачный drill → эскалация в Multica-тикет ops-очереди | `alerts.jsonl` в off-site каталоге |
+
+## Off-site копия (FAN-3462)
+
+Локальные поколения живут на том же носителе, что и production-базы, поэтому
+`aistat.backup_offsite push` публикует новейшее поколение как **один
+зашифрованный бандл** `<generation>.tar.gz.enc` в независимый каталог
+`AISTAT_OFFSITE_BACKUP_DIR` (по умолчанию `data/backups-offsite/`, обязательно
+вне `data/backups/` — вложенность проверяется и отклоняется).
+
+Бандл — это tar.gz поколения, зашифрованный системным `openssl`
+(AES-256-CBC, PBKDF2). Ключ передаётся openssl через `-pass env:` из
+`AISTAT_BACKUP_ENCRYPTION_KEY`: он не попадает в argv, логи, манифесты или
+отчёты и никогда не хранится в `Config`. Рядом лежит `<generation>.json` с
+sha256 шифротекста и внутреннего tar — по ним `verify`/`drill` детектируют
+повреждение и неверный ключ.
+
+Публикация идёт через staging-файл `.incoming-*` и атомарный `rename`, поэтому
+провал или retry **никогда не повреждает предыдущий успешный бандл**; повторный
+`push` того же поколения — идемпотентный no-op. Любой провал (нет ключа, нет
+локального поколения, ошибка записи) дописывает событие в `alerts.jsonl` с
+стабильным `dedupe_key` — потребитель алертов может сворачивать retry.
+
+Независимость носителя: путь должен быть вне локального backup-дерева;
+признак `same_device_as_local` в метаданных показывает, физически ли это тот
+же диск. **Целевая конфигурация — другой носитель**: смонтированный внешний
+диск, бесплатный rclone/SSHFS-маунт или диск другой машины. Используйте только
+бесплатные ресурсы; если доступен лишь платный target — остановите шаг и
+вынесите решение в отдельную карту (финансовые действия вне этой операции).
+
+Команды:
+
+```
+export AISTAT_BACKUP_ENCRYPTION_KEY='<секрет из менеджера секретов>'
+python -m aistat.backup_offsite push          # опубликовать новейшее поколение
+python -m aistat.backup_offsite list          # бандлы + метаданные
+python -m aistat.backup_offsite verify latest # расшифровать и перепроверить sha256
+python -m aistat.backup_offsite drill latest  # изолированный restore drill
+```
+
+### Изолированный restore drill
+
+`drill` восстанавливает бандл **полностью в scratch-пространстве**: расшифровка,
+проверка sha256 каждого члена по манифесту, `PRAGMA integrity_check`,
+сравнение счётчиков строк и критические запросы (наличие и наполненность
+таблицы `issues` в `aistat.db`). Живые данные не читаются-не пишутся. Отчёт с
+поэтапными таймингами и измеренным RTO сохраняется как `drill-report.json`
+в off-site каталоге; превышение RTO-цели 4 ч — warning в отчёте, любой провал
+проверок — FAIL, событие в `alerts.jsonl` и ненулевой код выхода.
+
+### Ротация логов
+
+`python -m aistat.backup_offsite rotate-log <path>` (или `rotate_backup_logs`)
+ротирует операционные логи (`data/backup.log`, `data/offsite-backup.log`) по
+лимиту размера (по умолчанию 5 MB) или возраста (по умолчанию 30 дней), хранит
+`<keep>` (по умолчанию 5) предыдущих файлов. Ротация касается только
+перечисленных логов: манифесты поколений, `alerts.jsonl` и `drill-report.json`
+— audit evidence и никогда не удаляются ротацией.
+
 
 ## Восстановление и тест восстановления
 
@@ -92,7 +178,13 @@ python -m aistat.backup self-test
 `--dry-run` показывает план, ничего не меняя). Перед подменой каждый член
 поколения разжимается, проверяется на целостность и сверяется по sha256; текущая
 живая база **сохраняется рядом как `<имя>.pre-restore`**, и лишь затем атомарно
-подменяется. Ошибка на любом шаге оставляет живые данные нетронутыми.
+подменяется. До первой live mutation проверяются все source и target paths,
+включая ancestors и `.pre-restore`. При синхронной ошибке после начала
+multi-member commit compensating rollback возвращает каждый затронутый файл,
+sidecar, права и состояние существования к значениям до команды. Эта гарантия
+не является crash/power-loss транзакцией между несколькими файлами: после
+аварийного завершения или потери питания требуется проверить generation и live
+данные вручную.
 
 ```
 python -m aistat.backup restore latest --dry-run        # предпросмотр
@@ -100,9 +192,107 @@ python -m aistat.backup restore latest --yes            # восстановит
 python -m aistat.backup restore latest --only aistat.db --yes  # одну базу
 ```
 
-Restore никогда не доверяет путям внутри манифеста: цель выводится только из
-текущей конфигурации, поэтому подделанный manifest не может записать данные вне
-`data/`.
+`verify`, `restore` и `self-test` принимают только ожидаемый обычный файл —
+не symlink — непосредственно внутри generation; absolute, traversal, вложенные
+и дублирующиеся `label`/`file` отклоняются до чтения данных. Restore-цель
+выводится только из текущей конфигурации, поэтому подделанный manifest не может
+читать archive member или записать live DB через внешний путь.
+
+## Детерминированное восстановление из Multica на изолированной копии
+
+`python -m aistat.rebuild` готовит доказуемую копию данных для независимой
+проверки. Он не использует существующую AIStat DB, snapshot, publisher или
+deploy: `capture` только читает ответы авторизованного CLI Multica, а `rebuild`
+и `verify` работают исключительно с сохранёнными файлами. Все созданные файлы
+owner-only; не переносите этот каталог на публичный хост и не добавляйте его в
+Git.
+
+Перед началом зафиксируйте точную интегрированную базу и создайте новый
+изолированный каталог (например, через `mktemp -d`). Команды ниже не меняют
+`origin/dev`, production, `data/`, `.previous` или любые release refs:
+
+```
+recovery_root="$(mktemp -d)"
+base_sha="$(git rev-parse origin/dev)"
+base_tree="$(git rev-parse "$base_sha^{tree}")"
+captured_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+python -m aistat.rebuild capture "$recovery_root/input" \
+  --base-sha "$base_sha" --base-ref origin/dev --base-tree "$base_tree" \
+  --captured-at "$captured_at"
+python -m aistat.rebuild rebuild "$recovery_root/input" "$recovery_root/output-a"
+python -m aistat.rebuild rebuild "$recovery_root/input" "$recovery_root/output-b"
+python -m aistat.rebuild verify "$recovery_root/input" "$recovery_root/output-a"
+python -m aistat.rebuild verify "$recovery_root/input" "$recovery_root/output-b"
+python -m aistat.rebuild self-test "$recovery_root/input" "$recovery_root/self-test"
+```
+
+`capture` pins every command and JSON response, full currently available
+365-day usage window, exact base/ref/tree, capture time, issue-page limit,
+credits-per-dollar setting and pricing-table hashes (including an optional
+override) in `input-manifest.json`. It fails rather than publishing a partial
+capture. The two output manifests must be byte-identical and report SHA-256 of
+the standalone SQLite copy, ordered per-runtime/model/day counter hash, range,
+totals, watermark, schema and table counts. A changed response, an unknown
+file, duplicate row, negative/decreased counter, unused response or output
+diff is a failure — never edit a manifest to bypass it.
+
+`self-test` runs backup/restore validation and a staged same-filesystem atomic
+swap followed by rollback **only** beneath its new `self-test` directory. It
+proves that the initial target bytes return after rollback. There is deliberately
+no production cutover command here: after independent exact-SHA QA, any live
+operation requires a separately authorized production card and its own backup,
+approval and rollback plan. Preserve `input/`, both `output-*` directories and
+the `self-test` evidence unchanged for that QA; do not delete or overwrite them
+while a verdict is pending.
+
+## Провал обязательного post-deploy HTTP smoke
+
+После каждой публикации `deploy/cpanel_deploy.sh` проверяет живой сайт и
+печатает в `~/aistat-private/deploy.log` одну JSON-строку evidence. `deploy
+complete` появляется только после `"result": "PASS"`. Настройка cookie-jar и
+переменных — в `docs/deployment-namecheap.md`.
+
+Что делать при `"result": "FAIL"`:
+
+1. Определить, откатился ли сайт. `ROLLED BACK after post-deploy smoke failure`
+   означает, что live link уже вернулся на прежний release и сайт работает —
+   срочности нет, разбирать причину можно спокойно. `NOT ROLLED BACK` означает,
+   что сайт остался на **непроверенном** release: это инцидент. Выбрать
+   проверенный release и выполнить обычный `rollback` из
+   `docs/deployment-namecheap.md`.
+2. Прочитать `reason` — он всегда из фиксированного набора:
+
+   - `cookie_file_missing` / `cookie_file_symlink` / `cookie_file_not_regular` /
+     `cookie_file_not_owned` / `cookie_file_permissive` /
+     `cookie_file_unreadable` — проблема в самом файле jar, а не в сайте.
+     Пересоздать его по шагу 4 инструкции развёртывания с правами `0600`.
+   - `identity_status_unexpected` — сайт ответил 4xx/5xx. Самая частая причина —
+     истёкшая сессия в jar; вторая — приложение действительно не поднялось.
+     Проверить `curl -I https://aistat.app/` перед перевыпуском jar.
+   - `identity_mismatch` — сайт отдаёт **не тот** release. Обычно это
+     недоперезапущенный Passenger или кеш перед приложением. Сверить
+     `readlink ~/aistat_app` с ожидаемым SHA из лога.
+   - `identity_cache_control_missing` — с ответа пропал `Cache-Control:
+     no-store`; ищите кеширующий слой или reverse proxy перед приложением.
+   - `identity_stale` — ответ пришёл из кеша (`Age`) или часы/`Date` разошлись
+     больше порога. Ответ из кеша ничего не доказывает о живом release.
+   - `identity_redirect_off_origin` / `proxy_spoof_redirect_off_origin` /
+     `proxy_spoof_honored` — хост уводит запрос на чужой origin или доверяет
+     подставленным `X-Forwarded-*`. Это **security-регрессия**: проверить
+     `AISTAT_PROXY_TRUST_HOPS` и конфигурацию proxy до повторного deploy.
+   - `healthz_*` с суффиксами `_transport_failed`, `_timeout`, `_tls_failed` —
+     сайт недоступен, отвалился TLS или истёк таймаут.
+   - `base_url_invalid` / `base_url_insecure` — `AISTAT_SMOKE_BASE_URL` задан
+     неверно. Плейнтекстовый `http://` разрешён только для loopback: на
+     production origin он отклоняется, а не понижает защиту молча.
+   - `usage_invalid` (exit `2`) — неверные аргументы; smoke до сайта не дошёл.
+3. Ничего не «чинить» ослаблением gate. Запрещено запускать deploy без
+   `AISTAT_SMOKE_*`, повышать `AISTAT_SMOKE_TIMEOUT` вместо диагностики
+   недоступности и считать публикацию успешной по строке `PUBLISHED`.
+
+Строка evidence не содержит cookie, тел ответов, заголовков, путей и значений
+окружения — её можно целиком передавать в задачу Multica как есть.
 
 ## Безопасная диагностика HTTP 409 freshness
 
@@ -118,8 +308,13 @@ python -m aistat.snapshot /verified/incoming-copy.db /verified/current-copy.db
 Команда открывает обе SQLite copies только для чтения и печатает JSON только с
 `verdict`, `reason` и агрегированными количествами строк; она возвращает `0`
 для `accept` и `1` для `reject`. Возможные `reason`: `incoming_older_day`,
-`incoming_empty_over_populated`, `missing_same_day_rows`,
-`decreased_same_day_counters`, `incoming_unreadable`, `target_unreadable`.
+`incoming_empty_over_populated`, `missing_rows`, `decreased_counters`,
+`incoming_unreadable`, `target_unreadable`. Проверка охватывает **всю**
+историю: `missing_rows`/`decreased_counters` означают, что incoming потерял
+или уменьшил уже записанную строку `(runtime_id, model, date)` на любой дате,
+даже если последний день совпадает. Хост предыдущего поколения возвращает те же
+два вердикта под старыми именами `missing_same_day_rows` и
+`decreased_same_day_counters`.
 Сохраните обе копии и backups, затем верните PM только код `reason` и verdict
 для отдельного решения.
 
@@ -155,8 +350,8 @@ curl -s http://127.0.0.1:8000/health | python -m json.tool | less
 Все сообщения об ошибках проходят через фиксированный безопасный словарь
 `aistat.handoff.safe_sync_error`, поэтому в `last_error` не попадают токены,
 пути или произвольный текст исключений. Сырые логи контуров лежат в
-`data/<контур>.log` (`poller.log`, `publisher.log`, `worker_sync.log`,
-`collector.log`) — это дополнение к health, а не замена.
+`data/<контур>.log` (`worker_sync.log`, `collector.log`) — это дополнение к
+health, а не замена.
 
 ## Гигиена секретов и логов
 
