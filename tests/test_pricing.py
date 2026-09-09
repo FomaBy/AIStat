@@ -239,7 +239,10 @@ def test_repo_fable_5_1_and_gpt_6_astra_rates_match_official_pages():
     assert rates["claude-fable-5"].cache_read == pytest.approx(10.0 * 0.1)
     assert fable.credits is None  # no owner directive maps Fable 5.1 to a credit tier
     assert fable.source_url.startswith("https://platform.claude.com/")
-    assert fable.captured_at == fable.effective_from == "2026-09-09"
+    # Capture date and confirmed effective date are separate facts: the rate
+    # was read 2026-09-09, the model was released 2026-09-01 (model overview).
+    assert fable.captured_at == "2026-09-09"
+    assert fable.effective_from == "2026-09-01"
 
     astra = rates["gpt-6-astra"]
     assert not astra.unpriced
@@ -247,22 +250,51 @@ def test_repo_fable_5_1_and_gpt_6_astra_rates_match_official_pages():
         (10.0, 50.0, 1.0, 12.5)
     assert astra.credits is None
     assert astra.source_url.startswith("https://developers.openai.com/")
-    assert astra.captured_at == astra.effective_from == "2026-09-09"
+    assert astra.captured_at == "2026-09-09"
+    assert astra.effective_from == "2026-09-03"  # OpenAI API changelog release date
 
 
-def test_repo_new_models_price_usage_seen_before_their_capture_date(conn):
-    # First usage predates the capture date (Fable 5.1 from 2026-09-01, Astra
-    # from 2026-09-04); without a matching history row the catalog rate applies,
-    # so that usage is priced rather than left unpriced.
+def test_repo_new_models_effective_date_boundaries():
+    # No confirmed rate exists before each model's release date; from the
+    # release date on, the captured rate applies.
+    rates = pricing.load_pricing(PRICING_JSON)
+    for model, release in (("claude-fable-5-1", "2026-09-01"),
+                           ("gpt-6-astra", "2026-09-03")):
+        day_before = release[:-1] + str(int(release[-1]) - 1)
+        assert pricing.effective_rate(rates, model, day_before) is None, model
+        on_release = pricing.effective_rate(rates, model, release)
+        assert on_release is rates[model], model
+        assert on_release.effective_from == release
+
+
+def test_repo_new_models_usage_is_priced_from_their_release_date(conn):
+    # QA finding on FAN-3953: usage on the release day must be priced from a
+    # persisted revision dated at the release, not the catalog capture date.
     rates = pricing.load_pricing(PRICING_JSON)
     _insert_usage(conn, "rt", "claude-fable-5-1", "2026-09-01", 1_000_000, 0, 1_000_000, 0)
+    _insert_usage(conn, "rt", "claude-fable-5-1", "2026-09-09", 1_000_000, 0, 1_000_000, 0)
+    _insert_usage(conn, "rt", "gpt-6-astra", "2026-09-03", 1_000_000, 0, 1_000_000, 0)
     _insert_usage(conn, "rt", "gpt-6-astra", "2026-09-04", 1_000_000, 0, 1_000_000, 0)
     pricing.upsert_model_pricing(conn, rates)
     pricing.recompute_daily_costs(conn, rates, credits_per_usd=2.0)
-    rows = {r["model"]: r for r in conn.execute(
-        "SELECT model, cost_usd, cost_credits, cost_priced FROM daily_usage")}
-    assert tuple(rows["claude-fable-5-1"]) == ("claude-fable-5-1", 10.25, 20.5, 1)
-    assert tuple(rows["gpt-6-astra"]) == ("gpt-6-astra", 11.0, 22.0, 1)
+    rows = conn.execute(
+        "SELECT model, date, cost_usd, cost_credits, cost_priced, rate_effective_from "
+        "FROM daily_usage ORDER BY model, date"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("claude-fable-5-1", "2026-09-01", 10.25, 20.5, 1, "2026-09-01"),
+        ("claude-fable-5-1", "2026-09-09", 10.25, 20.5, 1, "2026-09-01"),
+        ("gpt-6-astra", "2026-09-03", 11.0, 22.0, 1, "2026-09-03"),
+        ("gpt-6-astra", "2026-09-04", 11.0, 22.0, 1, "2026-09-03"),
+    ]
+    history = conn.execute(
+        "SELECT model, effective_from, captured_at FROM model_price_history "
+        "WHERE model IN ('claude-fable-5-1', 'gpt-6-astra') ORDER BY model"
+    ).fetchall()
+    assert [tuple(r) for r in history] == [
+        ("claude-fable-5-1", "2026-09-01", "2026-09-09"),
+        ("gpt-6-astra", "2026-09-03", "2026-09-09"),
+    ]
     assert pricing.unpriced_models_in_usage(conn, rates) == []
 
 

@@ -84,8 +84,8 @@
       "currency": "USD",
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "captured_at": "2026-09-09",
-      "effective_from": "2026-09-09",
-      "notes": "Claude Fable 5.1 (API ID claude-fable-5-1; first seen in runtime usage 2026-09-01). 5m cache write = 1.25x input; 1h = 2x. Cache read (hit) is 0.025x input ($0.25/MTok) on Fable 5.1 and Mythos 5.1, not the 0.1x used by every other Claude model. No credits block: no owner directive maps Fable 5.1 to a Codex credit tier (FAN-1427 covers Fable 5 only), so cost_credits falls back to usd*AISTAT_CREDITS_PER_USD until one is recorded."
+      "effective_from": "2026-09-01",
+      "notes": "Claude Fable 5.1 (API ID claude-fable-5-1). effective_from is the release date 2026-09-01 from the official model overview (platform.claude.com/docs/en/models/fable-5-1/overview); the rate was captured 2026-09-09. 5m cache write = 1.25x input; 1h = 2x. Cache read (hit) is 0.025x input ($0.25/MTok) on Fable 5.1 and Mythos 5.1, not the 0.1x used by every other Claude model. No credits block: no owner directive maps Fable 5.1 to a Codex credit tier (FAN-1427 covers Fable 5 only), so cost_credits falls back to usd*AISTAT_CREDITS_PER_USD until one is recorded."
     },
     "claude-sonnet-5": {
       "vendor": "Anthropic",
@@ -243,8 +243,8 @@
       "currency": "USD",
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "captured_at": "2026-09-09",
-      "effective_from": "2026-09-09",
-      "notes": "GPT-6 Astra Standard / short-context API rates (first seen in runtime usage 2026-09-04). cache_read is the published cached-input rate (0.1x input); cache_write = 1.25x uncached input per the gpt-6-astra model page. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator. No credits block: the Codex rate card could not be re-read on 2026-09-09 and no owner directive maps GPT-6 Astra to a credit rate, so cost_credits falls back to usd*AISTAT_CREDITS_PER_USD."
+      "effective_from": "2026-09-03",
+      "notes": "GPT-6 Astra Standard / short-context API rates. effective_from is the release date 2026-09-03 from the OpenAI API changelog; the rate was captured 2026-09-09. cache_read is the published cached-input rate (0.1x input); cache_write = 1.25x uncached input per the gpt-6-astra model page. Fast and long-context rates are excluded because usage has no service-tier or context-length discriminator. No credits block: the Codex rate card could not be re-read on 2026-09-09 and no owner directive maps GPT-6 Astra to a credit rate, so cost_credits falls back to usd*AISTAT_CREDITS_PER_USD."
     }
   }
 }

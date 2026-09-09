@@ -497,9 +497,9 @@ python3 -m aistat.migrate
 [анонсу OpenAI](https://openai.com/index/advancing-the-price-performance-frontier-with-gpt-5-6/)
 и [Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card).
 USD-ставки Claude и OpenAI повторно сверены **2026-09-09** (FAN-3953): добавлены
-`claude-fable-5-1` и `gpt-6-astra`, для `gpt-5.6-sol` записана промо-ревизия с
-2026-08-21; credit-ставки Codex при этой сверке перечитать не удалось и оставлены
-от 2026-07-30. Для остальных моделей точная дата снятия указана в `pricing.json`.
+`claude-fable-5-1` (действует с релиза 2026-09-01) и `gpt-6-astra` (с релиза
+2026-09-03), для `gpt-5.6-sol` записана промо-ревизия с 2026-08-21; credit-ставки
+Codex при этой сверке перечитать не удалось и оставлены от 2026-07-30. Для остальных моделей точная дата снятия указана в `pricing.json`.
 
 | Модель | Вендор | input | output | cache read | cache write (5m) | Источник |
 |---|---|---|---|---|---|---|
