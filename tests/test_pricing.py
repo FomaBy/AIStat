@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -260,11 +261,36 @@ def test_repo_new_models_effective_date_boundaries():
     rates = pricing.load_pricing(PRICING_JSON)
     for model, release in (("claude-fable-5-1", "2026-09-01"),
                            ("gpt-6-astra", "2026-09-03")):
-        day_before = release[:-1] + str(int(release[-1]) - 1)
+        day_before = (date.fromisoformat(release) - timedelta(days=1)).isoformat()
+        assert day_before in ("2026-08-31", "2026-09-02")  # real calendar dates
         assert pricing.effective_rate(rates, model, day_before) is None, model
         on_release = pricing.effective_rate(rates, model, release)
         assert on_release is rates[model], model
         assert on_release.effective_from == release
+
+
+def test_repo_cache_read_ratios_follow_vendor_footnotes_and_docs_say_so():
+    # Second QA finding on FAN-3953: the catalog stored the right Fable 5.1
+    # cache-read rate, but README and the assumptions text still claimed a
+    # universal 0.1x ratio. Pin both the per-model ratios and the prose.
+    doc = json.loads(PRICING_JSON.read_text(encoding="utf-8"))
+    rates = pricing.load_pricing(PRICING_JSON)
+    quarter_rate = {"claude-fable-5-1"}
+    for model, rate in rates.items():
+        if rate.unpriced:
+            continue
+        expected = 0.025 if model in quarter_rate else 0.1
+        assert rate.cache_read == pytest.approx(rate.input * expected), model
+        if rate.vendor == "OpenAI":
+            assert rate.cache_write == pytest.approx(rate.input * 1.25), model
+    cache_read_rule = next(a for a in doc["assumptions"] if a.startswith("cache_read"))
+    assert "0.025x" in cache_read_rule and "claude-fable-5-1" in cache_read_rule
+    assert "never a universal ratio" in cache_read_rule
+    cache_write_rule = next(a for a in doc["assumptions"] if a.startswith("cache_write"))
+    assert "gpt-6-astra" in cache_write_rule
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "0.025× input" in readme and "`claude-fable-5-1` (и Mythos 5.1)" in readme
+    assert "`cache_read` — по ставке кеш-хита (0.1× input)" not in readme
 
 
 def test_repo_new_models_usage_is_priced_from_their_release_date(conn):
