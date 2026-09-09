@@ -496,17 +496,23 @@ python3 -m aistat.migrate
 **2026-07-30** по [таблице API pricing](https://developers.openai.com/api/docs/pricing),
 [анонсу OpenAI](https://openai.com/index/advancing-the-price-performance-frontier-with-gpt-5-6/)
 и [Codex rate card](https://help.openai.com/en/articles/20001106-codex-rate-card).
-Для остальных моделей точная дата снятия указана в `pricing.json`.
+USD-ставки Claude и OpenAI повторно сверены **2026-09-09** (FAN-3953): добавлены
+`claude-fable-5-1` (действует с релиза 2026-09-01) и `gpt-6-astra` (с релиза
+2026-09-03), для `gpt-5.6-sol` записана промо-ревизия с 2026-08-21; credit-ставки
+Codex при этой сверке перечитать не удалось и оставлены от 2026-07-30. Для остальных моделей точная дата снятия указана в `pricing.json`.
 
 | Модель | Вендор | input | output | cache read | cache write (5m) | Источник |
 |---|---|---|---|---|---|---|
 | `claude-opus-4-8` | Anthropic | $5 | $25 | $0.50 | $6.25 | docs.claude.com/pricing |
 | `claude-opus-5` | Anthropic | $5 | $25 | $0.50 | $6.25 | docs.claude.com/pricing |
 | `claude-fable-5` | Anthropic | $10 | $50 | $1.00 | $12.50 | docs.claude.com/pricing |
+| `claude-fable-5-1` | Anthropic | $10 | $50 | $0.25 | $12.50 | docs.claude.com/pricing |
 | `claude-haiku-4-5-20251001` | Anthropic | $1 | $5 | $0.10 | $1.25 | docs.claude.com/pricing |
-| `gpt-5.6-sol` | OpenAI | $5 | $30 | $0.50 | $6.25 | developers.openai.com/api/docs/pricing |
+| `gpt-5.6-sol` (с 2026-08-21, промо минимум до 2026-11-21) | OpenAI | $4 | $20 | $0.40 | $5.00 | developers.openai.com/api/docs/pricing |
+| `gpt-5.6-sol` (до 2026-08-21) | OpenAI | $5 | $30 | $0.50 | $6.25 | developers.openai.com/api/docs/pricing |
 | `gpt-5.6-terra` | OpenAI | $2 | $12 | $0.20 | $2.50 | developers.openai.com/api/docs/pricing |
 | `gpt-5.6-luna` | OpenAI | $0.20 | $1.20 | $0.02 | $0.25 | developers.openai.com/api/docs/pricing |
+| `gpt-6-astra` | OpenAI | $10 | $50 | $1.00 | $12.50 | developers.openai.com/api/docs/pricing |
 
 Точные URL и даты для каждой ставки — в `pricing.json` и в таблице
 `model_pricing` (видна в health, поле `pricing.rates`). Все модели из реальной
@@ -529,11 +535,15 @@ usd = (input·input_rate + output·output_rate
 ```
 
 `cache_write` тарифицируется по ставке кеш-записи с TTL 5 минут (у Anthropic и у
-gpt-5.6 это 1.25× input — дефолтный ephemeral-кеш, которым и пользуются агенты);
-ставка 1-часового кеша хранится в `pricing.json` (`cache_write_1h`) для справки и
-переопределения. `cache_read` — по ставке кеш-хита (0.1× input). У codex-моделей
-Multica отдаёт `cache_write_tokens = 0`, поэтому ставка кеш-записи OpenAI на
-текущую стоимость не влияет.
+OpenAI-моделей gpt-5.6 и gpt-6-astra это 1.25× input — дефолтный ephemeral-кеш,
+которым и пользуются агенты); ставка 1-часового кеша хранится в `pricing.json`
+(`cache_write_1h`) для справки и переопределения. `cache_read` — по опубликованной
+вендором ставке кеш-хита конкретной модели, а не по единому множителю: у Anthropic
+это 0.1× input для всех моделей, кроме `claude-fable-5-1` (и Mythos 5.1), где
+вендор отдельной сноской задаёт 0.025× input ($0.25 вместо $1.00 за MTok); у OpenAI —
+опубликованная cached-input ставка (0.1× input). У codex-моделей Multica отдаёт
+`cache_write_tokens = 0`, поэтому ставка кеш-записи OpenAI на текущую стоимость
+не влияет.
 
 AIStat не получает service tier или длину контекста каждого запроса, поэтому для
 обычных агрегированных строк применяются только Standard / short-context ставки.

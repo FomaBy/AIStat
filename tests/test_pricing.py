@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -158,9 +159,9 @@ def test_credits_block_must_be_numeric(tmp_path):
 
 def test_load_repo_pricing_json_has_official_rates_and_sources():
     rates = pricing.load_pricing(PRICING_JSON)
-    for model in ("claude-opus-4-8", "claude-fable-5",
+    for model in ("claude-opus-4-8", "claude-fable-5", "claude-fable-5-1",
                   "claude-haiku-4-5-20251001", "gpt-5.6-sol", "gpt-5.6-terra",
-                  "gpt-5.6-luna"):
+                  "gpt-5.6-luna", "gpt-6-astra"):
         assert model in rates, model
         rate = rates[model]
         assert not rate.unpriced
@@ -170,21 +171,157 @@ def test_load_repo_pricing_json_has_official_rates_and_sources():
     opus = rates["claude-opus-4-8"]
     assert (opus.input, opus.output, opus.cache_read, opus.cache_write) == (5.0, 25.0, 0.5, 6.25)
     sol = rates["gpt-5.6-sol"]
-    assert (sol.input, sol.output, sol.cache_read) == (5.0, 30.0, 0.5)
+    assert (sol.input, sol.output, sol.cache_read) == (4.0, 20.0, 0.4)
 
 
 def test_repo_gpt_5_6_standard_rates_and_credits_are_current():
+    # FAN-3953: Sol carries OpenAI's 2026-08-21 promotional cut ($5/$30 ->
+    # $4/$20, cached input $0.40). The Codex credit rate card could not be
+    # re-read on 2026-09-09, so every credits block is still the 2026-07-30 card.
     rates = pricing.load_pricing(PRICING_JSON)
     expected = {
-        "gpt-5.6-luna": ((0.2, 1.2, 0.02, 0.25), (5.0, 0.5, 30.0)),
-        "gpt-5.6-terra": ((2.0, 12.0, 0.2, 2.5), (50.0, 5.0, 300.0)),
-        "gpt-5.6-sol": ((5.0, 30.0, 0.5, 6.25), (125.0, 12.5, 750.0)),
+        "gpt-5.6-luna": ((0.2, 1.2, 0.02, 0.25), (5.0, 0.5, 30.0), "2026-07-30"),
+        "gpt-5.6-terra": ((2.0, 12.0, 0.2, 2.5), (50.0, 5.0, 300.0), "2026-07-30"),
+        "gpt-5.6-sol": ((4.0, 20.0, 0.4, 5.0), (125.0, 12.5, 750.0), "2026-09-09"),
     }
-    for model, (usd, credits) in expected.items():
+    for model, (usd, credits, captured) in expected.items():
         rate = rates[model]
         assert (rate.input, rate.output, rate.cache_read, rate.cache_write) == usd
         assert (rate.credits.input, rate.credits.cache_read, rate.credits.output) == credits
-        assert rate.captured_at == rate.credits.captured_at == "2026-07-30"
+        assert rate.captured_at == captured
+        assert rate.credits.captured_at == "2026-07-30"
+
+
+def test_repo_sol_promotional_cut_is_a_dated_revision():
+    # The pre-cut Sol rate stays as an immutable revision so usage before
+    # 2026-08-21 keeps its historical price; the cut is a new effective date.
+    rates = pricing.load_pricing(PRICING_JSON)
+    revisions = rates.revisions["gpt-5.6-sol"]
+    assert [r.effective_from for r in revisions] == ["2026-07-30", "2026-08-21"]
+    before, after = revisions
+    assert (before.input, before.output, before.cache_read, before.cache_write) == \
+        (5.0, 30.0, 0.5, 6.25)
+    assert (after.input, after.output, after.cache_read, after.cache_write) == \
+        (4.0, 20.0, 0.4, 5.0)
+    assert after.cache_write == pytest.approx(after.input * 1.25)
+    for rate in revisions:
+        assert (rate.credits.input, rate.credits.cache_read, rate.credits.output) == \
+            (125.0, 12.5, 750.0)
+    assert pricing.effective_rate(rates, "gpt-5.6-sol", "2026-08-20") is before
+    assert pricing.effective_rate(rates, "gpt-5.6-sol", "2026-08-21") is after
+    assert rates["gpt-5.6-sol"] is after
+
+
+def test_repo_sol_usage_is_priced_by_its_date(conn):
+    rates = pricing.load_pricing(PRICING_JSON)
+    _insert_usage(conn, "rt", "gpt-5.6-sol", "2026-08-20", 1_000_000, 1_000_000, 0, 0)
+    _insert_usage(conn, "rt", "gpt-5.6-sol", "2026-08-21", 1_000_000, 1_000_000, 0, 0)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=1.0)
+    rows = conn.execute(
+        "SELECT date, cost_usd, cost_credits, rate_effective_from "
+        "FROM daily_usage ORDER BY date"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("2026-08-20", 35.0, 875.0, "2026-07-30"),
+        ("2026-08-21", 24.0, 875.0, "2026-08-21"),
+    ]
+
+
+def test_repo_fable_5_1_and_gpt_6_astra_rates_match_official_pages():
+    # FAN-3953: both models appear in live runtime usage since September 2026.
+    rates = pricing.load_pricing(PRICING_JSON)
+    fable = rates["claude-fable-5-1"]
+    assert not fable.unpriced
+    assert (fable.input, fable.output, fable.cache_read,
+            fable.cache_write, fable.cache_write_1h) == (10.0, 50.0, 0.25, 12.5, 20.0)
+    # Fable 5.1 cache hits are 0.025x input, unlike the 0.1x on every other Claude model.
+    assert fable.cache_read == pytest.approx(fable.input * 0.025)
+    assert rates["claude-fable-5"].cache_read == pytest.approx(10.0 * 0.1)
+    assert fable.credits is None  # no owner directive maps Fable 5.1 to a credit tier
+    assert fable.source_url.startswith("https://platform.claude.com/")
+    # Capture date and confirmed effective date are separate facts: the rate
+    # was read 2026-09-09, the model was released 2026-09-01 (model overview).
+    assert fable.captured_at == "2026-09-09"
+    assert fable.effective_from == "2026-09-01"
+
+    astra = rates["gpt-6-astra"]
+    assert not astra.unpriced
+    assert (astra.input, astra.output, astra.cache_read, astra.cache_write) == \
+        (10.0, 50.0, 1.0, 12.5)
+    assert astra.credits is None
+    assert astra.source_url.startswith("https://developers.openai.com/")
+    assert astra.captured_at == "2026-09-09"
+    assert astra.effective_from == "2026-09-03"  # OpenAI API changelog release date
+
+
+def test_repo_new_models_effective_date_boundaries():
+    # No confirmed rate exists before each model's release date; from the
+    # release date on, the captured rate applies.
+    rates = pricing.load_pricing(PRICING_JSON)
+    for model, release in (("claude-fable-5-1", "2026-09-01"),
+                           ("gpt-6-astra", "2026-09-03")):
+        day_before = (date.fromisoformat(release) - timedelta(days=1)).isoformat()
+        assert day_before in ("2026-08-31", "2026-09-02")  # real calendar dates
+        assert pricing.effective_rate(rates, model, day_before) is None, model
+        on_release = pricing.effective_rate(rates, model, release)
+        assert on_release is rates[model], model
+        assert on_release.effective_from == release
+
+
+def test_repo_cache_read_ratios_follow_vendor_footnotes_and_docs_say_so():
+    # Second QA finding on FAN-3953: the catalog stored the right Fable 5.1
+    # cache-read rate, but README and the assumptions text still claimed a
+    # universal 0.1x ratio. Pin both the per-model ratios and the prose.
+    doc = json.loads(PRICING_JSON.read_text(encoding="utf-8"))
+    rates = pricing.load_pricing(PRICING_JSON)
+    quarter_rate = {"claude-fable-5-1"}
+    for model, rate in rates.items():
+        if rate.unpriced:
+            continue
+        expected = 0.025 if model in quarter_rate else 0.1
+        assert rate.cache_read == pytest.approx(rate.input * expected), model
+        if rate.vendor == "OpenAI":
+            assert rate.cache_write == pytest.approx(rate.input * 1.25), model
+    cache_read_rule = next(a for a in doc["assumptions"] if a.startswith("cache_read"))
+    assert "0.025x" in cache_read_rule and "claude-fable-5-1" in cache_read_rule
+    assert "never a universal ratio" in cache_read_rule
+    cache_write_rule = next(a for a in doc["assumptions"] if a.startswith("cache_write"))
+    assert "gpt-6-astra" in cache_write_rule
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "0.025× input" in readme and "`claude-fable-5-1` (и Mythos 5.1)" in readme
+    assert "`cache_read` — по ставке кеш-хита (0.1× input)" not in readme
+
+
+def test_repo_new_models_usage_is_priced_from_their_release_date(conn):
+    # QA finding on FAN-3953: usage on the release day must be priced from a
+    # persisted revision dated at the release, not the catalog capture date.
+    rates = pricing.load_pricing(PRICING_JSON)
+    _insert_usage(conn, "rt", "claude-fable-5-1", "2026-09-01", 1_000_000, 0, 1_000_000, 0)
+    _insert_usage(conn, "rt", "claude-fable-5-1", "2026-09-09", 1_000_000, 0, 1_000_000, 0)
+    _insert_usage(conn, "rt", "gpt-6-astra", "2026-09-03", 1_000_000, 0, 1_000_000, 0)
+    _insert_usage(conn, "rt", "gpt-6-astra", "2026-09-04", 1_000_000, 0, 1_000_000, 0)
+    pricing.upsert_model_pricing(conn, rates)
+    pricing.recompute_daily_costs(conn, rates, credits_per_usd=2.0)
+    rows = conn.execute(
+        "SELECT model, date, cost_usd, cost_credits, cost_priced, rate_effective_from "
+        "FROM daily_usage ORDER BY model, date"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("claude-fable-5-1", "2026-09-01", 10.25, 20.5, 1, "2026-09-01"),
+        ("claude-fable-5-1", "2026-09-09", 10.25, 20.5, 1, "2026-09-01"),
+        ("gpt-6-astra", "2026-09-03", 11.0, 22.0, 1, "2026-09-03"),
+        ("gpt-6-astra", "2026-09-04", 11.0, 22.0, 1, "2026-09-03"),
+    ]
+    history = conn.execute(
+        "SELECT model, effective_from, captured_at FROM model_price_history "
+        "WHERE model IN ('claude-fable-5-1', 'gpt-6-astra') ORDER BY model"
+    ).fetchall()
+    assert [tuple(r) for r in history] == [
+        ("claude-fable-5-1", "2026-09-01", "2026-09-09"),
+        ("gpt-6-astra", "2026-09-03", "2026-09-09"),
+    ]
+    assert pricing.unpriced_models_in_usage(conn, rates) == []
 
 
 def test_repo_pricing_has_an_effective_date_for_each_confirmed_rate():
@@ -194,40 +331,43 @@ def test_repo_pricing_has_an_effective_date_for_each_confirmed_rate():
 
 def test_repo_sonnet_rates_match_official_table():
     # FAN-2161: Sonnet rows from the official Anthropic pricing table.
-    # Sonnet 5 carries introductory pricing through 2026-08-31 ($3/$15 after);
+    # Sonnet 5's $2/$10 launch price became the standard price (the planned
+    # 2026-09-01 rise to $3/$15 was cancelled; re-verified 2026-09-09, FAN-3953);
     # the other Sonnet models are at standard rates. No Sonnet model has a
     # credits block (no owner directive maps Sonnet to a Codex credit tier),
     # so cost_credits falls back to usd*AISTAT_CREDITS_PER_USD.
     rates = pricing.load_pricing(PRICING_JSON)
     expected = {
-        "claude-sonnet-5": (2.0, 10.0, 0.2, 2.5, 4.0),
-        "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75, 6.0),
-        "claude-sonnet-4-5-20250929": (3.0, 15.0, 0.3, 3.75, 6.0),
-        "claude-sonnet-4-20250514": (3.0, 15.0, 0.3, 3.75, 6.0),
+        "claude-sonnet-5": ((2.0, 10.0, 0.2, 2.5, 4.0), "2026-09-09"),
+        "claude-sonnet-4-6": ((3.0, 15.0, 0.3, 3.75, 6.0), "2026-08-05"),
+        "claude-sonnet-4-5-20250929": ((3.0, 15.0, 0.3, 3.75, 6.0), "2026-08-05"),
+        "claude-sonnet-4-20250514": ((3.0, 15.0, 0.3, 3.75, 6.0), "2026-08-05"),
     }
-    for model, usd in expected.items():
+    for model, (usd, captured) in expected.items():
         rate = rates[model]
         assert not rate.unpriced
         assert (rate.input, rate.output, rate.cache_read,
                 rate.cache_write, rate.cache_write_1h) == usd, model
         assert rate.credits is None, model
         assert rate.source_url.startswith("https://platform.claude.com/")
-        assert rate.captured_at == "2026-08-05"
+        assert rate.captured_at == captured, model
+    assert rates["claude-sonnet-5"].effective_from == "2026-08-05"
 
 
 def test_health_mirrors_current_gpt_5_6_rates(conn):
     rates = pricing.load_pricing(PRICING_JSON)
     pricing.upsert_model_pricing(conn, rates)
     health_rates = {rate["model"]: rate for rate in snapshot(conn)["pricing"]["rates"]}
-    for model, expected in {
-        "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
-        "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
-        "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+    for model, (expected, captured) in {
+        "gpt-5.6-luna": ((0.2, 1.2, 0.02, 0.25), "2026-07-30"),
+        "gpt-5.6-terra": ((2.0, 12.0, 0.2, 2.5), "2026-07-30"),
+        "gpt-5.6-sol": ((4.0, 20.0, 0.4, 5.0), "2026-09-09"),
+        "gpt-6-astra": ((10.0, 50.0, 1.0, 12.5), "2026-09-09"),
     }.items():
         rate = health_rates[model]
         assert (rate["input_rate"], rate["output_rate"],
                 rate["cache_read_rate"], rate["cache_write_rate"]) == expected
-        assert rate["captured_at"] == "2026-07-30"
+        assert rate["captured_at"] == captured
 
 
 def test_load_pricing_override_extends_and_replaces(tmp_path):
